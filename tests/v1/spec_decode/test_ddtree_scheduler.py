@@ -14,7 +14,7 @@ class _Request:
         self.request_id = "r0"
         self.is_prefill_chunk = is_prefill_chunk
         self.spec_token_ids: list[int] = []
-        self.structured_output_request = None
+        self.structured_output_request: SimpleNamespace | None = None
         self.max_tokens = 8
         self._output_token_ids: list[int] = []
         self.num_output_placeholders = 0

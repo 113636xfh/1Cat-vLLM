@@ -590,7 +590,9 @@ def sm70_awq_warmup(worker: Worker) -> None:
         return
 
     device = worker.device
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (7, 0):
+    if device is None or (
+        device.type != "cuda" or torch.cuda.get_device_capability(device) != (7, 0)
+    ):
         return
 
     model = worker.get_model()
