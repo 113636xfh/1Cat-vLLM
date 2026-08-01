@@ -1025,9 +1025,7 @@ def test_sm70_qwen_gdn_full_forward_auto_protects_non_mtp(
 ):
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", str(int(spec_core)))
-    monkeypatch.setenv(
-        "VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", str(int(spec_core_003))
-    )
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", str(int(spec_core_003)))
     _clear_envs_cache()
 
     assert (
