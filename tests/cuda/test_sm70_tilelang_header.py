@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import importlib.metadata
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import regex as re
 from packaging.version import Version
 
 SM70_TILELANG_FIX_VERSION = Version("0.1.10")
@@ -27,6 +27,7 @@ def test_tilelang_header_compiles_for_sm70(tmp_path: Path) -> None:
     nvcc = shutil.which("nvcc")
     if nvcc is None:
         pytest.skip("requires nvcc")
+    assert nvcc is not None
 
     compiler = subprocess.run(
         [nvcc, "--version"],
@@ -37,6 +38,7 @@ def test_tilelang_header_compiles_for_sm70(tmp_path: Path) -> None:
     match = re.search(r"release (\d+)\.", compiler.stdout)
     if match is None:
         pytest.fail(f"could not determine CUDA version from: {compiler.stdout}")
+    assert match is not None
     if int(match.group(1)) >= 13:
         pytest.skip("CUDA 13 no longer supports SM70 offline compilation")
 
@@ -46,9 +48,9 @@ def test_tilelang_header_compiles_for_sm70(tmp_path: Path) -> None:
         pytest.skip("requires the CUDA tilelang dependency")
 
     assert Version(tilelang.version) >= SM70_TILELANG_FIX_VERSION
-    include_dir = Path(tilelang.locate_file("tilelang/src"))
+    include_dir = Path(str(tilelang.locate_file("tilelang/src")))
     cutlass_include_dir = Path(
-        tilelang.locate_file("tilelang/3rdparty/cutlass/include")
+        str(tilelang.locate_file("tilelang/3rdparty/cutlass/include"))
     )
     assert (include_dir / "tl_templates/cuda/common.h").is_file()
     assert cutlass_include_dir.is_dir()
