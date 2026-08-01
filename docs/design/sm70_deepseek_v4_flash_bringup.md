@@ -102,7 +102,8 @@ Reuse these official implementations and semantics:
 2. The fused CUDA qnorm/RoPE/KV-insert op intentionally errors on SM70.
 3. Main MLA currently requires the FlashMLA backend and FP8 DS MLA cache.
 4. The O projection uses FP8 einsum kernels unavailable on SM70.
-5. TileLang mHC currently assumes BF16.
+5. TileLang 0.1.9 does not compile its packed BF16 fallback on SM70. CUDA uses
+   TileLang/TVM-FFI 0.1.10, and V100 model execution must explicitly use FP16.
 6. MXFP4 expert MoE has no registered TurboMind SM70 route.
 7. Official upstream fixes after the current 1Cat import must be audited for
    TP, MTP, prefix-cache, packed-KV, graph, OOM, and indexer correctness.
@@ -181,3 +182,6 @@ Reuse these official implementations and semantics:
 | 2026-08-01 | Standalone C++/CUDA compile | TurboMind source compiles for `sm_70` with the repository constexpr flags; Torch bindings pass C++17 syntax checking. | New MXFP4 operator and registration are build-valid locally. |
 | 2026-08-01 | Independent graph-contract review | Found C128 active width was also changing physical row stride, so FULL-graph replay could read another row's old indices. | Fixed only on SM70 with a stable row stride plus a device-side dynamic length loop; preserve upstream packed layout on other GPUs. |
 | 2026-08-01 | Local CUDA execution | CUDA initialization fails with error 804 because of the local driver/userspace mismatch. | Do not claim runtime correctness or speed from local AOT; run real GPU gates remotely. |
+| 2026-08-02 | Remote full-core SM70 build | The 80-core build completed all main vLLM and Flash-V100 extensions; `_C`, `_moe_C`, stable libtorch, and Flash-V100 import successfully. | Reuse the built extensions for component gates instead of rebuilding the full tree. |
+| 2026-08-02 | TileLang dependency isolation on V100 | TileLang 0.1.9 fails while compiling an unused BF16 `fma2` fallback. Exact TileLang/TVM-FFI 0.1.10 passes 7 focused and 43 general SM70 FP16 mHC tests; 8 ROCm-only cases skip. | Pin CUDA to 0.1.10; preserve FP16 inputs rather than silently casting BF16. |
+| 2026-08-02 | Remote V4 component gates | SM70 route tests pass 9/9, TurboMind MXFP4 MoE passes 12/12, and compressed indexer slot mapping passes with the local V4 config. The DeepGEMM MegaMoE staging test is not applicable because that runtime requires SM100. | Proceed to full-model TP8 and PP2 x TP4 route and quality gates. |
