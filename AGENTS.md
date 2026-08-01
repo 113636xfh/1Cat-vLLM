@@ -127,3 +127,7 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **SM70/V100 performance engineering**:
+  [`docs/contributing/sm70-worktree-pr-workflow.md`](docs/contributing/sm70-worktree-pr-workflow.md)
+  — Mandatory isolated-worktree, evidence, and Draft-PR workflow for 1Cat
+  performance changes.
