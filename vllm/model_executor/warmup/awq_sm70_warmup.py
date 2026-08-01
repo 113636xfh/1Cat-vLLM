@@ -184,6 +184,15 @@ def _iter_unique_fp8_dense_layers(
         if not getattr(layer, "sm70_fp8_turbomind", False):
             continue
 
+        if getattr(layer, "sm70_fp8_bmm", False):
+            k_dim = int(layer.weight.shape[1])
+            n_dim = int(layer.sm70_fp8_bmm_output_size)
+            key = (k_dim, n_dim, False)
+            if key not in seen:
+                seen.add(key)
+                yield layer, False
+            continue
+
         k_dim = int(layer.weight.shape[0])
         n_dim = int(layer.output_size_per_partition)
         if not getattr(layer, "sm70_fp8_gated_silu_primary", False):
@@ -336,7 +345,14 @@ def _warmup_fp8_dense_layers(
 
     calls = 0
     for layer, gated_silu in dense_layers:
-        if gated_silu:
+        if getattr(layer, "sm70_fp8_bmm", False):
+            assert not gated_silu
+            weight = layer.weight[0]
+            scales = layer.weight_scale_inv[0]
+            k_ld = int(layer.sm70_fp8_k_ld)
+            q_ld = int(layer.sm70_fp8_q_ld)
+            n_dim = int(layer.sm70_fp8_bmm_output_size)
+        elif gated_silu:
             if getattr(layer, "sm70_fp8_gated_silu_primary", False):
                 weight = layer.weight
                 scales = layer.weight_scale_inv

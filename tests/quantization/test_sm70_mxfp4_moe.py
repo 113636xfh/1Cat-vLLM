@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -176,3 +178,23 @@ def test_mxfp4_sm70_factory_rejects_marlin_or_emulation(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="Marlin"):
         make_deepseek_v4_mxfp4_moe_method(_v4_flash_moe_config())
+
+
+def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
+    for op_name in (
+        "mxfp4_sm70_prepare",
+        "mxfp4_moe_dense_stage_sm70_out",
+        "awq_moe_build_strided_ptrs",
+    ):
+        monkeypatch.setattr(torch.ops._C, op_name, object(), raising=False)
+    monkeypatch.setattr(
+        torch.ops._moe_C, "moe_permute_with_scratch", object(), raising=False
+    )
+    method = Mxfp4SM70MoEMethod(_v4_flash_moe_config())
+    layer = SimpleNamespace(
+        activation=MoEActivation.GELU,
+        apply_router_weight_on_input=False,
+    )
+
+    with pytest.raises(NotImplementedError, match="SwiGLU"):
+        method.process_weights_after_loading(layer)
