@@ -231,9 +231,7 @@ def test_gemma4_non_centroid_greedy_sample_passes_spec_step_idx(
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         observed_spec_step_indices.append(spec_step_idx)
-        return torch.full(
-            (hidden_states.shape[0],), spec_step_idx, dtype=torch.int64
-        )
+        return torch.full((hidden_states.shape[0],), spec_step_idx, dtype=torch.int64)
 
     monkeypatch.setattr(SpecDecodeBaseProposer, "_greedy_sample", fake_greedy_sample)
 

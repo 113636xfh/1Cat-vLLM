@@ -123,9 +123,7 @@ def test_update_draft_token_ids_caches_matching_ddtree_payload() -> None:
     scheduler = _scheduler(request)
     payload = _payload()
 
-    scheduler.update_draft_token_ids(
-        DraftTokenIds(["r0"], [[11, 21, 31]], [payload])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds(["r0"], [[11, 21, 31]], [payload]))
 
     assert request.spec_token_ids == [11, 21, 31]
     assert scheduler.ddtree_payloads_by_req_id == {"r0": payload}
@@ -137,9 +135,7 @@ def test_update_draft_token_ids_drops_payload_after_grammar_trim() -> None:
     scheduler = _scheduler(request, advance=True)
     payload = _payload()
 
-    scheduler.update_draft_token_ids(
-        DraftTokenIds(["r0"], [[11, 21, 31]], [payload])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds(["r0"], [[11, 21, 31]], [payload]))
 
     assert request.spec_token_ids == [11, 21]
     assert scheduler.ddtree_payloads_by_req_id == {}
@@ -152,9 +148,7 @@ def test_update_draft_token_ids_drops_payload_for_prefill_chunk() -> None:
     payload = _payload()
     scheduler.ddtree_payloads_by_req_id = {"r0": payload}
 
-    scheduler.update_draft_token_ids(
-        DraftTokenIds(["r0"], [[11, 21, 31]], [payload])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds(["r0"], [[11, 21, 31]], [payload]))
 
     assert request.spec_token_ids == []
     assert scheduler.ddtree_payloads_by_req_id == {}

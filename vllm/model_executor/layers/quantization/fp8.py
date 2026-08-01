@@ -482,9 +482,7 @@ class Fp8LinearMethod(LinearMethodBase):
             if weight_scale_inv.dtype != torch.float32:
                 weight_scale_inv = weight_scale_inv.to(torch.float32)
             is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
-            use_gated_silu = (
-                is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
-            )
+            use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
                 weight_scale_inv,
@@ -1124,16 +1122,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13 = self._dequantize_block_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_block_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_block_moe_weight(w2, w2_scale, layer.orig_dtype)
             else:
                 w13 = self._dequantize_tensor_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_tensor_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_tensor_moe_weight(w2, w2_scale, layer.orig_dtype)
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             layer.w13_input_scale = None

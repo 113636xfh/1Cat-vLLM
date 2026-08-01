@@ -95,9 +95,7 @@ def _make_fixed_prefill_impl(fixed_entry, splitkv3_entry=None):
     impl.logits_soft_cap = 0.0
     impl.sinks = None
     impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch = fixed_entry
-    impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3 = (
-        splitkv3_entry
-    )
+    impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3 = splitkv3_entry
     impl.last_route_proof = None
     impl._flashinfer_sm70_active_metadata = None
     return impl
