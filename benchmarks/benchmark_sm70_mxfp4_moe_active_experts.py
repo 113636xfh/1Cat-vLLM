@@ -326,6 +326,59 @@ def benchmark_stage(
     return result
 
 
+def profile_active_stage_once(
+    shape: StageShape,
+    *,
+    num_experts: int,
+    top_k: int,
+    seed: int,
+) -> dict[str, object]:
+    """Capture one warmed active-expert stage without dense-control kernels."""
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    _weights, _scales, ptrs_w, ptrs_s = _prepare_experts(shape, num_experts, device)
+    route = [3, 17, 42, 99, 128, 255]
+    if top_k != len(route) or max(route) >= num_experts:
+        raise ValueError("The exact profile requires 256 experts and top-k=6")
+
+    x = torch.randn(top_k, shape.k, dtype=torch.float16, device=device) * 0.01
+    active_out = torch.empty(top_k, shape.n, dtype=torch.float16, device=device)
+    active_ids = torch.tensor(route, dtype=torch.int32, device=device)
+    active_offsets = torch.arange(top_k + 1, dtype=torch.int32, device=device)
+
+    def active_call() -> None:
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            active_out,
+            x,
+            active_offsets,
+            active_ids,
+            ptrs_w,
+            ptrs_s,
+            top_k,
+            shape.k,
+            shape.n,
+            32,
+        )
+
+    for _ in range(5):
+        active_call()
+    torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    active_call()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    return {
+        "stage": shape.name,
+        "k": shape.k,
+        "n": shape.n,
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "captured_active_expert_launches": top_k,
+        "output_finite": bool(torch.isfinite(active_out).all().item()),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", choices=("w13", "w2", "both"), default="both")
@@ -333,12 +386,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--profile-active-once",
+        action="store_true",
+        help="Warm up, then CUDA-profiler capture one six-expert stage.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     _require_sm70()
+    if args.profile_active_once:
+        if args.stage == "both":
+            raise ValueError("--profile-active-once requires --stage w13 or w2")
+        result = profile_active_stage_once(
+            STAGES[args.stage],
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            seed=args.seed,
+        )
+        print(
+            json.dumps(
+                {
+                    "benchmark": "sm70_mxfp4_moe_active_experts_profile",
+                    "device": torch.cuda.get_device_name(),
+                    "result": result,
+                },
+                indent=2,
+            )
+        )
+        return 0
     selected = STAGES.values() if args.stage == "both" else (STAGES[args.stage],)
     results = [
         benchmark_stage(
