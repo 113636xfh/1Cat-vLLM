@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
+    VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1809,6 +1810,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # back to the generic vLLM permute path in Python.
     "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH", "1"))
+    ),
+    # DeepSeek V4 batch-one MXFP4 decode has six routed slots but 256 local
+    # experts. Dispatch only those six fixed graph slots; expert IDs remain
+    # device tensors and can change between CUDA Graph replays.
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
