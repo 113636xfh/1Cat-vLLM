@@ -71,6 +71,7 @@ source with the fixed contract above.
 | Date | Change or test | Result | Decision |
 | --- | --- | --- | --- |
 | 2026-08-02 | Audit checkpoint and local MTP route | One complete MTP predictor layer is present; MTP4 serially reuses it. Existing instrumentation covers verifier, drafter steps, sampling, state, and bookkeeping. | Establish the exact unprofiled baseline before changing kernels. |
+| 2026-08-02 | First TP8 MTP4 startup | Startup incorrectly requested the Qwen3.6-27B TP8 dynamic-vocabulary asset before loading weights. Only Qwen dense TP2/TP4 assets exist, and their ranking is not valid for DeepSeek V4. | Scope the automatic reduced-vocabulary route to its validated Qwen architecture and TP sizes. DeepSeek V4 starts with the full draft vocabulary. |
 
 ## Artifacts And Handoff
 
