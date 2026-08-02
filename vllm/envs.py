@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
+    VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1829,6 +1830,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
     "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "0"))
+    ),
+    "VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE", "0"))
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics

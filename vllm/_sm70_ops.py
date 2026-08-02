@@ -1477,6 +1477,41 @@ if hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out"):
         return None
 
 
+def sm70_moe_single_token_weighted_reduce_add_out(
+    sorted_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    shared_output: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    hidden_logical_size: int,
+) -> None:
+    _op("sm70_moe_single_token_weighted_reduce_add_out")(
+        sorted_output,
+        topk_weights,
+        inv_permuted_idx,
+        shared_output,
+        out,
+        top_k,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_moe_single_token_weighted_reduce_add_out"):
+
+    @register_fake("_C::sm70_moe_single_token_weighted_reduce_add_out")
+    def _sm70_moe_single_token_weighted_reduce_add_out_fake(
+        sorted_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        shared_output: torch.Tensor,
+        out: torch.Tensor,
+        top_k: int,
+        hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,

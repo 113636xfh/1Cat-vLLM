@@ -781,6 +781,11 @@ class MoERunner(MoERunnerInterface):
         shared_out = (
             self._shared_experts.output if self._shared_experts is not None else None
         )
+        shared_out, fused_out = self._quant_method.finalize_shared_expert_output(
+            layer,
+            shared_out,
+            fused_out,
+        )
         if shared_out is not None:
             shared_out = _sm70_dump_moe_runner_tensor(
                 shared_out,

@@ -430,6 +430,11 @@ void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
                                               int64_t top_k,
                                               int64_t hidden_logical_size);
 
+void sm70_moe_single_token_weighted_reduce_add_out(
+    torch::Tensor sorted_output, torch::Tensor topk_weights,
+    torch::Tensor inv_permuted_idx, torch::Tensor shared_output,
+    torch::Tensor out, int64_t top_k, int64_t hidden_logical_size);
+
 void awq_moe_single_token_sm70_out(
     torch::Tensor out,
     torch::Tensor x,

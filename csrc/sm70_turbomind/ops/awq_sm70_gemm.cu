@@ -5611,6 +5611,60 @@ __global__ void awq_moe_single_token_weighted_reduce_half2_kernel(
   }
 }
 
+__global__ void sm70_moe_single_token_weighted_reduce_add_kernel(
+    const __half* sorted_output, const float* topk_weights,
+    const int* inv_permuted_idx, const __half* shared_output, __half* out,
+    int top_k, int hidden_logical_size, int sorted_output_row_stride) {
+  for (int col = blockIdx.x * blockDim.x + threadIdx.x;
+       col < hidden_logical_size; col += blockDim.x * gridDim.x) {
+    float acc = 0.f;
+    for (int route_idx = 0; route_idx < top_k; ++route_idx) {
+      const int sorted_pos = inv_permuted_idx[route_idx];
+      const __half value =
+          sorted_output[sorted_pos * sorted_output_row_stride + col];
+      acc = fmaf(topk_weights[route_idx], __half2float(value), acc);
+    }
+    const __half routed = __float2half(acc);
+    out[col] = __hadd(shared_output[col], routed);
+  }
+}
+
+template <int TOPK>
+__global__ void sm70_moe_single_token_weighted_reduce_add_half2_kernel(
+    const __half* sorted_output, const float* topk_weights,
+    const int* inv_permuted_idx, const __half* shared_output, __half* out,
+    int hidden_logical_size, int sorted_output_row_stride) {
+  __shared__ int sorted_pos_sh[TOPK];
+  __shared__ float weight_sh[TOPK];
+
+  if (threadIdx.x < TOPK) {
+    const int route_idx = threadIdx.x;
+    sorted_pos_sh[route_idx] = inv_permuted_idx[route_idx];
+    weight_sh[route_idx] = topk_weights[route_idx];
+  }
+  __syncthreads();
+
+  const int hidden_pairs = hidden_logical_size >> 1;
+  for (int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pair_idx < hidden_pairs; pair_idx += blockDim.x * gridDim.x) {
+    float2 acc = {0.f, 0.f};
+  #pragma unroll
+    for (int route_idx = 0; route_idx < TOPK; ++route_idx) {
+      const __half2 value = reinterpret_cast<const __half2*>(
+          sorted_output +
+          sorted_pos_sh[route_idx] * sorted_output_row_stride)[pair_idx];
+      const float2 value_f = __half22float2(value);
+      const float weight = weight_sh[route_idx];
+      acc.x = fmaf(weight, value_f.x, acc.x);
+      acc.y = fmaf(weight, value_f.y, acc.y);
+    }
+    const __half2 routed = __floats2half2_rn(acc.x, acc.y);
+    const __half2 shared =
+        reinterpret_cast<const __half2*>(shared_output)[pair_idx];
+    reinterpret_cast<__half2*>(out)[pair_idx] = __hadd2(shared, routed);
+  }
+}
+
 void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
                                               torch::Tensor topk_weights,
                                               torch::Tensor inv_permuted_idx,
@@ -5671,6 +5725,72 @@ void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
         static_cast<int>(top_k), hidden_logical_size_i,
         sorted_output_row_stride);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm70_moe_single_token_weighted_reduce_add_out(
+    torch::Tensor sorted_output, torch::Tensor topk_weights,
+    torch::Tensor inv_permuted_idx, torch::Tensor shared_output,
+    torch::Tensor out, int64_t top_k, int64_t hidden_logical_size) {
+  TORCH_CHECK(
+      sorted_output.is_cuda() && sorted_output.scalar_type() == torch::kFloat16,
+      "sm70 weighted-reduce-add: sorted_output must be CUDA float16.");
+  TORCH_CHECK(
+      topk_weights.is_cuda() && topk_weights.scalar_type() == torch::kFloat32,
+      "sm70 weighted-reduce-add: topk_weights must be CUDA float32.");
+  TORCH_CHECK(inv_permuted_idx.is_cuda() &&
+                  inv_permuted_idx.scalar_type() == torch::kInt32,
+              "sm70 weighted-reduce-add: inv_permuted_idx must be CUDA int32.");
+  TORCH_CHECK(shared_output.is_cuda() &&
+                  shared_output.scalar_type() == torch::kFloat16 &&
+                  shared_output.is_contiguous(),
+              "sm70 weighted-reduce-add: shared_output must be contiguous "
+              "CUDA float16.");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.is_contiguous(),
+              "sm70 weighted-reduce-add: out must be contiguous CUDA float16.");
+  TORCH_CHECK(sorted_output.dim() == 2 && shared_output.dim() == 2 &&
+                  shared_output.size(0) == 1 && out.dim() == 2 &&
+                  out.size(0) == 1,
+              "sm70 weighted-reduce-add: invalid tensor rank.");
+  TORCH_CHECK(top_k > 0 && top_k <= 32,
+              "sm70 weighted-reduce-add: top_k must be in [1, 32].");
+  TORCH_CHECK(sorted_output.size(0) >= top_k && topk_weights.numel() >= top_k &&
+                  inv_permuted_idx.numel() >= top_k,
+              "sm70 weighted-reduce-add: top_k size mismatch.");
+  TORCH_CHECK(shared_output.size(1) >= hidden_logical_size &&
+                  out.size(1) >= hidden_logical_size &&
+                  sorted_output.size(1) >= hidden_logical_size,
+              "sm70 weighted-reduce-add: hidden size mismatch.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(sorted_output));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kThreads = 256;
+  const int hidden_size = static_cast<int>(hidden_logical_size);
+  const int row_stride = static_cast<int>(sorted_output.stride(0));
+  const bool use_half2 = (hidden_size % 2) == 0 && (row_stride % 2) == 0;
+  if (top_k == 6 && use_half2) {
+    const int blocks =
+        std::max<int>(1, ((hidden_size >> 1) + kThreads - 1) / kThreads);
+    sm70_moe_single_token_weighted_reduce_add_half2_kernel<6>
+        <<<blocks, kThreads, 0, stream>>>(
+            reinterpret_cast<const __half*>(sorted_output.data_ptr<at::Half>()),
+            topk_weights.data_ptr<float>(),
+            inv_permuted_idx.data_ptr<int32_t>(),
+            reinterpret_cast<const __half*>(shared_output.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), hidden_size,
+            row_stride);
+  } else {
+    const int blocks =
+        std::max<int>(1, (hidden_size + kThreads - 1) / kThreads);
+    sm70_moe_single_token_weighted_reduce_add_kernel<<<blocks, kThreads, 0,
+                                                       stream>>>(
+        reinterpret_cast<const __half*>(sorted_output.data_ptr<at::Half>()),
+        topk_weights.data_ptr<float>(), inv_permuted_idx.data_ptr<int32_t>(),
+        reinterpret_cast<const __half*>(shared_output.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        static_cast<int>(top_k), hidden_size, row_stride);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
