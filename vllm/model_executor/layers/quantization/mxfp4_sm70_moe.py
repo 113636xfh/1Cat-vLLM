@@ -226,6 +226,8 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "mxfp4_moe_dense_stage_sm70_out",
             "awq_moe_build_strided_ptrs",
         )
+        if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
+            required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
             raise RuntimeError(
@@ -419,6 +421,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_compact_expert_offsets = torch.arange(
             top_k + 1, dtype=torch.int32, device=device
         )
+        layer._mxfp4_sm70_buf_compact_expert_offsets64 = torch.arange(
+            top_k + 1, dtype=torch.int64, device=device
+        )
 
     @staticmethod
     def _persistent_b1_buffers(layer: RoutedExperts) -> dict[str, torch.Tensor]:
@@ -440,6 +445,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
             "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
+            "compact_expert_offsets64": (
+                layer._mxfp4_sm70_buf_compact_expert_offsets64
+            ),
         }
 
     @staticmethod
@@ -504,6 +512,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
             "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
+            "compact_expert_offsets64": (
+                layer._mxfp4_sm70_buf_compact_expert_offsets64
+            ),
         }
 
     def _get_buffers(
@@ -566,6 +577,52 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             return x.new_empty((0, _DEEPSEEK_V4_FLASH_HIDDEN_SIZE))
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
+
+        direct_top6 = (
+            num_tokens == 1
+            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+            and layer.expert_map is None
+            and layer.local_num_experts == layer.global_num_experts
+        )
+        if direct_top6:
+            sm70_ops.mxfp4_moe_single_token_prepare_w13_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                x,
+                topk_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                buffers["compact_expert_offsets"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_experts_id"],
+                layer.sm70_mxfp4_w13_k_dim,
+                layer.sm70_mxfp4_w13_n_dim,
+                layer.sm70_mxfp4_group_size,
+                layer.sm70_mxfp4_hidden_size,
+            )
+            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["compact_expert_offsets"],
+                buffers["permuted_experts_id"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                layer.sm70_mxfp4_w2_k_dim,
+                layer.sm70_mxfp4_w2_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                buffers["compact_expert_offsets64"],
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                output,
+            )
+            return output
+
         output.zero_()
 
         total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
