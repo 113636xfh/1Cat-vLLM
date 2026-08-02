@@ -52,6 +52,7 @@ inline hipPointer_attribute rangeStartAddrAttr =
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
 constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
+constexpr int kSm70Tp8TwoCtaCompletionSignalSlotBase = 4;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
 
@@ -94,6 +95,11 @@ inline bool sm70_tp8_hierarchical_custom_ar_enabled(int world_size,
 
 inline bool sm70_tp8_hierarchical_peer(int rank, int peer) {
   return rank / 4 == peer / 4 || rank + 4 == peer || peer + 4 == rank;
+}
+
+inline bool sm70_tp8_hierarchical_two_cta_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_TP8_HIERARCHICAL_TWO_CTA");
+  return raw != nullptr && std::atoi(raw) != 0;
 }
 
 inline int custom_allreduce_block_limit(int default_limit,
@@ -691,19 +697,19 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg,
-                                         Signal* self_sg, int rank,
-                                         int signal_slot) {
+DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg, Signal* self_sg,
+                                         int rank, int signal_slot,
+                                         int flag_slot) {
   const int tid = threadIdx.x;
   const int clique_base = rank < 4 ? 0 : 4;
-  const FlagType flag = self_sg->_flag[0] + 1;
+  const FlagType flag = self_sg->_flag[flag_slot] + 1;
   if (tid < 4) {
     const int peer = clique_base + tid;
     st_flag_sys_visible(&sg.signals[peer]->start[signal_slot][rank], flag);
     while (ld_flag_sys_visible(&self_sg->start[signal_slot][peer]) != flag);
   }
   __syncthreads();
-  if (tid == 0) self_sg->_flag[0] = flag;
+  if (tid == 0) self_sg->_flag[flag_slot] = flag;
   return flag;
 }
 
@@ -722,7 +728,7 @@ static __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
   // clique may safely run one round ahead of its paired clique.
   const int partial_slot = (self_sg->_flag[0] >> 1) & 1;
   const FlagType clique_flag =
-      sm70_tp8_clique_barrier(sg, self_sg, rank, partial_slot);
+      sm70_tp8_clique_barrier(sg, self_sg, rank, partial_slot, 0);
   A* const self_partial =
       get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
   const A* const pair_partial =
@@ -764,6 +770,63 @@ static __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
     reinterpret_cast<P*>(result)[tid] = downcast<P>(partial);
   }
   if (tid == 0) self_sg->_flag[0] = pair_flag;
+}
+
+static __global__ void __launch_bounds__(256, 1)
+    sm70_tp8_hierarchical_reduce_two_cta(RankData* _dp, RankSignals sg,
+                                         Signal* self_sg,
+                                         half* __restrict__ result, int rank,
+                                         int packed_size) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+
+  const int tid = threadIdx.x;
+  const int cta = blockIdx.x;
+  const int idx = cta * blockDim.x + tid;
+  const int clique_base = rank < 4 ? 0 : 4;
+  const int pair_rank = rank < 4 ? rank + 4 : rank - 4;
+  auto dp = *_dp;
+
+  const int partial_slot = (self_sg->_flag[cta] >> 1) & 1;
+  const int signal_slot = cta * 2 + partial_slot;
+  const FlagType clique_flag =
+      sm70_tp8_clique_barrier(sg, self_sg, rank, signal_slot, cta);
+  A* const self_partial = get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
+  const A* const pair_partial =
+      get_tmp_buf<A>(sg.signals[pair_rank]) + partial_slot * packed_size;
+
+  A partial{};
+  if (idx < packed_size) {
+    partial = upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base])[idx]);
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+      packed_assign_add(
+          partial,
+          upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base + i])[idx]));
+    }
+    self_partial[idx] = partial;
+  }
+
+  __threadfence_system();
+  __syncthreads();
+  const FlagType pair_flag = clique_flag + 1;
+  if (tid < 4) {
+    const int peer = clique_base + tid;
+    const int completion_slot =
+        kSm70Tp8TwoCtaCompletionSignalSlotBase + signal_slot;
+    st_flag_volatile(&sg.signals[peer]->end[completion_slot][rank], pair_flag);
+    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) != pair_flag);
+  } else if (tid == 4) {
+    st_flag_release(&sg.signals[pair_rank]->end[signal_slot][rank], pair_flag);
+    while (ld_flag_acquire(&self_sg->end[signal_slot][pair_rank]) != pair_flag);
+  }
+  __syncthreads();
+
+  if (idx < packed_size) {
+    packed_assign_add(partial, pair_partial[idx]);
+    reinterpret_cast<P*>(result)[idx] = downcast<P>(partial);
+  }
+  if (tid == 0) self_sg->_flag[cta] = pair_flag;
 }
 
 template <typename T, int ngpus>
@@ -1111,8 +1174,13 @@ class CustomAllreduce {
       if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
                                                   fully_connected_) &&
           bytes == kSm70Tp8HierarchicalAllreduceBytes) {
-        sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
-            ptrs, sg_, self_sg_, output, rank_, size);
+        if (sm70_tp8_hierarchical_two_cta_enabled()) {
+          sm70_tp8_hierarchical_reduce_two_cta<<<2, 256, 0, stream>>>(
+              ptrs, sg_, self_sg_, output, rank_, size);
+        } else {
+          sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
+              ptrs, sg_, self_sg_, output, rank_, size);
+        }
         return;
       }
     }
