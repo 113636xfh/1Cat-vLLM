@@ -50,6 +50,13 @@ The fixed rank order and FP32 intermediate are deliberate. The optimization
 does not use reduced precision, skip ranks, or change the tensor shape.
 Required P2P edges and IPC opens are validated before enabling the route.
 
+The graph-safe protocol uses two alternating slots for clique-ready signals,
+pair-ready signals, and FP32 partials. After consuming the four local inputs,
+threads 0-3 publish clique completion while thread 4 exchanges the paired
+partial-ready signal. These two handshakes run concurrently. This prevents a
+faster four-GPU clique from overwriting a signal, input, or partial still in
+use by the slower clique without adding a serialized eight-rank barrier.
+
 ## Correctness
 
 The exact 8-rank CUDA Graph microbenchmark reports:
@@ -73,9 +80,9 @@ join surrounding each model collective:
 
 | Route | Median per call | Projected 87-call time |
 |---|---:|---:|
-| NCCL Ring LL | 39.255 us | 3.415 ms |
-| Hierarchical | 31.922 us | 2.777 ms |
-| Saving | 7.333 us | 0.638 ms/token |
+| NCCL Ring LL | 39.384 us | 3.426 ms |
+| Hierarchical | 32.154 us | 2.798 ms |
+| Saving | 7.230 us | 0.629 ms/token |
 
 The full model exposes a larger benefit because the custom kernel launches
 independently on each rank and waits on device instead of adding a collective
@@ -102,6 +109,36 @@ Custom-kernel GPU service is 4.490 ms/token versus 4.192 ms for NCCL. The win
 is therefore graph critical-path scheduling, not a misleading reduction in
 summed kernel service.
 
+## Graph-Skew Stability Fix
+
+Combining the first hierarchical kernel with the sparse-MLA QK D-split made a
+latent graph race reproducible. Two 32-token warmups completed near 20.5
+ms/token, but the following request stopped after 22 emitted tokens. Disabling
+hierarchical all-reduce completed 128/128 tokens at 23.198 ms/token, isolating
+the fault to rank-skew tolerance rather than sparse-MLA arithmetic.
+
+The original protocol reused one exact-valued signal slot and one FP32 partial
+buffer. A fast clique could advance by one collective before its peer consumed
+the previous slot. Merely double-buffering the partial changed timing and made
+the same signal overtake deadlock reproducible in the 87-call microbenchmark.
+The accepted protocol therefore double-buffers both signals and data and
+acknowledges local-input consumption in parallel with the pair exchange.
+
+Validation after the fix:
+
+| Gate | Result |
+|---|---:|
+| Pure CUDA Graph stress | 8,700 collectives, 17.099 us/call, complete |
+| Eight-rank numerical result | Bitwise equal across ranks |
+| Graph-join microbenchmark | 32.154 us/call versus 39.384 us NCCL |
+| Stacked 1024/256 endpoint | 20.768 / 20.758 / 20.770 ms/token |
+| Stacked endpoint mean | 20.765 ms/token, 0.006 ms stdev |
+
+The stacked endpoint also includes compact/direct MXFP4 and the sparse-MLA QK
+D-split candidate, so 20.765 ms is not an all-reduce-only A/B. It proves that
+the corrected communication protocol transfers through the current combined
+graph and remains stable for three full 256-token requests.
+
 ## Rejected Paths
 
 | Path | Evidence | Decision |
@@ -110,6 +147,9 @@ summed kernel service.
 | 87 consecutive collectives | 16.055 us custom versus 16.021 us NCCL | Diagnostic only; it pipelines away the model's rank-join bubble |
 | 256 threads, two FP32 partials per thread | Eight GPUs remain in low-power 100% synchronization spin | Reject and remove |
 | 128 threads, four FP32 partials per thread | Not run after the 256-thread protocol failure | Reject this family |
+| One signal/partial slot | Full model stopped after 22 tokens under larger graph skew | Reject; unsafe slot reuse |
+| Partial double-buffer only | 87-call graph microbenchmark entered synchronization spin | Reject; signal overtake remains |
+| Serialized clique completion | Stable at 21.055 ms/token in the stacked endpoint | Correct diagnostic; replaced by concurrent acknowledgement at 20.765 ms/token |
 
 ## Artifacts
 
@@ -119,6 +159,7 @@ summed kernel service.
   dsv4-tp8-hierarchical-ar-fullmodel-20260803/
   dsv4-tp8-hierarchical-ar-nsys-i1024-o128-20260803/
   dsv4-tp8-hierarchical-ar-threads-micro-20260803/
+  dsv4-sparse-mla-qk-dsplit-fullmodel-20260803/
 ```
 
 ## Remaining Gates

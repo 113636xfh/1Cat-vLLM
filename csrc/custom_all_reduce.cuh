@@ -51,6 +51,7 @@ inline hipPointer_attribute rangeStartAddrAttr =
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
 constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
+constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
 
@@ -691,14 +692,15 @@ DINLINE P* get_tmp_buf(Signal* sg) {
 }
 
 DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg,
-                                         Signal* self_sg, int rank) {
+                                         Signal* self_sg, int rank,
+                                         int signal_slot) {
   const int tid = threadIdx.x;
   const int clique_base = rank < 4 ? 0 : 4;
   const FlagType flag = self_sg->_flag[0] + 1;
   if (tid < 4) {
     const int peer = clique_base + tid;
-    st_flag_sys_visible(&sg.signals[peer]->start[0][rank], flag);
-    while (ld_flag_sys_visible(&self_sg->start[0][peer]) != flag);
+    st_flag_sys_visible(&sg.signals[peer]->start[signal_slot][rank], flag);
+    while (ld_flag_sys_visible(&self_sg->start[signal_slot][peer]) != flag);
   }
   __syncthreads();
   if (tid == 0) self_sg->_flag[0] = flag;
@@ -716,7 +718,15 @@ __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
   const int pair_rank = rank < 4 ? rank + 4 : rank - 4;
   auto dp = *_dp;
 
-  const FlagType clique_flag = sm70_tp8_clique_barrier(sg, self_sg, rank);
+  // The counter advances twice per call. Alternate signal/data slots so one
+  // clique may safely run one round ahead of its paired clique.
+  const int partial_slot = (self_sg->_flag[0] >> 1) & 1;
+  const FlagType clique_flag =
+      sm70_tp8_clique_barrier(sg, self_sg, rank, partial_slot);
+  A* const self_partial =
+      get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
+  const A* const pair_partial =
+      get_tmp_buf<A>(sg.signals[pair_rank]) + partial_slot * packed_size;
 
   A partial{};
   if (tid < packed_size) {
@@ -727,7 +737,7 @@ __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
           partial,
           upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base + i])[tid]));
     }
-    get_tmp_buf<A>(self_sg)[tid] = partial;
+    self_partial[tid] = partial;
   }
 
   // Publish the FP32 clique partial only after every producer thread has made
@@ -735,14 +745,22 @@ __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
   __threadfence_system();
   __syncthreads();
   const FlagType pair_flag = clique_flag + 1;
-  if (tid == 0) {
-    st_flag_release(&sg.signals[pair_rank]->end[0][rank], pair_flag);
-    while (ld_flag_acquire(&self_sg->end[0][pair_rank]) != pair_flag);
+  if (tid < 4) {
+    const int peer = clique_base + tid;
+    const int completion_slot =
+        kSm70Tp8CompletionSignalSlotBase + partial_slot;
+    st_flag_volatile(&sg.signals[peer]->end[completion_slot][rank], pair_flag);
+    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) !=
+           pair_flag);
+  } else if (tid == 4) {
+    st_flag_release(&sg.signals[pair_rank]->end[partial_slot][rank], pair_flag);
+    while (ld_flag_acquire(&self_sg->end[partial_slot][pair_rank]) !=
+           pair_flag);
   }
   __syncthreads();
 
   if (tid < packed_size) {
-    packed_assign_add(partial, get_tmp_buf<A>(sg.signals[pair_rank])[tid]);
+    packed_assign_add(partial, pair_partial[tid]);
     reinterpret_cast<P*>(result)[tid] = downcast<P>(partial);
   }
   if (tid == 0) self_sg->_flag[0] = pair_flag;
