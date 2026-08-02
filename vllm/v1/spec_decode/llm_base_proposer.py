@@ -88,7 +88,7 @@ def _sm70_mtp_profile_interval() -> int:
 
 
 def _is_dflash_method(method: str | None) -> bool:
-    return method in ("dflash", "dflash_ddtree")
+    return method in ("dflash", "dflash_ddtree", "dspark")
 
 
 def _spec_debug_corruption_enabled(method: str) -> bool:
@@ -195,8 +195,10 @@ class SpecDecodeBaseProposer:
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
         draft_hf_config = self.draft_model_config.hf_config
-        if hasattr(draft_hf_config, "compress_ratios") and hasattr(
-            draft_hf_config, "hc_mult"
+        if (
+            self.method == "mtp"
+            and hasattr(draft_hf_config, "compress_ratios")
+            and hasattr(draft_hf_config, "hc_mult")
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
@@ -454,10 +456,12 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
+        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
         else:
             raise ValueError(
                 "For parallel drafting, the draft model config must have "
-                "`pard_token`, `ptd_token_id`, or "
+                "`pard_token`, `ptd_token_id`, `dspark_noise_token_id`, or "
                 "`dflash_config.mask_token_id` specified in its config.json."
             )
 
@@ -1007,7 +1011,7 @@ class SpecDecodeBaseProposer:
                     Eagle3DeepseekV2ForCausalLM,
                     DFlashQwen3ForCausalLM,
                 ),
-            )
+            ) or hasattr(self.model, "combine_hidden_states")
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
@@ -1650,7 +1654,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash", "dflash_ddtree")
+        return self.method not in (
+            "mtp",
+            "draft_model",
+            "dflash",
+            "dflash_ddtree",
+            "dspark",
+        )
 
     def prepare_next_token_ids_cpu(
         self,
