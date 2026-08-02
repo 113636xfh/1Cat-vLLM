@@ -105,6 +105,75 @@ Artifacts:
   dsv4-sm70-sparse-attn-micro-20260802/
 ```
 
+## Full-Model TP8 Result
+
+The combined C4+C128 candidate was measured with the same accepted contract as
+the trace baseline: exact 1024 input / 256 output, official
+`temperature=1.0`, `top_p=1.0`, no MTP, FP8 MLA KV, and FULL CUDA Graph.
+
+Three unprofiled runs used seeds 4201-4203. All consumed exactly 1024 prompt
+tokens, emitted 256 tokens, and stopped at the length limit.
+
+| Metric | Active-expert baseline | C4+C128 split-K | Change |
+|---|---:|---:|---:|
+| TPOT | 76.268 ms | 33.853 ms | -55.61% |
+| Decode throughput | 13.112 tok/s | 29.539 tok/s | +125.29% |
+| TTFT | 1789.254 ms | 1787.083 ms | -0.12% |
+
+Candidate TPOT was 33.869, 33.873, and 33.818 ms across the three runs. The
+mean interval p50/p90/p99 values were 33.845/35.104/36.928 ms. Basic output
+health checks found no NUL, replacement-character, or single-character-repeat
+failure. This is a text-health smoke, not the remaining deterministic
+logit/token or semantic-quality gate.
+
+The fresh graph-node capture contains 255 decode steps x 8 ranks. Aggregate
+statistics use 247 middle steps and have 98.20% graph-node kernel coverage.
+Node tracing raises request TPOT to 35.409 ms, so the following values are for
+composition, not accepted absolute speed.
+
+| Timing view | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| TP rank replay interval max | 35.734 ms | 35.577 | 36.225 | 38.887 |
+| TP rank GPU service max | 35.217 ms | 35.073 | 35.726 | 38.350 |
+| Replay minus GPU service | 0.517 ms | 0.561 | 0.871 | 1.141 |
+| Replay-start skew | 0.740 ms | 0.606 | 1.102 | 3.379 |
+
+GPU service by category:
+
+| Category | Rank-average | p50 | p90 | p99 | Rank-max mean | Launches/rank/token |
+|---|---:|---:|---:|---:|---:|---:|
+| TurboMind MXFP4 MoE | 7.542 ms | 7.543 | 7.611 | 7.857 | 7.671 | 516 |
+| TurboMind FP8 dense GEMM | 6.251 ms | 6.251 | 6.309 | 6.516 | 6.478 | 279 |
+| SM70 sparse MLA attention | 4.392 ms | 4.392 | 4.422 | 4.535 | 4.471 | 84 |
+| TP all-reduce/communication | 4.045 ms | 4.035 | 4.197 | 4.423 | 4.519 | 87 |
+| Dense GEMV/GEMM and compressor | 3.380 ms | 3.379 | 3.406 | 3.542 | 3.442 | 252 |
+| mHC TileLang | 2.980 ms | 2.980 | 3.011 | 3.107 | 3.040 | 174 |
+| MoE routing/activation | 2.412 ms | 2.411 | 2.440 | 2.521 | 2.474 | 363 |
+| Q/KV preparation and cache | 1.360 ms | 1.207 | 1.772 | 1.790 | 1.407 | 234 |
+
+The sparse MLA service consists of 41 split-K stages at 3.125 ms/token, 41
+reducers at 0.173 ms/token, and two unsplit SWA calls at 1.094 ms/token. Total
+sparse service fell from 46.920 to 4.392 ms/token (-90.64%). The 42.527 ms
+sparse reduction translated into a 42.415 ms unprofiled TPOT reduction, so the
+endpoint realizes 99.7% of the measured kernel-family saving.
+
+No output-position decay is visible in this 256-token trace:
+
+| Emitted-token positions | Replay interval | GPU service | Sparse rank-max |
+|---|---:|---:|---:|
+| 5-64 | 35.738 ms | 35.201 ms | 4.474 ms |
+| 65-128 | 35.589 ms | 35.101 ms | 4.461 ms |
+| 129-192 | 35.802 ms | 35.281 ms | 4.469 ms |
+| 193-251 | 35.813 ms | 35.290 ms | 4.481 ms |
+
+Raw endpoint and graph-node artifacts:
+
+```text
+/home/fudanwl/v100-worktrees/runs/
+  dsv4-tp8-active-expert-splitk-both-i1024-o256-20260802-2008/
+  dsv4-tp8-active-expert-splitk-both-nsys-i1024-o256-20260802-2020/
+```
+
 ## Rejected Variants
 
 | Variant | C4 graph mean | Decision |
@@ -117,10 +186,8 @@ Artifacts:
 
 ## Remaining Gates
 
-1. Measure C4-only and C4+C128 TP8 1024/256 endpoint TPOT against the accepted
-   active-expert baseline.
-2. Verify worker logs select both split-K routes inside FULL CUDA Graph.
-3. Compare deterministic tokens/logits and run official-sampling long output.
-4. Re-profile one endpoint request to prove sparse MLA service moves out of the
-   first position without shifting cost into another kernel family.
-5. Sweep long-context decode before either gate becomes default-on.
+1. Compare deterministic tokens/logits and run a model-specific semantic
+   quality gate with official sampling.
+2. Sweep long-context decode before either route becomes default-on.
+3. Run C4-only endpoint attribution only if a later regression requires C128
+   to be isolated from the accepted combined path.
