@@ -52,8 +52,11 @@ def _mxfp4_active_expert_b1_enabled() -> bool:
 
 def _single_token_weighted_reduce_enabled() -> bool:
     if not (
-        envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
-        or envs.VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH
+        envs.VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE
+        and (
+            envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
+            or envs.VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH
+        )
     ):
         return False
     return hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out")

@@ -90,6 +90,29 @@ Initial and changed-input graph replays are bitwise equal to the corrected
 control on all eight ranks. The focused CUDA test covers both scale 1.0 and
 the model's `1 / 1.5` compensation with zero tolerance.
 
+## Full-Model Result
+
+The low-overhead endpoint A/B used the same source, binary, prompt, TP8
+topology, FP8 KV cache, CUDA Graph mode, and official `temperature=1`,
+`top_p=1` sampling. Each side ran two 32-token warmups followed by three
+256-token requests.
+
+| Route | Mean TPOT | Decode throughput | Change |
+|---|---:|---:|---:|
+| Generic unpermute + scale + add | 21.3091 ms | 46.928 token/s | - |
+| Fused reduce-scale-add | 21.2797 ms | 46.993 token/s | -0.0294 ms (-0.138%) |
+
+All six 256-token requests completed with no NUL, replacement character, or
+single-character repetition. The candidate's 0.0294 ms endpoint saving is
+only 10.9% of the 0.271 ms joined-microbenchmark projection. It is too small
+to justify defaulting the extra runner state and custom-op ABI path, so the
+route remains default-off and work moves to the larger TP collective and
+rank-arrival costs.
+
+The historical 20.7655 ms stacked result used a different evolving dependency
+set and is not the control for this A/B. The fused route is also not promoted
+as a replacement baseline while it remains slower than that recorded stack.
+
 ## Rejected Paths
 
 | Path | Result | Decision |
@@ -111,9 +134,11 @@ the model's `1 / 1.5` compensation with zero tolerance.
   tp8_hierarchical_sum2_v1.json
   screen_v4_scaled_fused.json
   moe_tp8_join_scaled_v3.json
+/home/fudanwl/v100-worktrees/runs/dsv4-moe-fused-reduce-control-20260803/
+/home/fudanwl/v100-worktrees/runs/dsv4-moe-fused-reduce-fullmodel-20260803/
 ```
 
-## Remaining Gates
+## Decision
 
-1. Prove the corrected fused route is selected inside the real model CUDA Graph.
-2. Run matching 1K/256 low-overhead endpoint timing and official-sampling quality.
+Keep the route default-off. Do not spend another full-model cycle tuning this
+tail unless a new design materially increases the joined critical-path saving.
