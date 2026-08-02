@@ -64,6 +64,32 @@ Initial and changed-input graph replays were bitwise equal to the incomplete
 V1 control. V2 must instead match the production scale-and-add sequence with
 zero tolerance.
 
+## V2 Microbenchmarks
+
+The corrected oracle performs the same FP16 shared scaling before the same
+FP16 add. On one GPU:
+
+| Route | Median per layer | Change from current overlap |
+|---|---:|---:|
+| Current unpermute + scale + add | 99.165 us | - |
+| Exact weighted-reduce + scale + add | 95.962 us | -3.203 us |
+| Fused weighted-reduce-scale-add | 92.585 us | -6.580 us |
+
+The fused route projects to 0.283 ms/token over 43 layers. Its output is
+bitwise equal to the production sequence.
+
+The eight-rank joined graph includes the corrected MoE tail and hierarchical
+all-reduce:
+
+| Route | Rank-max median per layer | 43-layer projection |
+|---|---:|---:|
+| Unpermute + scale + add + hierarchical AR | 120.290 us | - |
+| Fused reduce-scale-add + hierarchical AR | 113.989 us | -0.271 ms/token |
+
+Initial and changed-input graph replays are bitwise equal to the corrected
+control on all eight ranks. The focused CUDA test covers both scale 1.0 and
+the model's `1 / 1.5` compensation with zero tolerance.
+
 ## Rejected Paths
 
 | Path | Result | Decision |
@@ -83,10 +109,11 @@ zero tolerance.
   moe_tp8_join_v1.json
   moe_tp8_join_t64.json
   tp8_hierarchical_sum2_v1.json
+  screen_v4_scaled_fused.json
+  moe_tp8_join_scaled_v3.json
 ```
 
 ## Remaining Gates
 
-1. Re-run the single-GPU and TP8 joined graph with the production scale oracle.
-2. Prove the corrected fused route is selected inside the real model CUDA Graph.
-3. Run matching 1K/256 low-overhead endpoint timing and official-sampling quality.
+1. Prove the corrected fused route is selected inside the real model CUDA Graph.
+2. Run matching 1K/256 low-overhead endpoint timing and official-sampling quality.
