@@ -574,6 +574,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "metadata": metadata_by_route,
                 "cache_layouts": cache_layouts,
             }
+            if self.prefix.endswith("layers.0.attn"):
+                dump_payload["hidden_full"] = hidden_states.detach().clone()
 
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
@@ -587,6 +589,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.kv_norm.weight.data,
             self.eps,
         )
+        if dump_payload is not None and self.prefix.endswith("layers.0.attn"):
+            dump_payload["qr_full"] = qr.detach().clone()
+            dump_payload["kv_full"] = kv.detach().clone()
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -652,12 +657,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         if dump_payload is not None:
             dump_payload["q_last"] = q[-1].detach().clone()
+            if self.prefix.endswith("layers.0.attn"):
+                dump_payload["q_full"] = q.detach().clone()
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.mla_attn(q, kv, positions, output=out)
         if dump_payload is not None:
             dump_payload["attention_last"] = out[-1].detach().clone()
+            if self.prefix.endswith("layers.0.attn"):
+                dump_payload["attention_full"] = out.detach().clone()
             assert dump_dir is not None
             layer_name = self.prefix.replace(".", "_")
             torch.save(
