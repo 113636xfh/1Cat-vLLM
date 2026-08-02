@@ -904,6 +904,8 @@ class MoERunner(MoERunnerInterface):
 
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
+        if self._quant_method.is_shared_expert_output_finalized():
+            shared_output = None
         if (
             shared_output is not None or self.routed_output_transform is not None
         ) and hidden_dim_was_padded:

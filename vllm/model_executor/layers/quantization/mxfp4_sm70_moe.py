@@ -767,7 +767,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             logger.info_once(
                 "SM70 MXFP4 MoE weighted-reduce + shared-add fusion enabled."
             )
-        return None, fused_output
+        # The shared-MoE custom-op schema requires two Tensor outputs. The
+        # outer runner discards this already-consumed tensor after unpacking.
+        return shared_output, fused_output
 
     def is_shared_expert_output_finalized(self) -> bool:
         return getattr(self, "_sm70_mxfp4_shared_output_finalized", False)
