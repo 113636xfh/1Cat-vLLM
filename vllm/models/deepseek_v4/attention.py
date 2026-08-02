@@ -4,10 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -39,10 +37,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -79,68 +74,6 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
-
-
-_SM70_ATTN_DUMP_TENSOR_FIELDS = (
-    "block_table",
-    "slot_mapping",
-    "token_to_req_indices",
-    "prefill_seq_lens",
-    "prefill_gather_lens",
-    "query_start_loc",
-    "decode_swa_indices",
-    "decode_swa_lens",
-)
-
-
-def _sm70_attention_dump_dir() -> Path | None:
-    dump_dir = os.environ.get("VLLM_SM70_DUMP_DSV4_ATTENTION_DIR")
-    if not dump_dir or get_tensor_model_parallel_rank() != 0:
-        return None
-    enable_file = os.environ.get("VLLM_SM70_DUMP_DSV4_ATTENTION_ENABLE_FILE")
-    if enable_file and not Path(enable_file).exists():
-        return None
-    path = Path(dump_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _sm70_metadata_snapshot(metadata: object | None) -> dict[str, Any] | None:
-    if metadata is None:
-        return None
-    snapshot: dict[str, Any] = {"type": type(metadata).__name__}
-    for field in _SM70_ATTN_DUMP_TENSOR_FIELDS:
-        value = getattr(metadata, field, None)
-        if isinstance(value, torch.Tensor):
-            snapshot[field] = value.detach().clone()
-    for field in (
-        "block_size",
-        "num_decode_tokens",
-        "num_decodes",
-        "num_prefill_tokens",
-        "num_prefills",
-        "max_seq_len",
-    ):
-        value = getattr(metadata, field, None)
-        if isinstance(value, int):
-            snapshot[field] = value
-    return snapshot
-
-
-def _sm70_snapshot_to_cpu(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, dict):
-        return {key: _sm70_snapshot_to_cpu(item) for key, item in value.items()}
-    return value
-
-
-def _sm70_cache_layout(cache: torch.Tensor) -> dict[str, Any]:
-    return {
-        "shape": tuple(cache.shape),
-        "stride": tuple(cache.stride()),
-        "dtype": str(cache.dtype),
-    }
 
 
 @triton.jit
@@ -260,7 +193,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.window_size = window_size
         self.compress_ratio = compress_ratio if compress_ratio is not None else 1
         self.prefix = prefix
-        self._sm70_attention_dump_step = 0
 
         # Extract config from vllm_config
         config = mla_modules.vllm_config.model_config.hf_config
@@ -530,53 +462,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        dump_dir = _sm70_attention_dump_dir()
-        dump_payload: dict[str, Any] | None = None
-        if dump_dir is not None:
-            self._sm70_attention_dump_step += 1
-            metadata_by_route: dict[str, Any] = {}
-            cache_layouts = {
-                "swa": _sm70_cache_layout(self.swa_cache_layer.kv_cache),
-                "compressed": _sm70_cache_layout(self.mla_attn.kv_cache),
-            }
-            if isinstance(attn_metadata, dict):
-                route_keys = {
-                    "swa": self.swa_cache_layer.prefix,
-                    "sparse": self.mla_attn.prefix,
-                }
-                if self.compressor is not None:
-                    route_keys["compressor_state"] = self.compressor.state_cache.prefix
-                    cache_layouts["compressor_state"] = _sm70_cache_layout(
-                        self.compressor.state_cache.kv_cache
-                    )
-                if self.indexer is not None:
-                    route_keys["indexer_cache"] = self.indexer.k_cache.prefix
-                    route_keys["indexer_state"] = (
-                        self.indexer.compressor.state_cache.prefix
-                    )
-                    cache_layouts["indexer_cache"] = _sm70_cache_layout(
-                        self.indexer.k_cache.kv_cache
-                    )
-                    cache_layouts["indexer_state"] = _sm70_cache_layout(
-                        self.indexer.compressor.state_cache.kv_cache
-                    )
-                metadata_by_route = {
-                    label: _sm70_metadata_snapshot(attn_metadata.get(key))
-                    for label, key in route_keys.items()
-                }
-            dump_payload = {
-                "step": self._sm70_attention_dump_step,
-                "layer": self.prefix,
-                "compress_ratio": self.compress_ratio,
-                "hidden_shape": tuple(hidden_states.shape),
-                "positions": positions.detach().clone(),
-                "hidden_last": hidden_states[-1].detach().clone(),
-                "metadata": metadata_by_route,
-                "cache_layouts": cache_layouts,
-            }
-            if self.prefix.endswith("layers.0.attn"):
-                dump_payload["hidden_full"] = hidden_states.detach().clone()
-
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
         )
@@ -589,9 +474,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.kv_norm.weight.data,
             self.eps,
         )
-        if dump_payload is not None and self.prefix.endswith("layers.0.attn"):
-            dump_payload["qr_full"] = qr.detach().clone()
-            dump_payload["kv_full"] = kv.detach().clone()
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -655,28 +537,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
-        if dump_payload is not None:
-            dump_payload["q_last"] = q[-1].detach().clone()
-            if self.prefix.endswith("layers.0.attn"):
-                dump_payload["q_full"] = q.detach().clone()
-
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.mla_attn(q, kv, positions, output=out)
-        if dump_payload is not None:
-            dump_payload["attention_last"] = out[-1].detach().clone()
-            if self.prefix.endswith("layers.0.attn"):
-                dump_payload["attention_full"] = out.detach().clone()
-            assert dump_dir is not None
-            layer_name = self.prefix.replace(".", "_")
-            torch.save(
-                _sm70_snapshot_to_cpu(dump_payload),
-                dump_dir
-                / (
-                    f"dsv4_attention_{layer_name}"
-                    f"_step{self._sm70_attention_dump_step:04d}.pt"
-                ),
-            )
 
     def _fused_qnorm_rope_kv_insert(
         self,

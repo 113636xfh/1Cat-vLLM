@@ -3,13 +3,10 @@
 
 """DeepSeek V4 sparse MLA implementation for exact SM70 CUDA devices."""
 
-import os
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -38,35 +35,6 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
-
-
-_SM70_SPARSE_DUMP_STEPS: dict[str, int] = {}
-
-
-def _sm70_sparse_dump_context(layer_prefix: str) -> tuple[Path, int] | None:
-    if not layer_prefix.endswith("layers.0.attn"):
-        return None
-    dump_dir = os.environ.get("VLLM_SM70_DUMP_DSV4_ATTENTION_DIR")
-    if not dump_dir or get_tensor_model_parallel_rank() != 0:
-        return None
-    enable_file = os.environ.get("VLLM_SM70_DUMP_DSV4_ATTENTION_ENABLE_FILE")
-    if enable_file and not Path(enable_file).exists():
-        return None
-    path = Path(dump_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    step = _SM70_SPARSE_DUMP_STEPS.get(layer_prefix, 0) + 1
-    _SM70_SPARSE_DUMP_STEPS[layer_prefix] = step
-    return path, step
-
-
-def _sm70_sparse_snapshot_to_cpu(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, dict):
-        return {
-            key: _sm70_sparse_snapshot_to_cpu(item) for key, item in value.items()
-        }
-    return value
 
 
 class DeepseekV4SM70SparseBackend(DeepseekV4FlashMLASparseBackend):
@@ -276,12 +244,9 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             prefill_chunk_size=cls.PREFILL_CHUNK_SIZE,
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
-        dump_context = _sm70_sparse_dump_context(layer.prefix)
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + layer.window_size, 128)
-        for chunk_index, (chunk_start, chunk_end, chunk_N, chunk_M) in enumerate(
-            chunk_plan
-        ):
+        for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             current_chunk = chunk_end - chunk_start
             workspace = workspace_manager.get_simultaneous(
                 ((current_chunk, chunk_M, q.shape[-1]), torch.float16),
@@ -337,28 +302,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
             )
-            dump_payload: dict[str, Any] | None = None
-            if dump_context is not None:
-                _, dump_step = dump_context
-                dump_payload = {
-                    "step": dump_step,
-                    "layer": layer.prefix,
-                    "chunk_index": chunk_index,
-                    "chunk_start": chunk_start,
-                    "chunk_end": chunk_end,
-                    "chunk_N": chunk_N,
-                    "chunk_M": chunk_M,
-                    "query_start": query_start,
-                    "query_end": query_end,
-                    "q": q[query_start:query_end].detach().clone(),
-                    "gathered_kv": kv_workspace[:current_chunk].detach().clone(),
-                    "combined_indices": combined_indices.detach().clone(),
-                    "combined_lens": combined_lens.detach().clone(),
-                    "seq_lens": seq_lens[chunk_start:chunk_end].detach().clone(),
-                    "gather_lens": gather_lens[chunk_start:chunk_end]
-                    .detach()
-                    .clone(),
-                }
             sm70_sparse_attention_gathered(
                 q[query_start:query_end],
                 kv_workspace[:current_chunk],
@@ -368,19 +311,5 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 layer.attn_sink[: q.shape[1]],
                 output[query_start:query_end],
             )
-            if dump_payload is not None:
-                dump_payload["output"] = (
-                    output[query_start:query_end].detach().clone()
-                )
-                dump_dir, dump_step = dump_context
-                layer_name = layer.prefix.replace(".", "_")
-                torch.save(
-                    _sm70_sparse_snapshot_to_cpu(dump_payload),
-                    dump_dir
-                    / (
-                        f"dsv4_sparse_{layer_name}_step{dump_step:04d}"
-                        f"_chunk{chunk_index:02d}.pt"
-                    ),
-                )
 
         logger.debug_once("DeepSeek V4 SM70 FP16 sparse attention route active.")
