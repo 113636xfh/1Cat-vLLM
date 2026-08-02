@@ -187,15 +187,20 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
         use_splitk = (
-            layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4
-        ) or (
-            layer.compress_ratio == 128 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128
+            (swa_only and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA)
+            or (layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4)
+            or (
+                layer.compress_ratio == 128
+                and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128
+            )
         )
         if use_splitk:
-            assert compressed_cache is not None
-            assert topk_indices is not None and topk_lens is not None
             main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
-            extra_width = topk_indices.reshape(num_decode_tokens, -1).shape[1]
+            extra_width = (
+                0
+                if topk_indices is None
+                else topk_indices.reshape(num_decode_tokens, -1).shape[1]
+            )
             num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
             partial_max, partial_sum, partial_acc = (
                 current_workspace_manager().get_simultaneous(
@@ -208,8 +213,8 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 )
             )
             logger.info_once(
-                "DeepSeek V4 SM70 C%d sparse MLA split-K enabled.",
-                layer.compress_ratio,
+                "DeepSeek V4 SM70 %s sparse MLA split-K enabled.",
+                "SWA-only" if swa_only else f"C{layer.compress_ratio}",
             )
             sm70_sparse_attention_paged_fp8_splitk(
                 q=q,

@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
@@ -1777,6 +1778,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
     # opt-in until full-model token and long-output quality gates pass.
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))
+    ),
     "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))
     ),

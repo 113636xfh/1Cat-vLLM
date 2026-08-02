@@ -63,6 +63,8 @@ def main() -> None:
     )
     parser.add_argument("--extra-len", type=int)
     parser.add_argument("--extra-width", type=int)
+    parser.add_argument("--main-len", type=int, default=128)
+    parser.add_argument("--main-width", type=int)
     parser.add_argument("--num-tokens", type=int, default=1)
     parser.add_argument("--stage1-block-h", type=int, choices=(4, 8), default=8)
     parser.add_argument("--stage1-warps", type=int, choices=(2, 4, 8), default=4)
@@ -111,12 +113,19 @@ def main() -> None:
     device = torch.device("cuda")
     num_heads = 8
     num_tokens = args.num_tokens
-    main_len = 128
+    main_len = args.main_len
+    main_width = args.main_width if args.main_width is not None else main_len
+    if main_width < main_len:
+        raise ValueError("main width must cover main length")
     q = torch.randn((num_tokens, num_heads, 512), dtype=torch.float16, device=device)
     out = torch.empty_like(q)
     main_cache = _make_cache(main_len, 256, device)
-    main_indices = torch.arange(main_len, dtype=torch.int32, device=device)[None, :]
-    main_indices = main_indices.expand(num_tokens, -1).contiguous()
+    main_indices = torch.full(
+        (num_tokens, main_width), -1, dtype=torch.int32, device=device
+    )
+    main_indices[:, :main_len] = torch.arange(
+        main_len, dtype=torch.int32, device=device
+    )[None, :]
     main_lengths = torch.full((num_tokens,), main_len, dtype=torch.int32, device=device)
     attn_sink = torch.randn((num_heads,), dtype=torch.float32, device=device)
 
@@ -152,11 +161,9 @@ def main() -> None:
         extra_lengths = None
 
     if args.implementation == "splitk":
-        if extra_cache is None or extra_indices is None or extra_lengths is None:
-            raise ValueError("split-K currently requires an extra sparse cache")
-        num_partials = math.ceil(main_indices.shape[-1] / 16) + math.ceil(
-            extra_indices.shape[-1] / 16
-        )
+        num_partials = math.ceil(main_indices.shape[-1] / 16)
+        if extra_indices is not None:
+            num_partials += math.ceil(extra_indices.shape[-1] / 16)
         partial_max = torch.empty(
             (q.shape[0], num_heads, num_partials),
             dtype=torch.float32,
@@ -175,9 +182,6 @@ def main() -> None:
 
     def run() -> None:
         if args.implementation == "splitk":
-            assert extra_cache is not None
-            assert extra_indices is not None
-            assert extra_lengths is not None
             assert partial_max is not None
             assert partial_sum is not None
             assert partial_acc is not None
@@ -242,9 +246,6 @@ def main() -> None:
     torch.cuda.synchronize()
     comparison = None
     if args.compare_baseline:
-        assert extra_cache is not None
-        assert extra_indices is not None
-        assert extra_lengths is not None
         baseline_out = torch.empty_like(out)
         sm70_sparse_attention_paged_fp8(
             q=q,
@@ -281,6 +282,7 @@ def main() -> None:
         "stage1_warps": args.stage1_warps,
         "num_heads": num_heads,
         "main_len": main_len,
+        "main_width": main_width,
         "extra_len": extra_len,
         "extra_width": extra_width,
         "main_block_size": 256,

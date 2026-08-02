@@ -6,12 +6,13 @@
 - Model: DeepSeek-V4-Flash, TP8 on 8 x V100-SXM2-32GB
 - Decode: CUDA Graph, FP16 query/output, packed `fp8_ds_mla` KV
 - Quantization: TurboMind MXFP4; Marlin is out of scope
-- Route gates: `VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4` and
+- Route gates: `VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA`,
+  `VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4`, and
   `VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128`
 
-Both gates remain default-off until same-contract full-model speed and quality
-checks pass. C4 and C128 use separate gates so either route can be rejected
-without weakening the other.
+All three gates remain default-off until same-contract full-model speed and
+quality checks pass. SWA, C4, and C128 use separate gates so any route can be
+rejected without weakening the others.
 
 ## Trace Baseline
 
@@ -66,6 +67,7 @@ The candidate uses Flash-Decoding-style KV partitioning:
 2. A second kernel combines partial states in FP32 and applies the attention
    sink before writing FP16 output.
 3. The C4 1024-token shape launches 40 stage-1 CTAs and 64 reduction CTAs.
+   The SWA-only shape launches eight stage-1 CTAs instead of one serial CTA.
 4. Scratch comes from the graph-safe worker workspace and is reused across
    layers; there is no hot-path allocation or host synchronization.
 5. E4M3 normal values are decoded by exact IEEE-FP32 bit construction. The
@@ -80,6 +82,7 @@ Exact q=1, eight-head CUDA Graph measurements:
 |---|---:|---:|---:|---:|
 | C4, main 128 + extra 320 | 1.957 ms | 0.101 ms | 19.4x | 1.53e-5 |
 | C128, main 128 + extra 10 | 0.581 ms | 0.078 ms | 7.4x | 3.05e-5 |
+| SWA-only, main 128 | 0.586 ms | 0.059 ms | 9.9x | 3.05e-5 |
 | C128, extra 512 | 4.899 ms | 0.100 ms | 49.1x | 7.63e-6 |
 | C128, extra 1024 | 9.265 ms | 0.119 ms | 77.9x | 7.63e-6 |
 | C128, extra 2048 | 17.966 ms | 0.152 ms | 118.2x | 7.63e-6 |
@@ -95,6 +98,7 @@ Numerical and graph gates completed:
 - realistic FP8 KV tests over multiple seeds have max absolute output error
   at or below `1.53e-5` for the main C4 target;
 - q=1 and q=2 CUDA Graph capture/replay complete with finite output;
+- SWA-only q=1 passes three seeds and q=2 graph replay stays within `3.05e-5`;
 - C128 lengths through 2048 compressed tokens remain finite and within the
   recorded error bound.
 
@@ -103,6 +107,7 @@ Artifacts:
 ```text
 /home/fudanwl/v100-worktrees/runs/
   dsv4-sm70-sparse-attn-micro-20260802/
+  dsv4-sm70-sparse-swa-splitk-micro-20260802/
 ```
 
 ## Full-Model TP8 Result
@@ -157,6 +162,11 @@ sparse service fell from 46.920 to 4.392 ms/token (-90.64%). The 42.527 ms
 sparse reduction translated into a 42.415 ms unprofiled TPOT reduction, so the
 endpoint realizes 99.7% of the measured kernel-family saving.
 
+This endpoint result predates the SWA-only candidate. The remaining two unsplit
+SWA calls contribute `1.094 ms/token` in that trace. The SWA microbenchmark
+projects about `1.05 ms/token` additional service reduction, but that value is
+not an endpoint claim until the accumulated full-model gate completes.
+
 No output-position decay is visible in this 256-token trace:
 
 | Emitted-token positions | Replay interval | GPU service | Sparse rank-max |
@@ -186,8 +196,9 @@ Raw endpoint and graph-node artifacts:
 
 ## Remaining Gates
 
-1. Compare deterministic tokens/logits and run a model-specific semantic
+1. Run the accumulated C4+C128+SWA endpoint speed and quality gate.
+2. Compare deterministic tokens/logits and run a model-specific semantic
    quality gate with official sampling.
-2. Sweep long-context decode before either route becomes default-on.
-3. Run C4-only endpoint attribution only if a later regression requires C128
+3. Sweep long-context decode before any route becomes default-on.
+4. Run C4-only endpoint attribution only if a later regression requires C128
    to be isolated from the accepted combined path.

@@ -639,9 +639,9 @@ def sm70_sparse_attention_paged_fp8_splitk(
     scale: float,
     attn_sink: torch.Tensor,
     out: torch.Tensor,
-    extra_cache: torch.Tensor,
-    extra_indices: torch.Tensor,
-    extra_lengths: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_lengths: torch.Tensor | None,
     partial_max: torch.Tensor,
     partial_sum: torch.Tensor,
     partial_acc: torch.Tensor,
@@ -651,13 +651,27 @@ def sm70_sparse_attention_paged_fp8_splitk(
     """Split sparse KV blocks across CTAs, then reduce online-softmax states."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == _HEAD_DIM
-    assert main_cache.dtype == extra_cache.dtype == torch.uint8
-    assert main_cache.ndim == extra_cache.ndim == 3
+    assert main_cache.dtype == torch.uint8 and main_cache.ndim == 3
 
     main_indices_2d = main_indices.reshape(q.shape[0], -1)
-    extra_indices_2d = extra_indices.reshape(q.shape[0], -1)
     main_lengths_1d = main_lengths.reshape(-1).to(torch.int32)
-    extra_lengths_1d = extra_lengths.reshape(-1).to(torch.int32)
+    has_extra = all(
+        value is not None for value in (extra_cache, extra_indices, extra_lengths)
+    )
+    assert has_extra or all(
+        value is None for value in (extra_cache, extra_indices, extra_lengths)
+    )
+    if has_extra:
+        assert extra_cache is not None
+        assert extra_indices is not None
+        assert extra_lengths is not None
+        assert extra_cache.dtype == torch.uint8 and extra_cache.ndim == 3
+        extra_indices_2d = extra_indices.reshape(q.shape[0], -1)
+        extra_lengths_1d = extra_lengths.reshape(-1).to(torch.int32)
+    else:
+        extra_cache = main_cache
+        extra_indices_2d = main_indices_2d[:, :0]
+        extra_lengths_1d = main_lengths_1d
     main_partials = triton.cdiv(main_indices_2d.shape[1], _SPLITK_BLOCK_K)
     extra_partials = triton.cdiv(extra_indices_2d.shape[1], _SPLITK_BLOCK_K)
     num_partials = main_partials + extra_partials
