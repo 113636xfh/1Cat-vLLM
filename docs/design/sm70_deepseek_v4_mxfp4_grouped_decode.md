@@ -91,6 +91,7 @@ that projection.
 | CTA_N=32/64 tactic-only changes | W13 0.1136 -> 0.1165 ms | Reject |
 | Split fused WQA/WKV into two FP8 GEMMs | Single-stream faster, but four-stream model overlap regresses about 0.556 ms/token | Removed |
 | mHC `tile_n=1` | Bitwise equal, only about 0.035 ms/token projected | Stop at marginal gain |
+| Parallel FP8 KV insert blocks | Bitwise equal, about 0.12 ms/token projected | Stop below 0.2 ms threshold |
 
 The FP8 split result is the key scheduling lesson: service-time improvements
 on an auxiliary stream are invalid unless the full overlap timeline also
@@ -103,6 +104,7 @@ shortens.
   dsv4-mxfp4-grouped-decode-micro-20260802/
   dsv4-mxfp4-direct-top6-clamp10-micro-20260802/
   dsv4-fp8-dense-shapes-20260802/
+  dsv4-sm70-kv-insert-parallel-micro-20260802/
   dsv4-tp8-stacked-mxfp4-fp8split-i1024-o256-20260802/
   dsv4-tp8-stacked-candidate-nsys-i1024-o128-20260802/
 ```
