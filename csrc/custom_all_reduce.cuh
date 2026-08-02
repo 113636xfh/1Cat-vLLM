@@ -707,7 +707,7 @@ DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg,
   return flag;
 }
 
-__global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
+static __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
     RankData* _dp, RankSignals sg, Signal* self_sg,
     half* __restrict__ result, int rank, int packed_size) {
   using P = typename packed_t<half>::P;
