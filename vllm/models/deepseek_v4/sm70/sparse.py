@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -21,6 +22,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
     sm70_sparse_attention_paged_fp8,
+    sm70_sparse_attention_paged_fp8_splitk,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
@@ -184,18 +186,59 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
-        sm70_sparse_attention_paged_fp8(
-            q=q,
-            main_cache=layer.swa_cache_layer.kv_cache,
-            main_indices=swa_indices,
-            main_lengths=swa_lens,
-            scale=layer.scale,
-            attn_sink=layer.attn_sink[: q.shape[1]],
-            out=output,
-            extra_cache=compressed_cache,
-            extra_indices=topk_indices,
-            extra_lengths=topk_lens,
+        use_splitk = (
+            layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4
+        ) or (
+            layer.compress_ratio == 128 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128
         )
+        if use_splitk:
+            assert compressed_cache is not None
+            assert topk_indices is not None and topk_lens is not None
+            main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
+            extra_width = topk_indices.reshape(num_decode_tokens, -1).shape[1]
+            num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
+            partial_max, partial_sum, partial_acc = (
+                current_workspace_manager().get_simultaneous(
+                    ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
+                    ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
+                    (
+                        (num_decode_tokens, q.shape[1], num_partials, q.shape[2]),
+                        torch.float32,
+                    ),
+                )
+            )
+            logger.info_once(
+                "DeepSeek V4 SM70 C%d sparse MLA split-K enabled.",
+                layer.compress_ratio,
+            )
+            sm70_sparse_attention_paged_fp8_splitk(
+                q=q,
+                main_cache=layer.swa_cache_layer.kv_cache,
+                main_indices=swa_indices,
+                main_lengths=swa_lens,
+                scale=layer.scale,
+                attn_sink=layer.attn_sink[: q.shape[1]],
+                out=output,
+                extra_cache=compressed_cache,
+                extra_indices=topk_indices,
+                extra_lengths=topk_lens,
+                partial_max=partial_max,
+                partial_sum=partial_sum,
+                partial_acc=partial_acc,
+            )
+        else:
+            sm70_sparse_attention_paged_fp8(
+                q=q,
+                main_cache=layer.swa_cache_layer.kv_cache,
+                main_indices=swa_indices,
+                main_lengths=swa_lens,
+                scale=layer.scale,
+                attn_sink=layer.attn_sink[: q.shape[1]],
+                out=output,
+                extra_cache=compressed_cache,
+                extra_indices=topk_indices,
+                extra_lengths=topk_lens,
+            )
 
     @classmethod
     def _forward_prefill(
