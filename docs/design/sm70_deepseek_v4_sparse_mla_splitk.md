@@ -80,9 +80,9 @@ Exact q=1, eight-head CUDA Graph measurements:
 |---|---:|---:|---:|---:|
 | C4, main 128 + extra 320 | 1.957 ms | 0.101 ms | 19.4x | 1.53e-5 |
 | C128, main 128 + extra 10 | 0.581 ms | 0.078 ms | 7.4x | 3.05e-5 |
-| C128, extra 512 | - | 0.100 ms | - | 7.63e-6 |
-| C128, extra 1024 | - | 0.119 ms | - | 7.63e-6 |
-| C128, extra 2048 | - | 0.152 ms | - | 7.63e-6 |
+| C128, extra 512 | 4.899 ms | 0.100 ms | 49.1x | 7.63e-6 |
+| C128, extra 1024 | 9.265 ms | 0.119 ms | 77.9x | 7.63e-6 |
+| C128, extra 2048 | 17.966 ms | 0.152 ms | 118.2x | 7.63e-6 |
 
 Latest C4 NCU stage times are `87.74 us` for split-K and `5.22 us` for the
 reducer. Stage-1 reaches 40 CTAs and 12.93% DRAM throughput. These are kernel
