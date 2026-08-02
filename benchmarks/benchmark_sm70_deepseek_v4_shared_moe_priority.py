@@ -78,6 +78,8 @@ class Fixture:
             1, 256, dtype=torch.float16, device=device
         )
         self.shared_output = torch.empty(1, 4096, dtype=torch.float16, device=device)
+        self.scaled_shared_output = torch.empty_like(self.shared_output)
+        self.shared_scale = 1.0 / 1.5
 
         num_experts = 256
         top_k = 6
@@ -192,8 +194,13 @@ class Fixture:
             )
 
     def combine(self) -> None:
-        torch.add(
+        torch.mul(
             self.shared_output,
+            self.shared_scale,
+            out=self.scaled_shared_output,
+        )
+        torch.add(
+            self.scaled_shared_output,
             self.routed_output,
             out=self.combined_output,
         )
@@ -205,6 +212,7 @@ class Fixture:
             self.inv_permuted_idx,
             self.shared_output,
             self.combined_output,
+            self.shared_scale,
             6,
             4096,
         )

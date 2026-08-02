@@ -1483,6 +1483,7 @@ def sm70_moe_single_token_weighted_reduce_add_out(
     inv_permuted_idx: torch.Tensor,
     shared_output: torch.Tensor,
     out: torch.Tensor,
+    shared_scale: float,
     top_k: int,
     hidden_logical_size: int,
 ) -> None:
@@ -1492,6 +1493,7 @@ def sm70_moe_single_token_weighted_reduce_add_out(
         inv_permuted_idx,
         shared_output,
         out,
+        shared_scale,
         top_k,
         hidden_logical_size,
     )
@@ -1506,6 +1508,7 @@ if hasattr(torch.ops._C, "sm70_moe_single_token_weighted_reduce_add_out"):
         inv_permuted_idx: torch.Tensor,
         shared_output: torch.Tensor,
         out: torch.Tensor,
+        shared_scale: float,
         top_k: int,
         hidden_logical_size: int,
     ) -> None:

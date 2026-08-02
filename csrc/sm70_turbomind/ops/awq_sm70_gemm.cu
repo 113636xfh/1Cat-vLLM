@@ -5614,7 +5614,8 @@ __global__ void awq_moe_single_token_weighted_reduce_half2_kernel(
 __global__ void sm70_moe_single_token_weighted_reduce_add_kernel(
     const __half* sorted_output, const float* topk_weights,
     const int* inv_permuted_idx, const __half* shared_output, __half* out,
-    int top_k, int hidden_logical_size, int sorted_output_row_stride) {
+    float shared_scale, int top_k, int hidden_logical_size,
+    int sorted_output_row_stride) {
   for (int col = blockIdx.x * blockDim.x + threadIdx.x;
        col < hidden_logical_size; col += blockDim.x * gridDim.x) {
     float acc = 0.f;
@@ -5625,7 +5626,9 @@ __global__ void sm70_moe_single_token_weighted_reduce_add_kernel(
       acc = fmaf(topk_weights[route_idx], __half2float(value), acc);
     }
     const __half routed = __float2half(acc);
-    out[col] = __hadd(shared_output[col], routed);
+    const __half shared = __float2half(__half2float(shared_output[col]) *
+                                       shared_scale);
+    out[col] = __hadd(shared, routed);
   }
 }
 
@@ -5633,7 +5636,8 @@ template <int TOPK>
 __global__ void sm70_moe_single_token_weighted_reduce_add_half2_kernel(
     const __half* sorted_output, const float* topk_weights,
     const int* inv_permuted_idx, const __half* shared_output, __half* out,
-    int hidden_logical_size, int sorted_output_row_stride) {
+    float shared_scale, int hidden_logical_size,
+    int sorted_output_row_stride) {
   __shared__ int sorted_pos_sh[TOPK];
   __shared__ float weight_sh[TOPK];
 
@@ -5661,7 +5665,11 @@ __global__ void sm70_moe_single_token_weighted_reduce_add_half2_kernel(
     const __half2 routed = __floats2half2_rn(acc.x, acc.y);
     const __half2 shared =
         reinterpret_cast<const __half2*>(shared_output)[pair_idx];
-    reinterpret_cast<__half2*>(out)[pair_idx] = __hadd2(shared, routed);
+    const float2 shared_f = __half22float2(shared);
+    const __half2 shared_scaled = __floats2half2_rn(
+        shared_f.x * shared_scale, shared_f.y * shared_scale);
+    reinterpret_cast<__half2*>(out)[pair_idx] =
+        __hadd2(shared_scaled, routed);
   }
 }
 
@@ -5732,7 +5740,8 @@ void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
 void sm70_moe_single_token_weighted_reduce_add_out(
     torch::Tensor sorted_output, torch::Tensor topk_weights,
     torch::Tensor inv_permuted_idx, torch::Tensor shared_output,
-    torch::Tensor out, int64_t top_k, int64_t hidden_logical_size) {
+    torch::Tensor out, double shared_scale, int64_t top_k,
+    int64_t hidden_logical_size) {
   TORCH_CHECK(
       sorted_output.is_cuda() && sorted_output.scalar_type() == torch::kFloat16,
       "sm70 weighted-reduce-add: sorted_output must be CUDA float16.");
@@ -5769,6 +5778,7 @@ void sm70_moe_single_token_weighted_reduce_add_out(
   constexpr int kThreads = 256;
   const int hidden_size = static_cast<int>(hidden_logical_size);
   const int row_stride = static_cast<int>(sorted_output.stride(0));
+  const float shared_scale_f = static_cast<float>(shared_scale);
   const bool use_half2 = (hidden_size % 2) == 0 && (row_stride % 2) == 0;
   if (top_k == 6 && use_half2) {
     const int blocks =
@@ -5779,8 +5789,8 @@ void sm70_moe_single_token_weighted_reduce_add_out(
             topk_weights.data_ptr<float>(),
             inv_permuted_idx.data_ptr<int32_t>(),
             reinterpret_cast<const __half*>(shared_output.data_ptr<at::Half>()),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), hidden_size,
-            row_stride);
+            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), shared_scale_f,
+            hidden_size, row_stride);
   } else {
     const int blocks =
         std::max<int>(1, (hidden_size + kThreads - 1) / kThreads);
@@ -5790,7 +5800,7 @@ void sm70_moe_single_token_weighted_reduce_add_out(
         topk_weights.data_ptr<float>(), inv_permuted_idx.data_ptr<int32_t>(),
         reinterpret_cast<const __half*>(shared_output.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-        static_cast<int>(top_k), hidden_size, row_stride);
+        shared_scale_f, static_cast<int>(top_k), hidden_size, row_stride);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

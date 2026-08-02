@@ -524,15 +524,19 @@ def test_sm70_single_token_weighted_reduce_add_matches_reference():
 
     routed = torch.empty_like(shared_output)
     moe_unpermute(routed, sorted_output, topk_weights, inv, offsets)
-    expected = shared_output + routed
-    actual = torch.empty_like(expected)
-    torch.ops._C.sm70_moe_single_token_weighted_reduce_add_out(
-        sorted_output,
-        topk_weights,
-        inv,
-        shared_output,
-        actual,
-        topk,
-        hidden,
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for shared_scale in (1.0, 1.0 / 1.5):
+        scaled_shared = shared_output.clone()
+        scaled_shared.mul_(shared_scale)
+        expected = scaled_shared + routed
+        actual = torch.empty_like(expected)
+        torch.ops._C.sm70_moe_single_token_weighted_reduce_add_out(
+            sorted_output,
+            topk_weights,
+            inv,
+            shared_output,
+            actual,
+            shared_scale,
+            topk,
+            hidden,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

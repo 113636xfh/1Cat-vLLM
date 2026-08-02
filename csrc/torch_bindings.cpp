@@ -439,7 +439,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "sm70_moe_single_token_weighted_reduce_add_out("
       "Tensor sorted_output, Tensor topk_weights, Tensor inv_permuted_idx, "
-      "Tensor shared_output, Tensor(a!) out, int top_k, "
+      "Tensor shared_output, Tensor(a!) out, float shared_scale, int top_k, "
       "int hidden_logical_size) -> ()");
   ops.impl("sm70_moe_single_token_weighted_reduce_add_out", torch::kCUDA,
            &sm70_moe_single_token_weighted_reduce_add_out);

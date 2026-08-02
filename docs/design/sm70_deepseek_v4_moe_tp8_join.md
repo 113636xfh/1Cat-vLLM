@@ -22,16 +22,25 @@ existing overlap, so disabling or replacing that overlap is not useful.
 ## Candidate
 
 The direct top-6 MXFP4 path now reuses the exact single-token weighted-reduce
-kernel. When `VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE=1`, the same kernel also
-performs the following FP16 shared+routed add before writing the all-reduce
-input. W13, SwiGLU, W2, route order, FP32 FMA order, FP16 downcast point, and
-the hierarchical cross-rank reduction order remain unchanged.
+kernel. When `VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE=1`, the fused variant
+also applies the production FP16 shared-expert scale and performs the following
+FP16 shared+routed add before writing the all-reduce input. W13, SwiGLU, W2,
+route order, FP32 FMA order, both FP16 downcast points, and the hierarchical
+cross-rank reduction order remain unchanged.
 
 The generic `FusedMoEMethodBase` finalization hook is a no-op for every other
 quantization method. The MXFP4 hook is restricted to batch one, direct top-6,
 fully replicated experts, a present shared expert, and the new operator.
 
-## Microbenchmarks
+## Rejected V1 Screening
+
+The first fused kernel omitted DeepSeek-V4-Flash's
+`routed_scaling_factor=1.5` compensation. Production computes
+`fp16(shared * (1 / 1.5)) + routed`, while V1 computed `shared + routed` and
+would then have allowed the runner to scale the combined tensor again. It was
+rejected before endpoint timing. The following results only quantify why the
+fusion idea was retained for a numerically corrected V2; they are not accepted
+performance evidence.
 
 Single-GPU exact-shape CUDA Graph:
 
@@ -51,8 +60,9 @@ The eight-rank joined graph includes the MoE tail and hierarchical all-reduce:
 | Unpermute + add + hierarchical AR | 118.437 us | - |
 | Fused reduce-add + hierarchical AR | 113.899 us | -0.195 ms/token |
 
-Initial and changed-input graph replays are bitwise equal to the control on
-all eight ranks. The focused CUDA test also passes with zero tolerance.
+Initial and changed-input graph replays were bitwise equal to the incomplete
+V1 control. V2 must instead match the production scale-and-add sequence with
+zero tolerance.
 
 ## Rejected Paths
 
@@ -62,6 +72,7 @@ all eight ranks. The focused CUDA test also passes with zero tolerance.
 | One-CTA hierarchical sum2 | 18.096 to 20.150 us/call | Remove; local add and fence dominate |
 | Fused reduce-add, 128 threads | Lower than 256-thread benefit | Reject |
 | Fused reduce-add, 64 threads | 0.191 ms/token in TP8 join | Reject; keep 256 |
+| Scale-free fused reduce-add V1 | Omits routed scale compensation | Reject; output semantics differ |
 
 ## Artifacts
 
@@ -76,6 +87,6 @@ all eight ranks. The focused CUDA test also passes with zero tolerance.
 
 ## Remaining Gates
 
-1. Prove the fused route is selected inside the real model CUDA Graph.
-2. Run matching 1K/64 low-overhead endpoint timing.
-3. Run the model-level official-sampling quality gate before defaulting it.
+1. Re-run the single-GPU and TP8 joined graph with the production scale oracle.
+2. Prove the corrected fused route is selected inside the real model CUDA Graph.
+3. Run matching 1K/256 low-overhead endpoint timing and official-sampling quality.
