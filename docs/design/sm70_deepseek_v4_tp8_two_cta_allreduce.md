@@ -2,10 +2,11 @@
 
 ## Scope
 
-This experiment targets the exact DeepSeek-V4-Flash TP8 decode collective:
+This rejected experiment targeted the exact DeepSeek-V4-Flash TP8 decode collective:
 4096 FP16 elements, eight V100 GPUs, CUDA Graph execution, and the existing
 two-clique hierarchical reduction order. It is gated by
-`VLLM_SM70_TP8_HIERARCHICAL_TWO_CTA=1` and is default-off.
+`VLLM_SM70_TP8_HIERARCHICAL_TWO_CTA=1`. The implementation and environment
+gate were removed after the microbenchmark regression.
 
 ## Trace Rationale
 
@@ -33,3 +34,28 @@ slots are not reused until the paired consumer acknowledges the matching CTA.
    time before any full-model launch.
 4. A candidate that only moves isolated service but not joined wall time is
    rejected.
+
+## Result
+
+Both routes produced the same SHA-256 output on all eight ranks. The two-CTA
+graph completed the short 87-call stress without signal overtake.
+
+| Test | One CTA | Two CTA | Change |
+|---|---:|---:|---:|
+| Pure 87-call graph | 18.710 us/call | 19.879 us/call | +6.25% |
+| Projection join + collective | 32.498 us/call | 35.035 us/call | +7.80% |
+
+The joined regression projects to `+0.221 ms/token` over 87 calls. At this
+8 KiB shape, duplicating clique and pair handshakes costs more than using a
+second SM saves in peer-memory latency. The candidate was removed without a
+full-model launch.
+
+Artifacts:
+
+```text
+/home/fudanwl/v100-worktrees/runs/dsv4-tp8-two-cta-ar-micro-20260803/
+  one_cta_short_pure.json
+  two_cta_short_pure.json
+  join_two_cta_0.json
+  join_two_cta_1.json
+```
