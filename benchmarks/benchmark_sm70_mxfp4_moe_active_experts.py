@@ -560,6 +560,8 @@ def benchmark_verifier_m8_pipeline(
     repeats: int,
     seed: int,
     route_case: str = "mixed",
+    input_scale: float = 0.01,
+    require_grouped_bitwise: bool = True,
 ) -> dict[str, object]:
     """Compare dense-256, active-48 loop, and grouped verifier pipelines."""
     num_tokens = 8
@@ -606,7 +608,7 @@ def benchmark_verifier_m8_pipeline(
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
     x = (
         torch.randn(num_tokens, STAGES["w13"].k, dtype=torch.float16, device=device)
-        * 0.01
+        * input_scale
     )
     total_slots = num_tokens * top_k
 
@@ -773,6 +775,10 @@ def benchmark_verifier_m8_pipeline(
         name: float((dense[name] - grouped[name]).abs().max().item())
         for name in ("gate_up", "intermediate", "sorted_output", "output")
     }
+    grouped_stages_finite = all(
+        bool(torch.isfinite(grouped[name]).all().item())
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    )
     expected_active_ids = sorted({expert for row in route_a for expert in row})
     actual_active_ids = active["active_expert_ids"][: len(expected_active_ids)]
     compact_ids_match = actual_active_ids.cpu().tolist() == expected_active_ids
@@ -804,6 +810,8 @@ def benchmark_verifier_m8_pipeline(
 
     result = {
         "route_case": route_case,
+        "input_scale": input_scale,
+        "grouped_bitwise_required": require_grouped_bitwise,
         "num_tokens": num_tokens,
         "total_routed_slots": total_slots,
         "unique_active_experts": len(expected_active_ids),
@@ -820,6 +828,7 @@ def benchmark_verifier_m8_pipeline(
         "initial_stage_bitwise_equal": stage_parity,
         "grouped_initial_stage_bitwise_equal": grouped_stage_parity,
         "grouped_initial_stage_max_abs": grouped_stage_max_abs,
+        "grouped_stages_finite": grouped_stages_finite,
         "compact_ids_match": compact_ids_match,
         "dynamic_replay_bitwise_equal": replay_equal,
         "dynamic_replay_max_abs": replay_max_abs,
@@ -827,15 +836,23 @@ def benchmark_verifier_m8_pipeline(
         "grouped_dynamic_replay_max_abs": grouped_replay_max_abs,
         "dynamic_route_changes_output": route_changes_output,
     }
-    if not (
+    base_gate_passed = (
         initial_equal
         and all(stage_parity.values())
-        and grouped_initial_equal
-        and all(grouped_stage_parity.values())
         and compact_ids_match
         and replay_equal
-        and grouped_replay_equal
         and route_changes_output
+        and grouped_stages_finite
+    )
+    grouped_bitwise_gate_passed = (
+        grouped_initial_equal
+        and all(grouped_stage_parity.values())
+        and grouped_replay_equal
+    )
+    result["base_gate_passed"] = base_gate_passed
+    result["grouped_bitwise_gate_passed"] = grouped_bitwise_gate_passed
+    if not base_gate_passed or (
+        require_grouped_bitwise and not grouped_bitwise_gate_passed
     ):
         raise RuntimeError(f"MXFP4 verifier M8 correctness gate failed: {result}")
     return result
@@ -894,6 +911,78 @@ def profile_active_stage_once(
     }
 
 
+def profile_grouped_m8_stage_once(
+    shape: StageShape,
+    *,
+    num_experts: int,
+    top_k: int,
+    seed: int,
+    route_case: str,
+) -> dict[str, object]:
+    """Capture one warmed exact-M8 grouped stage for Nsight Compute."""
+    num_tokens = 8
+    total_slots = num_tokens * top_k
+    if num_experts != 256 or top_k != 6:
+        raise ValueError("The exact M8 profile requires 256 experts and top-k=6")
+
+    route_cases = {
+        "mixed": [
+            [3, 17 + row, 42, 99 + row, 128 + row, 255 - row]
+            for row in range(num_tokens)
+        ],
+        "unique48": [
+            list(range(row * top_k, (row + 1) * top_k)) for row in range(num_tokens)
+        ],
+        "hot6": [[3, 17, 42, 99, 128, 255] for _ in range(num_tokens)],
+    }
+    routed_experts = sorted(expert for row in route_cases[route_case] for expert in row)
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    _weights, _scales, ptrs_w, ptrs_s = _prepare_experts(shape, num_experts, device)
+    x = torch.randn(total_slots, shape.k, dtype=torch.float16, device=device) * 0.01
+    out = torch.empty(total_slots, shape.n, dtype=torch.float16, device=device)
+    slot_offsets = torch.arange(total_slots + 1, dtype=torch.int32, device=device)
+    slot_expert_ids = torch.tensor(routed_experts, dtype=torch.int32, device=device)
+
+    os.environ["VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE"] = "1"
+    os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8"] = "1"
+
+    def grouped_call() -> None:
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            out,
+            x,
+            slot_offsets,
+            slot_expert_ids,
+            ptrs_w,
+            ptrs_s,
+            total_slots,
+            shape.k,
+            shape.n,
+            32,
+        )
+
+    for _ in range(5):
+        grouped_call()
+    torch.accelerator.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    grouped_call()
+    torch.accelerator.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+    return {
+        "stage": shape.name,
+        "k": shape.k,
+        "n": shape.n,
+        "num_tokens": num_tokens,
+        "total_routed_slots": total_slots,
+        "route_case": route_case,
+        "unique_active_experts": len(set(routed_experts)),
+        "captured_grouped_launches": 1,
+        "output_finite": bool(torch.isfinite(out).all().item()),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", choices=("w13", "w2", "both"), default="both")
@@ -901,8 +990,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--input-scale", type=float, default=0.01)
     parser.add_argument("--full-pipeline", action="store_true")
     parser.add_argument("--verifier-m8-pipeline", action="store_true")
+    parser.add_argument(
+        "--allow-grouped-numeric-drift",
+        action="store_true",
+        help=(
+            "Report grouped tactic drift while retaining finite/replay baseline gates."
+        ),
+    )
     parser.add_argument(
         "--route-case",
         choices=("mixed", "unique48", "hot6"),
@@ -913,6 +1010,11 @@ def parse_args() -> argparse.Namespace:
         "--profile-active-once",
         action="store_true",
         help="Warm up, then CUDA-profiler capture one six-expert stage.",
+    )
+    parser.add_argument(
+        "--profile-grouped-m8-once",
+        action="store_true",
+        help="Warm up, then capture one exact-M8 grouped stage for NCU.",
     )
     return parser.parse_args()
 
@@ -927,6 +1029,8 @@ def main() -> int:
             repeats=args.repeats,
             seed=args.seed,
             route_case=args.route_case,
+            input_scale=args.input_scale,
+            require_grouped_bitwise=not args.allow_grouped_numeric_drift,
         )
         print(
             json.dumps(
@@ -970,6 +1074,27 @@ def main() -> int:
             json.dumps(
                 {
                     "benchmark": "sm70_mxfp4_moe_active_experts_profile",
+                    "device": torch.cuda.get_device_name(),
+                    "result": result,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if args.profile_grouped_m8_once:
+        if args.stage == "both":
+            raise ValueError("--profile-grouped-m8-once requires --stage w13 or w2")
+        result = profile_grouped_m8_stage_once(
+            STAGES[args.stage],
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            seed=args.seed,
+            route_case=args.route_case,
+        )
+        print(
+            json.dumps(
+                {
+                    "benchmark": "sm70_mxfp4_moe_grouped_m8_profile",
                     "device": torch.cuda.get_device_name(),
                     "result": result,
                 },

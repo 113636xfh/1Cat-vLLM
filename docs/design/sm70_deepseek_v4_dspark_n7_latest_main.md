@@ -238,6 +238,72 @@ emitted tokens per round, matching the 15.357 ms no-speculation TPOT would
 require a round below 24.1 ms. Slot grouping removes the launch explosion but
 does not by itself make low-acceptance DSpark faster than no speculation.
 
+## Exact M=8 MXFP4 Tactic Selection
+
+An exact CUDA Graph node trace of the slot-grouped verifier records 1,935
+nodes and 47.530 ms of traced GPU service per replay. The target graph is no
+longer dominated by launch count, but its selected MXFP4 tactics are not
+appropriate for the fixed 48 one-row groups:
+
+| Target graph category | Service | Share |
+|---|---:|---:|
+| MXFP4 W13 | 12.692 ms | 26.70% |
+| mHC | 6.829 ms | 14.37% |
+| TurboMind dense GEMM | 6.194 ms | 13.03% |
+| Sparse MLA/indexer | 5.418 ms | 11.40% |
+| CUTLASS/cuBLAS | 4.817 ms | 10.14% |
+| NCCL | 4.433 ms | 9.33% |
+| MXFP4 W2 | 3.742 ms | 7.87% |
+| Routing, elementwise, and other | 3.405 ms | 7.16% |
+
+The captured W13 kernel uses CTA `64x128x32`, split-K 10, 190 registers per
+thread, and 16.4 KB shared memory. The W2 kernel uses CTA `32x128x32`, split-K
+1, 121 registers per thread, and the same shared-memory allocation. A
+capture-time Python prewarm did not change the production graph and is
+rejected; it did not solve descriptor-cache selection deterministically.
+
+NCU on the exact grouped descriptor instead selected CTA `8x128x64`, split-K
+5 for W13 and CTA `16x128x32`, split-K 1 for W2. The W13 candidate uses about
+102 registers per thread and measures 108.54 us; W2 measures 63.74 us. The
+first full-layer comparison appeared bitwise, but selector-scope review found
+that the nominal control descriptor could select the same fast tactic. That
+comparison is invalid as a baseline-versus-candidate numerical gate. After
+adding a dedicated dispatch-policy bit, trace confirms generic 48-row calls
+retain `measure/reuse` while only the exact grouped-M8 call selects the fast
+tactic. With genuinely distinct tactics, the synthetic scale-1.0 pipeline is
+not bitwise: gate-up max abs is 0.25 and final output max abs is 2.0. The data
+type and accumulator precision are unchanged; this is reduction-order drift,
+so promotion is decided by model-level acceptance and output-quality gates.
+
+The implementation bypasses MXFP4 small-shape autotuning only for the two exact
+`(48, 512, 4096)` and `(48, 4096, 256)` verifier descriptors and uses
+deterministic tactics. Every other MXFP4 descriptor retains the existing
+autotune policy and cache. The selector is default-on only when grouped M8
+itself is enabled, and has an independent A/B disable gate. The synchronized
+TP8 endpoint profile measures:
+
+| Component | Slot-grouped baseline | Exact selector | Change |
+|---|---:|---:|---:|
+| Target forward, M=8 | 42.410 ms | 32.441 ms | -23.5% |
+| Target logits | 0.352 ms | 0.352 ms | flat |
+| Rejection sample | 0.446 ms | 0.450 ms | +0.9% |
+| Draft GPU | 4.732 ms | 4.008 ms | -15.3% |
+
+The first three matched seeds suggested a 7.7% acceptance loss, but the result
+did not survive the required larger gate. Across matched seeds 4210-4219,
+aggregate emitted tokens per stream chunk improve from 1.753 to 1.823 (+4.0%).
+Median endpoint TPOT falls from 31.282 to 25.533 ms (-18.4%), and throughput
+rises from 31.97 to 39.16 token/s (+22.5%). The temperature-zero 256-token
+output is byte-identical to the selector-off control, including its SHA256.
+The official-sampling quality request remains coherent and stops naturally
+after 71 tokens. These results satisfy the numeric, acceptance, and text-health
+gates; the exact selector is accepted for grouped M8.
+
+The dispatch-scope hardening leaves the selected exact-M8 kernels unchanged,
+but its final full-model smoke is still required before merge. The first retry
+was blocked by an unrelated TP8 prefill service occupying all eight GPUs; no
+task-owned process was left running and no external process was stopped.
+
 ## Experiment Log
 
 | Date | Source | Test | Result | Decision |
@@ -261,6 +327,16 @@ does not by itself make low-acceptance DSpark faster than no speculation.
 | 2026-08-03 | candidate | Slot-grouped TP8 matched seeds | Median 16.545 -> 30.420 token/s; acceptance flat | Accept endpoint speed gate |
 | 2026-08-03 | candidate | Slot-grouped synchronized profile | Target 78.779 -> 42.394 ms | Accept verifier transfer gate |
 | 2026-08-03 | candidate | Slot-grouped official-sampling natural stop | Coherent two-sentence response; 66 tokens | Accept quality gate |
+| 2026-08-03 | candidate | Exact slot-grouped graph-node trace | MXFP4 W13/W2 are 16.434 ms; production W13 uses 190 registers/thread | Replace exact descriptor tactics |
+| 2026-08-03 | rejected | Python graph prewarm | Target remains about 42 ms | Do not rely on capture-time cache warming |
+| 2026-08-03 | candidate | Exact W13/W2 NCU | 108.54 + 63.74 us/layer | Admit narrow selector to endpoint profile |
+| 2026-08-03 | candidate | Exact-selector synchronized TP8 profile | Target 42.394 -> 32.359 ms (-23.7%) | Run matched acceptance gate |
+| 2026-08-03 | inconclusive | Exact-selector seeds 4201-4203 | Emitted tokens/chunk 1.652 -> 1.524 (-7.7%) | Too much seed variance; expand to ten matched seeds |
+| 2026-08-03 | candidate | Scoped-policy positive/negative route trace | Generic descriptor retains measure/reuse; exact M8 alone selects fast tactic | Accept dispatch-scope gate |
+| 2026-08-03 | candidate | Distinct-tactic synthetic comparison | Same precision, but reduction-order drift reaches final max abs 2.0 at scale 1 | Require model-level acceptance and quality gates |
+| 2026-08-03 | candidate | Exact-selector seeds 4210-4219 | TPOT 31.282 -> 25.533 ms; emitted/chunk +4.0% | Accept speed and acceptance gates |
+| 2026-08-03 | candidate | Greedy equality and natural stop | 256-token SHA256 equal; coherent 71-token stop | Accept quality gate and enable by default |
+| 2026-08-03 | pending | Scoped-policy full-model smoke | Unrelated TP8 prefill service owns all GPUs | Retry without stopping external work |
 
 ## Artifacts
 
@@ -288,6 +364,8 @@ Retained remote root:
 - No-speculation regression: `nospec-active48-regression-seed4201.json`.
 - Slot-grouped microbenchmarks and endpoint/profile artifacts:
   `/home/fudanwl/v100-worktrees/runs/dsv4-dspark-grouped-m8-20260803`.
+- Exact selector NCU, profile, quality, and matched-control artifacts:
+  `/home/fudanwl/v100-worktrees/runs/dsv4-dspark-grouped-m8-fast-selector-20260803`.
 
 Disabling prefix caching and reducing `max_num_batched_tokens` to 2048 did not
 recover the gap; those paths were rejected. The task-owned API service must be

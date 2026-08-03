@@ -1077,6 +1077,11 @@ bool mxfp4_moe_grouped_m8_enabled() {
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
 bool nvfp4_tune_small_shapes_enabled() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES");
   return raw == nullptr || std::atoi(raw) != 0;
@@ -1345,6 +1350,13 @@ turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream) {
+  const bool exact_grouped_m8 =
+      total_tokens == 48 && num_experts == 48 && group_size == 32 &&
+      ((n == 512 && k == 4096) || (n == 4096 && k == 256));
+  if (mxfp4_moe_grouped_m8_enabled() &&
+      mxfp4_moe_grouped_m8_fast_selector_enabled() && exact_grouped_m8) {
+    return turbomind::gemm::DispatchPolicy::kMxfp4MoeGroupedM8Fast;
+  }
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
       TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());

@@ -81,6 +81,16 @@ bool Sm70AwqMtpM5FastSelectorEnabled()
     return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()
+{
+    const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
+    if (!grouped || std::atoi(grouped) == 0) {
+        return false;
+    }
+    const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
     int  n;
     int  k;
@@ -157,12 +167,15 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(const GemmDesc&  
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
 {
-    if (!Sm70AwqTp2FastSelectorEnabled()) {
-        return std::nullopt;
-    }
+    const bool        awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
     const std::string desc_str = to_string(desc);
-    if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
-        return target;
+    if (awq_fast_selector_enabled) {
+        if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
+            return target;
+        }
+    }
+    if (!awq_fast_selector_enabled) {
+        return std::nullopt;
     }
     if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x17408x5120_1") {
         return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 1, 0, false, ""};
@@ -197,6 +210,23 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc
     }
     if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1") {
         return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false, ""};
+    }
+    return std::nullopt;
+}
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(const GemmDesc& desc)
+{
+    if (!Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()) {
+        return std::nullopt;
+    }
+    const std::string desc_str = to_string(desc);
+    if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x512x4096_1") {
+        return Sm70AwqTp2FastTarget{
+            desc.n, desc.k, 8, 128, 64, 5, 0, true, "c8x128_a1x1x64_01"};
+    }
+    if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x4096x256_1") {
+        return Sm70AwqTp2FastTarget{
+            desc.n, desc.k, 16, 128, 32, 1, 0, true, "c16x128_a1x1x32_01"};
     }
     return std::nullopt;
 }
@@ -265,17 +295,22 @@ std::optional<LaunchSpec> SelectSm70AwqTp2FastSpec(Context&                     
 const char* ToString(DispatchPolicy policy)
 {
     if ((policy & DispatchPolicy::kPreserveDefaultSplits)
-        || (policy & DispatchPolicy::kPreserveDefaultSplitCount)) {
+        || (policy & DispatchPolicy::kPreserveDefaultSplitCount)
+        || (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast)) {
         static thread_local std::string text;
         auto base =
             static_cast<DispatchPolicy>((int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits
-                                        & ~(int)DispatchPolicy::kPreserveDefaultSplitCount);
+                                        & ~(int)DispatchPolicy::kPreserveDefaultSplitCount
+                                        & ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast);
         text = std::string(ToString(base));
         if (policy & DispatchPolicy::kPreserveDefaultSplits) {
             text += "|preserve_default_splits";
         }
         if (policy & DispatchPolicy::kPreserveDefaultSplitCount) {
             text += "|preserve_default_split_count";
+        }
+        if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
+            text += "|mxfp4_moe_grouped_m8_fast";
         }
         return text.c_str();
     }
@@ -368,6 +403,16 @@ struct Gemm::Impl {
         const auto is_feasible = [&](const LaunchSpec& spec) {
             return spec.kernel && spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
         };
+        if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
+            if (auto fast_target = GetSm70Mxfp4MoeGroupedM8FastTarget(desc)) {
+                auto specs = Find(ctx, barriers_size, partials_size, 0);
+                if (auto fast_spec = SelectSm70AwqTp2FastSpec(
+                        ctx, specs, *fast_target, barriers_size, partials_size)) {
+                    return *fast_spec;
+                }
+                return {};
+            }
+        }
         if (policy & DispatchPolicy::kReuse) {
             if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
                 return *spec;

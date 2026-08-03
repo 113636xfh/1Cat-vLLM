@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
@@ -1863,6 +1864,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # active-expert stage calls into one TurboMind grouped launch.
     "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
+    ),
+    # Use deterministic W13/W2 tactics for the fixed 48 one-row
+    # verifier groups instead of relying on capture-time autotune stability.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR", "1"))
     ),
     # Skip the generic 256-expert sort/permute/unpermute pipeline for the
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
