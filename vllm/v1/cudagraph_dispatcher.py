@@ -10,13 +10,14 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
 
-def _get_sm70_mtp_context_buckets() -> tuple[int, ...]:
-    """Parse optional one-request MTP attention graph context buckets."""
-    raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", "").strip()
+def _get_sm70_context_buckets(env_name: str) -> tuple[int, ...]:
+    """Parse optional one-request attention graph context buckets."""
+    raw = os.getenv(env_name, "").strip()
     if not raw:
         return ()
 
@@ -24,15 +25,58 @@ def _get_sm70_mtp_context_buckets() -> tuple[int, ...]:
         buckets = tuple(sorted({int(value.strip()) for value in raw.split(",")}))
     except ValueError as exc:
         raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKETS must be a comma-separated list "
-            f"of positive integers, got {raw!r}"
+            f"{env_name} must be a comma-separated list of positive integers, "
+            f"got {raw!r}"
         ) from exc
     if not buckets or buckets[0] <= 0:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKETS must contain only positive integers, "
-            f"got {raw!r}"
-        )
+        raise ValueError(f"{env_name} must contain only positive integers, got {raw!r}")
     return buckets
+
+
+def _get_sm70_dsv4_decode_context_buckets(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
+    if env_name in os.environ:
+        return _get_sm70_context_buckets(env_name)
+    if vllm_config.speculative_config is not None:
+        return ()
+
+    model_config = vllm_config.model_config
+    architectures = getattr(model_config, "architectures", ())
+    if not isinstance(architectures, (list, tuple)) or (
+        "DeepseekV4ForCausalLM" not in architectures
+    ):
+        return ()
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    ):
+        return ()
+
+    hf_config = model_config.hf_config
+    topk_tokens = getattr(hf_config, "index_topk", None)
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    if not isinstance(topk_tokens, int) or not isinstance(
+        compress_ratios, (list, tuple)
+    ):
+        return ()
+    positive_ratios = [
+        ratio for ratio in compress_ratios if isinstance(ratio, int) and ratio > 0
+    ]
+    if not positive_ratios:
+        return ()
+
+    bucket = topk_tokens * min(positive_ratios)
+    if bucket <= 0 or model_config.max_model_len <= bucket:
+        return ()
+    logger.info_once(
+        "Auto-enabling the SM70 DeepSeek V4 short-context decode CUDA graph "
+        "at %d tokens. Set %s explicitly to override or to an empty value "
+        "to disable.",
+        bucket,
+        env_name,
+    )
+    return (bucket,)
 
 
 class CudagraphDispatcher:
@@ -62,8 +106,13 @@ class CudagraphDispatcher:
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        self.sm70_mtp_context_buckets = _get_sm70_mtp_context_buckets()
-        self._logged_sm70_mtp_context_bucket = False
+        self.sm70_mtp_context_buckets = _get_sm70_context_buckets(
+            "VLLM_SM70_MTP_CONTEXT_BUCKETS"
+        )
+        self.sm70_dsv4_decode_context_buckets = _get_sm70_dsv4_decode_context_buckets(
+            vllm_config
+        )
+        self._logged_sm70_context_bucket = False
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
@@ -196,39 +245,48 @@ class CudagraphDispatcher:
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
-    def _add_mtp_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
-        """Add short-context graphs only for the single-request MTP verifier."""
+    def _active_context_buckets(self) -> tuple[int, ...]:
+        if self.uniform_decode_query_len > 1:
+            return self.sm70_mtp_context_buckets
+        return self.sm70_dsv4_decode_context_buckets
+
+    @property
+    def has_attention_context_buckets(self) -> bool:
+        return bool(self._active_context_buckets())
+
+    def _add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
+        """Add bounded graphs only for a single uniform-decode request."""
+        context_buckets = self._active_context_buckets()
         if (
-            not self.sm70_mtp_context_buckets
-            or self.uniform_decode_query_len <= 1
+            not context_buckets
             or not batch_descriptor.uniform
             or batch_descriptor.num_tokens != self.uniform_decode_query_len
         ):
             return
 
-        for bucket in self.sm70_mtp_context_buckets:
+        for bucket in context_buckets:
             self.add_cudagraph_key(
                 CUDAGraphMode.FULL,
                 replace(batch_descriptor, attention_context_bucket=bucket),
             )
 
-    def _get_mtp_context_bucket_descriptor(
+    def _get_context_bucket_descriptor(
         self,
         batch_descriptor: BatchDescriptor,
         attention_context_len: int | None,
     ) -> BatchDescriptor:
-        """Return a bounded MTP graph key only when its capacity is sufficient."""
+        """Return a bounded graph key only when its capacity is sufficient."""
+        context_buckets = self._active_context_buckets()
         if (
             attention_context_len is None
             or attention_context_len <= 0
-            or not self.sm70_mtp_context_buckets
-            or self.uniform_decode_query_len <= 1
+            or not context_buckets
             or not batch_descriptor.uniform
             or batch_descriptor.num_tokens != self.uniform_decode_query_len
         ):
             return batch_descriptor
 
-        for bucket in self.sm70_mtp_context_buckets:
+        for bucket in context_buckets:
             if attention_context_len <= bucket:
                 return replace(batch_descriptor, attention_context_bucket=bucket)
         return batch_descriptor
@@ -306,11 +364,7 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens
                 and x >= uniform_decode_query_len
-                and (
-                    self._bs_to_padded_graph_size[x]
-                    % uniform_decode_query_len
-                    == 0
-                )
+                and (self._bs_to_padded_graph_size[x] % uniform_decode_query_len == 0)
             ]
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
@@ -319,7 +373,7 @@ class CudagraphDispatcher:
                     bs, True, num_active_loras > 0, num_active_loras
                 )
                 self.add_cudagraph_key(CUDAGraphMode.FULL, batch_descriptor)
-                self._add_mtp_context_bucket_keys(batch_descriptor)
+                self._add_context_bucket_keys(batch_descriptor)
 
         self.keys_initialized = True
 
@@ -400,22 +454,22 @@ class CudagraphDispatcher:
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
-            batch_desc_to_check = self._get_mtp_context_bucket_descriptor(
+            batch_desc_to_check = self._get_context_bucket_descriptor(
                 batch_desc, attention_context_len
             )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
                 if (
                     batch_desc_to_check.attention_context_bucket is not None
-                    and not self._logged_sm70_mtp_context_bucket
+                    and not self._logged_sm70_context_bucket
                 ):
                     logger.info(
-                        "Using bounded SM70 MTP attention CUDA graph: "
+                        "Using bounded SM70 attention CUDA graph: "
                         "context=%d bucket=%d descriptor=%s",
                         attention_context_len,
                         batch_desc_to_check.attention_context_bucket,
                         batch_desc_to_check,
                     )
-                    self._logged_sm70_mtp_context_bucket = True
+                    self._logged_sm70_context_bucket = True
                 return CUDAGraphMode.FULL, batch_desc_to_check
             # A bounded graph might be absent because capture-size policy
             # excluded it. Preserve the existing full-context graph then.
