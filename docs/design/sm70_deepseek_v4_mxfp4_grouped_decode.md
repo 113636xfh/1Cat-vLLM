@@ -150,6 +150,25 @@ split epilogue work. Other model streams already consume the nominally idle
 SMs, so increasing this kernel's CTA count does not recover end-to-end wall
 time. The candidates are rejected before endpoint testing.
 
+NCU SASS attribution placed about 85% of the excessive shared wavefronts on
+the eight 128-bit A-fragment loads. An exact-shape experiment therefore kept
+the baseline `CTA_N=128` tactic and replaced only the A operand with the
+existing `A[8,64]` swizzle for all six real decode shapes. The extension was
+rebuilt from the same source as the runtime under test; earlier numbers from a
+stale build tree are invalid.
+
+| Run order | Baseline | A-swizzle | Projected saving |
+|---|---:|---:|---:|
+| baseline then candidate | 3.8835 ms/token | 3.8499 ms/token | 0.0336 ms/token |
+| candidate then baseline | 3.8885 ms/token | 3.8844 ms/token | 0.0041 ms/token |
+
+Both results are below the 0.2 ms/token admission threshold and the reverse
+run reduces the apparent gain to timer noise. Five shapes retained the same
+output SHA, but `fused_wqa_wkv` did not, so the candidate also fails the exact
+output contract. The source candidate was removed without endpoint testing.
+The shared conflict is real, but removing it does not materially shorten this
+kernel family at the current tactic and overlap schedule.
+
 ## FP8 Lossless Packing Screen
 
 Real checkpoint weights rule out a fixed-width, per-block codebook as a useful
