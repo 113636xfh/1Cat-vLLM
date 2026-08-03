@@ -150,6 +150,23 @@ split epilogue work. Other model streams already consume the nominally idle
 SMs, so increasing this kernel's CTA count does not recover end-to-end wall
 time. The candidates are rejected before endpoint testing.
 
+## FP8 Lossless Packing Screen
+
+Real checkpoint weights rule out a fixed-width, per-block codebook as a useful
+way to reduce the FP8 weight stream. Across nine layer-2 dense projections,
+each complete weight uses 254 raw E4M3 codes. A sampled 128x128 block typically
+contains 191-215 unique codes and no sampled block contains at most 128 codes.
+The codebook plus 8-bit indices therefore consumes 1.012-1.013 times the raw
+weight size instead of compressing it.
+
+Global Shannon entropy is 6.51-6.66 bits per weight for most projections and
+6.95 bits for the indexer. That lower bound cannot be realized by the random,
+fixed-width accesses required by the HMMA main loop; Huffman or arithmetic
+decoding would add serial, irregular work on the critical path. Lossless FP8
+codebook/entropy packing is rejected. The next FP8 work must reduce execution
+overhead or improve the existing shared-memory path without changing weight
+values or accumulation order.
+
 ## Artifacts
 
 ```text
@@ -158,6 +175,7 @@ time. The candidates are rejected before endpoint testing.
   dsv4-mxfp4-direct-top6-clamp10-micro-20260802/
   dsv4-fp8-dense-shapes-20260802/
   dsv4-fp8-dense-ncu-20260803/
+  dsv4-sparse-mla-qk-dsplit-fullmodel-20260803/fp8_weight_entropy_layer2.json
   dsv4-sm70-kv-insert-parallel-micro-20260802/
   dsv4-tp8-stacked-mxfp4-fp8split-i1024-o256-20260802/
   dsv4-tp8-stacked-candidate-nsys-i1024-o128-20260802/
