@@ -4,7 +4,7 @@
 
 This benchmark uses the exact DeepSeek-V4-Flash TP8 W13/W2 shapes. Both paths
 call the same TurboMind per-expert GEMM. They differ only in whether the fixed
-CUDA Graph contains all 256 experts or the six routed slots.
+CUDA Graph contains all 256 experts, six B=1 slots, or 48 verifier M=8 slots.
 """
 
 from __future__ import annotations
@@ -16,6 +16,9 @@ from dataclasses import dataclass
 import torch
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
+    _compact_mxfp4_active_experts,
+)
 
 
 @dataclass(frozen=True)
@@ -549,6 +552,236 @@ def benchmark_full_pipeline(
     return result
 
 
+def benchmark_verifier_m8_pipeline(
+    *,
+    num_experts: int,
+    top_k: int,
+    repeats: int,
+    seed: int,
+) -> dict[str, object]:
+    """Compare dense-256 and graph-safe active-48 verifier MoE pipelines."""
+    num_tokens = 8
+    if num_experts != 256 or top_k != 6:
+        raise ValueError("The verifier benchmark requires 256 experts/top-k=6")
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    w13_weights, w13_scales, w13_ptrs_w, w13_ptrs_s = _prepare_experts(
+        STAGES["w13"], num_experts, device
+    )
+    w2_weights, w2_scales, w2_ptrs_w, w2_ptrs_s = _prepare_experts(
+        STAGES["w2"], num_experts, device
+    )
+    # Keep prepared storage alive for the pointer tables.
+    _storage = (w13_weights, w13_scales, w2_weights, w2_scales)
+
+    route_a = [
+        [3, 17 + row, 42, 99 + row, 128 + row, 255 - row] for row in range(num_tokens)
+    ]
+    route_b = [
+        [1, 9 + row, 63, 111 + row, 177 + row, 240 - row] for row in range(num_tokens)
+    ]
+    topk_ids = torch.tensor(route_a, dtype=torch.int32, device=device)
+    topk_weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device=device)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    x = (
+        torch.randn(num_tokens, STAGES["w13"].k, dtype=torch.float16, device=device)
+        * 0.01
+    )
+    total_slots = num_tokens * top_k
+
+    def make_buffers() -> dict[str, torch.Tensor]:
+        workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
+            total_slots, num_experts
+        )
+        return {
+            "output": torch.empty(num_tokens, 4096, dtype=torch.float16, device=device),
+            "permuted_input": torch.empty(
+                total_slots, 4096, dtype=torch.float16, device=device
+            ),
+            "gate_up": torch.empty(
+                total_slots, 512, dtype=torch.float16, device=device
+            ),
+            "intermediate": torch.empty(
+                total_slots, 256, dtype=torch.float16, device=device
+            ),
+            "sorted_output": torch.empty(
+                total_slots, 4096, dtype=torch.float16, device=device
+            ),
+            "expert_offsets": torch.empty(
+                num_experts + 1, dtype=torch.int32, device=device
+            ),
+            "expert_offsets64": torch.empty(
+                num_experts + 1, dtype=torch.int64, device=device
+            ),
+            "inv_permuted_idx": torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=device
+            ),
+            "topk_ids_i32": torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=device
+            ),
+            "token_expert_indices": torch.arange(
+                total_slots, dtype=torch.int32, device=device
+            ).view(num_tokens, top_k),
+            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
+            "workspace": torch.empty(workspace_size, dtype=torch.int8, device=device),
+            "permuted_experts_id": torch.empty(
+                total_slots, dtype=torch.int32, device=device
+            ),
+            "sorted_row_idx": torch.empty(
+                total_slots, dtype=torch.int32, device=device
+            ),
+            "topk_ids_for_sort": torch.empty(
+                total_slots, dtype=torch.int32, device=device
+            ),
+            "dense_expert_ids": torch.arange(
+                num_experts, dtype=torch.int32, device=device
+            ),
+            "compact_offsets": torch.empty(
+                total_slots + 1, dtype=torch.int32, device=device
+            ),
+            "active_expert_ids": torch.empty(
+                total_slots, dtype=torch.int32, device=device
+            ),
+        }
+
+    dense = make_buffers()
+    active = make_buffers()
+
+    def pipeline_call(buffers: dict[str, torch.Tensor], active_only: bool) -> None:
+        buffers["output"].zero_()
+        buffers["topk_ids_i32"].copy_(topk_ids)
+        buffers["permuted_idx"].fill_(total_slots)
+        torch.ops._moe_C.moe_permute_with_scratch(
+            x,
+            buffers["topk_ids_i32"],
+            buffers["token_expert_indices"],
+            None,
+            num_experts,
+            num_experts,
+            top_k,
+            buffers["permuted_input"],
+            buffers["expert_offsets64"],
+            buffers["inv_permuted_idx"],
+            buffers["permuted_idx"],
+            buffers["workspace"],
+            buffers["permuted_experts_id"],
+            buffers["sorted_row_idx"],
+            buffers["topk_ids_for_sort"],
+        )
+        buffers["expert_offsets"].copy_(buffers["expert_offsets64"])
+        if active_only:
+            _compact_mxfp4_active_experts(
+                buffers["permuted_experts_id"],
+                buffers["compact_offsets"],
+                buffers["active_expert_ids"],
+            )
+            stage_offsets = buffers["compact_offsets"]
+            stage_expert_ids = buffers["active_expert_ids"]
+            stage_expert_count = total_slots
+        else:
+            stage_offsets = buffers["expert_offsets"]
+            stage_expert_ids = buffers["dense_expert_ids"]
+            stage_expert_count = num_experts
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            buffers["gate_up"],
+            buffers["permuted_input"],
+            stage_offsets,
+            stage_expert_ids,
+            w13_ptrs_w,
+            w13_ptrs_s,
+            stage_expert_count,
+            4096,
+            512,
+            32,
+        )
+        torch.ops._C.silu_and_mul_with_clamp(
+            buffers["intermediate"], buffers["gate_up"], 10.0
+        )
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            buffers["sorted_output"],
+            buffers["intermediate"],
+            stage_offsets,
+            stage_expert_ids,
+            w2_ptrs_w,
+            w2_ptrs_s,
+            stage_expert_count,
+            256,
+            4096,
+            32,
+        )
+        torch.ops._moe_C.moe_unpermute(
+            buffers["sorted_output"],
+            topk_weights,
+            buffers["inv_permuted_idx"],
+            buffers["expert_offsets64"],
+            top_k,
+            buffers["output"],
+        )
+
+    def dense_call() -> None:
+        pipeline_call(dense, False)
+
+    def active_call() -> None:
+        pipeline_call(active, True)
+
+    dense_call()
+    active_call()
+    torch.cuda.synchronize()
+    initial_equal = torch.equal(dense["output"], active["output"])
+    stage_parity = {
+        name: torch.equal(dense[name], active[name])
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    }
+    expected_active_ids = sorted({expert for row in route_a for expert in row})
+    actual_active_ids = active["active_expert_ids"][: len(expected_active_ids)]
+    compact_ids_match = actual_active_ids.cpu().tolist() == expected_active_ids
+
+    dense_graph = _capture(dense_call)
+    active_graph = _capture(active_call)
+    dense_ms = _time_graph(dense_graph, repeats)
+    active_ms = _time_graph(active_graph, repeats)
+
+    topk_ids.copy_(torch.tensor(route_b, dtype=torch.int32, device=device))
+    dense_graph.replay()
+    active_graph.replay()
+    torch.cuda.synchronize()
+    replay_equal = torch.equal(dense["output"], active["output"])
+    replay_max_abs = float((dense["output"] - active["output"]).abs().max().item())
+    route_b_output = active["output"].clone()
+
+    topk_ids.copy_(torch.tensor(route_a, dtype=torch.int32, device=device))
+    active_graph.replay()
+    torch.cuda.synchronize()
+    route_changes_output = not torch.equal(active["output"], route_b_output)
+
+    result = {
+        "num_tokens": num_tokens,
+        "total_routed_slots": total_slots,
+        "unique_active_experts": len(expected_active_ids),
+        "fixed_graph_expert_slots": total_slots,
+        "dense_graph_ms": dense_ms,
+        "active_graph_ms": active_ms,
+        "speedup": dense_ms / active_ms,
+        "projected_savings_ms_per_43_layers": (dense_ms - active_ms) * 43,
+        "initial_bitwise_equal": initial_equal,
+        "initial_stage_bitwise_equal": stage_parity,
+        "compact_ids_match": compact_ids_match,
+        "dynamic_replay_bitwise_equal": replay_equal,
+        "dynamic_replay_max_abs": replay_max_abs,
+        "dynamic_route_changes_output": route_changes_output,
+    }
+    if not (
+        initial_equal
+        and all(stage_parity.values())
+        and compact_ids_match
+        and replay_equal
+        and route_changes_output
+    ):
+        raise RuntimeError(f"MXFP4 verifier M8 correctness gate failed: {result}")
+    return result
+
+
 def profile_active_stage_once(
     shape: StageShape,
     *,
@@ -610,6 +843,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--full-pipeline", action="store_true")
+    parser.add_argument("--verifier-m8-pipeline", action="store_true")
     parser.add_argument(
         "--profile-active-once",
         action="store_true",
@@ -621,6 +855,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     _require_sm70()
+    if args.verifier_m8_pipeline:
+        result = benchmark_verifier_m8_pipeline(
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            repeats=args.repeats,
+            seed=args.seed,
+        )
+        print(
+            json.dumps(
+                {
+                    "benchmark": "sm70_mxfp4_moe_verifier_m8_pipeline",
+                    "device": torch.cuda.get_device_name(),
+                    "result": result,
+                },
+                indent=2,
+            )
+        )
+        return 0
     if args.full_pipeline:
         result = benchmark_full_pipeline(
             num_experts=args.num_experts,

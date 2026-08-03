@@ -90,6 +90,99 @@ allows the existing software E4M3 decoder to run without changing values or
 accumulation. A V100 numerical test passes, and an exact 2304-token prompt now
 completes with healthy output and 19.32-19.61 ms/token decode.
 
+## DSpark N7 Verifier Bottleneck
+
+The corrected no-speculation baseline does not make the existing DSpark N7
+route competitive. Three official-sampling runs measured 66.951-105.631 ms per
+emitted token, with mean emitted lengths of 1.342-2.098 tokens per round. Draft
+acceptance varies materially with the seed, but synchronized timing and Nsight
+show a separate verifier implementation bottleneck that must be removed even
+when acceptance improves.
+
+One steady M=8 proposal round consists of approximately 124-134 ms of target
+forward and 9.9-10.2 ms of draft GPU work. Target sampling, rejection, and
+bookkeeping together remain below 0.5 ms. `draft_wall_cpu` overlaps the prior
+asynchronous target forward and must not be added to those GPU times.
+
+The target CUDA Graph on rank 0 contains 23,909 distinct nodes and takes
+125.984 ms per replay in the node trace. TurboMind `gemm_kernel` service is
+100.834 ms, or 80.04% of target service. It executes 22,274 GEMM kernels per
+replay. Of these, exactly `43 layers * 256 experts * 2 MoE stages = 22,016`
+come from launching W13 and W2 for every expert; the remaining 258 are the six
+dense GEMMs in each layer. The verifier has at most 48 routed slots, so the
+all-256-expert dispatch is the first target-forward optimization point.
+
+The admitted design preserves all rows routed to the same expert. A graph-safe
+SM70 Triton scan compacts the sorted 48 slots into unique expert IDs and
+offsets entirely on device, then passes a fixed 48-entry active table to the
+existing exact TurboMind stage. Empty tail entries retain graph shape without
+host readback. B=1 continues to use the accepted direct top-6 implementation.
+The active-token limit now defaults to eight when the existing active-expert
+master switch is enabled; disabling that switch retains the dense fallback.
+
+V100 gates completed so far:
+
+- The compactor captures under CUDA Graph and replays a changed route with
+  exact IDs and offsets.
+- An exact M=8 full MoE microbenchmark, including permute, compaction, W13,
+  SwiGLU, W2, and unpermute, is bitwise equal at every stage and after dynamic
+  replay (`max_abs=0`). It has 34 unique experts in 48 routed slots.
+- An exclusively owned repeat measured 5.321 ms for dense-256 and 4.384 ms for
+  active-48, a 1.214x speedup that projects 40.31 ms saved over 43 layers. An
+  earlier externally contended run projected a similar 42.9 ms saving.
+
+The full-model synchronized profile confirms that the microbenchmark saving
+reaches the production M=8 graph. With the same filtering rule, the steady
+median target forward falls from 126.531 to 78.779 ms (-37.7%), draft GPU work
+falls from 9.983 to 6.746 ms, and the serial GPU subtotal falls from 137.444 to
+86.416 ms (-37.1%). A same-seed profiled endpoint improved from 9.028 to 15.233
+token/s, but profiled throughput is diagnostic only; the unprofiled three-seed
+gate remains required.
+
+The unprofiled matched-seed gate passes:
+
+| Seed | Old token/s | Active-48 token/s | Gain | Old emitted/round | Active-48 emitted/round |
+|---:|---:|---:|---:|---:|---:|
+| 4201 | 12.194 | 22.179 | +81.9% | 1.782 | 2.048 |
+| 4202 | 9.467 | 15.024 | +58.7% | 1.342 | 1.364 |
+| 4203 | 14.936 | 16.545 | +10.8% | 2.098 | 1.500 |
+
+Median TPOT falls from 82.007 to 60.441 ms (-26.3%), and median throughput
+rises from 12.194 to 16.545 token/s (+35.7%). Mean emitted length across the
+three seeds falls from 1.741 to 1.637, so the endpoint improvement is not an
+acceptance-rate artifact. The official-sampling natural-stop gate also passes:
+the model emits exactly two coherent sentences and stops after 65 tokens.
+
+The post-change Nsight node trace closes the verifier composition. Graph 557
+contains 6,021 nodes per replay instead of 23,909. The exact reduction of
+17,888 nodes equals `43 * (256 - 48) * 2`. Node tracing reports 89.022 ms of
+rank-0 target service per replay; the lower-overhead synchronized target wall
+remains 78.779 ms and is the accepted absolute latency.
+
+| Rank-0 target category | Dense-256 trace | Active-48 trace | Active-48 share |
+|---|---:|---:|---:|
+| MXFP4 MoE W13 | 60.940 ms | 42.673 ms | 47.94% |
+| MXFP4 MoE W2 | 33.682 ms | 14.975 ms | 16.82% |
+| mHC kernels | 6.884 ms | 6.850 ms | 7.70% |
+| TurboMind dense GEMM | 6.212 ms | 6.211 ms | 6.98% |
+| Sparse MLA/indexer | 5.407 ms | 5.415 ms | 6.08% |
+| CUTLASS/cuBLAS GEMM | 4.831 ms | 4.868 ms | 5.47% |
+| NCCL all-reduce | 4.532 ms | 4.492 ms | 5.05% |
+| MoE routing/activation | 1.987 ms | 2.118 ms | 2.38% |
+| Generic elementwise | 1.051 ms | 1.047 ms | 1.18% |
+| Other | 0.457 ms | 0.372 ms | 0.42% |
+
+The active table reduces MoE W13+W2 service from 94.622 to 57.648 ms. The new
+compaction kernel itself is 0.120 ms per round. The next verifier optimization
+must therefore reduce the real active-expert W13/W2 work or its 4,128 remaining
+per-expert launches; optimizing sampling or the compactor first would target
+the wrong scale.
+
+A same-contract no-speculation regression run measures 15.377 ms/token, or
+65.03 token/s, versus the accepted 15.357 ms/token baseline. The 0.13%
+difference is noise, so extending graph-safe buffers through M=8 does not
+regress the B=1 path.
+
 ## Experiment Log
 
 | Date | Source | Test | Result | Decision |
@@ -99,6 +192,14 @@ completes with healthy output and 19.32-19.61 ms/token decode.
 | 2026-08-03 | candidate | Nsight graph-node A/B | Exact 21-layer C4 Indexer route difference | Add bounded graph |
 | 2026-08-03 | candidate | 4K auto-bucket, 3 seeds | 15.357 ms median, 65.12 token/s | Accept speed gate |
 | 2026-08-03 | candidate | 2048 crossing and 2304 prefill | Safe fallback, natural output, FP8 prefill fixed | Accept quality gate |
+| 2026-08-03 | `3765c56a96` | DSpark N7 target graph-node trace | 80.04% target service in GEMM; 22,016 inactive-capable MoE launches | Compact M=8 routed experts on device |
+| 2026-08-03 | candidate | M=8 active-48 CUDA Graph microbenchmark | Bitwise exact; first timing 1.30x but externally contended | Repeat exclusively, then run full model |
+| 2026-08-03 | candidate | Exclusive M=8 active-48 microbenchmark | 5.321 -> 4.384 ms; bitwise exact; projected -40.31 ms/round | Admit to full model |
+| 2026-08-03 | candidate | Same-contract synchronized profile | Target 126.531 -> 78.779 ms; GPU subtotal -37.1% | Run unprofiled three-seed gate |
+| 2026-08-03 | candidate | Unprofiled matched seeds 4201-4203 | Median 12.194 -> 16.545 token/s; emitted length decreases | Accept endpoint speed gate |
+| 2026-08-03 | candidate | Official-sampling natural stop | Coherent two-sentence response; `finish_reason=stop` | Accept text-health gate |
+| 2026-08-03 | candidate | Post-change graph-node trace | 23,909 -> 6,021 nodes; current MoE is 64.8% | Target active W13/W2 next |
+| 2026-08-03 | candidate | No-speculation B=1 regression | 15.377 ms/token, 65.03 token/s | Accept regression gate |
 
 ## Artifacts
 
@@ -113,6 +214,17 @@ Retained remote root:
 - Long prefill gate: `nospec-4k-autobucket-i2304-o32.json`.
 - Natural-stop quality gate: `nospec-4k-autobucket-quality-natural-stop.json`.
 - Final worker log: `server-nospec-4k-autobucket.log`.
+- DSpark target trace: `dspark7-head3765-i1k-o16-node.sqlite`.
+- M=8 microbenchmark: `mxfp4-verifier-m8-dense256-vs-active48-seed4201.log`.
+- Exclusive repeat: `mxfp4-verifier-m8-dense256-vs-active48-exclusive-seed4201.log`.
+- Candidate profile: `server-dspark7-profile-active48.log` and
+  `dspark7-profile-active48-i1024-o128.json`.
+- Unprofiled comparison: `dspark7-active48-unprofiled-comparison.json` and
+  `dspark7-active48-unprofiled-seed4201.json` through `seed4203.json`.
+- Candidate quality: `dspark7-active48-quality-natural-stop.json`.
+- Post-change trace: `dspark7-active48-i1k-o16-node.sqlite` and
+  `dspark7-active48-node-trace-comparison.json`.
+- No-speculation regression: `nospec-active48-regression-seed4201.json`.
 
 Disabling prefix caching and reducing `max_num_batched_tokens` to 2048 did not
 recover the gap; those paths were rejected. The task-owned API service must be

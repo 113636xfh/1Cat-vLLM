@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 )
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
+    _compact_mxfp4_active_experts,
     _select_mxfp4_stage_dispatch,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
@@ -189,10 +190,12 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
         "permuted_experts_id": torch.tensor(
             [3, 17, 42, 99, 128, 255], dtype=torch.int32
         ),
+        "active_expert_ids": torch.tensor([3, 17, 42, 99, 128, 255], dtype=torch.int32),
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
     monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -228,10 +231,12 @@ def test_mxfp4_sm70_b1_dispatch_rejects_expert_parallel_metadata(monkeypatch):
     buffers = {
         "compact_expert_offsets": torch.arange(7, dtype=torch.int32),
         "permuted_experts_id": torch.arange(6, dtype=torch.int32),
+        "active_expert_ids": torch.arange(6, dtype=torch.int32),
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
     monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -250,14 +255,11 @@ def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
     buffers = {
         "compact_expert_offsets": torch.arange(7, dtype=torch.int32),
         "permuted_experts_id": torch.arange(6, dtype=torch.int32),
+        "active_expert_ids": torch.arange(6, dtype=torch.int32),
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(
-        mxfp4_moe,
-        "_mxfp4_active_expert_b1_enabled",
-        lambda: num_tokens != 1,
-    )
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 0)
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -269,6 +271,69 @@ def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
     assert offsets is buffers["expert_offsets"]
     assert expert_ids is buffers["dense_expert_ids"]
     assert count == 256
+
+
+def test_mxfp4_sm70_m8_dispatch_selects_fixed_active_slots(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "active_expert_ids": torch.arange(48, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=8,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    assert offsets is buffers["compact_expert_offsets"]
+    assert expert_ids is buffers["active_expert_ids"]
+    assert count == 48
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires NVIDIA V100/SM70",
+)
+def test_mxfp4_sm70_active_expert_compaction_replays_dynamic_routes():
+    sorted_ids = torch.tensor(
+        [3] * 8 + [17, 18, 19, 20] + [42] * 8 + list(range(99, 127)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    compact_offsets = torch.empty(49, dtype=torch.int32, device="cuda")
+    active_ids = torch.empty(48, dtype=torch.int32, device="cuda")
+
+    graph = torch.cuda.CUDAGraph()
+    _compact_mxfp4_active_experts(sorted_ids, compact_offsets, active_ids)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        _compact_mxfp4_active_experts(sorted_ids, compact_offsets, active_ids)
+
+    expected_ids = [3, 17, 18, 19, 20, 42, *range(99, 127)]
+    expected_offsets = [0, 8, 9, 10, 11, 12, 20, *range(21, 49)]
+    torch.testing.assert_close(
+        active_ids.cpu(),
+        torch.tensor(expected_ids + [0] * (48 - len(expected_ids)), dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        compact_offsets.cpu(),
+        torch.tensor(
+            expected_offsets + [48] * (49 - len(expected_offsets)),
+            dtype=torch.int32,
+        ),
+    )
+
+    sorted_ids.copy_(torch.arange(48, dtype=torch.int32, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(active_ids.cpu(), torch.arange(48, dtype=torch.int32))
+    torch.testing.assert_close(
+        compact_offsets.cpu(), torch.arange(49, dtype=torch.int32)
+    )
 
 
 def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):

@@ -1070,7 +1070,10 @@ class GPUModelRunner(
             spec_config is not None
             and self.device.type == "cuda"
             and (
-                (spec_config.method == "mtp" and _sm70_mtp_profile_env_enabled())
+                (
+                    spec_config.method in ("mtp", "dflash", "dspark")
+                    and _sm70_mtp_profile_env_enabled()
+                )
                 or (
                     spec_config.use_dflash_ddtree() and _dflash_ddtree_profile_enabled()
                 )

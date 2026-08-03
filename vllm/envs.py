@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
+    VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
@@ -1846,6 +1847,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device tensors and can change between CUDA Graph replays.
     "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
+    ),
+    # Extend the graph-safe active-expert route beyond B1. Values above eight
+    # are clamped by the exact DeepSeek V4 verifier buffer contract.
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS": lambda: max(
+        1, int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS", "8"))
     ),
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.
