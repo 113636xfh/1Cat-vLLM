@@ -221,7 +221,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         return hidden_size, intermediate_size_per_partition
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        required_ops = (
+        required_ops: tuple[str, ...] = (
             "mxfp4_sm70_prepare",
             "mxfp4_moe_dense_stage_sm70_out",
             "awq_moe_build_strided_ptrs",
