@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Profile the exact DeepSeek V4 M=1 mHC decode path on SM70."""
+"""Profile exact DeepSeek V4 mHC decode and prefill shapes on SM70."""
 
 from __future__ import annotations
 
@@ -16,10 +16,12 @@ import torch
 from safetensors import safe_open
 
 from vllm.model_executor.kernels.mhc.tilelang import (
+    _select_hc_prenorm_block_config,
     _tilelang_hc_prenorm_gemm,
     mhc_fused_post_pre_tilelang,
 )
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+    hc_prenorm_gemm_block_m_tilelang,
     mhc_fused_tilelang,
     mhc_post_tilelang,
     mhc_pre_big_fuse_with_norm_tilelang,
@@ -34,7 +36,11 @@ from vllm.model_executor.kernels.mhc.tilelang_kernels import (
 HIDDEN_SIZE = 4096
 HC_MULT = 4
 HC_OUT = 2 * HC_MULT + HC_MULT * HC_MULT
-CALLS_PER_TOKEN = 85
+MODEL_CALLS_BY_COMPONENT = {
+    "post": 86,
+    "dot": 86,
+    "pre": 85,
+}
 
 
 def _load_tensor(
@@ -67,7 +73,12 @@ def _time_graph(
     graph: torch.cuda.CUDAGraph,
     replays: int,
     repeats: int,
+    warmup_replays: int,
 ) -> list[float]:
+    for _ in range(warmup_replays):
+        graph.replay()
+    torch.cuda.synchronize()
+
     samples = []
     for _ in range(repeats):
         start = torch.cuda.Event(enable_timing=True)
@@ -96,6 +107,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=3)
+    parser.add_argument("--num-tokens", type=int, default=1)
+    parser.add_argument(
+        "--block-m",
+        type=int,
+        help="Override the SM70 prenorm GEMM token block for staged dot runs.",
+    )
     parser.add_argument(
         "--path", choices=("fused", "separate", "fp32_stage"), default="fused"
     )
@@ -108,6 +125,7 @@ def main() -> int:
     )
     parser.add_argument("--replays", type=int, default=3000)
     parser.add_argument("--repeats", type=int, default=9)
+    parser.add_argument("--warmup-replays", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260803)
     parser.add_argument("--profile-replay", action="store_true")
     parser.add_argument("--json-out", type=Path)
@@ -115,7 +133,15 @@ def main() -> int:
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("This benchmark requires NVIDIA V100/SM70.")
-    if HC_OUT % args.tile_n != 0:
+    if args.num_tokens < 1:
+        raise ValueError("num-tokens must be positive")
+    if args.warmup_replays < 0:
+        raise ValueError("warmup-replays must be non-negative")
+    if args.block_m is not None and args.block_m < 1:
+        raise ValueError("block-m must be positive")
+    if args.block_m is not None and args.path != "separate":
+        raise ValueError("block-m requires --path separate")
+    if args.block_m is None and HC_OUT % args.tile_n != 0:
         raise ValueError(f"tile-n must divide {HC_OUT}")
     if HIDDEN_SIZE % args.n_splits != 0:
         raise ValueError(f"n-splits must divide {HIDDEN_SIZE}")
@@ -139,15 +165,21 @@ def main() -> int:
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    x = torch.randn((1, HIDDEN_SIZE), device="cuda", dtype=torch.float16)
+    x = torch.randn((args.num_tokens, HIDDEN_SIZE), device="cuda", dtype=torch.float16)
     residual = torch.randn(
-        (1, HC_MULT, HIDDEN_SIZE), device="cuda", dtype=torch.float16
+        (args.num_tokens, HC_MULT, HIDDEN_SIZE),
+        device="cuda",
+        dtype=torch.float16,
     )
     post_mix = torch.sigmoid(
-        torch.randn((1, HC_MULT), device="cuda", dtype=torch.float32)
+        torch.randn((args.num_tokens, HC_MULT), device="cuda", dtype=torch.float32)
     )
     comb_mix = torch.softmax(
-        torch.randn((1, HC_MULT, HC_MULT), device="cuda", dtype=torch.float32),
+        torch.randn(
+            (args.num_tokens, HC_MULT, HC_MULT),
+            device="cuda",
+            dtype=torch.float32,
+        ),
         dim=1,
     )
 
@@ -171,18 +203,30 @@ def main() -> int:
 
     active_splits = 1 if args.path == "separate" else args.n_splits
     gemm_out_mul = torch.empty(
-        (active_splits, 1, HC_OUT), device="cuda", dtype=torch.float32
+        (active_splits, args.num_tokens, HC_OUT),
+        device="cuda",
+        dtype=torch.float32,
     )
     gemm_out_sqrsum = torch.empty(
-        (active_splits, 1), device="cuda", dtype=torch.float32
+        (active_splits, args.num_tokens), device="cuda", dtype=torch.float32
     )
     residual_out = torch.empty_like(residual)
     residual_fp32 = torch.empty(
-        (1, HC_MULT, HIDDEN_SIZE), device="cuda", dtype=torch.float32
+        (args.num_tokens, HC_MULT, HIDDEN_SIZE),
+        device="cuda",
+        dtype=torch.float32,
     )
-    post_out = torch.empty((1, HC_MULT), device="cuda", dtype=torch.float32)
-    comb_out = torch.empty((1, HC_MULT * HC_MULT), device="cuda", dtype=torch.float32)
-    layer_input = torch.empty((1, HIDDEN_SIZE), device="cuda", dtype=torch.float16)
+    post_out = torch.empty(
+        (args.num_tokens, HC_MULT), device="cuda", dtype=torch.float32
+    )
+    comb_out = torch.empty(
+        (args.num_tokens, HC_MULT * HC_MULT),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    layer_input = torch.empty(
+        (args.num_tokens, HIDDEN_SIZE), device="cuda", dtype=torch.float16
+    )
 
     def fused_call() -> None:
         mhc_fused_tilelang(
@@ -215,8 +259,23 @@ def main() -> int:
         )
 
     def dot_call() -> None:
+        if args.block_m is not None:
+            hc_prenorm_gemm_block_m_tilelang(
+                residual_out.view(args.num_tokens, HC_MULT * HIDDEN_SIZE),
+                fn,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                HIDDEN_SIZE,
+                HC_MULT,
+                HC_OUT,
+                512,
+                args.tile_n,
+                args.block_m,
+                use_fp16=True,
+            )
+            return
         _tilelang_hc_prenorm_gemm(
-            residual_out.view(1, HC_MULT * HIDDEN_SIZE),
+            residual_out.view(args.num_tokens, HC_MULT * HIDDEN_SIZE),
             fn,
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -291,8 +350,8 @@ def main() -> int:
     torch.cuda.synchronize()
     eager_outputs = (
         residual_out.clone(),
-        post_out.view(1, HC_MULT, 1).clone(),
-        comb_out.view(1, HC_MULT, HC_MULT).clone(),
+        post_out.view(args.num_tokens, HC_MULT, 1).clone(),
+        comb_out.view(args.num_tokens, HC_MULT, HC_MULT).clone(),
         layer_input.clone(),
     )
 
@@ -316,11 +375,16 @@ def main() -> int:
         torch.cuda.cudart().cudaProfilerStop()
         torch.cuda.synchronize()
 
-    samples = _time_graph(graph, args.replays, args.repeats)
+    samples = _time_graph(
+        graph,
+        args.replays,
+        args.repeats,
+        args.warmup_replays,
+    )
     graph_outputs = (
         residual_out,
-        post_out.view(1, HC_MULT, 1),
-        comb_out.view(1, HC_MULT, HC_MULT),
+        post_out.view(args.num_tokens, HC_MULT, 1),
+        comb_out.view(args.num_tokens, HC_MULT, HC_MULT),
         layer_input,
     )
     names = ("residual", "post_mix", "comb_mix", "layer_input")
@@ -336,23 +400,46 @@ def main() -> int:
     }
 
     median_ms = statistics.median(samples)
+    model_calls = MODEL_CALLS_BY_COMPONENT.get(args.component)
+    prenorm_block_config = None
+    if args.path == "separate" and args.num_tokens >= 1024:
+        if args.block_m is None:
+            selected_tile_n, selected_block_m = _select_hc_prenorm_block_config(
+                torch.float16,
+                HIDDEN_SIZE,
+                HC_MULT,
+                HC_OUT,
+                12,
+            )
+        else:
+            selected_tile_n = args.tile_n
+            selected_block_m = args.block_m
+        prenorm_block_config = {
+            "tile_n": selected_tile_n,
+            "block_m": selected_block_m,
+        }
     result = {
         "contract": {
             "layer": args.layer,
-            "num_tokens": 1,
+            "num_tokens": args.num_tokens,
             "hidden_size": HIDDEN_SIZE,
             "hc_mult": HC_MULT,
             "hc_out": HC_OUT,
             "path": args.path,
+            "block_m": args.block_m,
             "tile_n": args.tile_n,
+            "prenorm_block_config": prenorm_block_config,
             "n_splits": active_splits,
             "component": args.component,
-            "calls_per_token": CALLS_PER_TOKEN,
+            "warmup_replays": args.warmup_replays,
+            "calls_per_model_forward": model_calls,
             "cuda_graph": True,
         },
         "samples_ms": samples,
         "median_ms": median_ms,
-        "projected_ms_per_token": median_ms * CALLS_PER_TOKEN,
+        "projected_ms_per_model_forward": (
+            median_ms * model_calls if model_calls is not None else None
+        ),
         "exactness_vs_runtime_oracle": exactness,
         "exactness_graph_vs_eager": graph_exactness,
     }

@@ -49,7 +49,10 @@ def _category(name: str) -> str:
         )
     ):
         return "KV compression/indexer/rope"
-    if "sparse_gathered" in lower or "sparse_attn" in lower:
+    if any(
+        marker in lower
+        for marker in ("sparse_gathered", "sparse_attn", "sparse_attention_hmma")
+    ):
         return "SM70 sparse MLA/SWA attention"
     if any(
         marker in lower
@@ -100,6 +103,11 @@ def main() -> int:
     )
     parser.add_argument("--device", type=int)
     parser.add_argument("--top-kernels", type=int, default=20)
+    parser.add_argument(
+        "--kernel-filter",
+        help="Restrict the top-kernel table to names containing this substring.",
+    )
+    parser.add_argument("--full-kernel-names", action="store_true")
     args = parser.parse_args()
 
     connection = sqlite3.connect(args.sqlite)
@@ -228,16 +236,23 @@ def main() -> int:
 
     print("\nTop kernels by summed service time")
     print("service_ms  service_%  launches  launch geometry and kernel")
-    for signature, (duration, count) in sorted(
+    sorted_kernels = sorted(
         kernel_totals.items(), key=lambda item: item[1][0], reverse=True
-    )[: args.top_kernels]:
+    )
+    if args.kernel_filter:
+        needle = args.kernel_filter.lower()
+        sorted_kernels = [
+            item for item in sorted_kernels if needle in item[0][0].lower()
+        ]
+    for signature, (duration, count) in sorted_kernels[: args.top_kernels]:
         name, grid, block, registers, dynamic_smem = signature
         geometry = (
             f"grid={grid} block={block} regs={registers} dynamic_smem={dynamic_smem}B"
         )
         print(
             f"{duration / 1e6:>10.3f}  {duration / total_service_ns * 100:>8.2f}  "
-            f"{count:>8}  {geometry}  {_short_name(name)}"
+            f"{count:>8}  {geometry}  "
+            f"{name if args.full_kernel_names else _short_name(name)}"
         )
     return 0
 

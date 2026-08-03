@@ -35,7 +35,12 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[position]
 
 
-def _build_prompt_ids(base_url: str, model: str, input_len: int) -> list[int]:
+def _build_prompt_ids(
+    base_url: str,
+    model: str,
+    input_len: int,
+    context: str | None = None,
+) -> list[int]:
     prefix = (
         "你是一名负责大模型推理性能的工程师。请阅读材料，最后给出严谨的"
         "瓶颈分析和下一步优化建议。\n\n材料：\n"
@@ -51,12 +56,15 @@ def _build_prompt_ids(base_url: str, model: str, input_len: int) -> list[int]:
         "不会牺牲输出质量的优化顺序。"
     )
     prefix_ids = _tokenize(base_url, model, prefix)
-    context_ids = _tokenize(base_url, model, paragraph * 80)
+    context_text = paragraph * 80 if context is None else context
+    context_ids = _tokenize(base_url, model, context_text)
     suffix_ids = _tokenize(base_url, model, suffix)
     context_len = input_len - len(prefix_ids) - len(suffix_ids)
     if context_len < 0 or not context_ids:
         raise ValueError("Unable to construct the requested input length")
     if len(context_ids) < context_len:
+        if context is not None:
+            raise ValueError("The supplied context file is too short")
         repeats = (context_len + len(context_ids) - 1) // len(context_ids)
         context_ids *= repeats
     prompt_ids = prefix_ids + context_ids[:context_len] + suffix_ids
@@ -76,10 +84,21 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=4201)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--context-file", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    prompt_ids = _build_prompt_ids(args.base_url, args.model, args.input_len)
+    context = (
+        args.context_file.read_text(encoding="utf-8")
+        if args.context_file is not None
+        else None
+    )
+    prompt_ids = _build_prompt_ids(
+        args.base_url,
+        args.model,
+        args.input_len,
+        context,
+    )
     payload = {
         "model": args.model,
         "prompt": prompt_ids,

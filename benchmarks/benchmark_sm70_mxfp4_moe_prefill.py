@@ -10,11 +10,13 @@ fixed between routes so any drift is an operator correctness failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -32,6 +34,11 @@ STAGES = {
     "w13": StageShape("w13", 4096, 512),
     "w2": StageShape("w2", 256, 4096),
 }
+
+
+def _digest(tensor: torch.Tensor) -> str:
+    raw = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _cuda_device_module():
@@ -194,6 +201,7 @@ def _run_stage(
     num_experts: int,
     pattern: str,
     grouped_experts_per_launch: int,
+    grouped_only: bool,
     repeats: int,
     seed: int,
 ) -> dict[str, object]:
@@ -229,21 +237,22 @@ def _run_stage(
     original = os.environ.get("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL")
     batch_env = "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH"
     original_batch = os.environ.get(batch_env)
+    legacy_output = None
+    legacy_timing = None
     try:
         os.environ[batch_env] = str(grouped_experts_per_launch)
-        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "0"
-        output.fill_(7.0)
-        call()
-        torch.accelerator.synchronize()
-        legacy_output = output.clone()
+        if not grouped_only:
+            os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "0"
+            output.fill_(7.0)
+            call()
+            torch.accelerator.synchronize()
+            legacy_output = output.clone()
 
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "1"
         output.fill_(7.0)
         call()
         torch.accelerator.synchronize()
         grouped_output = output.clone()
-        cross_route_equal = torch.equal(legacy_output, grouped_output)
-        cross_route_max_abs = float((legacy_output - grouped_output).abs().max().item())
 
         output.fill_(7.0)
         call()
@@ -252,8 +261,17 @@ def _run_stage(
         repeat_equal = torch.equal(grouped_output, repeated_output)
         repeat_max_abs = float((grouped_output - repeated_output).abs().max().item())
 
-        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "0"
-        legacy_timing = _measure(call, repeats)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        graph.replay()
+        torch.accelerator.synchronize()
+        graph_equal = torch.equal(grouped_output, output)
+        graph_max_abs = float((grouped_output - output).abs().max().item())
+
+        if not grouped_only:
+            os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "0"
+            legacy_timing = _measure(call, repeats)
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "1"
         grouped_timing = _measure(call, repeats)
     finally:
@@ -265,6 +283,15 @@ def _run_stage(
             os.environ.pop(batch_env, None)
         else:
             os.environ[batch_env] = original_batch
+
+    if legacy_output is None:
+        cross_route_equal = None
+        cross_route_max_abs = None
+        cross_route_diff = None
+    else:
+        cross_route_equal = torch.equal(legacy_output, grouped_output)
+        cross_route_max_abs = float((legacy_output - grouped_output).abs().max().item())
+        cross_route_diff = _diff_summary(legacy_output, grouped_output, counts)
 
     result = {
         "stage": shape.name,
@@ -279,21 +306,30 @@ def _run_stage(
         "routing_pattern": pattern,
         "active_experts": sum(count > 0 for count in counts),
         "grouped_experts_per_launch": grouped_experts_per_launch,
+        "grouped_only": grouped_only,
         "legacy": legacy_timing,
         "grouped": grouped_timing,
         "gpu_speedup": (
             legacy_timing["gpu_median_ms"] / grouped_timing["gpu_median_ms"]
+            if legacy_timing is not None
+            else None
         ),
         "wall_speedup": (
             legacy_timing["wall_median_ms"] / grouped_timing["wall_median_ms"]
+            if legacy_timing is not None
+            else None
         ),
         "cross_route_bitwise": cross_route_equal,
         "cross_route_max_abs": cross_route_max_abs,
-        "cross_route_diff": _diff_summary(legacy_output, grouped_output, counts),
+        "legacy_sha256": _digest(legacy_output) if legacy_output is not None else None,
+        "grouped_sha256": _digest(grouped_output),
+        "cross_route_diff": cross_route_diff,
         "grouped_repeat_bitwise": repeat_equal,
         "grouped_repeat_max_abs": repeat_max_abs,
+        "grouped_graph_bitwise": graph_equal,
+        "grouped_graph_max_abs": graph_max_abs,
     }
-    if not cross_route_equal or not repeat_equal:
+    if cross_route_equal is False or not repeat_equal or not graph_equal:
         raise RuntimeError(f"Grouped MXFP4 prefill correctness gate failed: {result}")
 
     torch.accelerator.synchronize()
@@ -323,6 +359,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--seed", type=int, default=29)
+    parser.add_argument("--json-out", type=Path)
+    parser.add_argument(
+        "--grouped-only",
+        action="store_true",
+        help=(
+            "Skip the per-expert route so grouped first-dispatch selectors are tested."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -353,20 +397,20 @@ def main() -> int:
                     num_experts=args.num_experts,
                     pattern=pattern,
                     grouped_experts_per_launch=args.grouped_experts_per_launch,
+                    grouped_only=args.grouped_only,
                     repeats=args.repeats,
                     seed=args.seed + stage_index * 10 + pattern_index,
                 )
             )
-    print(
-        json.dumps(
-            {
-                "benchmark": "sm70_mxfp4_moe_grouped_prefill",
-                "device": _cuda_device_module().get_device_name(),
-                "results": results,
-            },
-            indent=2,
-        )
-    )
+    payload = {
+        "benchmark": "sm70_mxfp4_moe_grouped_prefill",
+        "device": _cuda_device_module().get_device_name(),
+        "results": results,
+    }
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(json.dumps(payload, indent=2))
     return 0
 
 

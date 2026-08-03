@@ -309,6 +309,323 @@ The median is 1818.623 ms, or 563.06 prompt tok/s at request level. This is a
 reference rather than the final task-owned result because the requested
 prefill contract uses one output token.
 
+## Sparse-Prefill HMMA Candidate
+
+The exact TP8 8192-token Nsight Systems trace identified sparse gathered
+attention as the next dominant category: 1600.504 ms over 43 launches, or
+53.33% of critical-rank kernel service. The layer split was 25.593 ms for two
+SWA layers, 1142.831 ms for 21 C4 layers, and 432.080 ms for 20 C128 layers.
+The C4 mean of 54.421 ms was reproduced by the standalone exact-shape
+benchmark at about 54.2 ms, so the microbenchmark is representative of the
+model path.
+
+Nsight Compute rejected further Triton launch tuning as the primary route.
+The C4 kernel used 255 registers per thread and 49.15 KiB dynamic shared
+memory, reached 12.49% achieved occupancy, and had no eligible warp in 91.69%
+of scheduler cycles. DRAM throughput was only 5.09%, while L1/TEX throughput
+was 96.12%. It accumulated 4.868 billion shared bank conflicts and 6.235
+billion shared wavefronts; MIO throttle was the dominant issue stall. SASS
+contained no HMMA instructions and lowered the two `tl.dot` operations to
+shared-memory FFMA sequences.
+
+Shallow shape tuning did not repair the lowering. `BLOCK_H=4/2/1` and eight
+warps were slower. Padding the eight valid heads to `BLOCK_H=16` remained
+bitwise equal but measured 128.010 ms with eight warps and 1313.295 ms with
+four warps, versus about 63.6 ms for the control in that clock state. These
+variants are rejected.
+
+The candidate is a fused SM70 CUDA kernel with one CTA per query and eight
+warps:
+
+1. Eight warps split the 512-dimensional QK reduction into 64 dimensions each
+   and use Volta WMMA/HMMA. Each warp also owns 64 PV output dimensions.
+2. The CTA gathers each 16-key KV tile once with aligned `half2` loads and
+   reuses it for both QK and PV.
+3. Q is staged once per CTA instead of being copied again for every key tile.
+4. QK and probability rows use padded shared-memory strides. QK partial and PV
+   scratch storage overlap because their lifetimes do not.
+5. Online softmax keeps the original 16-key update order and converts
+   probabilities to FP16 before PV. The changed HMMA reduction tree is the
+   only intended numerical difference from the Triton path.
+
+The final object contains 128 static HMMA instructions, uses 110 registers per
+thread and 46.27 KiB dynamic shared memory, and has no local-memory spills. It
+supports all three gathered layouts used by the model. Same-process 8192-query
+microbenchmarks measured:
+
+| Layer pattern | Triton median | HMMA median | Speedup | Max abs error |
+| :--- | ---: | ---: | ---: | ---: |
+| C4, width 640 | 54.211 ms | 20.337 ms | 2.666x | 0.0009765625 |
+| C128, width 256 | 21.636 ms | 7.264 ms | 2.979x | 0.0009765625 |
+| SWA, width 128 | 10.918 ms | 4.401 ms | 2.481x | 0.0009765625 |
+
+All outputs were finite. GPU tests cover widths 128, 256, and 640 and accept at
+most one FP16 ULP. The candidate is not bitwise equal to the scalar-FFMA Triton
+route.
+
+The final C4 Nsight Compute profile measured 23.31 ms, 24.92% achieved
+occupancy, 98.16 GB/s memory throughput, 73.29% scheduler cycles with no
+eligible warp, 5.58 long-scoreboard cycles per issued instruction, and 0.99
+barrier cycles per issued instruction. The final warp-softmax implementation
+executes 2.549 billion instructions; its lower barrier cost is partly offset by
+shuffle instructions, so further softmax-only work is at marginal return.
+
+The source-level profile attributed 95.6% of the intermediate eight-warp
+kernel's long-scoreboard samples to the KV global-load-to-shared-store chain.
+Staging Q once and vectorizing KV movement removed 1.205 billion executed
+instructions from that intermediate version. The remaining 293.6 million
+excessive shared wavefronts are predominantly inside Volta WMMA fragment
+loads and stores. Bypassing those stores requires fixed SM70 fragment or SASS
+mapping and remains a separate high-risk experiment.
+
+The same-binary, default-off endpoint control measured 8K TTFT values of
+3030.361, 2993.855, 2997.582, 2991.335, and 2990.318 ms after cold JIT and two
+warmups. Its median is 2993.855 ms, or 2736.27 prompt token/s. The final HMMA
+candidate measured 1900.654, 1901.288, 1889.743, 1889.015, and 1891.466 ms.
+Its median is 1891.466 ms, or 4331.03 prompt token/s. TTFT falls by 1102.389 ms
+or 36.82%; request-level prompt throughput rises by 58.28%. These are
+unprofiled endpoint measurements rather than a service-time projection.
+
+### HMMA Quality Blocker
+
+The performance path remains default-off. Official-sampling tests use the
+model's `temperature=1.0`, `top_p=1.0`, and natural stopping. Both paths were
+coherent for the clean PagedAttention material at seed 9601, but the candidate
+leaked source text at seed 9602 while the repeated baseline stayed on topic.
+At the synthetic 8192/256 seed 9202 workload, two independent baseline starts
+produced coherent Chinese analyses; two candidate starts produced an English
+paper excerpt or prompt-template leakage. A one-ULP operator bound therefore
+does not close the model-quality gate.
+
+Raw artifacts are retained as:
+
+- `microbench-sparse-prefill-hmma-8warp-vectored-{c4,c128,swa}-q8192.json`
+- `ncu-hmma-vectored-c4-q8192.ncu-rep`
+- `hmma-vectored-candidate-seed970{3..7}-i8192-o1.json`
+- `hmma-{baseline-repeat,vectored-candidate}-quality-*.json`
+
+The release-guarded binary hash for these results is
+`ac8fd1f20d289e947517636310f2b5c10c72b11d3f6d31a204035121e38d7af2`.
+
+## mHC Prenorm Weight Reuse
+
+After the sparse-attention reduction, the exact 8K trace exposed mHC as the
+next target: 302.284 ms of critical-rank service, including 196.032 ms over 86
+launches of `hc_prenorm_gemm_block_m_tilelang_kernel`. Its baseline NCU report
+showed 85.75% L2 throughput, 91.43% L2 hit rate, only 22.14% DRAM throughput,
+and 18.26 long-scoreboard cycles per issued instruction. The repeated 1.5 MiB
+FP32 `fn` weight was being fetched from L2 once per two-token CTA block.
+
+The SM70 candidate changes the prenorm tile from `(block_m, tile_n)=(2,12)` to
+`(4,6)`. Both shapes keep 24 FP32 accumulators per thread and the same 8192 CTA
+count at M=8192, but the candidate reuses each weight load across four tokens.
+It is guarded by `VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE=1`, requires the
+DeepSeek V4 FP16 shape, and remains default-off until endpoint validation.
+
+Clean CUDA Graph microbenchmarks measured:
+
+| Tokens | Baseline `(2,12)` | Candidate `(4,6)` | Reduction | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.3359 ms | 0.2422 ms | 27.91% | 1.387x |
+| 4096 | 1.1716 ms | 0.9071 ms | 22.57% | 1.292x |
+| 8192 | 2.3161 ms | 1.7876 ms | 22.82% | 1.296x |
+
+All candidate outputs were bitwise equal to both the runtime oracle and eager
+execution. The non-divisible M=1025 tail also passed bitwise. At M=8192, the
+86-launch model-forward projection falls from 199.186 to 153.732 ms, a 45.454
+ms saving; this is a projection, not an endpoint result.
+
+NCU confirms that the candidate reduces L2 work without sacrificing residency:
+
+| M=8192 metric | Baseline `(2,12)` | Candidate `(4,6)` |
+| :--- | ---: | ---: |
+| NCU duration | 2.85 ms | 1.89 ms |
+| Registers/thread | 55 | 56 |
+| Achieved occupancy | 49.35% | 48.71% |
+| L2 throughput | 85.75% | 86.36% |
+| L2 hit rate | 91.43% | 73.57% |
+| DRAM throughput | 22.14% | 63.93% |
+| Compute throughput | 26.68% | 39.44% |
+| Scheduler cycles with no eligible warp | 73.76% | 60.87% |
+
+Larger reuse blocks were rejected after clean reruns: `(5,5)` measured 2.009
+ms, `(6,4)` 2.204 ms, and `(8,3)` 3.109 ms. The first two already require 64
+registers per thread; added x rereads and dependency stalls outweigh further
+weight reuse even though they retain two CTAs per SM.
+
+### Remaining mHC Kernels
+
+The other two repeated mHC kernels account for another 104.653 ms in the 8K
+trace. `mhc_post_tilelang_kernel` reproduces at 0.7437 ms per call and reaches
+805.47 GB/s, or 89.71% DRAM throughput. Its mandatory 40 KiB input and 32 KiB
+output per token make standalone tuning a sub-10% opportunity, so it is not
+the next implementation target.
+
+`mhc_pre_big_fuse_with_norm_tilelang_kernel` accounts for 40.669 ms over 85
+calls. NCU measures 79.22% DRAM throughput, 103 registers per thread, 29.04
+KiB dynamic shared memory, and only 12.32% achieved occupancy. Its 1024-wide
+software-pipelined tile double-buffers residual and norm-weight staging.
+Temporary 512- and 256-wide benchmark variants measured only 0.36% and 1.69%
+faster, respectively, while both changed `layer_input` by up to 0.00012207.
+They are rejected and the production tile remains 1024.
+
+Raw artifacts are retained as:
+
+- `microbench-mhc-prenorm-m{1024,4096,8192}-idle-repeat-*.json`
+- `microbench-mhc-prenorm-m1025-tail-blockm4-tilen6.json`
+- `microbench-mhc-prenorm-m4096-production-dispatch-weight-reuse.json`
+- `ncu-mhc-prenorm-m8192-weight-reuse.ncu-rep`
+- `ncu-mhc-prenorm-m8192-blockm{5,6}-*-resources.ncu-rep`
+- `ncu-mhc-{post,pre-with-norm}-m8192-baseline.ncu-rep`
+
+## Indexed MXFP4 W13 Prefill
+
+The final 8K trace attributes 61.950 ms over 43 launches to
+`expandInputRowsKernel`, or 1.441 ms per MoE layer. It materializes a
+`[8192 * 6, 4096]` FP16 matrix before W13 even though every destination row is
+an unchanged source-token row. This is a routing algorithm cost rather than a
+GEMM tile-selection problem.
+
+TurboMind's existing SM70 grouped MXFP4 kernels already instantiate an
+indexed-A iterator. The candidate therefore keeps the same W13 kernel and
+arithmetic but supplies the sorted source-token row map directly:
+
+1. CUB still sorts the same expanded `(token, expert-slot)` IDs and produces
+   the same expert offsets.
+2. A 256-thread metadata kernel builds the existing forward and inverse
+   permutation maps and converts each sorted expanded ID to its source-token
+   row. It does not copy activation data.
+3. Grouped W13 reads `x[source_row, :]` through TurboMind's indexed-A iterator.
+4. SwiGLU, W2, weighted unpermute, FP16 accumulation order, and router weights
+   are unchanged.
+
+The route is guarded by `VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL=1`, also requires
+grouped prefill, at least 1024 prompt tokens, top-k 6, and fully replicated 256
+experts. Expert-parallel and short/decode shapes remain on the materialized
+path. The switch remains default-off pending an unprofiled endpoint run.
+
+Clean full `permute + W13` microbenchmarks measured:
+
+| Prompt tokens | Materialized | Indexed | Speedup | 43-layer projected saving |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 3.258 ms | 3.065 ms | 1.063x | 8.319 ms |
+| 1025 tail | 3.213 ms | 3.052 ms | 1.053x | 6.921 ms |
+| 4096 | 3.817 ms | 3.119 ms | 1.224x | 30.000 ms |
+| 8192 | 7.395 ms | 6.001 ms | 1.232x | 59.928 ms |
+| 8192, second seed | 7.390 ms | 5.977 ms | 1.237x | 60.771 ms |
+
+All rows passed bitwise output equality, bitwise expert offsets, forward and
+inverse permutation equality, source-row-map equality, and bitwise CUDA Graph
+replay. The clean M=8192 result recovers about 96.7% of the 61.950 ms trace
+cost; indexed W13 adds only about 0.05 ms per layer relative to removing the
+copy in isolation.
+
+The validated extension hashes are:
+
+- `_C.abi3.so`: `fe03604ac5f681a9c4ca5be4443d271749c79dfcd67a8abd64bb3f363caafa77`
+- `_moe_C.abi3.so`: `45c69eba91875db122a61c371c35b6a840c566a4d170ffcaa1fd74ce5f42ee61`
+
+Raw artifacts are retained as
+`microbench-mxfp4-indexed-prefill-m*.json`,
+`indexed-prefill-*-peer-util.log`, and `build-indexed-prefill.log` under the
+task run directory. The next gate is a matched 8K TP8 endpoint comparison with
+the sparse-HMMA and mHC switches held fixed.
+
+## Exact MXFP4 W2 Prefill Selector
+
+The grouped MXFP4 stage was retuned only after the indexed-W13 change. Generic
+autotuning selected CTA 16x128x32 for W13, but grouped W13 regressed from 5.045
+to 5.261 ms, so that result is rejected. For W2, changing only the swizzle of
+the existing CTA 128x128x16, split-1 kernel from 0 to 4 is consistently faster.
+
+`VLLM_SM70_MXFP4_MOE_PREFILL_FAST_SELECTOR=1` enables the exact
+`49152x4096x256` TP8 descriptor only when group-64 prefill is also enabled.
+This combined gate matters because swizzle 4 improves grouped execution but
+regresses the per-expert route. All other shapes retain normal dispatch.
+
+Same-binary A/B/A grouped-only measurements produced:
+
+| Routing | Baseline mean | Swizzle 4 | Reduction | 43-layer saving |
+| :--- | ---: | ---: | ---: | ---: |
+| balanced | 3.578 ms | 3.138 ms | 12.29% | 18.91 ms |
+| random | 3.574 ms | 3.134 ms | 12.32% | 18.94 ms |
+| half-active | 2.974 ms | 2.469 ms | 17.00% | 21.74 ms |
+
+Every route matches the original tactic's cross-process output hash and is
+bitwise stable across direct repeats and CUDA Graph replay. The validated
+binary hash is
+`dba88d00245f6ace0d56fac66e1b8c54ac309512dd6649f812ada68390759c88`.
+Raw artifacts are retained as
+`microbench-mxfp4-w2-m8192-{grouped-only-baseline,grouped-only-baseline-repeat,grouped-only-fast-selector-graph}.json`.
+
+## Exact FP8 Dense Prefill Selector
+
+The 8K trace attributes 315.809 ms to dense FP8 GEMMs. A clean exhaustive
+tactic search found faster, bitwise-identical choices for five exact DeepSeek
+V4 TP8 shapes at M=8192. `VLLM_SM70_FP8_PREFILL_FAST_SELECTOR=1` selects only
+those descriptors; all other token counts and shapes retain the normal
+selector. The switch remains default-off until endpoint validation.
+
+| Projection | Exact tactic |
+| :--- | :--- |
+| fused WQA/WKV, 8192x1536x4096 | CTA 128x128x16, split 1, swizzle 4 |
+| WQ-B/WO-B, 8192x4096x1024 | CTA 128x128x16, split 1, swizzle 4 |
+| WO-A group, 8192x1024x4096 | CTA 128x128x16, split 1, swizzle 3 |
+| shared down, 8192x4096x256 | CTA 128x128x16, split 1, swizzle 4 |
+| C4 indexer WQ-B, 8192x8192x1024 | CTA 64x256x16, split 1, swizzle 2 |
+
+The shared gate/up shape is deliberately excluded. Its faster measured
+tactics changed the FP16 output hash, including CTA 64x256x16 and several
+128x128/96x128/64x128 alternatives. It therefore stays on the baseline CTA
+128x256x16, split-8 route.
+
+A same-binary A/B/A CUDA Graph run measured a 328.108 ms selector-off
+projection and 311.574/312.763 ms selector-on projections. The candidate mean
+is 312.168 ms, saving 15.939 ms or 4.86% of this dense substage. All six output
+hashes match the paired baseline, direct versus graph output is bitwise equal,
+and the other seven GPUs stayed idle during measurement. The final independent
+selector check used binary
+`dba88d00245f6ace0d56fac66e1b8c54ac309512dd6649f812ada68390759c88`.
+
+Raw artifacts are retained as
+`microbench-fp8-dense-m8192-{paired-baseline,fast-selector,fast-selector-repeat}.json`.
+
+## Bitwise-Safe Combined 8K Endpoint
+
+The final endpoint comparison keeps sparse HMMA disabled because its text gate
+is unresolved. Both routes use TP8, one 8192-token chunk, `fp8_ds_mla`, no
+prefix cache, no MTP, breakable CUDA Graph, group-64 MXFP4 prefill, official
+`temperature=1.0`/`top_p=1.0`, and one sampled output token. The candidate
+adds only mHC weight reuse, indexed W13, the exact W2 selector, and the exact
+FP8 dense selector.
+
+One cold request and two warmups precede five measured requests in each run:
+
+| Route | Median TTFT | Prompt throughput |
+| :--- | ---: | ---: |
+| selector-off control A | 2993.893 ms | 2736.24 token/s |
+| four-way candidate | 2858.855 ms | 2865.48 token/s |
+| selector-off control A repeat | 2996.340 ms | 2734.00 token/s |
+
+The candidate saves 135.038-137.485 ms against the two controls. TTFT falls by
+4.51-4.59%, and request-level prompt throughput rises by 4.72-4.81%. This is a
+measured endpoint result rather than a sum of microbenchmark projections. All
+eight paired one-token seeds returned the same token in control and candidate.
+
+The longer text gate does not support a stronger quality claim. At 8192/64,
+the candidate and control chose different continuations after the same first
+token. More importantly, the selector-off control itself produced different
+continuations for two repeated requests with the same seed. It remained
+non-reproducible with `temperature=0` and the same seed, and both control and
+candidate samples could leak prompt-like instructions or English text. The
+operator and first-token evidence shows no detected regression from these
+four changes, but the model's endpoint text-quality baseline is not closed.
+All four switches therefore remain default-off.
+
+Raw endpoint artifacts are retained as
+`final-safe-{baseline,baseline-repeat,combined}-seed*-i8192-o1.json` and
+`final-safe-{baseline-repeat,combined}-quality-seed8701-i8192-o64.json`.
+
 ## Rejected Evidence
 
 The earlier report

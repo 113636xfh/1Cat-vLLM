@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Profile the exact DeepSeek V4 TP8 FP8 dense decode shapes on SM70."""
+"""Profile exact DeepSeek V4 TP8 FP8 dense shapes on SM70."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class Shape:
     name: str
     k: int
     n: int
-    calls_per_token: int
+    calls_per_model_forward: int
     gated_silu: bool = False
 
 
@@ -42,7 +42,16 @@ def _digest(tensor: torch.Tensor) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _time_graph(graph: torch.cuda.CUDAGraph, replays: int, repeats: int) -> list[float]:
+def _time_graph(
+    graph: torch.cuda.CUDAGraph,
+    replays: int,
+    repeats: int,
+    warmup_replays: int,
+) -> list[float]:
+    for _ in range(warmup_replays):
+        graph.replay()
+    torch.cuda.synchronize()
+
     samples_ms: list[float] = []
     for _ in range(repeats):
         start = torch.cuda.Event(enable_timing=True)
@@ -56,7 +65,14 @@ def _time_graph(graph: torch.cuda.CUDAGraph, replays: int, repeats: int) -> list
     return samples_ms
 
 
-def _measure(shape: Shape, replays: int, repeats: int) -> dict[str, object]:
+def _measure(
+    shape: Shape,
+    num_tokens: int,
+    replays: int,
+    repeats: int,
+    warmup_replays: int,
+    profile_replay: bool,
+) -> dict[str, object]:
     qweight = torch.randn((shape.n, shape.k), device="cuda", dtype=torch.float16).to(
         torch.float8_e4m3fn
     )
@@ -68,9 +84,9 @@ def _measure(shape: Shape, replays: int, repeats: int) -> dict[str, object]:
     weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
         qweight, scales, 128, shape.gated_silu
     )
-    x = torch.randn((1, shape.k), device="cuda", dtype=torch.float16)
+    x = torch.randn((num_tokens, shape.k), device="cuda", dtype=torch.float16)
     out_n = shape.n // 2 if shape.gated_silu else shape.n
-    direct = torch.empty((1, out_n), device="cuda", dtype=torch.float16)
+    direct = torch.empty((num_tokens, out_n), device="cuda", dtype=torch.float16)
     graph_out = torch.empty_like(direct)
 
     for _ in range(4):
@@ -89,21 +105,32 @@ def _measure(shape: Shape, replays: int, repeats: int) -> dict[str, object]:
     equal = torch.equal(direct, graph_out)
     max_abs = float((direct.float() - graph_out.float()).abs().max().item())
 
-    samples_ms = _time_graph(graph, replays, repeats)
+    if profile_replay:
+        torch.cuda.cudart().cudaProfilerStart()
+        graph.replay()
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.synchronize()
+
+    samples_ms = _time_graph(graph, replays, repeats, warmup_replays)
 
     median_ms = statistics.median(samples_ms)
     return {
         **asdict(shape),
         "samples_ms": samples_ms,
         "median_ms": median_ms,
-        "projected_ms_per_token": median_ms * shape.calls_per_token,
+        "num_tokens": num_tokens,
+        "projected_ms_per_model_forward": (median_ms * shape.calls_per_model_forward),
         "graph_equal": equal,
         "graph_max_abs": max_abs,
         "output_sha256": _digest(graph_out),
     }
 
 
-def _measure_split_parity(replays: int, repeats: int) -> dict[str, object]:
+def _measure_split_parity(
+    replays: int,
+    repeats: int,
+    warmup_replays: int,
+) -> dict[str, object]:
     k, fused_n, split_n = 4096, 1536, 1024
     qweight = torch.randn((fused_n, k), device="cuda", dtype=torch.float16).to(
         torch.float8_e4m3fn
@@ -163,8 +190,8 @@ def _measure_split_parity(replays: int, repeats: int) -> dict[str, object]:
     torch.cuda.synchronize()
 
     diff = (fused_out.float() - split_out.float()).abs()
-    fused_samples = _time_graph(fused_graph, replays, repeats)
-    split_samples = _time_graph(split_graph, replays, repeats)
+    fused_samples = _time_graph(fused_graph, replays, repeats, warmup_replays)
+    split_samples = _time_graph(split_graph, replays, repeats, warmup_replays)
     fused_median = statistics.median(fused_samples)
     split_median = statistics.median(split_samples)
     return {
@@ -187,20 +214,33 @@ def main() -> int:
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--warmup-replays", type=int, default=100)
+    parser.add_argument("--num-tokens", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument(
         "--name", choices=[shape.name for shape in SHAPES + DIAGNOSTIC_SHAPES]
     )
     parser.add_argument("--split-parity", action="store_true")
+    parser.add_argument("--profile-replay", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("This benchmark requires an NVIDIA V100 (SM70).")
+    if args.num_tokens < 1:
+        raise ValueError("num-tokens must be positive")
+    if args.warmup_replays < 0:
+        raise ValueError("warmup-replays must be non-negative")
+    if args.split_parity and args.num_tokens != 1:
+        raise ValueError("split-parity currently requires num-tokens=1")
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     if args.split_parity:
-        result = _measure_split_parity(args.replays, args.repeats)
+        result = _measure_split_parity(
+            args.replays,
+            args.repeats,
+            args.warmup_replays,
+        )
         payload = {"contract": {"m": 1, "tp": 8}, "split_parity": result}
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -213,24 +253,39 @@ def main() -> int:
     )
     if args.name is None:
         selected_shapes = SHAPES
-    results = [_measure(shape, args.replays, args.repeats) for shape in selected_shapes]
-    projected_ms = sum(float(item["projected_ms_per_token"]) for item in results)
+    results = [
+        _measure(
+            shape,
+            args.num_tokens,
+            args.replays,
+            args.repeats,
+            args.warmup_replays,
+            args.profile_replay,
+        )
+        for shape in selected_shapes
+    ]
+    projected_ms = sum(
+        float(item["projected_ms_per_model_forward"]) for item in results
+    )
     failures = [item["name"] for item in results if not item["graph_equal"]]
     payload = {
         "contract": {
             "model": "DeepSeek-V4-Flash",
             "tp": 8,
-            "m": 1,
+            "m": args.num_tokens,
             "group_size": 128,
             "cuda_graph": True,
             "replays": args.replays,
             "repeats": args.repeats,
+            "warmup_replays": args.warmup_replays,
             "seed": args.seed,
         },
         "summary": {
             "shape_count": len(results),
-            "calls_per_token": sum(shape.calls_per_token for shape in selected_shapes),
-            "projected_ms_per_token": projected_ms,
+            "calls_per_model_forward": sum(
+                shape.calls_per_model_forward for shape in selected_shapes
+            ),
+            "projected_ms_per_model_forward": projected_ms,
             "graph_failures": failures,
         },
         "results": results,
@@ -241,8 +296,9 @@ def main() -> int:
     for item in results:
         print(
             f"{item['name']:20s} K={item['k']:5d} N={item['n']:5d} "
-            f"{item['median_ms']:.6f} ms x {item['calls_per_token']:3d} = "
-            f"{item['projected_ms_per_token']:.3f} ms/token"
+            f"{item['median_ms']:.6f} ms x "
+            f"{item['calls_per_model_forward']:3d} = "
+            f"{item['projected_ms_per_model_forward']:.3f} ms/forward"
         )
     return 1 if failures else 0
 
