@@ -1068,9 +1068,18 @@ bool mxfp4_tune_small_shapes_enabled() {
 }
 
 bool mxfp4_moe_compact_grouped_decode_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
   return raw != nullptr && std::atoi(raw) != 0;
+}
+
+bool mxfp4_moe_grouped_m8_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
+bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool nvfp4_tune_small_shapes_enabled() {
@@ -1341,6 +1350,13 @@ turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream) {
+  const bool exact_grouped_m8 =
+      total_tokens == 48 && num_experts == 48 && group_size == 32 &&
+      ((n == 512 && k == 4096) || (n == 4096 && k == 256));
+  if (mxfp4_moe_grouped_m8_enabled() &&
+      mxfp4_moe_grouped_m8_fast_selector_enabled() && exact_grouped_m8) {
+    return turbomind::gemm::DispatchPolicy::kMxfp4MoeGroupedM8Fast;
+  }
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
       TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());
@@ -7117,7 +7133,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "mxfp4_moe_gemm_sm70: input must be CUDA float16.");
   TORCH_CHECK(
-      expert_offsets.is_cuda() && expert_offsets.scalar_type() == torch::kInt32 &&
+      expert_offsets.is_cuda() &&
+          expert_offsets.scalar_type() == torch::kInt32 &&
           expert_offsets.is_contiguous(),
       "mxfp4_moe_gemm_sm70: expert_offsets must be contiguous CUDA int32.");
   TORCH_CHECK(strided_ptrs_w.is_cuda() && strided_ptrs_s.is_cuda(),
@@ -7203,10 +7220,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
   const bool is_b_s = !is_a_s;
   const int64_t num_groups = k / group_size;
   turbomind::gemm::MatrixLayout scale_desc{
-      turbomind::kUint8,
-      order_s,
-      static_cast<int>(n),
-      static_cast<int>(num_groups),
+      turbomind::kUint8,   order_s,
+      static_cast<int>(n), static_cast<int>(num_groups),
       static_cast<int>(n),
   };
   if (is_b_s) {
@@ -7257,14 +7272,14 @@ void mxfp4_moe_gemm_sm70_out_impl(
               ").");
 }
 
-void mxfp4_moe_dense_stage_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
-    torch::Tensor dense_expert_ids, torch::Tensor ptrs_w,
-    torch::Tensor ptrs_s, int64_t num_experts, int64_t k, int64_t n,
-    int64_t group_size) {
-  TORCH_CHECK(
-      input.is_cuda() && input.scalar_type() == torch::kFloat16,
-      "mxfp4_moe_dense_stage_sm70_out: input must be CUDA float16.");
+void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor expert_offsets,
+                                    torch::Tensor dense_expert_ids,
+                                    torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+                                    int64_t num_experts, int64_t k, int64_t n,
+                                    int64_t group_size) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16,
+              "mxfp4_moe_dense_stage_sm70_out: input must be CUDA float16.");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
               "mxfp4_moe_dense_stage_sm70_out: out must be CUDA float16.");
   TORCH_CHECK(expert_offsets.is_cuda() &&
@@ -7286,9 +7301,9 @@ void mxfp4_moe_dense_stage_sm70_out(
               "supported.");
   TORCH_CHECK(input.dim() == 2 && input.size(1) == k,
               "mxfp4_moe_dense_stage_sm70_out: input shape mismatch.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == input.size(0) &&
-                  out.size(1) == n,
-              "mxfp4_moe_dense_stage_sm70_out: out shape mismatch.");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(0) == input.size(0) && out.size(1) == n,
+      "mxfp4_moe_dense_stage_sm70_out: out shape mismatch.");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "mxfp4_moe_dense_stage_sm70_out: expert_offsets too small.");
   TORCH_CHECK(dense_expert_ids.numel() >= num_experts,
@@ -7310,26 +7325,37 @@ void mxfp4_moe_dense_stage_sm70_out(
                                  dense_expert_ids, true);
     return;
   }
+  const bool grouped_m8_shape =
+      input.size(0) == 48 && num_experts == 48 &&
+      ((k == 4096 && n == 512) || (k == 256 && n == 4096));
+  if (vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) {
+    // Keep every routed slot as an independent one-row group. Repeated experts
+    // reuse the same weight pointer row, while the scheduler retains the exact
+    // arithmetic contract already accepted for compact B1 decode.
+    mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                                 num_experts, k, n, group_size,
+                                 dense_expert_ids, true);
+    return;
+  }
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
     torch::Tensor offsets = expert_offsets.narrow(0, expert, 2);
     torch::Tensor expert_idx = dense_expert_ids.narrow(0, expert, 1);
-    mxfp4_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k,
-                                 n, group_size, expert_idx);
+    mxfp4_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
+                                 group_size, expert_idx);
   }
 }
 
 void mxfp4_moe_single_token_prepare_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
-    torch::Tensor topk_ids, torch::Tensor w13_ptrs_w,
-    torch::Tensor w13_ptrs_s,
+    torch::Tensor topk_ids, torch::Tensor w13_ptrs_w, torch::Tensor w13_ptrs_s,
     torch::Tensor expert_offsets, torch::Tensor inv_permuted_idx,
     torch::Tensor sorted_expert_ids, int64_t w13_k, int64_t w13_n,
     int64_t group_size, int64_t hidden_logical_size) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
-                  x.dim() == 2 && x.size(0) == 1 &&
-                  x.size(1) == hidden_logical_size,
-              "mxfp4_moe_single_token_prepare_w13_sm70_out: x must be CUDA FP16 "
-              "[1, hidden].");
+  TORCH_CHECK(
+      x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.dim() == 2 &&
+          x.size(0) == 1 && x.size(1) == hidden_logical_size,
+      "mxfp4_moe_single_token_prepare_w13_sm70_out: x must be CUDA FP16 "
+      "[1, hidden].");
   TORCH_CHECK(topk_ids.is_cuda() && topk_ids.is_contiguous() &&
                   (topk_ids.scalar_type() == torch::kInt32 ||
                    topk_ids.scalar_type() == torch::kInt64),
@@ -7346,36 +7372,36 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
   TORCH_CHECK(group_size == 32 && w13_k == hidden_logical_size && w13_n == 512,
               "mxfp4_moe_single_token_prepare_w13_sm70_out: unsupported "
               "DeepSeek V4 W13 shape contract.");
-  TORCH_CHECK(compact_input.is_cuda() &&
-                  compact_input.scalar_type() == torch::kFloat16 &&
-                  compact_input.dim() == 2 &&
-                  compact_input.size(0) == kTopK &&
-                  compact_input.size(1) == hidden_logical_size,
-              "mxfp4_moe_single_token_prepare_w13_sm70_out: compact input scratch "
-              "mismatch.");
+  TORCH_CHECK(
+      compact_input.is_cuda() &&
+          compact_input.scalar_type() == torch::kFloat16 &&
+          compact_input.dim() == 2 && compact_input.size(0) == kTopK &&
+          compact_input.size(1) == hidden_logical_size,
+      "mxfp4_moe_single_token_prepare_w13_sm70_out: compact input scratch "
+      "mismatch.");
   TORCH_CHECK(gate_up.is_cuda() && gate_up.scalar_type() == torch::kFloat16 &&
                   gate_up.dim() == 2 && gate_up.size(0) == kTopK &&
                   gate_up.size(1) == w13_n,
               "mxfp4_moe_single_token_prepare_w13_sm70_out: gate/up scratch "
               "mismatch.");
-  TORCH_CHECK(expert_offsets.is_cuda() &&
-                  expert_offsets.scalar_type() == torch::kInt32 &&
-                  expert_offsets.is_contiguous() &&
-                  expert_offsets.numel() == kTopK + 1 &&
-                  inv_permuted_idx.is_cuda() &&
-                  inv_permuted_idx.scalar_type() == torch::kInt32 &&
-                  inv_permuted_idx.is_contiguous() &&
-                  inv_permuted_idx.numel() == kTopK &&
-                  sorted_expert_ids.is_cuda() &&
-                  sorted_expert_ids.scalar_type() == torch::kInt32 &&
-                  sorted_expert_ids.is_contiguous() &&
-                  sorted_expert_ids.numel() >= kTopK,
-              "mxfp4_moe_single_token_prepare_w13_sm70_out: routing scratch "
-              "mismatch.");
-  TORCH_CHECK(w13_ptrs_w.is_cuda() && w13_ptrs_s.is_cuda() &&
-                  w13_ptrs_w.is_contiguous() && w13_ptrs_s.is_contiguous(),
-              "mxfp4_moe_single_token_prepare_w13_sm70_out: expert pointer rows "
-              "must be contiguous CUDA tensors.");
+  TORCH_CHECK(
+      expert_offsets.is_cuda() &&
+          expert_offsets.scalar_type() == torch::kInt32 &&
+          expert_offsets.is_contiguous() &&
+          expert_offsets.numel() == kTopK + 1 && inv_permuted_idx.is_cuda() &&
+          inv_permuted_idx.scalar_type() == torch::kInt32 &&
+          inv_permuted_idx.is_contiguous() &&
+          inv_permuted_idx.numel() == kTopK && sorted_expert_ids.is_cuda() &&
+          sorted_expert_ids.scalar_type() == torch::kInt32 &&
+          sorted_expert_ids.is_contiguous() &&
+          sorted_expert_ids.numel() >= kTopK,
+      "mxfp4_moe_single_token_prepare_w13_sm70_out: routing scratch "
+      "mismatch.");
+  TORCH_CHECK(
+      w13_ptrs_w.is_cuda() && w13_ptrs_s.is_cuda() &&
+          w13_ptrs_w.is_contiguous() && w13_ptrs_s.is_contiguous(),
+      "mxfp4_moe_single_token_prepare_w13_sm70_out: expert pointer rows "
+      "must be contiguous CUDA tensors.");
   constexpr int kPtrRowBytes = 16;
   TORCH_CHECK(w13_ptrs_w.numel() == w13_ptrs_s.numel() &&
                   w13_ptrs_w.numel() >= kTopK * kPtrRowBytes &&
@@ -7425,9 +7451,9 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  mxfp4_moe_gemm_sm70_out_impl(
-      gate_up, compact_input, expert_offsets, w13_ptrs_w, w13_ptrs_s, kTopK,
-      w13_k, w13_n, group_size, sorted_expert_ids, true);
+  mxfp4_moe_gemm_sm70_out_impl(gate_up, compact_input, expert_offsets,
+                               w13_ptrs_w, w13_ptrs_s, kTopK, w13_k, w13_n,
+                               group_size, sorted_expert_ids, true);
 }
 
 void fp8_moe_single_token_dense_stage_sm70_out(

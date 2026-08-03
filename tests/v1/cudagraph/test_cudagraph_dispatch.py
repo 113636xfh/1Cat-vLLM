@@ -320,6 +320,87 @@ class TestCudagraphDispatcher:
         assert mode == CUDAGraphMode.FULL
         assert desc == BatchDescriptor(num_tokens=10, num_reqs=2, uniform=True)
 
+    def test_dsv4_decode_context_bucket_selects_short_single_request_graph(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "2048")
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        base = BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True)
+        bounded = replace(base, attention_context_bucket=2048)
+        assert dispatcher.has_attention_context_buckets
+        assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=1024,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == bounded
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=2049,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == base
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=2,
+            uniform_decode=True,
+            attention_context_len=1024,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(num_tokens=2, num_reqs=2, uniform=True)
+
+    def test_dsv4_decode_context_bucket_is_derived_on_sm70(self, monkeypatch):
+        monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        config.model_config.max_model_len = 4096
+        config.model_config.hf_config.index_topk = 512
+        config.model_config.hf_config.compress_ratios = [128, 4, 128]
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+        ):
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048,)
+        bounded = BatchDescriptor(
+            num_tokens=1,
+            num_reqs=1,
+            uniform=True,
+            attention_context_bucket=2048,
+        )
+        assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "")
+        disabled = CudagraphDispatcher(config)
+        assert not disabled.sm70_dsv4_decode_context_buckets
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

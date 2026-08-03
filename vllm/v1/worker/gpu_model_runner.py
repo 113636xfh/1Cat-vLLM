@@ -1070,7 +1070,10 @@ class GPUModelRunner(
             spec_config is not None
             and self.device.type == "cuda"
             and (
-                (spec_config.method == "mtp" and _sm70_mtp_profile_env_enabled())
+                (
+                    spec_config.method in ("mtp", "dflash", "dspark")
+                    and _sm70_mtp_profile_env_enabled()
+                )
                 or (
                     spec_config.use_dflash_ddtree() and _dflash_ddtree_profile_enabled()
                 )
@@ -7752,10 +7755,9 @@ class GPUModelRunner(
 
         if (
             attention_context_len is None
-            and self.speculative_config is not None
             and uniform_decode
-            and self.uniform_decode_query_len > 1
             and num_reqs > 0
+            and self.cudagraph_dispatcher.has_attention_context_buckets
         ):
             attention_context_len = int(
                 self.optimistic_seq_lens_cpu[:num_reqs].max().item()
@@ -7804,7 +7806,7 @@ class GPUModelRunner(
                 return
             if attention_context_len is None or attention_context_len > bucket:
                 raise RuntimeError(
-                    "Refusing to replay a bounded MTP CUDA graph outside its "
+                    "Refusing to replay a bounded CUDA graph outside its "
                     f"attention context capacity: context={attention_context_len}, "
                     f"bucket={bucket}, descriptor={batch_descriptor}"
                 )

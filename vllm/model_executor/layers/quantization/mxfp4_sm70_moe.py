@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.sm70_turbomind import (
     is_exact_sm70_cuda,
     unpack_mxfp4_weight,
 )
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
@@ -39,7 +40,7 @@ _DEEPSEEK_V4_FLASH_HIDDEN_SIZE: Final = 4096
 _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE: Final = 2048
 _DEEPSEEK_V4_FLASH_NUM_EXPERTS: Final = 256
 _DEEPSEEK_V4_FLASH_TOP_K: Final = 6
-_GRAPH_SAFE_MAX_TOKENS: Final = 1
+_GRAPH_SAFE_MAX_TOKENS: Final = 8
 
 
 def _mxfp4_active_expert_b1_enabled() -> bool:
@@ -50,6 +51,83 @@ def _mxfp4_active_expert_b1_enabled() -> bool:
     )
 
 
+def _mxfp4_active_expert_max_tokens() -> int:
+    if not _mxfp4_active_expert_b1_enabled():
+        return 0
+    return min(
+        int(envs.VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS),
+        _GRAPH_SAFE_MAX_TOKENS,
+    )
+
+
+def _mxfp4_grouped_m8_enabled() -> bool:
+    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8)
+
+
+@triton.jit
+def _compact_sorted_experts_kernel(
+    sorted_expert_ids_ptr,
+    compact_offsets_ptr,
+    active_expert_ids_ptr,
+    TOTAL_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    valid = offsets < TOTAL_SLOTS
+    expert_ids = tl.load(
+        sorted_expert_ids_ptr + offsets,
+        mask=valid,
+        other=-1,
+    )
+    previous_ids = tl.load(
+        sorted_expert_ids_ptr + offsets - 1,
+        mask=valid & (offsets > 0),
+        other=-2,
+    )
+    is_boundary = valid & ((offsets == 0) | (expert_ids != previous_ids))
+    active_indices = tl.cumsum(is_boundary.to(tl.int32), axis=0) - 1
+
+    tl.store(
+        compact_offsets_ptr + offsets,
+        TOTAL_SLOTS,
+        mask=offsets <= TOTAL_SLOTS,
+    )
+    tl.store(
+        active_expert_ids_ptr + offsets,
+        0,
+        mask=valid,
+    )
+    tl.store(
+        compact_offsets_ptr + active_indices,
+        offsets,
+        mask=is_boundary,
+    )
+    tl.store(
+        active_expert_ids_ptr + active_indices,
+        expert_ids,
+        mask=is_boundary,
+    )
+
+
+def _compact_mxfp4_active_experts(
+    sorted_expert_ids: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    total_slots = sorted_expert_ids.numel()
+    if not (0 < total_slots <= _GRAPH_SAFE_MAX_TOKENS * _DEEPSEEK_V4_FLASH_TOP_K):
+        raise ValueError(f"Unsupported SM70 MXFP4 active-expert slots: {total_slots}")
+    block = triton.next_power_of_2(total_slots + 1)
+    _compact_sorted_experts_kernel[(1,)](
+        sorted_expert_ids,
+        compact_offsets,
+        active_expert_ids,
+        TOTAL_SLOTS=total_slots,
+        BLOCK=block,
+        num_warps=1,
+    )
+
+
 def _select_mxfp4_stage_dispatch(
     buffers: dict[str, torch.Tensor],
     *,
@@ -57,15 +135,25 @@ def _select_mxfp4_stage_dispatch(
     num_experts: int,
     fully_replicated_experts: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    if (
-        num_tokens == 1
-        and fully_replicated_experts
-        and _mxfp4_active_expert_b1_enabled()
-    ):
+    if 0 < num_tokens <= _mxfp4_active_expert_max_tokens() and fully_replicated_experts:
+        # Keep the graph launch count fixed. The compactor represents unused
+        # tail entries as zero-row experts, avoiding a host readback of the
+        # dynamic unique-expert count.
+        graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        if num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled():
+            return (
+                buffers["slot_expert_offsets"],
+                buffers["permuted_experts_id"],
+                graph_expert_slots,
+            )
         return (
             buffers["compact_expert_offsets"],
-            buffers["permuted_experts_id"],
-            _DEEPSEEK_V4_FLASH_TOP_K,
+            (
+                buffers["permuted_experts_id"]
+                if num_tokens == 1
+                else buffers["active_expert_ids"]
+            ),
+            graph_expert_slots,
         )
     return buffers["expert_offsets"], buffers["dense_expert_ids"], num_experts
 
@@ -338,7 +426,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer.sm70_mxfp4_w2_k_dim = intermediate_size
         layer.sm70_mxfp4_w2_n_dim = hidden_size
         layer.sm70_mxfp4_group_size = MXFP4_GROUP_SIZE
-        self._allocate_graph_safe_b1_buffers(layer)
+        self._allocate_graph_safe_decode_buffers(layer)
 
         # Raw checkpoint tensors are replaced by the equivalent TurboMind
         # packed e2m1/UE8M0 representation, never by dequantized weights.
@@ -348,12 +436,14 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         del layer.w2_weight_scale
         logger.info_once(
             "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
-            "(local_experts=%d, graph_safe_decode=B1, active_expert_b1=%s).",
+            "(local_experts=%d, graph_safe_decode=B1-B%d, "
+            "active_expert_max_tokens=%d).",
             num_experts,
-            _mxfp4_active_expert_b1_enabled(),
+            _GRAPH_SAFE_MAX_TOKENS,
+            _mxfp4_active_expert_max_tokens(),
         )
 
-    def _allocate_graph_safe_b1_buffers(self, layer: RoutedExperts) -> None:
+    def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = _DEEPSEEK_V4_FLASH_TOP_K
         max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
@@ -419,34 +509,57 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             num_experts, dtype=torch.int32, device=device
         )
         layer._mxfp4_sm70_buf_compact_expert_offsets = torch.arange(
-            top_k + 1, dtype=torch.int32, device=device
+            max_slots + 1, dtype=torch.int32, device=device
         )
         layer._mxfp4_sm70_buf_compact_expert_offsets64 = torch.arange(
-            top_k + 1, dtype=torch.int64, device=device
+            max_slots + 1, dtype=torch.int64, device=device
+        )
+        layer._mxfp4_sm70_buf_slot_expert_offsets = torch.arange(
+            max_slots + 1, dtype=torch.int32, device=device
+        )
+        layer._mxfp4_sm70_buf_active_expert_ids = torch.empty(
+            max_slots, dtype=torch.int32, device=device
         )
 
     @staticmethod
-    def _persistent_b1_buffers(layer: RoutedExperts) -> dict[str, torch.Tensor]:
+    def _persistent_decode_buffers(
+        layer: RoutedExperts, num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
         return {
-            "output": layer._mxfp4_sm70_buf_output,
-            "permuted_input": layer._mxfp4_sm70_buf_permuted_input,
-            "gate_up": layer._mxfp4_sm70_buf_gate_up,
-            "intermediate": layer._mxfp4_sm70_buf_intermediate,
-            "sorted_output": layer._mxfp4_sm70_buf_sorted_output,
+            "output": layer._mxfp4_sm70_buf_output[:num_tokens],
+            "permuted_input": layer._mxfp4_sm70_buf_permuted_input[:total_slots],
+            "gate_up": layer._mxfp4_sm70_buf_gate_up[:total_slots],
+            "intermediate": layer._mxfp4_sm70_buf_intermediate[:total_slots],
+            "sorted_output": layer._mxfp4_sm70_buf_sorted_output[:total_slots],
             "expert_offsets": layer._mxfp4_sm70_buf_expert_offsets,
             "expert_offsets64": layer._mxfp4_sm70_buf_expert_offsets64,
-            "inv_permuted_idx": layer._mxfp4_sm70_buf_inv_permuted_idx,
-            "topk_ids": layer._mxfp4_sm70_buf_topk_ids,
-            "token_expert_indices": layer._mxfp4_sm70_buf_token_expert_indices,
-            "permuted_idx": layer._mxfp4_sm70_buf_permuted_idx,
+            "inv_permuted_idx": layer._mxfp4_sm70_buf_inv_permuted_idx[:num_tokens],
+            "topk_ids": layer._mxfp4_sm70_buf_topk_ids[:num_tokens],
+            "token_expert_indices": (
+                layer._mxfp4_sm70_buf_token_expert_indices[:num_tokens]
+            ),
+            "permuted_idx": layer._mxfp4_sm70_buf_permuted_idx[:total_slots],
             "sort_workspace": layer._mxfp4_sm70_buf_sort_workspace,
-            "permuted_experts_id": layer._mxfp4_sm70_buf_permuted_experts_id,
-            "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx,
-            "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
+            "permuted_experts_id": (
+                layer._mxfp4_sm70_buf_permuted_experts_id[:total_slots]
+            ),
+            "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx[:total_slots],
+            "topk_ids_for_sort": (
+                layer._mxfp4_sm70_buf_topk_ids_for_sort[:total_slots]
+            ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
-            "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
+            "compact_expert_offsets": (
+                layer._mxfp4_sm70_buf_compact_expert_offsets[: total_slots + 1]
+            ),
             "compact_expert_offsets64": (
-                layer._mxfp4_sm70_buf_compact_expert_offsets64
+                layer._mxfp4_sm70_buf_compact_expert_offsets64[: total_slots + 1]
+            ),
+            "slot_expert_offsets": (
+                layer._mxfp4_sm70_buf_slot_expert_offsets[: total_slots + 1]
+            ),
+            "active_expert_ids": (
+                layer._mxfp4_sm70_buf_active_expert_ids[:total_slots]
             ),
         }
 
@@ -515,17 +628,19 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "compact_expert_offsets64": (
                 layer._mxfp4_sm70_buf_compact_expert_offsets64
             ),
+            "slot_expert_offsets": torch.arange(
+                total_slots + 1, dtype=torch.int32, device=device
+            ),
+            "active_expert_ids": torch.empty(
+                total_slots, dtype=torch.int32, device=device
+            ),
         }
 
     def _get_buffers(
         self, layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
-        if num_tokens == _GRAPH_SAFE_MAX_TOKENS:
-            return self._persistent_b1_buffers(layer)
-        # B1 owns fixed buffers before capture. Larger M remains a functional
-        # eager/prefill route; during a fixed-shape graph capture PyTorch owns
-        # these allocations in that graph's pool. Its replay stability is a
-        # separate GPU gate and is not claimed by the B1 contract.
+        if 0 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS:
+            return self._persistent_decode_buffers(layer, num_tokens)
         return self._eager_buffers(layer, num_tokens)
 
     @staticmethod
@@ -647,6 +762,21 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             buffers["topk_ids_for_sort"],
         )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+
+        if (
+            num_tokens > 1
+            and num_tokens <= _mxfp4_active_expert_max_tokens()
+            and not (
+                num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled()
+            )
+            and layer.expert_map is None
+            and layer.local_num_experts == layer.global_num_experts
+        ):
+            _compact_mxfp4_active_experts(
+                buffers["permuted_experts_id"],
+                buffers["compact_expert_offsets"],
+                buffers["active_expert_ids"],
+            )
 
         stage_offsets, stage_expert_ids, stage_expert_count = (
             _select_mxfp4_stage_dispatch(
