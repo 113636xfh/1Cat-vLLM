@@ -15,6 +15,7 @@ import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -39,6 +40,34 @@ _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE: Final = 2048
 _DEEPSEEK_V4_FLASH_NUM_EXPERTS: Final = 256
 _DEEPSEEK_V4_FLASH_TOP_K: Final = 6
 _GRAPH_SAFE_MAX_TOKENS: Final = 1
+
+
+def _mxfp4_active_expert_b1_enabled() -> bool:
+    return bool(
+        envs.VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1
+        and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
+        and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH
+    )
+
+
+def _select_mxfp4_stage_dispatch(
+    buffers: dict[str, torch.Tensor],
+    *,
+    num_tokens: int,
+    num_experts: int,
+    fully_replicated_experts: bool,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if (
+        num_tokens == 1
+        and fully_replicated_experts
+        and _mxfp4_active_expert_b1_enabled()
+    ):
+        return (
+            buffers["compact_expert_offsets"],
+            buffers["permuted_experts_id"],
+            _DEEPSEEK_V4_FLASH_TOP_K,
+        )
+    return buffers["expert_offsets"], buffers["dense_expert_ids"], num_experts
 
 
 def validate_mxfp4_sm70_moe_contract(
@@ -317,8 +346,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         del layer.w2_weight_scale
         logger.info_once(
             "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
-            "(local_experts=%d, graph_safe_decode=B1).",
+            "(local_experts=%d, graph_safe_decode=B1, active_expert_b1=%s).",
             num_experts,
+            _mxfp4_active_expert_b1_enabled(),
         )
 
     def _allocate_graph_safe_b1_buffers(self, layer: RoutedExperts) -> None:
@@ -386,6 +416,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_dense_expert_ids = torch.arange(
             num_experts, dtype=torch.int32, device=device
         )
+        layer._mxfp4_sm70_buf_compact_expert_offsets = torch.arange(
+            top_k + 1, dtype=torch.int32, device=device
+        )
 
     @staticmethod
     def _persistent_b1_buffers(layer: RoutedExperts) -> dict[str, torch.Tensor]:
@@ -406,6 +439,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx,
             "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
+            "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
         }
 
     @staticmethod
@@ -469,6 +503,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 total_slots, dtype=torch.int32, device=device
             ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
+            "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
         }
 
     def _get_buffers(
@@ -556,14 +591,26 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
 
+        stage_offsets, stage_expert_ids, stage_expert_count = (
+            _select_mxfp4_stage_dispatch(
+                buffers,
+                num_tokens=num_tokens,
+                num_experts=layer.sm70_mxfp4_num_experts,
+                fully_replicated_experts=(
+                    layer.expert_map is None
+                    and layer.local_num_experts == layer.global_num_experts
+                ),
+            )
+        )
+
         sm70_ops.mxfp4_moe_dense_stage_sm70_out(
             buffers["gate_up"],
             buffers["permuted_input"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_expert_ids,
             layer.w13_strided_ptrs_w,
             layer.w13_strided_ptrs_s,
-            layer.sm70_mxfp4_num_experts,
+            stage_expert_count,
             layer.sm70_mxfp4_w13_k_dim,
             layer.sm70_mxfp4_w13_n_dim,
             layer.sm70_mxfp4_group_size,
@@ -572,11 +619,11 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         sm70_ops.mxfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
             buffers["intermediate"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_expert_ids,
             layer.w2_strided_ptrs_w,
             layer.w2_strided_ptrs_s,
-            layer.sm70_mxfp4_num_experts,
+            stage_expert_count,
             layer.sm70_mxfp4_w2_k_dim,
             layer.sm70_mxfp4_w2_n_dim,
             layer.sm70_mxfp4_group_size,

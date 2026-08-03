@@ -6,18 +6,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     MoEActivation,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.quantization import mxfp4_sm70_moe as mxfp4_moe
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.mxfp4 import (
     make_deepseek_v4_mxfp4_moe_method,
 )
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
+    _select_mxfp4_stage_dispatch,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
 )
@@ -178,6 +181,94 @@ def test_mxfp4_sm70_factory_rejects_marlin_or_emulation(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="Marlin"):
         make_deepseek_v4_mxfp4_moe_method(_v4_flash_moe_config())
+
+
+def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(7, dtype=torch.int32),
+        "permuted_experts_id": torch.tensor(
+            [3, 17, 42, 99, 128, 255], dtype=torch.int32
+        ),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=1,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    assert offsets is buffers["compact_expert_offsets"]
+    assert expert_ids is buffers["permuted_experts_id"]
+    assert count == 6
+
+
+def test_mxfp4_sm70_b1_dispatch_rejects_incompatible_permute_fastpath(
+    monkeypatch,
+):
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", True)
+    monkeypatch.setattr(envs, "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", True)
+
+    assert not mxfp4_moe._mxfp4_active_expert_b1_enabled()
+
+
+def test_mxfp4_sm70_b1_dispatch_rejects_generic_single_token_fastpath(
+    monkeypatch,
+):
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", True)
+    monkeypatch.setattr(envs, "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", True)
+
+    assert not mxfp4_moe._mxfp4_active_expert_b1_enabled()
+
+
+def test_mxfp4_sm70_b1_dispatch_rejects_expert_parallel_metadata(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(7, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(6, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=1,
+        num_experts=256,
+        fully_replicated_experts=False,
+    )
+
+    assert offsets is buffers["expert_offsets"]
+    assert expert_ids is buffers["dense_expert_ids"]
+    assert count == 256
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
+    buffers = {
+        "compact_expert_offsets": torch.arange(7, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(6, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(
+        mxfp4_moe,
+        "_mxfp4_active_expert_b1_enabled",
+        lambda: num_tokens != 1,
+    )
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=num_tokens,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    assert offsets is buffers["expert_offsets"]
+    assert expert_ids is buffers["dense_expert_ids"]
+    assert count == 256
 
 
 def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
