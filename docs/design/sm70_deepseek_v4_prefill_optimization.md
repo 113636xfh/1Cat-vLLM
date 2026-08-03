@@ -239,6 +239,62 @@ the GPUs. The feature therefore remains default-off until same-process model
 output or logit equality is closed. No quality-pass claim is made from the
 semantic smoke alone.
 
+## Exact 8K Chunk Comparison
+
+The next workload uses exactly 8192 prompt tokens, one officially sampled
+output token, TP8, `fp8_ds_mla`, no prefix cache, no MTP, and non-eager
+breakable CUDA Graph execution. The benchmark prompt builder preserves its
+existing token prefix and repeats the already-tokenized context only when the
+requested length exceeds the original 80-paragraph fixture.
+
+The first 4096-token chunk request exposed a correctness bug before timing:
+the SM70 indexer dequantization kernel has a `uint8` AOT signature and performs
+software E4M3 decoding, but its runtime call passed the same storage with a
+native `float8_e4m3fn` type. Triton rejects that native FP8 type on SM70 before
+entering the kernel. Passing a zero-copy `uint8` view at the call boundary
+preserves every value and scale. A direct GPU oracle covering weighted-Q,
+software FP8 K dequantization, and FP16 HMMA was bitwise equal to the reference
+with zero mismatched elements.
+
+The endpoint comparison measured:
+
+| Chunk | Grouped prefill | Median TTFT | Mean TTFT | Prompt throughput |
+| ---: | :---: | ---: | ---: | ---: |
+| 4096 | off | 7458.383 ms | 7457.075 ms | 1098.36 token/s |
+| 4096 | group-64 | 3179.100 ms | 3178.883 ms | 2576.83 token/s |
+| 8192 | group-64 | 2997.086 ms | 2997.686 ms | 2733.32 token/s |
+
+Each row uses five measured requests after a cold request and two warmups. The
+4096 rows used `gpu_memory_utilization=0.90`. An 8192-token profile run leaves
+only 2.92 GiB for KV at that setting, below the 3.32 GiB startup admission
+requirement for `max_model_len=10240`, so the 8192 row used 0.95 and retained
+15,667 KV tokens. GPU memory utilization changes the allocated KV pool rather
+than the active 8192-token execution, but a strict 0.95-versus-0.95 endpoint
+repeat remains outstanding. Subject to that caveat, one 8192-token chunk is
+5.73% faster than two 4096-token chunks.
+
+The exact 8192-token, 49,152-routed-row operator gate passed before the model
+run. Group-64 W13 measured 5.124 ms versus 54.956 ms legacy (10.72x); W2
+measured 3.237 ms versus 14.504 ms (4.48x). Both stages were cross-route and
+repeated-run bitwise equal over the complete output buffer.
+
+An official-sampling 8192/64 request completed all 64 tokens with 20.330 ms
+mean decode interval, but its continuation ended in an unrelated TypeScript
+fragment. It is not a text-quality pass. The speed route remains experimental
+until the same prompt and seed are compared with the 4096-token chunk path and
+the broader model-quality investigation is closed.
+
+Raw artifacts include:
+
+- `baseline-c4096-seed820{1..5}-fixed-i8192-o1.json`
+- `group64-c4096-seed840{1..5}-i8192-o1.json`
+- `group64-c8192-u095-seed860{1..5}-i8192-o1.json`
+- `microbench-grouped-prefill-chunk8192-random-b64.log`
+- `group64-c8192-u095-quality-i8192-o64.json`
+
+They are retained in
+`/home/fudanwl/v100-worktrees/runs/dsv4-prefill-trace-20260803/`.
+
 As a same-source preliminary reference, an earlier no-MTP run used runtime
 source `6f946b603a`, the same TP8 and KV-cache configuration, and 256 output
 tokens. Its exact 1024-token prompt had these request TTFT values:
