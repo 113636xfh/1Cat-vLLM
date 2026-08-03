@@ -18,6 +18,7 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_paged_fp8,
     sm70_sparse_attention_paged_fp8_splitk,
+    sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
 )
 from vllm.triton_utils import tl, triton
 
@@ -59,7 +60,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=("c4", "c128", "swa"), default="c4")
     parser.add_argument(
-        "--implementation", choices=("baseline", "splitk"), default="baseline"
+        "--implementation",
+        choices=("baseline", "splitk", "splitk-qk-dsplit"),
+        default="baseline",
     )
     parser.add_argument("--extra-len", type=int)
     parser.add_argument("--extra-width", type=int)
@@ -68,6 +71,7 @@ def main() -> None:
     parser.add_argument("--num-tokens", type=int, default=1)
     parser.add_argument("--stage1-block-h", type=int, choices=(4, 8), default=8)
     parser.add_argument("--stage1-warps", type=int, choices=(2, 4, 8), default=4)
+    parser.add_argument("--qk-block-d", type=int, choices=(32, 64, 128), default=64)
     parser.add_argument("--seed", type=int, default=4111)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -107,8 +111,8 @@ def main() -> None:
         )
         return
 
-    if args.compare_baseline and args.implementation != "splitk":
-        raise ValueError("baseline comparison requires --implementation splitk")
+    if args.compare_baseline and args.implementation == "baseline":
+        raise ValueError("baseline comparison requires a split-K implementation")
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     num_heads = 8
@@ -160,7 +164,7 @@ def main() -> None:
         extra_indices = None
         extra_lengths = None
 
-    if args.implementation == "splitk":
+    if args.implementation != "baseline":
         num_partials = math.ceil(main_indices.shape[-1] / 16)
         if extra_indices is not None:
             num_partials += math.ceil(extra_indices.shape[-1] / 16)
@@ -175,17 +179,47 @@ def main() -> None:
             dtype=torch.float32,
             device=device,
         )
+        partial_probs = (
+            torch.empty(
+                (q.shape[0], num_heads, num_partials, 16),
+                dtype=torch.float16,
+                device=device,
+            )
+            if args.implementation == "splitk-qk-dsplit"
+            else None
+        )
+        partial_qk = (
+            torch.empty(
+                (
+                    q.shape[0],
+                    num_heads,
+                    num_partials,
+                    q.shape[-1] // args.qk_block_d,
+                    16,
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+            if args.implementation == "splitk-qk-dsplit"
+            else None
+        )
     else:
         partial_max = None
         partial_sum = None
         partial_acc = None
+        partial_probs = None
+        partial_qk = None
 
     def run() -> None:
-        if args.implementation == "splitk":
+        if args.implementation != "baseline":
             assert partial_max is not None
             assert partial_sum is not None
             assert partial_acc is not None
-            sm70_sparse_attention_paged_fp8_splitk(
+            splitk_fn = {
+                "splitk": sm70_sparse_attention_paged_fp8_splitk,
+                "splitk-qk-dsplit": sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
+            }[args.implementation]
+            kwargs = dict(
                 q=q,
                 main_cache=main_cache,
                 main_indices=main_indices,
@@ -202,6 +236,14 @@ def main() -> None:
                 stage1_num_warps=args.stage1_warps,
                 stage1_block_h=args.stage1_block_h,
             )
+            if args.implementation == "splitk-qk-dsplit":
+                assert partial_probs is not None
+                kwargs["partial_probs"] = partial_probs
+            if args.implementation == "splitk-qk-dsplit":
+                assert partial_qk is not None
+                kwargs["partial_qk"] = partial_qk
+                kwargs["block_d"] = args.qk_block_d
+            splitk_fn(**kwargs)
         else:
             sm70_sparse_attention_paged_fp8(
                 q=q,
@@ -280,6 +322,7 @@ def main() -> None:
         "num_tokens": num_tokens,
         "stage1_block_h": args.stage1_block_h,
         "stage1_warps": args.stage1_warps,
+        "qk_block_d": args.qk_block_d,
         "num_heads": num_heads,
         "main_len": main_len,
         "main_width": main_width,

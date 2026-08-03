@@ -23,6 +23,7 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
     sm70_sparse_attention_paged_fp8,
     sm70_sparse_attention_paged_fp8_splitk,
+    sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
@@ -202,21 +203,42 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 else topk_indices.reshape(num_decode_tokens, -1).shape[1]
             )
             num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
-            partial_max, partial_sum, partial_acc = (
-                current_workspace_manager().get_simultaneous(
-                    ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
-                    ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
+            use_qk_dsplit = envs.VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT
+            workspace_specs = [
+                ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
+                ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
+                (
+                    (num_decode_tokens, q.shape[1], num_partials, q.shape[2]),
+                    torch.float32,
+                ),
+            ]
+            if use_qk_dsplit:
+                workspace_specs.extend(
                     (
-                        (num_decode_tokens, q.shape[1], num_partials, q.shape[2]),
-                        torch.float32,
-                    ),
+                        (
+                            (
+                                num_decode_tokens,
+                                q.shape[1],
+                                num_partials,
+                                q.shape[2] // 64,
+                                16,
+                            ),
+                            torch.float32,
+                        ),
+                        (
+                            (num_decode_tokens, q.shape[1], num_partials, 16),
+                            torch.float16,
+                        ),
+                    )
                 )
-            )
+            workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
+            partial_max, partial_sum, partial_acc = workspaces[:3]
             logger.info_once(
-                "DeepSeek V4 SM70 %s sparse MLA split-K enabled.",
+                "DeepSeek V4 SM70 %s sparse MLA split-K%s enabled.",
                 "SWA-only" if swa_only else f"C{layer.compress_ratio}",
+                " QK-D split" if use_qk_dsplit else "",
             )
-            sm70_sparse_attention_paged_fp8_splitk(
+            common_kwargs = dict(
                 q=q,
                 main_cache=layer.swa_cache_layer.kv_cache,
                 main_indices=swa_indices,
@@ -231,6 +253,15 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 partial_sum=partial_sum,
                 partial_acc=partial_acc,
             )
+            if use_qk_dsplit:
+                partial_qk, partial_probs = workspaces[3:]
+                sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
+                    partial_qk=partial_qk,
+                    partial_probs=partial_probs,
+                    **common_kwargs,
+                )
+            else:
+                sm70_sparse_attention_paged_fp8_splitk(**common_kwargs)
         else:
             sm70_sparse_attention_paged_fp8(
                 q=q,
