@@ -276,11 +276,14 @@ def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
 def test_mxfp4_sm70_m8_dispatch_selects_fixed_active_slots(monkeypatch):
     buffers = {
         "compact_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "slot_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(48, dtype=torch.int32),
         "active_expert_ids": torch.arange(48, dtype=torch.int32),
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
     monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -291,6 +294,30 @@ def test_mxfp4_sm70_m8_dispatch_selects_fixed_active_slots(monkeypatch):
 
     assert offsets is buffers["compact_expert_offsets"]
     assert expert_ids is buffers["active_expert_ids"]
+    assert count == 48
+
+
+def test_mxfp4_sm70_m8_grouped_dispatch_keeps_one_row_slots(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "slot_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(48, dtype=torch.int32).flip(0),
+        "active_expert_ids": torch.arange(48, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=8,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    assert offsets is buffers["slot_expert_offsets"]
+    assert expert_ids is buffers["permuted_experts_id"]
     assert count == 48
 
 
@@ -309,7 +336,7 @@ def test_mxfp4_sm70_active_expert_compaction_replays_dynamic_routes():
 
     graph = torch.cuda.CUDAGraph()
     _compact_mxfp4_active_experts(sorted_ids, compact_offsets, active_ids)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     with torch.cuda.graph(graph):
         _compact_mxfp4_active_experts(sorted_ids, compact_offsets, active_ids)
 
@@ -329,7 +356,7 @@ def test_mxfp4_sm70_active_expert_compaction_replays_dynamic_routes():
 
     sorted_ids.copy_(torch.arange(48, dtype=torch.int32, device="cuda"))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     torch.testing.assert_close(active_ids.cpu(), torch.arange(48, dtype=torch.int32))
     torch.testing.assert_close(
         compact_offsets.cpu(), torch.arange(49, dtype=torch.int32)

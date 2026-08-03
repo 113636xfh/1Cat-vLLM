@@ -60,6 +60,10 @@ def _mxfp4_active_expert_max_tokens() -> int:
     )
 
 
+def _mxfp4_grouped_m8_enabled() -> bool:
+    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8)
+
+
 @triton.jit
 def _compact_sorted_experts_kernel(
     sorted_expert_ids_ptr,
@@ -136,6 +140,12 @@ def _select_mxfp4_stage_dispatch(
         # tail entries as zero-row experts, avoiding a host readback of the
         # dynamic unique-expert count.
         graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        if num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled():
+            return (
+                buffers["slot_expert_offsets"],
+                buffers["permuted_experts_id"],
+                graph_expert_slots,
+            )
         return (
             buffers["compact_expert_offsets"],
             (
@@ -504,6 +514,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_compact_expert_offsets64 = torch.arange(
             max_slots + 1, dtype=torch.int64, device=device
         )
+        layer._mxfp4_sm70_buf_slot_expert_offsets = torch.arange(
+            max_slots + 1, dtype=torch.int32, device=device
+        )
         layer._mxfp4_sm70_buf_active_expert_ids = torch.empty(
             max_slots, dtype=torch.int32, device=device
         )
@@ -541,6 +554,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             ),
             "compact_expert_offsets64": (
                 layer._mxfp4_sm70_buf_compact_expert_offsets64[: total_slots + 1]
+            ),
+            "slot_expert_offsets": (
+                layer._mxfp4_sm70_buf_slot_expert_offsets[: total_slots + 1]
             ),
             "active_expert_ids": (
                 layer._mxfp4_sm70_buf_active_expert_ids[:total_slots]
@@ -611,6 +627,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
             "compact_expert_offsets64": (
                 layer._mxfp4_sm70_buf_compact_expert_offsets64
+            ),
+            "slot_expert_offsets": torch.arange(
+                total_slots + 1, dtype=torch.int32, device=device
             ),
             "active_expert_ids": torch.empty(
                 total_slots, dtype=torch.int32, device=device
@@ -747,6 +766,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         if (
             num_tokens > 1
             and num_tokens <= _mxfp4_active_expert_max_tokens()
+            and not (
+                num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled()
+            )
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
         ):

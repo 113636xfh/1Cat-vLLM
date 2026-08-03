@@ -183,6 +183,61 @@ A same-contract no-speculation regression run measures 15.377 ms/token, or
 difference is noise, so extending graph-safe buffers through M=8 does not
 regress the B=1 path.
 
+## M=8 Slot-Grouped Candidate
+
+The remaining 4,128 MoE calls are launch organization, not required arithmetic.
+The first candidate sent compact unique experts through TurboMind's generic
+grouped scheduler. It was fast, but rejected: kernel autotuning changed the
+accumulation tactic for one seed, and an eight-row hot-expert case changed W2
+by up to 0.25. Reusing a single-group dispatch tactic fixed the mixed case but
+not the multi-row W2 case.
+
+The admitted microbenchmark candidate keeps all 48 routed slots as independent
+one-row groups. Repeated expert IDs reuse their original packed weight pointer;
+no weight, activation, or scale is converted. This reuses the accepted compact
+B1 scheduler and replaces 48 stage calls with one fixed-shape call. A separate
+immutable `arange(49)` offsets buffer prevents M=2-M=7 graph replays from
+polluting M=8 metadata.
+
+| M=8 route distribution | Active-48 loop | Slot-grouped | Speedup | Numeric gate |
+|---|---:|---:|---:|---|
+| Mixed, 34 unique experts | 1.535 ms | 0.472 ms | 3.25x | Bitwise, max abs 0 |
+| 48 unique experts | 1.380 ms | 0.184 ms | 7.49x | Bitwise, max abs 0 |
+| Six experts with eight rows each | 0.708 ms | 0.281 ms | 2.52x | Bitwise, max abs 0 |
+
+Each timing covers one complete layer pipeline: permute, W13, clamped SwiGLU,
+W2, and unpermute under CUDA Graph. All cases also pass changed-route replay.
+
+The same-contract TP8 endpoint gate passes:
+
+| Seed | Active-48 token/s | Slot-grouped token/s | Gain | Slot-grouped TPOT |
+|---:|---:|---:|---:|---:|
+| 4201 | 22.179 | 29.747 | +34.1% | 33.616 ms |
+| 4202 | 15.024 | 32.416 | +115.8% | 30.849 ms |
+| 4203 | 16.545 | 30.420 | +83.9% | 32.873 ms |
+
+Median throughput rises from 16.545 to 30.420 token/s (+83.9%), while median
+TPOT falls from 60.441 to 32.873 ms (-45.6%). Aggregate emitted tokens per
+stream chunk are 1.580 for active-48 and 1.571 for slot-grouped, so acceptance
+does not explain the gain. The official-sampling quality request emits two
+coherent sentences and stops naturally after 66 tokens.
+
+The synchronized profile reports 11 steady eight-step intervals:
+
+| Round component | Active-48 | Slot-grouped | Change |
+|---|---:|---:|---:|
+| Target forward, M=8 | 78.779 ms | 42.394 ms | -46.2% |
+| Target logits | 0.354 ms | 0.352 ms | -0.6% |
+| Rejection sample | 0.447 ms | 0.457 ms | +2.2% |
+| Draft GPU | 6.746 ms | 4.709 ms | -30.2% |
+| GPU serial subtotal | 86.416 ms | 47.923 ms | -44.5% |
+
+The unprofiled request timeline is approximately 51 ms per speculative round,
+leaving about 3 ms outside the profiled GPU subtotal. At the measured 1.571
+emitted tokens per round, matching the 15.357 ms no-speculation TPOT would
+require a round below 24.1 ms. Slot grouping removes the launch explosion but
+does not by itself make low-acceptance DSpark faster than no speculation.
+
 ## Experiment Log
 
 | Date | Source | Test | Result | Decision |
@@ -200,6 +255,12 @@ regress the B=1 path.
 | 2026-08-03 | candidate | Official-sampling natural stop | Coherent two-sentence response; `finish_reason=stop` | Accept text-health gate |
 | 2026-08-03 | candidate | Post-change graph-node trace | 23,909 -> 6,021 nodes; current MoE is 64.8% | Target active W13/W2 next |
 | 2026-08-03 | candidate | No-speculation B=1 regression | 15.377 ms/token, 65.03 token/s | Accept regression gate |
+| 2026-08-03 | candidate | Generic grouped M=8, multiple seeds | Fast but W13/final drift up to 0.125 | Reject changed tactic |
+| 2026-08-03 | candidate | Generic grouped M=8 hot-six route | W2 drift up to 0.25 | Reject multi-row grouped path |
+| 2026-08-03 | candidate | Slot-grouped M=8, three route distributions | 2.52-7.49x; all stages/replays bitwise | Admit to TP8 endpoint gate |
+| 2026-08-03 | candidate | Slot-grouped TP8 matched seeds | Median 16.545 -> 30.420 token/s; acceptance flat | Accept endpoint speed gate |
+| 2026-08-03 | candidate | Slot-grouped synchronized profile | Target 78.779 -> 42.394 ms | Accept verifier transfer gate |
+| 2026-08-03 | candidate | Slot-grouped official-sampling natural stop | Coherent two-sentence response; 66 tokens | Accept quality gate |
 
 ## Artifacts
 
@@ -225,6 +286,8 @@ Retained remote root:
 - Post-change trace: `dspark7-active48-i1k-o16-node.sqlite` and
   `dspark7-active48-node-trace-comparison.json`.
 - No-speculation regression: `nospec-active48-regression-seed4201.json`.
+- Slot-grouped microbenchmarks and endpoint/profile artifacts:
+  `/home/fudanwl/v100-worktrees/runs/dsv4-dspark-grouped-m8-20260803`.
 
 Disabling prefix caching and reducing `max_num_batched_tokens` to 2048 did not
 recover the gap; those paths were rejected. The task-owned API service must be

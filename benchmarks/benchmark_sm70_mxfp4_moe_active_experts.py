@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 
 import torch
@@ -103,19 +104,19 @@ def _capture(fn) -> torch.cuda.CUDAGraph:
     with torch.cuda.stream(stream):
         fn()
     torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return graph
 
 
 def _time_graph(graph: torch.cuda.CUDAGraph, repeats: int) -> float:
     for _ in range(5):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -199,7 +200,7 @@ def _validate_permute_contract(
         shape.n,
         32,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     expected_sorted = sorted(route)
     actual_sorted = permuted_experts_id.cpu().tolist()
     result = {
@@ -271,7 +272,7 @@ def benchmark_stage(
 
     dense_call()
     active_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     initial_equal = torch.equal(dense_out, active_out)
     initial_max_abs = float((dense_out - active_out).abs().max().item())
 
@@ -282,7 +283,7 @@ def benchmark_stage(
 
     active_ids.copy_(torch.tensor(route_b, dtype=torch.int32, device=device))
     active_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     route_b_graph_out = active_out.clone()
 
     dense_offsets.copy_(
@@ -291,13 +292,13 @@ def benchmark_stage(
         )
     )
     dense_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     replay_equal = torch.equal(dense_out, route_b_graph_out)
     replay_max_abs = float((dense_out - route_b_graph_out).abs().max().item())
 
     active_ids.copy_(torch.tensor(route_a, dtype=torch.int32, device=device))
     active_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     route_a_graph_out = active_out.clone()
     route_changes_output = not torch.equal(route_a_graph_out, route_b_graph_out)
 
@@ -499,7 +500,7 @@ def benchmark_full_pipeline(
 
     generic_call()
     direct_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     initial_equal = torch.equal(generic["output"], direct["output"])
     initial_max_abs = float((generic["output"] - direct["output"]).abs().max().item())
     stage_parity = {
@@ -532,7 +533,7 @@ def benchmark_full_pipeline(
     topk_ids.copy_(torch.tensor([route_b], dtype=torch.int32, device=device))
     generic_graph.replay()
     direct_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     replay_equal = torch.equal(generic["output"], direct["output"])
     replay_max_abs = float((generic["output"] - direct["output"]).abs().max().item())
 
@@ -558,8 +559,9 @@ def benchmark_verifier_m8_pipeline(
     top_k: int,
     repeats: int,
     seed: int,
+    route_case: str = "mixed",
 ) -> dict[str, object]:
-    """Compare dense-256 and graph-safe active-48 verifier MoE pipelines."""
+    """Compare dense-256, active-48 loop, and grouped verifier pipelines."""
     num_tokens = 8
     if num_experts != 256 or top_k != 6:
         raise ValueError("The verifier benchmark requires 256 experts/top-k=6")
@@ -575,12 +577,30 @@ def benchmark_verifier_m8_pipeline(
     # Keep prepared storage alive for the pointer tables.
     _storage = (w13_weights, w13_scales, w2_weights, w2_scales)
 
-    route_a = [
-        [3, 17 + row, 42, 99 + row, 128 + row, 255 - row] for row in range(num_tokens)
-    ]
-    route_b = [
-        [1, 9 + row, 63, 111 + row, 177 + row, 240 - row] for row in range(num_tokens)
-    ]
+    route_cases = {
+        "mixed": (
+            [
+                [3, 17 + row, 42, 99 + row, 128 + row, 255 - row]
+                for row in range(num_tokens)
+            ],
+            [
+                [1, 9 + row, 63, 111 + row, 177 + row, 240 - row]
+                for row in range(num_tokens)
+            ],
+        ),
+        "unique48": (
+            [list(range(row * top_k, (row + 1) * top_k)) for row in range(num_tokens)],
+            [
+                list(range(49 + row * top_k, 49 + (row + 1) * top_k))
+                for row in range(num_tokens)
+            ],
+        ),
+        "hot6": (
+            [[3, 17, 42, 99, 128, 255] for _ in range(num_tokens)],
+            [[1, 9, 63, 111, 177, 240] for _ in range(num_tokens)],
+        ),
+    }
+    route_a, route_b = route_cases[route_case]
     topk_ids = torch.tensor(route_a, dtype=torch.int32, device=device)
     topk_weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device=device)
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
@@ -637,7 +657,7 @@ def benchmark_verifier_m8_pipeline(
             "dense_expert_ids": torch.arange(
                 num_experts, dtype=torch.int32, device=device
             ),
-            "compact_offsets": torch.empty(
+            "compact_offsets": torch.arange(
                 total_slots + 1, dtype=torch.int32, device=device
             ),
             "active_expert_ids": torch.empty(
@@ -647,8 +667,12 @@ def benchmark_verifier_m8_pipeline(
 
     dense = make_buffers()
     active = make_buffers()
+    grouped = make_buffers()
 
-    def pipeline_call(buffers: dict[str, torch.Tensor], active_only: bool) -> None:
+    def pipeline_call(
+        buffers: dict[str, torch.Tensor], *, active_only: bool, grouped_m8: bool
+    ) -> None:
+        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8"] = "1" if grouped_m8 else "0"
         buffers["output"].zero_()
         buffers["topk_ids_i32"].copy_(topk_ids)
         buffers["permuted_idx"].fill_(total_slots)
@@ -671,13 +695,16 @@ def benchmark_verifier_m8_pipeline(
         )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"])
         if active_only:
-            _compact_mxfp4_active_experts(
-                buffers["permuted_experts_id"],
-                buffers["compact_offsets"],
-                buffers["active_expert_ids"],
-            )
             stage_offsets = buffers["compact_offsets"]
-            stage_expert_ids = buffers["active_expert_ids"]
+            if grouped_m8:
+                stage_expert_ids = buffers["permuted_experts_id"]
+            else:
+                _compact_mxfp4_active_experts(
+                    buffers["permuted_experts_id"],
+                    buffers["compact_offsets"],
+                    buffers["active_expert_ids"],
+                )
+                stage_expert_ids = buffers["active_expert_ids"]
             stage_expert_count = total_slots
         else:
             stage_offsets = buffers["expert_offsets"]
@@ -720,17 +747,30 @@ def benchmark_verifier_m8_pipeline(
         )
 
     def dense_call() -> None:
-        pipeline_call(dense, False)
+        pipeline_call(dense, active_only=False, grouped_m8=False)
 
     def active_call() -> None:
-        pipeline_call(active, True)
+        pipeline_call(active, active_only=True, grouped_m8=False)
+
+    def grouped_call() -> None:
+        pipeline_call(grouped, active_only=True, grouped_m8=True)
 
     dense_call()
     active_call()
-    torch.cuda.synchronize()
+    grouped_call()
+    torch.accelerator.synchronize()
     initial_equal = torch.equal(dense["output"], active["output"])
+    grouped_initial_equal = torch.equal(dense["output"], grouped["output"])
     stage_parity = {
         name: torch.equal(dense[name], active[name])
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    }
+    grouped_stage_parity = {
+        name: torch.equal(dense[name], grouped[name])
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    }
+    grouped_stage_max_abs = {
+        name: float((dense[name] - grouped[name]).abs().max().item())
         for name in ("gate_up", "intermediate", "sorted_output", "output")
     }
     expected_active_ids = sorted({expert for row in route_a for expert in row})
@@ -739,43 +779,62 @@ def benchmark_verifier_m8_pipeline(
 
     dense_graph = _capture(dense_call)
     active_graph = _capture(active_call)
+    grouped_graph = _capture(grouped_call)
     dense_ms = _time_graph(dense_graph, repeats)
     active_ms = _time_graph(active_graph, repeats)
+    grouped_ms = _time_graph(grouped_graph, repeats)
 
     topk_ids.copy_(torch.tensor(route_b, dtype=torch.int32, device=device))
     dense_graph.replay()
     active_graph.replay()
-    torch.cuda.synchronize()
+    grouped_graph.replay()
+    torch.accelerator.synchronize()
     replay_equal = torch.equal(dense["output"], active["output"])
     replay_max_abs = float((dense["output"] - active["output"]).abs().max().item())
-    route_b_output = active["output"].clone()
+    grouped_replay_equal = torch.equal(dense["output"], grouped["output"])
+    grouped_replay_max_abs = float(
+        (dense["output"] - grouped["output"]).abs().max().item()
+    )
+    route_b_output = grouped["output"].clone()
 
     topk_ids.copy_(torch.tensor(route_a, dtype=torch.int32, device=device))
-    active_graph.replay()
-    torch.cuda.synchronize()
-    route_changes_output = not torch.equal(active["output"], route_b_output)
+    grouped_graph.replay()
+    torch.accelerator.synchronize()
+    route_changes_output = not torch.equal(grouped["output"], route_b_output)
 
     result = {
+        "route_case": route_case,
         "num_tokens": num_tokens,
         "total_routed_slots": total_slots,
         "unique_active_experts": len(expected_active_ids),
         "fixed_graph_expert_slots": total_slots,
         "dense_graph_ms": dense_ms,
         "active_graph_ms": active_ms,
+        "grouped_graph_ms": grouped_ms,
         "speedup": dense_ms / active_ms,
+        "grouped_vs_active_speedup": active_ms / grouped_ms,
+        "grouped_projected_savings_ms_per_43_layers": (active_ms - grouped_ms) * 43,
         "projected_savings_ms_per_43_layers": (dense_ms - active_ms) * 43,
         "initial_bitwise_equal": initial_equal,
+        "grouped_initial_bitwise_equal": grouped_initial_equal,
         "initial_stage_bitwise_equal": stage_parity,
+        "grouped_initial_stage_bitwise_equal": grouped_stage_parity,
+        "grouped_initial_stage_max_abs": grouped_stage_max_abs,
         "compact_ids_match": compact_ids_match,
         "dynamic_replay_bitwise_equal": replay_equal,
         "dynamic_replay_max_abs": replay_max_abs,
+        "grouped_dynamic_replay_bitwise_equal": grouped_replay_equal,
+        "grouped_dynamic_replay_max_abs": grouped_replay_max_abs,
         "dynamic_route_changes_output": route_changes_output,
     }
     if not (
         initial_equal
         and all(stage_parity.values())
+        and grouped_initial_equal
+        and all(grouped_stage_parity.values())
         and compact_ids_match
         and replay_equal
+        and grouped_replay_equal
         and route_changes_output
     ):
         raise RuntimeError(f"MXFP4 verifier M8 correctness gate failed: {result}")
@@ -818,11 +877,11 @@ def profile_active_stage_once(
 
     for _ in range(5):
         active_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.cuda.cudart().cudaProfilerStart()
     active_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     return {
         "stage": shape.name,
@@ -845,6 +904,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-pipeline", action="store_true")
     parser.add_argument("--verifier-m8-pipeline", action="store_true")
     parser.add_argument(
+        "--route-case",
+        choices=("mixed", "unique48", "hot6"),
+        default="mixed",
+        help="Verifier M8 expert-overlap distribution.",
+    )
+    parser.add_argument(
         "--profile-active-once",
         action="store_true",
         help="Warm up, then CUDA-profiler capture one six-expert stage.",
@@ -861,6 +926,7 @@ def main() -> int:
             top_k=args.top_k,
             repeats=args.repeats,
             seed=args.seed,
+            route_case=args.route_case,
         )
         print(
             json.dumps(
