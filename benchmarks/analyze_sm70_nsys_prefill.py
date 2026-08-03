@@ -8,7 +8,20 @@ from __future__ import annotations
 import argparse
 import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Kernel:
+    start: int
+    end: int
+    graph_node: int | None
+    name: str
+    grid: tuple[int, int, int]
+    block: tuple[int, int, int]
+    registers: int
+    dynamic_smem: int
 
 
 def _category(name: str) -> str:
@@ -93,32 +106,62 @@ def main() -> int:
     rows = list(
         connection.execute(
             """
-            SELECT k.deviceId, k.start, k.end, k.graphNodeId, s.value
+            SELECT k.deviceId, k.start, k.end, k.graphNodeId, s.value,
+                   k.gridX, k.gridY, k.gridZ,
+                   k.blockX, k.blockY, k.blockZ,
+                   k.registersPerThread, k.dynamicSharedMemory
             FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
             JOIN StringIds AS s ON s.id = k.demangledName
             ORDER BY k.deviceId, k.start
             """
         )
     )
-    by_device: dict[int, list[tuple[int, int, int | None, str]]] = defaultdict(list)
-    for device, start, end, graph_node, name in rows:
-        by_device[device].append((start, end, graph_node, name))
+    by_device: dict[int, list[Kernel]] = defaultdict(list)
+    for (
+        device,
+        start,
+        end,
+        graph_node,
+        name,
+        grid_x,
+        grid_y,
+        grid_z,
+        block_x,
+        block_y,
+        block_z,
+        registers,
+        dynamic_smem,
+    ) in rows:
+        by_device[device].append(
+            Kernel(
+                start=start,
+                end=end,
+                graph_node=graph_node,
+                name=name,
+                grid=(grid_x, grid_y, grid_z),
+                block=(block_x, block_y, block_z),
+                registers=registers,
+                dynamic_smem=dynamic_smem,
+            )
+        )
 
-    selected: dict[int, list[tuple[int, int, str]]] = {}
+    selected: dict[int, list[Kernel]] = {}
     for device, kernels in by_device.items():
-        graph_starts = [start for start, _, graph, _ in kernels if graph is not None]
+        graph_starts = [
+            kernel.start for kernel in kernels if kernel.graph_node is not None
+        ]
         cutoff = min(graph_starts) if args.before_first_graph and graph_starts else None
         selected[device] = [
-            (start, end, name)
-            for start, end, graph, name in kernels
-            if (cutoff is None or (graph is None and end <= cutoff))
+            kernel
+            for kernel in kernels
+            if (cutoff is None or (kernel.graph_node is None and kernel.end <= cutoff))
         ]
 
     summaries = {}
     for device, kernels in selected.items():
         if not kernels:
             continue
-        intervals = [(start, end) for start, end, _ in kernels]
+        intervals = [(kernel.start, kernel.end) for kernel in kernels]
         start = min(item[0] for item in intervals)
         end = max(item[1] for item in intervals)
         summaries[device] = {
@@ -145,17 +188,33 @@ def main() -> int:
     if device is None:
         device = max(summaries, key=lambda item: summaries[item]["envelope_ns"])
     kernels = selected[device]
-    total_service_ns = sum(end - start for start, end, _ in kernels)
+    total_service_ns = sum(kernel.end - kernel.start for kernel in kernels)
 
     categories: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    kernel_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    for start, end, name in kernels:
-        duration = end - start
-        category = _category(name)
+    kernel_totals: dict[
+        tuple[
+            str,
+            tuple[int, int, int],
+            tuple[int, int, int],
+            int,
+            int,
+        ],
+        list[int],
+    ] = defaultdict(lambda: [0, 0])
+    for kernel in kernels:
+        duration = kernel.end - kernel.start
+        category = _category(kernel.name)
         categories[category][0] += duration
         categories[category][1] += 1
-        kernel_totals[name][0] += duration
-        kernel_totals[name][1] += 1
+        signature = (
+            kernel.name,
+            kernel.grid,
+            kernel.block,
+            kernel.registers,
+            kernel.dynamic_smem,
+        )
+        kernel_totals[signature][0] += duration
+        kernel_totals[signature][1] += 1
 
     print(f"\nCritical device: {device}")
     print("category                            service_ms  service_%  launches")
@@ -168,13 +227,17 @@ def main() -> int:
         )
 
     print("\nTop kernels by summed service time")
-    print("service_ms  service_%  launches  kernel")
-    for name, (duration, count) in sorted(
+    print("service_ms  service_%  launches  launch geometry and kernel")
+    for signature, (duration, count) in sorted(
         kernel_totals.items(), key=lambda item: item[1][0], reverse=True
     )[: args.top_kernels]:
+        name, grid, block, registers, dynamic_smem = signature
+        geometry = (
+            f"grid={grid} block={block} regs={registers} dynamic_smem={dynamic_smem}B"
+        )
         print(
             f"{duration / 1e6:>10.3f}  {duration / total_service_ns * 100:>8.2f}  "
-            f"{count:>8}  {_short_name(name)}"
+            f"{count:>8}  {geometry}  {_short_name(name)}"
         )
     return 0
 
