@@ -205,6 +205,7 @@ from vllm.v1.spec_decode.draft_prob_alignment import (
     clone_draft_prob_token_ids,
     get_aligned_draft_probs,
 )
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -1358,6 +1359,7 @@ class GPUModelRunner(
         draft_vocab_config = resolve_mtp_draft_vocab_config(
             (self.speculative_config.method or "") if self.speculative_config else "",
             self.parallel_config.tensor_parallel_size,
+            self.model_config.architecture,
         )
         self.dynamic_draft_vocab_prefill_topk = draft_vocab_config.prefill_topk
         validate_dynamic_draft_vocab_prefill_topk(
@@ -1421,6 +1423,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DSparkProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -1462,6 +1465,9 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_dspark():
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = (
@@ -9866,6 +9872,13 @@ class GPUModelRunner(
 
             if eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
+        if not layer_ids:
+            dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+            if dspark_layer_ids:
+                # DSpark config uses zero-based decoder-layer IDs; the target
+                # model's capture interface numbers outputs after each layer.
+                layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
