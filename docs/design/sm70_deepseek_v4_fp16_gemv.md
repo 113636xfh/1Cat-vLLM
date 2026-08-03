@@ -91,3 +91,29 @@ Trace artifact:
   warmup_i1024_o32.json
   trace_request_i1024_o64.json
 ```
+
+## Rejected Router Fusion
+
+A last-CTA Triton prototype fused the FP16 router GEMV with
+`sqrt(softplus)`, correction bias, top-6 selection, and normalization. The
+single-layer microbenchmark overestimated the saving because the 2 MiB gate
+weight stayed hot in L2. A 40-layer CUDA Graph using every regular router
+weight (`layers.3..42`) measured the actual per-token chain:
+
+| route | 40-layer median | delta |
+|---|---:|---:|
+| Separate FP16 GEMV + C++ top-k | 0.5201 ms | baseline |
+| Fused, 128 CTAs | 0.4551 ms | -0.0650 ms |
+| Fused, 256 CTAs | 0.3861 ms | -0.1340 ms |
+
+All 40 top-6 ID sets matched the separate route, with maximum normalized
+weight difference `1.05e-7`. The best saving is only 0.66% of the 20.276 ms
+endpoint baseline, below the 0.2 ms/token admission threshold. The prototype
+is retained as a benchmark but is not integrated into production dispatch.
+
+Artifact:
+
+```text
+/home/fudanwl/v100-worktrees/runs/dsv4-sm70-fused-router-20260803/
+  v5-all40.json
+```
