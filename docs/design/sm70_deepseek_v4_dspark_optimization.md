@@ -25,8 +25,10 @@ execution, Marlin, altered model weights, or reduced-precision shortcuts.
   Markov samples, verifier width `N + 1`
 - Drafter attention: DeepSeek V4 SM70 sparse SWA with DSpark non-causal indices
 - Initial workload: exactly 1024 prompt tokens and at most 256 output tokens
-- Sampling: official target `temperature=1.0`, `top_p=1.0` for non-agentic
-  workloads; official DSpark draft sampling is greedy; natural EOS is preserved
+- Sampling: target `temperature=1.0`, `top_p=1.0` for non-agentic workloads;
+  the public V4 model-card route uses greedy drafts, while paper-comparable
+  acceptance uses probabilistic drafts and standard rejection sampling;
+  natural EOS is preserved
 - Bring-up context limit and token budget: 2048, sufficient for the exact
   1024-token prompt plus 256-token decode workload
 - Active-expert candidate: disabled during the first MTP/no-MTP comparison
@@ -51,12 +53,13 @@ namespace, not evidence that the ordinary vLLM MTP architecture applies.
 
 ## Speculative Width
 
-The checkpoint stores `dspark_block_size=5`, and its bundled reference runner
-generates five draft tokens. The official DeepSeek model-card vLLM command uses
-`N=7` with greedy draft sampling, and the released DeepSpec checkpoints use
-block seven. Therefore `N=7` is fixed for this route. The earlier `N=4` and
-`N=5` runs remain diagnostics only; do not spend another model startup on
-`N=16` without new acceptance evidence that can repay its wider verifier.
+The checkpoint stores `dspark_block_size=5`, and the DSpark paper's V4
+production route uses a maximum width of five with confidence scheduling. The
+public DeepSeek model-card vLLM command instead uses `N=7` with greedy draft
+sampling. Keep `N=7` as the current model-card deployment baseline, but do not
+treat it as the paper's V4 production contract. See
+`sm70_deepseek_v4_dspark_acceptance.md` before running another width or
+acceptance experiment.
 
 ## Measurement Order
 
