@@ -34,10 +34,17 @@ STAGES = {
 }
 
 
-def _require_sm70() -> None:
-    if not torch.cuda.is_available():
+def _cuda_device_module():
+    if not torch.accelerator.is_available():
         raise RuntimeError("CUDA is required")
-    capability = torch.cuda.get_device_capability()
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or accelerator.type != "cuda":
+        raise RuntimeError(f"CUDA is required, got {accelerator}")
+    return torch.get_device_module(accelerator)
+
+
+def _require_sm70() -> None:
+    capability = _cuda_device_module().get_device_capability()
     if capability != (7, 0):
         raise RuntimeError(f"This benchmark requires SM70, got SM{capability}")
     for op_name in (
@@ -115,14 +122,14 @@ def _offsets_from_counts(counts: list[int], device: torch.device) -> torch.Tenso
 def _measure(call, repeats: int) -> dict[str, object]:
     for _ in range(3):
         call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     gpu_ms: list[float] = []
     wall_ms: list[float] = []
     for _ in range(repeats):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
+        torch.accelerator.synchronize()
         wall_start = time.perf_counter()
         start.record()
         call()
@@ -227,20 +234,20 @@ def _run_stage(
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "0"
         output.fill_(7.0)
         call()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         legacy_output = output.clone()
 
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL"] = "1"
         output.fill_(7.0)
         call()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         grouped_output = output.clone()
         cross_route_equal = torch.equal(legacy_output, grouped_output)
         cross_route_max_abs = float((legacy_output - grouped_output).abs().max().item())
 
         output.fill_(7.0)
         call()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         repeated_output = output
         repeat_equal = torch.equal(grouped_output, repeated_output)
         repeat_max_abs = float((grouped_output - repeated_output).abs().max().item())
@@ -289,7 +296,7 @@ def _run_stage(
     if not cross_route_equal or not repeat_equal:
         raise RuntimeError(f"Grouped MXFP4 prefill correctness gate failed: {result}")
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     del weights, scales
     return result
 
@@ -354,7 +361,7 @@ def main() -> int:
         json.dumps(
             {
                 "benchmark": "sm70_mxfp4_moe_grouped_prefill",
-                "device": torch.cuda.get_device_name(),
+                "device": _cuda_device_module().get_device_name(),
                 "results": results,
             },
             indent=2,
