@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import MethodType, SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -57,6 +59,8 @@ def test_dspark_markov_sampling_is_sequential(
     proposer = object.__new__(DSparkProposer)
     proposer.num_speculative_tokens = num_speculative_tokens
     proposer.model = _FakeDSparkModel()
+    proposer._enable_probabilistic_draft_probs = False
+    proposer._static_draft_vocab = None
     proposer.input_ids = torch.zeros(2 * num_speculative_tokens, dtype=torch.int32)
     proposer.input_ids[0] = 1
     proposer.input_ids[num_speculative_tokens] = 4
@@ -71,6 +75,55 @@ def test_dspark_markov_sampling_is_sequential(
     )
 
     assert draft_probs is None
+    expected = [
+        [
+            (anchor + step + 1) % _FakeDSparkModel.vocab_size
+            for step in range(num_speculative_tokens)
+        ]
+        for anchor in (1, 4)
+    ]
+    assert output.view(2, num_speculative_tokens).tolist() == expected
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [5, 7])
+def test_dspark_probabilistic_sampling_returns_sequential_probs(
+    num_speculative_tokens: int,
+) -> None:
+    proposer = object.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = num_speculative_tokens
+    proposer.model = _FakeDSparkModel()
+    proposer._enable_probabilistic_draft_probs = True
+    proposer._static_draft_vocab = None
+    proposer.input_ids = torch.zeros(2 * num_speculative_tokens, dtype=torch.int32)
+    proposer.input_ids[0] = 1
+    proposer.input_ids[num_speculative_tokens] = 4
+    proposer._anchor_indices = torch.tensor(
+        [0, num_speculative_tokens], dtype=torch.int64
+    )
+
+    def sample_from_logits(
+        self: DSparkProposer,
+        logits: torch.Tensor,
+        sampling_metadata: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del self, sampling_metadata
+        return logits.argmax(dim=-1), logits.softmax(dim=-1)
+
+    proposer._sample_from_logits = MethodType(sample_from_logits, proposer)
+    hidden_states = torch.zeros(2 * num_speculative_tokens, 2)
+    metadata = SimpleNamespace(all_greedy=False)
+
+    output, draft_probs = proposer._sample_draft_tokens(
+        hidden_states,
+        sampling_metadata=metadata,  # type: ignore[arg-type]
+    )
+
+    assert draft_probs is not None
+    assert draft_probs.shape == (
+        2 * num_speculative_tokens,
+        _FakeDSparkModel.vocab_size,
+    )
+    assert torch.equal(draft_probs.argmax(dim=-1), output)
     expected = [
         [
             (anchor + step + 1) % _FakeDSparkModel.vocab_size

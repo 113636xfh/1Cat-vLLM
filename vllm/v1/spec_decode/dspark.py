@@ -18,11 +18,6 @@ class DSparkProposer(DFlashProposer):
         runner=None,
     ) -> None:
         super().__init__(vllm_config, device, runner)
-        if self.speculative_config.draft_sample_method != "greedy":
-            raise ValueError(
-                "DeepSeek V4 DSpark currently requires the official greedy "
-                "draft sampling mode."
-            )
         if self.use_local_argmax_reduction:
             raise ValueError(
                 "DSpark cannot use local argmax reduction because its replicated "
@@ -40,8 +35,8 @@ class DSparkProposer(DFlashProposer):
         sampling_metadata: SamplingMetadata,
         logits: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> tuple[torch.Tensor, None]:
-        del sampling_metadata, spec_step_idx
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del spec_step_idx
 
         num_rows = hidden_states.shape[0]
         batch_size, remainder = divmod(num_rows, self.num_speculative_tokens)
@@ -59,9 +54,25 @@ class DSparkProposer(DFlashProposer):
         # contents across asynchronous scheduling and CUDA Graph replay.
         prev = self.input_ids[self._anchor_indices[:batch_size]].to(torch.long)
         draft_tokens: list[torch.Tensor] = []
+        draft_probs: list[torch.Tensor] | None = None
         for step in range(self.num_speculative_tokens):
             markov_embed = self.model.markov_embed(prev)
             step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
-            prev = self.model.map_draft_to_target(step_logits.argmax(dim=-1))
+            sampled, step_probs = self._sample_from_logits(
+                step_logits,
+                sampling_metadata,
+            )
+            prev = self.model.map_draft_to_target(sampled)
             draft_tokens.append(prev)
-        return torch.stack(draft_tokens, dim=1).reshape(-1), None
+            if step_probs is not None:
+                if draft_probs is None:
+                    draft_probs = []
+                draft_probs.append(step_probs)
+
+        flat_tokens = torch.stack(draft_tokens, dim=1).reshape(-1)
+        if draft_probs is None:
+            return flat_tokens, None
+        if len(draft_probs) != self.num_speculative_tokens:
+            raise RuntimeError("DSpark produced incomplete draft probabilities.")
+        flat_probs = torch.stack(draft_probs, dim=1).flatten(0, 1).contiguous()
+        return flat_tokens, flat_probs
