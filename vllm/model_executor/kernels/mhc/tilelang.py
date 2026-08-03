@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 def _require_mhc_activation_dtype(
@@ -551,6 +555,8 @@ def mhc_fused_post_pre_tilelang(
         mhc_post_tilelang,
         mhc_pre_big_fuse_tilelang,
         mhc_pre_big_fuse_with_norm_tilelang,
+        sm70_mhc_dot_from_fp32_stage_tilelang,
+        sm70_mhc_post_fp32_stage_tilelang,
     )
     from vllm.utils.math_utils import cdiv
 
@@ -611,6 +617,23 @@ def mhc_fused_post_pre_tilelang(
         else:
             n_splits = 1
 
+    capability = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    use_sm70_fp32_stage = (
+        envs.VLLM_SM70_DSV4_MHC_FP32_STAGE
+        and use_small_fma
+        and use_fp16
+        and capability is not None
+        and capability.to_int() == 70
+        and num_tokens == 1
+        and hidden_size == 4096
+        and hc_mult == 4
+        and hc_mult3 == 24
+        and tile_n == 2
+        and n_splits == 8
+    )
+
     gemm_out_mul = torch.empty(
         n_splits,
         num_tokens,
@@ -625,6 +648,11 @@ def mhc_fused_post_pre_tilelang(
         device=residual.device,
     )
     residual_cur = torch.empty_like(residual_flat)
+    residual_cur_fp32 = (
+        torch.empty_like(residual_flat, dtype=torch.float32)
+        if use_sm70_fp32_stage
+        else None
+    )
     post_mix_cur = torch.empty(
         num_tokens,
         hc_mult,
@@ -645,22 +673,48 @@ def mhc_fused_post_pre_tilelang(
     )
 
     if use_small_fma:
-        mhc_fused_tilelang(
-            comb_res_mix_flat,
-            residual_flat,
-            post_layer_mix_flat,
-            x_flat,
-            fn.view(hc_mult3, hc_mult, hidden_size),
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            residual_cur,
-            hc_mult,
-            hidden_size,
-            hc_mult3,
-            tile_n=tile_n,
-            n_splits=n_splits,
-            use_fp16=use_fp16,
-        )
+        if use_sm70_fp32_stage:
+            assert residual_cur_fp32 is not None
+            logger.info_once("SM70 DeepSeek V4 mHC FP32 staging decode path enabled.")
+            sm70_mhc_post_fp32_stage_tilelang(
+                comb_res_mix_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                x_flat,
+                residual_cur_fp32,
+                residual_cur,
+                gemm_out_sqrsum,
+                hidden_size,
+                hc_mult,
+                n_splits=n_splits,
+            )
+            sm70_mhc_dot_from_fp32_stage_tilelang(
+                residual_cur_fp32,
+                fn.view(hc_mult3, hc_mult, hidden_size),
+                gemm_out_mul,
+                hidden_size,
+                hc_mult,
+                hc_mult3,
+                tile_n=tile_n,
+                n_splits=n_splits,
+            )
+        else:
+            mhc_fused_tilelang(
+                comb_res_mix_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                x_flat,
+                fn.view(hc_mult3, hc_mult, hidden_size),
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                residual_cur,
+                hc_mult,
+                hidden_size,
+                hc_mult3,
+                tile_n=tile_n,
+                n_splits=n_splits,
+                use_fp16=use_fp16,
+            )
     else:
         mhc_post_tilelang(
             comb_res_mix_flat,

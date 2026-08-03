@@ -525,6 +525,135 @@ def mhc_pre_big_fuse_broadcast_with_norm_tilelang(
             T.pdl_trigger()
 
 
+@tilelang.jit(pass_configs=pass_configs)
+def sm70_mhc_post_fp32_stage_tilelang(
+    comb_mix,
+    residual_in,
+    post_mix,
+    x_in,
+    residual_fp32,
+    residual_out,
+    rp_out,
+    hidden: int,
+    hc: int = 4,
+    n_thr: int = 256,
+    n_splits: int = 8,
+) -> tilelang.JITKernel:
+    """Materialize the M=1 post mapping without rounding the dot input."""
+    num_tokens = T.dynamic("num_tokens")
+    h_per_split = hidden // n_splits
+    h_iters = h_per_split // n_thr
+    num_warps = n_thr // 32
+
+    comb_mix: T.Tensor((num_tokens, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    residual_in: T.Tensor((num_tokens, hc, hidden), T.float16)  # type: ignore[no-redef, valid-type]
+    post_mix: T.Tensor((num_tokens, hc), T.float32)  # type: ignore[no-redef, valid-type]
+    x_in: T.Tensor((num_tokens, hidden), T.float16)  # type: ignore[no-redef, valid-type]
+    residual_fp32: T.Tensor((num_tokens, hc, hidden), T.float32)  # type: ignore[no-redef, valid-type]
+    residual_out: T.Tensor((num_tokens, hc, hidden), T.float16)  # type: ignore[no-redef, valid-type]
+    rp_out: T.Tensor((n_splits, num_tokens), T.float32)  # type: ignore[no-redef, valid-type]
+
+    with T.Kernel(num_tokens, n_splits, threads=n_thr) as (i_n, i_ks):
+        tid = T.get_thread_binding()
+        warp_id = tid // 32
+        lane = tid % 32
+        s_post = T.alloc_shared((hc,), T.float32)
+        s_comb = T.alloc_shared((hc, hc), T.float32)
+        s_warp = T.alloc_shared((num_warps,), T.float32)
+        pm = T.alloc_local((hc,), T.float32)
+        cm = T.alloc_local((hc, hc), T.float32)
+        new_r = T.alloc_local((hc,), T.float32)
+        sqr = T.alloc_local((1,), T.float32)
+        T.clear(sqr)
+
+        T.copy(post_mix[i_n, 0], s_post)
+        T.copy(comb_mix[i_n, 0, 0], s_comb)
+        for j in T.unroll(hc):
+            pm[j] = s_post[j]
+        for j in T.unroll(hc):
+            for k in T.unroll(hc):
+                cm[k, j] = s_comb[k, j]
+
+        split_start = i_ks * h_per_split
+        for it in T.serial(h_iters):
+            h_idx = split_start + it * n_thr + tid
+            for j in T.unroll(hc):
+                new_r[j] = pm[j] * x_in[i_n, h_idx]
+                for k in T.unroll(hc):
+                    new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
+                residual_fp32[i_n, j, h_idx] = new_r[j]
+                residual_out[i_n, j, h_idx] = new_r[j]
+                sqr[0] += new_r[j] * new_r[j]
+
+        sqr[0] = T.warp_reduce_sum(sqr[0])
+        if lane == 0:
+            s_warp[warp_id] = sqr[0]
+        T.sync_threads()
+        if warp_id == 0 and lane == 0:
+            total = T.alloc_var(T.float32, init=0.0)
+            for warp in T.unroll(num_warps):
+                total += s_warp[warp]
+            rp_out[i_ks, i_n] = total
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def sm70_mhc_dot_from_fp32_stage_tilelang(
+    residual_fp32,
+    weight_t,
+    yp_out,
+    hidden: int,
+    hc: int = 4,
+    n_out: int = 24,
+    n_thr: int = 256,
+    tile_n: int = 2,
+    n_splits: int = 8,
+) -> tilelang.JITKernel:
+    """Run the M=1 dot accumulation from the exact FP32 post stage."""
+    num_tokens = T.dynamic("num_tokens")
+    h_per_split = hidden // n_splits
+    h_iters = h_per_split // n_thr
+    n_tiles = n_out // tile_n
+    num_warps = n_thr // 32
+
+    residual_fp32: T.Tensor((num_tokens, hc, hidden), T.float32)  # type: ignore[no-redef, valid-type]
+    weight_t: T.Tensor((n_out, hc, hidden), T.float32)  # type: ignore[no-redef, valid-type]
+    yp_out: T.Tensor((n_splits, num_tokens, n_out), T.float32)  # type: ignore[no-redef, valid-type]
+
+    with T.Kernel(num_tokens, n_tiles, n_splits, threads=n_thr) as (
+        i_n,
+        i_nt,
+        i_ks,
+    ):
+        tid = T.get_thread_binding()
+        warp_id = tid // 32
+        lane = tid % 32
+        s_warp = T.alloc_shared((num_warps, tile_n + 1), T.float32)
+        acc = T.alloc_local((tile_n,), T.float32)
+        T.clear(acc)
+
+        split_start = i_ks * h_per_split
+        for it in T.serial(h_iters):
+            h_idx = split_start + it * n_thr + tid
+            for n in T.unroll(tile_n):
+                for j in T.unroll(hc):
+                    acc[n] += (
+                        weight_t[i_nt * tile_n + n, j, h_idx]
+                        * residual_fp32[i_n, j, h_idx]
+                    )
+
+        for n in T.unroll(tile_n):
+            acc[n] = T.warp_reduce_sum(acc[n])
+        if lane == 0:
+            for n in T.unroll(tile_n):
+                s_warp[warp_id, n] = acc[n]
+        T.sync_threads()
+        if warp_id == 0 and lane < tile_n:
+            total = T.alloc_var(T.float32, init=0.0)
+            for warp in T.unroll(num_warps):
+                total += s_warp[warp, lane]
+            yp_out[i_ks, i_n, i_nt * tile_n + lane] = total
+
+
 @tilelang.jit(
     pass_configs=pass_configs,
 )
