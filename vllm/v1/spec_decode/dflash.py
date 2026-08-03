@@ -62,7 +62,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         runner=None,
     ):
         assert vllm_config.speculative_config is not None
-        assert vllm_config.speculative_config.use_dflash()
+        assert (
+            vllm_config.speculative_config.use_dflash()
+            or vllm_config.speculative_config.use_dspark()
+        )
         super().__init__(
             vllm_config=vllm_config,
             device=device,
@@ -70,6 +73,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
         self.use_ddtree = vllm_config.speculative_config.use_dflash_ddtree()
+        self.sample_from_anchor = vllm_config.speculative_config.use_dspark()
+        self.num_query_per_req = (
+            self.num_speculative_tokens
+            if self.sample_from_anchor
+            else 1 + self.num_speculative_tokens
+        )
         self.ddtree_budget = vllm_config.speculative_config.ddtree_budget
         self.ddtree_top_k = vllm_config.speculative_config.ddtree_top_k
         self.ddtree_chain_seed = vllm_config.speculative_config.ddtree_chain_seed
@@ -92,7 +101,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         )
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
-        self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+        self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Positions covers both context states + query states
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
@@ -301,6 +310,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                         num_context,
                         BLOCK_SIZE=copy_block_size,
                         HAS_NUM_REJECTED=has_num_rejected,
+                        SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
                     )
             torch.accelerator.synchronize(self.device)
         except Exception as err:  # pragma: no cover - best-effort warmup
@@ -717,7 +727,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # Q from query embeddings (bonus + mask tokens).
         batch_size = cad.batch_size()
         num_context = target_token_ids.shape[0]
-        num_query_per_req = 1 + self.num_speculative_tokens
+        num_query_per_req = self.num_query_per_req
         num_query_total = batch_size * num_query_per_req
 
         # Store for build_model_inputs_first_pass to use
@@ -797,6 +807,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 total_input_tokens=num_context,
                 BLOCK_SIZE=BLOCK_SIZE,
                 HAS_NUM_REJECTED=has_num_rejected,
+                SAMPLE_FROM_ANCHOR=self.sample_from_anchor,
             )
             group_effective_seq_lens = group_cad.seq_lens
             if has_num_rejected:
@@ -1039,6 +1050,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
+        if self.speculative_config.use_dspark():
+            return True
         return self.dflash_config.get("use_aux_hidden_state", True)
 
     @property
