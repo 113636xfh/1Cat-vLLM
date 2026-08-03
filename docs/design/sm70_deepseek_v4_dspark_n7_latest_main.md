@@ -284,10 +284,10 @@ TP8 endpoint profile measures:
 
 | Component | Slot-grouped baseline | Exact selector | Change |
 |---|---:|---:|---:|
-| Target forward, M=8 | 42.410 ms | 32.441 ms | -23.5% |
-| Target logits | 0.352 ms | 0.352 ms | flat |
-| Rejection sample | 0.446 ms | 0.450 ms | +0.9% |
-| Draft GPU | 4.732 ms | 4.008 ms | -15.3% |
+| Target forward, M=8 | 42.410 ms | 32.426 ms | -23.5% |
+| Target logits | 0.352 ms | 0.346 ms | -1.7% |
+| Rejection sample | 0.446 ms | 0.453 ms | +1.6% |
+| Draft GPU | 4.732 ms | 4.001 ms | -15.4% |
 
 The first three matched seeds suggested a 7.7% acceptance loss, but the result
 did not survive the required larger gate. Across matched seeds 4210-4219,
@@ -299,10 +299,13 @@ The official-sampling quality request remains coherent and stops naturally
 after 71 tokens. These results satisfy the numeric, acceptance, and text-health
 gates; the exact selector is accepted for grouped M8.
 
-The dispatch-scope hardening leaves the selected exact-M8 kernels unchanged,
-but its final full-model smoke is still required before merge. The first retry
-was blocked by an unrelated TP8 prefill service occupying all eight GPUs; no
-task-owned process was left running and no external process was stopped.
+The final dispatch-scoped smoke leaves the selected exact-M8 kernels and target
+latency unchanged. On matched seeds 4210-4212, emitted tokens per stream chunk
+are 1.774 for the control and 1.770 for the scoped selector (-0.23%), within
+the 2% loss budget. Median TPOT falls from 33.404 to 27.992 ms (-16.2%). The
+scoped greedy output remains byte-identical to control, and the quality prompt
+stops naturally after 76 coherent tokens. All task-owned services were stopped
+after validation.
 
 ## Experiment Log
 
@@ -336,7 +339,7 @@ task-owned process was left running and no external process was stopped.
 | 2026-08-03 | candidate | Distinct-tactic synthetic comparison | Same precision, but reduction-order drift reaches final max abs 2.0 at scale 1 | Require model-level acceptance and quality gates |
 | 2026-08-03 | candidate | Exact-selector seeds 4210-4219 | TPOT 31.282 -> 25.533 ms; emitted/chunk +4.0% | Accept speed and acceptance gates |
 | 2026-08-03 | candidate | Greedy equality and natural stop | 256-token SHA256 equal; coherent 71-token stop | Accept quality gate and enable by default |
-| 2026-08-03 | pending | Scoped-policy full-model smoke | Unrelated TP8 prefill service owns all GPUs | Retry without stopping external work |
+| 2026-08-03 | candidate | Scoped-policy full-model smoke | Target 32.426 ms; matched emitted/chunk -0.23%; greedy equal; natural stop | Accept final scoped selector |
 
 ## Artifacts
 
@@ -366,6 +369,7 @@ Retained remote root:
   `/home/fudanwl/v100-worktrees/runs/dsv4-dspark-grouped-m8-20260803`.
 - Exact selector NCU, profile, quality, and matched-control artifacts:
   `/home/fudanwl/v100-worktrees/runs/dsv4-dspark-grouped-m8-fast-selector-20260803`.
+  Final scoped artifacts are under its `final-scoped/` directory.
 
 Disabling prefix caching and reducing `max_num_batched_tokens` to 2048 did not
 recover the gap; those paths were rejected. The task-owned API service must be
