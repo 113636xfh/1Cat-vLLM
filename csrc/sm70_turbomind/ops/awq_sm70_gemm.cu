@@ -7314,8 +7314,10 @@ void mxfp4_moe_dense_stage_sm70_out(
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kDeepSeekV4Experts = 256;
+  constexpr int kDeepSeekV4PrefillMinRows = 1024 * 6;
   if (vllm::awq_sm70::mxfp4_moe_grouped_prefill_enabled() &&
-      num_experts == kDeepSeekV4Experts && input.size(0) >= num_experts) {
+      num_experts == kDeepSeekV4Experts &&
+      input.size(0) >= kDeepSeekV4PrefillMinRows) {
     static std::atomic<unsigned> logged_mxfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
         logged_mxfp4_grouped_prefill,

@@ -165,10 +165,12 @@ projection.
 
 ## Grouped-Prefill Candidate
 
-The candidate keeps the route default-off and hard-clamps the group width to
-64. Worker logs proved that a 1024-token API request reached the grouped C++
-path with a 12288-row internal staging shape. Decode graph capture remained on
-the existing dense-stage path with 12 rows and did not enter grouped prefill.
+The candidate keeps the route default-off, requires at least 6144 routed rows
+(1024 tokens times top-k 6), and hard-clamps the group width to 64. This keeps
+unvalidated high-concurrency decode shapes out of the prefill route. Worker
+logs proved that a 1024-token API request reached the grouped C++ path with a
+12288-row internal staging shape. Decode graph capture remained on the existing
+dense-stage path with 12 rows and did not enter grouped prefill.
 
 After a cold request and two warmups, five unprofiled requests produced:
 
