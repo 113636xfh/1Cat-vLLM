@@ -62,19 +62,27 @@ split, exact 1024-token input, 256-token maximum output, and official
 
 | Seed | Baseline TPOT | Candidate TPOT | Saving |
 |---:|---:|---:|---:|
-| 4201 | 21.590 ms | 20.057 ms | 1.532 ms |
-| 4202 | 21.599 ms | 19.971 ms | 1.628 ms |
-| 4203 | 21.576 ms | 19.881 ms | 1.695 ms |
-| median | 21.590 ms | 19.971 ms | 1.618 ms |
+| 4201 | 20.772 ms | 19.284 ms | 1.488 ms |
+| 4202 | 20.764 ms | 19.377 ms | 1.387 ms |
+| 4203 | 20.716 ms | 19.366 ms | 1.350 ms |
+| median | 20.764 ms | 19.366 ms | 1.398 ms |
 
-The median TPOT reduction is 7.50%; decode throughput rises from about 46.32
-to 50.07 token/s, or 8.10%. Both official-sampling sides produce coherent
-Chinese technical answers. Two identical greedy requests within one candidate
-service also produce different text, confirming that the existing TP8
-multi-stream/custom-all-reduce stack is not a deterministic token oracle.
-Quality acceptance therefore uses bitwise operator outputs across all 85 real
-calls plus text-health checks, rather than requiring text identity across
-service restarts.
+The matched median TPOT reduction is 6.73%; decode throughput rises from
+48.16 to 51.64 token/s, or 7.22%. The corrected candidate graph-node trace
+reports 1.650 ms/token of mHC service versus 2.864 ms/token before the change,
+a 1.214 ms/token service reduction. The node-trace request itself measures
+21.884 ms/token and is used only for composition because profiler overhead
+raises it above the accepted low-overhead endpoint result.
+
+An earlier endpoint table was discarded after its remote runtime assembly was
+found to omit the accepted FP16 GEMV dispatch sites. The table above uses the
+same combined source, flags, model, sampling contract, and three seeds on both
+sides; only `VLLM_SM70_DSV4_MHC_FP32_STAGE` changes. Both official-sampling
+sides produce coherent Chinese technical answers. Two identical greedy
+requests within one service can produce different text under the existing TP8
+multi-stream/custom-all-reduce stack, so quality acceptance uses bitwise
+operator outputs across all 85 real calls plus text-health checks rather than
+requiring text identity across service restarts.
 
 ## Rejected Paths
 
@@ -95,4 +103,7 @@ Raw evidence is retained under:
 ```text
 /home/fudanwl/v100-worktrees/runs/dsv4-mhc-hotspot-20260803/
 /home/fudanwl/v100-worktrees/runs/dsv4-mhc-endpoint-20260803/
+/home/fudanwl/v100-worktrees/runs/dsv4-mhc-combined-endpoint-20260803/
+/home/fudanwl/v100-worktrees/runs/dsv4-mhc-combined-matched-baseline-20260803/
+/home/fudanwl/v100-worktrees/runs/dsv4-combined-latest-graphtrace-20260803/
 ```
