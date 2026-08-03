@@ -59,3 +59,61 @@ Artifacts:
   join_two_cta_0.json
   join_two_cta_1.json
 ```
+
+## Rank-Arrival Follow-Up
+
+CUDA graph nodes cross the next host replay range boundary in this trace. A
+timestamp-window assignment therefore reports 85-89 collectives for some
+rank/replay pairs even though every replay contains exactly 87. The retained
+analyzer aligns the full per-rank collective sequence by ordinal first, then
+splits it into fixed 87-call replays.
+
+Across 61 steady replays and 5,307 aligned collectives:
+
+| phase | mean | p90 | sum/token |
+|---|---:|---:|---:|
+| Rank arrival skew | 31.578 us | 51.589 us | 2.747 ms |
+| Tail after last rank arrives | 40.532 us | 51.823 us | 3.526 ms |
+| First-start to last-end envelope | 72.110 us | 90.810 us | 6.274 ms |
+
+The 43 attention segments average 18.527 us of arrival skew. The 43 MoE
+segments average 41.363 us and 22.159 us of rank-local idle time. No rank is a
+fixed straggler: rank 2 is last most often at 18.64%, but the last rank rotates
+across all eight GPUs. GPU remapping or a different clique pairing therefore
+cannot remove this skew.
+
+The trace also shows different TurboMind FP8 tactics on different ranks, but
+total FP8 service spans only 5.502-5.593 ms/token. Selecting the best observed
+tactic everywhere has less than 0.1 ms/token rank-max headroom and is below the
+production-change threshold.
+
+## Router-First Shared Expert Screen
+
+The MoE timeline runs routed MXFP4 work on the main stream and shared FP8 work
+on an auxiliary stream. A default-off prototype delayed the auxiliary-stream
+release until the top-k router completed, without changing any arithmetic.
+
+| Test | Root release | Router first | Projected saving |
+|---|---:|---:|---:|
+| Single-GPU exact-shape graph | 81.741 us/layer | 75.615 us/layer | 0.263 ms/token |
+| TP8 graph joined to hierarchical AR | 102.664 us/layer | 101.142 us/layer | 0.065 ms/token |
+
+Initial and changed-input TP8 graph replays were bitwise equal to the control
+on every rank. The TP8 joined saving is nevertheless below the 0.2 ms/token
+gate, and the earlier shared-tail experiment showed that joined projections
+can realize only about 11% end to end. The production scheduling change was
+removed without a full-model launch.
+
+Follow-up artifacts:
+
+```text
+/home/fudanwl/v100-worktrees/runs/dsv4-tp8-latest-graphtrace-20260803/
+  tp8_collective_skew.json
+  tp8_collective_skew.md
+/home/fudanwl/v100-worktrees/runs/dsv4-tp8-shared-moe-stagger-20260803/
+  single_gpu_v1.json
+  tp8_join_v1.json
+```
+
+The next independent trace hotspot is the existing FP16 GEMV/compressor scope
+in Draft PR #168. This branch does not duplicate that production route.
