@@ -560,6 +560,7 @@ def copy_and_expand_dflash_inputs_kernel(
     total_input_tokens,  # tl.int32
     BLOCK_SIZE: tl.constexpr,
     HAS_NUM_REJECTED: tl.constexpr = False,
+    SAMPLE_FROM_ANCHOR: tl.constexpr = False,
 ):
     """
     Fused kernel for DFlash first-pass input setup.
@@ -635,9 +636,15 @@ def copy_and_expand_dflash_inputs_kernel(
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
     tl.store(out_input_ids_ptr + query_out, input_id, mask=is_query)
 
-    # --- Token indices to sample (mask tokens, skip the bonus token) ---
-    is_sample = is_query & (query_off > 0)
-    sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
+    # DFlash samples only masks after the anchor. DSpark samples every query:
+    # the anchor predicts the first draft token and the remaining queries
+    # predict the rest of the block.
+    if SAMPLE_FROM_ANCHOR:
+        is_sample = is_query
+        sample_out_idx = req_idx * num_speculative_tokens + query_off
+    else:
+        is_sample = is_query & (query_off > 0)
+        sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
     tl.store(
         out_token_indices_ptr + sample_out_idx,
         query_out,

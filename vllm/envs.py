@@ -195,6 +195,12 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
+    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
+    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -204,6 +210,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = True
     VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH: bool = True
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
+    VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -1778,6 +1785,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
     ),
+    # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
+    # opt-in until full-model token and long-output quality gates pass.
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
+    ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
     # then executed by the unquantized Triton MoE path. Keep this default-off:
@@ -1821,6 +1842,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
     ),
+    # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
+    # TurboMind launch. The C++ route reads this value directly as well.
+    "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "0"))
+    ),
+    # Skip the generic 256-expert sort/permute/unpermute pipeline for the
+    # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
+    "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "0"))
+    ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
     # while skipping inactive experts; this route is default-on after the
@@ -1833,6 +1864,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routed) instead of materializing shared+routed before TP allreduce.
     "VLLM_SM70_MOE_ADD_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0"))
+    ),
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
