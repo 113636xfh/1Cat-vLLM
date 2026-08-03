@@ -5,7 +5,7 @@
 This Draft provides one reproducible Git tree for the current DeepSeek V4
 Flash SM70 work. It starts from `onecat/main` at
 `270a468d112a628182c748c171ad002f44d79b21`, which already contains PRs
-#159, #160, and #162, then integrates:
+`#159`, `#160`, and `#162`, then integrates:
 
 | PR | Scope |
 |---|---|
