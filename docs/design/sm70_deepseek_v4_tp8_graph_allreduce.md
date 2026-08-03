@@ -139,6 +139,32 @@ D-split candidate, so 20.765 ms is not an all-reduce-only A/B. It proves that
 the corrected communication protocol transfers through the current combined
 graph and remains stable for three full 256-token requests.
 
+## Latest Critical-Path Screen
+
+A 64-token graph-node trace of the combined route reports 4.495 ms/token of
+hierarchical all-reduce service across 87 calls, or 51.681 us/call. The same
+run measures 31.578 us/call of rank input-ready skew and 40.532 us/call from
+the last rank's arrival until all ranks complete. Their 72.110 us/call
+envelope is a diagnostic span, not additive wall time. Summed over 87 calls,
+the corresponding values are 2.747, 3.526, and 6.274 ms/token.
+
+The start barrier originally executes `membar.sys` on every unsuccessful flag
+poll. A default-off experiment deferred that fence until the expected flag was
+observed; a second mode also used relaxed polling before the pair acquire.
+Both retained the final fence/acquire and the fixed FP32 reduction order.
+
+| Deferred-poll mode | Pure collective | Graph-join | Change from graph-join baseline |
+|---|---:|---:|---:|
+| Baseline | 16.752 us | 32.369 us | - |
+| Start barrier only | 16.596 us | 31.998 us | -0.032 ms/token projected |
+| Start and pair barriers | 16.595 us | 32.214 us | -0.013 ms/token projected |
+
+All three modes completed an 8,700-collective graph stress and were bitwise
+equal across all eight ranks. The best projected endpoint movement is below
+the 0.2 ms/token continuation threshold, so the deferred-poll code was removed.
+The remaining TP opportunity is upstream rank-arrival skew or a larger
+compute/collective boundary change, not further flag-loop tuning.
+
 ## Rejected Paths
 
 | Path | Evidence | Decision |
@@ -150,6 +176,7 @@ graph and remains stable for three full 256-token requests.
 | One signal/partial slot | Full model stopped after 22 tokens under larger graph skew | Reject; unsafe slot reuse |
 | Partial double-buffer only | 87-call graph microbenchmark entered synchronization spin | Reject; signal overtake remains |
 | Serialized clique completion | Stable at 21.055 ms/token in the stacked endpoint | Correct diagnostic; replaced by concurrent acknowledgement at 20.765 ms/token |
+| Deferred fence/acquire polling | Best graph-join projection is 0.032 ms/token | Reject and remove; below continuation threshold |
 
 ## Artifacts
 
@@ -160,6 +187,8 @@ graph and remains stable for three full 256-token requests.
   dsv4-tp8-hierarchical-ar-nsys-i1024-o128-20260803/
   dsv4-tp8-hierarchical-ar-threads-micro-20260803/
   dsv4-sparse-mla-qk-dsplit-fullmodel-20260803/
+  dsv4-tp8-latest-graphtrace-20260803/
+  dsv4-tp8-deferred-fence-poll-micro-20260803/
 ```
 
 ## Remaining Gates
