@@ -1244,7 +1244,9 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
     return turbomind::gemm::DispatchPolicy::kReuse;
   }
   if (is_stream_capturing(stream)) {
-    if (has_imported_cache(device)) {
+    // tune_mutex is already held here. Calling has_imported_cache() would
+    // acquire it recursively and deadlock on the first uncached graph shape.
+    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
       return turbomind::gemm::DispatchPolicy::kReuse;
     }
     return turbomind::gemm::DispatchPolicy::kDefault;
@@ -1311,7 +1313,7 @@ turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     return turbomind::gemm::DispatchPolicy::kReuse;
   }
   if (is_stream_capturing(stream)) {
-    if (has_imported_cache(device)) {
+    if (imported_cache_devices.find(device) != imported_cache_devices.end()) {
       return turbomind::gemm::DispatchPolicy::kReuse;
     }
     return turbomind::gemm::DispatchPolicy::kDefault;

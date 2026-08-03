@@ -196,6 +196,10 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1776,6 +1780,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
+    ),
+    # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
+    # opt-in until full-model token and long-output quality gates pass.
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and

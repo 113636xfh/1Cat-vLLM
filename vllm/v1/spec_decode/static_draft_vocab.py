@@ -46,11 +46,16 @@ class MTPDraftVocabConfig:
     using_defaults: bool = False
 
 
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES = frozenset((2, 4))
+
+
 def resolve_mtp_draft_vocab_config(
     method: str,
     tensor_parallel_size: int = 2,
+    model_architecture: str | None = None,
 ) -> MTPDraftVocabConfig:
-    """Resolve explicit vocabulary controls or the default MTP GPU-LRU route."""
+    """Resolve explicit controls or the model-specific default MTP vocabulary."""
     config = MTPDraftVocabConfig(
         ranking_path=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING,
         shortlist_size=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE,
@@ -77,6 +82,8 @@ def resolve_mtp_draft_vocab_config(
         method != "mtp"
         or not envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT
         or explicit_config
+        or model_architecture != _DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE
+        or tensor_parallel_size not in _DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES
     ):
         return config
 

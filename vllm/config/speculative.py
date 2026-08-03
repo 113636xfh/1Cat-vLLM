@@ -53,9 +53,15 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
+DSparkModelTypes = Literal["dspark"]
 DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -295,10 +301,15 @@ class SpeculativeConfig:
         factors: list[Any] = []
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in (
-            "eagle3",
-            "extract_hidden_states",
-        ) or self.use_dflash()
+        uses_aux_hidden_states = (
+            self.method
+            in (
+                "eagle3",
+                "extract_hidden_states",
+            )
+            or self.use_dflash()
+            or self.use_dspark()
+        )
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph
@@ -308,6 +319,12 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None and self.use_dspark():
+                layer_ids = getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_target_layer_ids",
+                    None,
+                )
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -596,6 +613,12 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
+            elif self.method == "dspark":
+                if self.target_model_config is None:
+                    raise ValueError("target_model_config must be present for dspark")
+                self.model = self.target_model_config.model
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
@@ -723,7 +746,11 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3") or self.use_dflash():
+                if (
+                    self.method in ("eagle", "eagle3")
+                    or self.use_dflash()
+                    or self.use_dspark()
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -782,7 +809,13 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.use_dflash():
+                if self.use_dspark():
+                    draft_hf_config = self.draft_model_config.hf_config
+                    draft_hf_config.model_type = "deepseek_v4"
+                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    self.update_arch_()
+
+                if self.use_dflash() or self.use_dspark():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -814,6 +847,23 @@ class SpeculativeConfig:
                         "A speculative model was provided, but "
                         "`num_speculative_tokens` was not provided"
                     )
+
+                if self.use_dspark():
+                    dspark_block_size = getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_block_size",
+                        None,
+                    )
+                    if (
+                        dspark_block_size is not None
+                        and self.num_speculative_tokens < dspark_block_size
+                    ):
+                        raise ValueError(
+                            "DSpark requires num_speculative_tokens >= "
+                            f"dspark_block_size ({dspark_block_size}); got "
+                            f"{self.num_speculative_tokens}. Smaller values "
+                            "produce incorrect output."
+                        )
 
                 if self.use_dflash_ddtree() and self.ddtree_budget is None:
                     self.ddtree_budget = self.num_speculative_tokens
@@ -1112,13 +1162,20 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp") or self.use_dflash()
+        return (
+            self.method in ("eagle", "eagle3", "mtp")
+            or self.use_dflash()
+            or self.use_dspark()
+        )
 
     def use_dflash(self) -> bool:
         return self.method in get_args(DFlashModelTypes)
 
     def use_dflash_ddtree(self) -> bool:
         return self.method == "dflash_ddtree"
+
+    def use_dspark(self) -> bool:
+        return self.method == "dspark"
 
     def num_speculative_state_tokens(self) -> int:
         num_spec_tokens = self.num_speculative_tokens or 0
