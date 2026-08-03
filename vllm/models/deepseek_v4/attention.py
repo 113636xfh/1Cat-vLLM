@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.sm70.gemv import maybe_sm70_dsv4_fp16_gemv
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -410,6 +411,13 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                output = maybe_sm70_dsv4_fp16_gemv(
+                    hidden_states,
+                    compressor.fused_wkv_wgate.weight,
+                    torch.float32,
+                )
+                if output is not None:
+                    return output
                 return torch.mm(
                     hidden_states,
                     compressor.fused_wkv_wgate.weight.T,
@@ -422,11 +430,25 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
+                output = maybe_sm70_dsv4_fp16_gemv(
+                    hidden_states,
+                    indexer.weights_proj.weight,
+                    hidden_states.dtype,
+                )
+                if output is not None:
+                    return output
                 # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                output = maybe_sm70_dsv4_fp16_gemv(
+                    hidden_states,
+                    indexer.compressor.fused_wkv_wgate.weight,
+                    torch.float32,
+                )
+                if output is not None:
+                    return output
                 return torch.mm(
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight.T,

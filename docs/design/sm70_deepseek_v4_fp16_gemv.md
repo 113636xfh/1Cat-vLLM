@@ -31,3 +31,63 @@ Acceptance requires:
 4. bounded compressor error and a later full-model quality gate.
 
 No production dispatch is changed until these gates pass.
+
+## Microbenchmark Result
+
+Real checkpoint weights, CUDA Graph, 500 replays and five repeats selected
+`BLOCK_K=1024`, `num_warps=4` for every accepted shape.
+
+| role | cuBLAS median | candidate median | speedup | projected service saving |
+|---|---:|---:|---:|---:|
+| Router | 10.047 us | 5.624 us | 1.79x | 0.190 ms/token |
+| Indexer weights | 6.834 us | 4.418 us | 1.55x | 0.051 ms/token |
+| C4 indexer compressor | 8.772 us | 5.415 us | 1.62x | 0.070 ms/token |
+| C4 main compressor | 26.792 us | 22.737 us | 1.18x | 0.085 ms/token |
+| C128 main compressor | 15.901 us | 12.597 us | 1.26x | 0.066 ms/token |
+
+The summed operator projection is 0.463 ms/token. The three C4 operations in a
+joined multi-stream graph improve from 42.004 to 31.908 us, projecting 0.212
+ms/token across 21 C4 layers before accounting for overlap with the FP8 default
+stream.
+
+Sixteen real-weight router seeds all preserve top-6 IDs after the production
+`sqrt(softplus(logit)) + correction_bias` selection. Maximum normalized routed
+weight error is 3.61e-5. Compressor maximum absolute error is at most 2.39e-6.
+
+The production route is default-off behind
+`VLLM_SM70_DSV4_FP16_GEMV=1`. A combined endpoint quality gate is still
+required before enabling it by default.
+
+Artifact:
+
+```text
+/home/fudanwl/v100-worktrees/runs/
+  dsv4-sm70-fp16-gemv-micro-20260802/validated.json
+```
+
+## Full-Graph Transfer
+
+The latest stacked TP8 graph run selected the production gate on every rank.
+Its low-overhead 1024-input/32-output request measured 20.276 ms/token; the
+node-traced 64-output request measured 22.708 ms/token and attributed 2.392
+ms/token to 125.9 fixed-shape GEMV launches. The trace is composition evidence,
+not a same-source route-off/route-on endpoint A/B.
+
+Both requests used the model's official `temperature=1.0`, `top_p=1.0`
+sampling and produced complete, non-repetitive text. This is a route and text
+health gate only. It does not replace the required long-output quality test,
+so `VLLM_SM70_DSV4_FP16_GEMV` remains default-off.
+
+The corrected V100 test resets the cached environment values around every
+case. All five supported CUDA Graph shapes plus the default-off test pass on a
+V100 (`6 passed`).
+
+Trace artifact:
+
+```text
+/home/fudanwl/v100-worktrees/runs/dsv4-tp8-latest-graphtrace-20260803/
+  graph_node_latest_v5_i1024_o64.sqlite
+  per_token_latest_v5_i1024_o64.json
+  warmup_i1024_o32.json
+  trace_request_i1024_o64.json
+```

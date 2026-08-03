@@ -96,6 +96,13 @@ def _load_weight(
     return torch.cat(tensors, dim=0).to(device="cuda", dtype=torch.float16)
 
 
+def _load_tensor(
+    model: Path, weight_map: dict[str, str], key: str, dtype: torch.dtype
+) -> torch.Tensor:
+    with safe_open(model / weight_map[key], framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key).to(device="cuda", dtype=dtype)
+
+
 def _capture(call: Callable[[], None]) -> torch.cuda.CUDAGraph:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -345,6 +352,81 @@ def _benchmark_c4_parallel(
     }
 
 
+def _router_quality(
+    model: Path,
+    weight_map: dict[str, str],
+    router_result: dict[str, object],
+    seeds: list[int],
+) -> dict[str, object]:
+    case = next(case for case in CASES if case.name == "router")
+    weight = _load_weight(model, weight_map, case.keys)
+    bias = _load_tensor(model, weight_map, "layers.3.ffn.gate.bias", torch.float32)
+    best = router_result["best"]
+    assert isinstance(best, dict)
+    block_k = int(best["block_k"])
+    num_warps = int(best["num_warps"])
+
+    rows = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        x = torch.randn((1, weight.shape[1]), device="cuda", dtype=torch.float16)
+        raw_reference = torch.empty(
+            (1, weight.shape[0]), device="cuda", dtype=torch.float16
+        )
+        reference = torch.empty(
+            (1, weight.shape[0]), device="cuda", dtype=torch.float32
+        )
+        candidate = torch.empty_like(reference)
+        _baseline_call(
+            x,
+            weight.T,
+            raw_reference,
+            reference,
+            torch.float16,
+            True,
+        )
+        _candidate_call(x, weight, candidate, block_k, num_warps)
+        torch.cuda.synchronize()
+
+        reference_scores = torch.nn.functional.softplus(reference).sqrt()
+        candidate_scores = torch.nn.functional.softplus(candidate).sqrt()
+        reference_ids = torch.topk(reference_scores + bias, 6, dim=-1).indices
+        candidate_ids = torch.topk(candidate_scores + bias, 6, dim=-1).indices
+        reference_weights = reference_scores.gather(1, reference_ids)
+        candidate_weights = candidate_scores.gather(1, reference_ids)
+        reference_weights /= reference_weights.sum(dim=-1, keepdim=True)
+        candidate_weights /= candidate_weights.sum(dim=-1, keepdim=True)
+        choice_values = torch.topk(reference_scores + bias, 7, dim=-1).values
+        rows.append(
+            {
+                "seed": seed,
+                "top6_match": torch.equal(reference_ids, candidate_ids),
+                "logit_max_abs": float((reference - candidate).abs().max().item()),
+                "score_max_abs": float(
+                    (reference_scores - candidate_scores).abs().max().item()
+                ),
+                "selected_weight_max_abs": float(
+                    (reference_weights - candidate_weights).abs().max().item()
+                ),
+                "reference_choice_margin_6v7": float(
+                    (choice_values[:, 5] - choice_values[:, 6]).item()
+                ),
+            }
+        )
+
+    return {
+        "seeds": seeds,
+        "all_top6_match": all(bool(row["top6_match"]) for row in rows),
+        "max_logit_abs": max(float(row["logit_max_abs"]) for row in rows),
+        "max_score_abs": max(float(row["score_max_abs"]) for row in rows),
+        "max_selected_weight_abs": max(
+            float(row["selected_weight_max_abs"]) for row in rows
+        ),
+        "rows": rows,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -353,6 +435,12 @@ def main() -> int:
     parser.add_argument("--replays", type=int, default=500)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260802)
+    parser.add_argument(
+        "--quality-seeds",
+        type=int,
+        nargs="+",
+        default=list(range(20260802, 20260818)),
+    )
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
 
@@ -386,6 +474,10 @@ def main() -> int:
         args.repeats,
         args.seed,
     )
+    router_result = next(result for result in results if result["name"] == "router")
+    router_quality = _router_quality(
+        args.model, weight_map, router_result, args.quality_seeds
+    )
 
     payload = {
         "contract": {
@@ -398,6 +490,7 @@ def main() -> int:
         },
         "results": results,
         "c4_parallel": c4_parallel,
+        "router_quality": router_quality,
         "projected_service_saving_ms": sum(
             float(result["projected_service_saving_ms"]) for result in results
         ),
