@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
+    VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE: bool = False
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
@@ -193,17 +194,21 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
+    VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = False
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH: int = 64
+    VLLM_SM70_MXFP4_MOE_PREFILL_FAST_SELECTOR: bool = False
+    VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL: bool = False
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
+    VLLM_SM70_DSV4_SPARSE_PREFILL_HMMA: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1655,6 +1660,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
     ),
+    "VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE", "0"))
+    ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
     ),
@@ -1775,6 +1783,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TURBOMIND", "1"))
     ),
+    "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "0"))
+    ),
     # Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It prepares
     # a single interleaved primary layout for gate_up_proj, avoiding the older
     # duplicate normal+gated layouts that cost about 5.4 GiB/rank on
@@ -1804,6 +1815,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_PREFILL_HMMA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_PREFILL_HMMA", "0"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
@@ -1864,6 +1878,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
             64,
         ),
+    ),
+    # Exact TP8 M=8192 group-64 tactic overrides validated against the
+    # baseline output. The C++ selector also requires grouped prefill.
+    "VLLM_SM70_MXFP4_MOE_PREFILL_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_PREFILL_FAST_SELECTOR", "0"))
+    ),
+    # Let the grouped W13 GEMM gather source token rows directly instead of
+    # materializing the top-k expanded activation matrix.
+    "VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL", "0"))
     ),
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.

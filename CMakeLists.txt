@@ -321,6 +321,7 @@ set(VLLM_EXT_SRC
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
+    "csrc/deepseek_v4_sm70_sparse_attention.cu"
     "csrc/minimax_reduce_rms_kernel.cu")
 
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")

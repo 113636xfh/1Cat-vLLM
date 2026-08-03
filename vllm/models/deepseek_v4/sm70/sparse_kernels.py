@@ -5,6 +5,8 @@
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
     fp8_e4m3fn_bits_to_fp32_bitcast,
@@ -15,6 +17,21 @@ _HEAD_DIM = 512
 _NOPE_DIM = 448
 _ROPE_DIM = 64
 _SPLITK_BLOCK_K = 16
+logger = init_logger(__name__)
+
+
+def _sm70_sparse_attention_hmma(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    sink: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+) -> None:
+    torch.ops._C.sm70_deepseek_v4_sparse_attention_hmma(
+        q, kv, indices, lengths, sink, out, scale
+    )
 
 
 @triton.jit
@@ -846,6 +863,23 @@ def sm70_sparse_attention_gathered(
     indices_2d = indices.reshape(indices.shape[0], -1)
     lengths = lengths.reshape(-1).to(torch.int32)
     assert indices_2d.shape[0] == q.shape[0] == lengths.shape[0]
+
+    if (
+        envs.VLLM_SM70_DSV4_SPARSE_PREFILL_HMMA
+        and q.shape[1] == 8
+        and indices_2d.shape[1] in (128, 256, 640)
+    ):
+        logger.info_once("DeepSeek V4 SM70 sparse prefill HMMA route active.")
+        _sm70_sparse_attention_hmma(
+            q,
+            kv_2d,
+            indices_2d,
+            lengths,
+            attn_sink.contiguous(),
+            out,
+            float(scale),
+        )
+        return
 
     block_h = 8
     _sm70_sparse_gathered_kernel[(q.shape[0], triton.cdiv(q.shape[1], block_h))](

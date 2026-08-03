@@ -40,6 +40,7 @@ _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE: Final = 2048
 _DEEPSEEK_V4_FLASH_NUM_EXPERTS: Final = 256
 _DEEPSEEK_V4_FLASH_TOP_K: Final = 6
 _GRAPH_SAFE_MAX_TOKENS: Final = 1
+_INDEXED_PREFILL_MIN_TOKENS: Final = 1024
 
 
 def _mxfp4_active_expert_b1_enabled() -> bool:
@@ -47,6 +48,17 @@ def _mxfp4_active_expert_b1_enabled() -> bool:
         envs.VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1
         and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
         and not envs.VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH
+    )
+
+
+def _mxfp4_indexed_prefill_enabled(
+    *, num_tokens: int, fully_replicated_experts: bool
+) -> bool:
+    return bool(
+        envs.VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL
+        and envs.VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL
+        and num_tokens >= _INDEXED_PREFILL_MIN_TOKENS
+        and fully_replicated_experts
     )
 
 
@@ -228,6 +240,11 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
             required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
+        if (
+            envs.VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL
+            and envs.VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL
+        ):
+            required_ops += ("mxfp4_moe_indexed_dense_stage_sm70_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
             raise RuntimeError(
@@ -238,6 +255,15 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             raise RuntimeError(
                 "DeepSeek-V4 MXFP4 MoE graph-safe B1 requires "
                 "_moe_C.moe_permute_with_scratch."
+            )
+        if (
+            envs.VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL
+            and envs.VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL
+            and not hasattr(torch.ops._moe_C, "moe_permute_indexed_with_scratch")
+        ):
+            raise RuntimeError(
+                "SM70 MXFP4 indexed prefill requires "
+                "_moe_C.moe_permute_indexed_with_scratch."
             )
         if self.moe.has_bias:
             raise NotImplementedError("SM70 MXFP4 MoE does not support expert bias.")
@@ -626,26 +652,53 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         output.zero_()
 
         total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
+        fully_replicated_experts = (
+            layer.expert_map is None
+            and layer.local_num_experts == layer.global_num_experts
+        )
+        indexed_prefill = _mxfp4_indexed_prefill_enabled(
+            num_tokens=num_tokens,
+            fully_replicated_experts=fully_replicated_experts,
+        )
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         buffers["permuted_idx"].fill_(total_slots)
-        torch.ops._moe_C.moe_permute_with_scratch(
-            x,
-            topk_ids_i32,
-            buffers["token_expert_indices"],
-            layer.expert_map,
-            layer.global_num_experts,
-            layer.local_num_experts,
-            _DEEPSEEK_V4_FLASH_TOP_K,
-            buffers["permuted_input"],
-            buffers["expert_offsets64"],
-            buffers["inv_permuted_idx"],
-            buffers["permuted_idx"],
-            buffers["sort_workspace"],
-            buffers["permuted_experts_id"],
-            buffers["sorted_row_idx"],
-            buffers["topk_ids_for_sort"],
-        )
+        if indexed_prefill:
+            logger.info_once("SM70 DeepSeek V4 MXFP4 indexed prefill path enabled.")
+            torch.ops._moe_C.moe_permute_indexed_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.global_num_experts,
+                layer.local_num_experts,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
+        else:
+            torch.ops._moe_C.moe_permute_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
 
         stage_offsets, stage_expert_ids, stage_expert_count = (
@@ -653,25 +706,37 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 buffers,
                 num_tokens=num_tokens,
                 num_experts=layer.sm70_mxfp4_num_experts,
-                fully_replicated_experts=(
-                    layer.expert_map is None
-                    and layer.local_num_experts == layer.global_num_experts
-                ),
+                fully_replicated_experts=fully_replicated_experts,
             )
         )
 
-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-            buffers["gate_up"],
-            buffers["permuted_input"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w13_strided_ptrs_w,
-            layer.w13_strided_ptrs_s,
-            stage_expert_count,
-            layer.sm70_mxfp4_w13_k_dim,
-            layer.sm70_mxfp4_w13_n_dim,
-            layer.sm70_mxfp4_group_size,
-        )
+        if indexed_prefill:
+            sm70_ops.mxfp4_moe_indexed_dense_stage_sm70_out(
+                buffers["gate_up"],
+                x,
+                buffers["sorted_row_idx"].view(-1),
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_expert_count,
+                layer.sm70_mxfp4_w13_k_dim,
+                layer.sm70_mxfp4_w13_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
+        else:
+            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_expert_count,
+                layer.sm70_mxfp4_w13_k_dim,
+                layer.sm70_mxfp4_w13_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
         self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
         sm70_ops.mxfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],

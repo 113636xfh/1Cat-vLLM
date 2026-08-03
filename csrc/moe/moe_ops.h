@@ -65,6 +65,15 @@ bool moe_permute_unpermute_supported();
 int64_t moe_permute_sort_workspace_size(int64_t num_expanded_rows,
                                         int64_t num_experts);
 
+void moe_permute_indexed_with_scratch(
+    const torch::Tensor& input, const torch::Tensor& topk_ids,
+    const torch::Tensor& token_expert_indices, int64_t n_expert,
+    int64_t n_local_expert, int64_t topk, torch::Tensor& permuted_input,
+    torch::Tensor& expert_first_token_offset, torch::Tensor& inv_permuted_idx,
+    torch::Tensor& permuted_idx, torch::Tensor& sort_workspace,
+    torch::Tensor& permuted_experts_id, torch::Tensor& sorted_row_idx,
+    torch::Tensor& topk_ids_for_sort);
+
 void shuffle_rows(const torch::Tensor& input_tensor,
                   const torch::Tensor& dst2src_map,
                   torch::Tensor& output_tensor);

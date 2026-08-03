@@ -103,6 +103,32 @@ def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
     assert kwargs["partial_probs"].shape == (1, 8, 8, 16)
 
 
+def test_sm70_sparse_prefill_hmma_route_is_shape_gated():
+    from vllm.models.deepseek_v4.sm70 import sparse_kernels
+
+    q = torch.empty((4, 8, 512), dtype=torch.float16)
+    kv = torch.empty((8, 512), dtype=torch.float16)
+    sink = torch.zeros(8, dtype=torch.float32)
+    out = torch.empty_like(q)
+
+    with (
+        patch.object(
+            sparse_kernels.envs,
+            "VLLM_SM70_DSV4_SPARSE_PREFILL_HMMA",
+            True,
+        ),
+        patch.object(sparse_kernels, "_sm70_sparse_attention_hmma") as hmma,
+    ):
+        for width in (128, 256, 640):
+            indices = torch.zeros((4, width), dtype=torch.int32)
+            lengths = torch.full((4,), width, dtype=torch.int32)
+            sparse_kernels.sm70_sparse_attention_gathered(
+                q, kv, indices, lengths, 512**-0.5, sink, out
+            )
+
+    assert hmma.call_count == 3
+
+
 def test_sm75_does_not_select_sm70_impl():
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.nvidia.flashmla import (

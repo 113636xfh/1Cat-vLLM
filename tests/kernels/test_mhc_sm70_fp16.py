@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.import_utils import has_tilelang
@@ -115,6 +116,32 @@ def test_mhc_fp16_fake_path_compiles_fullgraph() -> None:
     assert output[2].shape == (2, 128)
 
 
+@pytest.mark.parametrize(
+    ("weight_reuse", "expected_tile_n", "expected_block_m"),
+    [("0", 12, 2), ("1", 6, 4)],
+)
+def test_mhc_sm70_prefill_weight_reuse_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    weight_reuse: str,
+    expected_tile_n: int,
+    expected_block_m: int,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE", weight_reuse)
+        patch.setattr(mhc_tilelang, "current_platform", _FakeCudaPlatform(False))
+        envs.disable_envs_cache()
+        actual = mhc_tilelang._select_hc_prenorm_block_config(
+            torch.float16,
+            4096,
+            4,
+            24,
+            12,
+        )
+    envs.disable_envs_cache()
+
+    assert actual == (expected_tile_n, expected_block_m)
+
+
 @pytest.mark.skipif(
     not (mhc_tilelang.current_platform.is_cuda() and has_tilelang()),
     reason="CUDA and TileLang required",
@@ -143,6 +170,52 @@ def test_mhc_sm70_fp16_block_m_prenorm_keeps_rows_independent() -> None:
 
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
     torch.testing.assert_close(sqrsum, sqrsum_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not (
+        mhc_tilelang.current_platform.is_cuda()
+        and has_tilelang()
+        and mhc_tilelang.current_platform.get_device_capability()
+        == DeviceCapability(7, 0)
+    ),
+    reason="NVIDIA V100/SM70 and TileLang required",
+)
+def test_mhc_sm70_prefill_weight_reuse_handles_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden_size = 4096
+    hc_mult = 4
+    num_tokens = 1025
+    hc_hidden_size = hc_mult * hidden_size
+    n_out = 2 * hc_mult + hc_mult * hc_mult
+    device = mhc_tilelang.current_platform.device_type
+
+    x = torch.ones((num_tokens, hc_hidden_size), dtype=torch.float16, device=device)
+    x[1::2].fill_(3)
+    fn = torch.ones((n_out, hc_hidden_size), dtype=torch.float32, device=device)
+    out = torch.empty((1, num_tokens, n_out), dtype=torch.float32, device=device)
+    sqrsum = torch.empty((1, num_tokens), dtype=torch.float32, device=device)
+
+    with monkeypatch.context() as patch:
+        patch.setenv("VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE", "1")
+        envs.disable_envs_cache()
+        mhc_tilelang._tilelang_hc_prenorm_gemm(
+            x,
+            fn,
+            out,
+            sqrsum,
+            hidden_size,
+            hc_mult,
+        )
+    envs.disable_envs_cache()
+
+    expected_out = torch.full_like(out, hc_hidden_size)
+    expected_out[:, 1::2].mul_(3)
+    expected_sqrsum = torch.full_like(sqrsum, hc_hidden_size)
+    expected_sqrsum[:, 1::2].mul_(9)
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(sqrsum, expected_sqrsum, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

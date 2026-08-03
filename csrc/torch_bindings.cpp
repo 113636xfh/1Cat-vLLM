@@ -86,6 +86,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // Quantization ops
 #ifndef USE_ROCM
 
+  ops.def(
+      "sm70_deepseek_v4_sparse_attention_hmma("
+      "Tensor q, Tensor kv, Tensor indices, Tensor lengths, Tensor sink, "
+      "Tensor! out, float scale) -> ()");
+  ops.impl("sm70_deepseek_v4_sparse_attention_hmma", torch::kCUDA,
+           &sm70_deepseek_v4_sparse_attention_hmma);
+
   // Note about marlin kernel 'workspace' arguments:
   // Technically these should be mutable since they are modified by the kernel.
   // But since they are set back to zero once the kernel is finished we can
@@ -480,6 +487,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size) -> ()");
   ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
            &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "mxfp4_moe_indexed_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
+      "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("mxfp4_moe_indexed_dense_stage_sm70_out", torch::kCUDA,
+           &mxfp4_moe_indexed_dense_stage_sm70_out);
 
   ops.def(
       "mxfp4_moe_single_token_prepare_w13_sm70_out("

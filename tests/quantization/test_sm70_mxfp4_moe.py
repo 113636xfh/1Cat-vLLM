@@ -20,10 +20,36 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 )
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
+    _mxfp4_indexed_prefill_enabled,
     _select_mxfp4_stage_dispatch,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
 )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "fully_replicated", "grouped", "expected"),
+    [
+        (1024, True, True, True),
+        (8192, True, True, True),
+        (1023, True, True, False),
+        (1024, False, True, False),
+        (1024, True, False, False),
+    ],
+)
+def test_mxfp4_sm70_indexed_prefill_gate(
+    monkeypatch, num_tokens, fully_replicated, grouped, expected
+):
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_INDEXED_PREFILL", True)
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL", grouped)
+
+    assert (
+        _mxfp4_indexed_prefill_enabled(
+            num_tokens=num_tokens,
+            fully_replicated_experts=fully_replicated,
+        )
+        is expected
+    )
 
 
 def _v4_flash_moe_config() -> FusedMoEConfig:

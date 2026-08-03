@@ -81,6 +81,19 @@ bool Sm70AwqMtpM5FastSelectorEnabled()
     return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Fp8PrefillFastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR");
+    return raw && std::atoi(raw) != 0;
+}
+
+bool Sm70Mxfp4MoePrefillFastSelectorEnabled()
+{
+    const char* raw     = std::getenv("VLLM_SM70_MXFP4_MOE_PREFILL_FAST_SELECTOR");
+    const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL");
+    return raw && std::atoi(raw) != 0 && grouped && std::atoi(grouped) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
     int  n;
     int  k;
@@ -157,12 +170,53 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(const GemmDesc&  
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
 {
-    if (!Sm70AwqTp2FastSelectorEnabled()) {
+    const bool awq_enabled    = Sm70AwqTp2FastSelectorEnabled();
+    const bool fp8_enabled    = Sm70Fp8PrefillFastSelectorEnabled();
+    const bool mxfp4_enabled  = Sm70Mxfp4MoePrefillFastSelectorEnabled();
+    if (!awq_enabled && !fp8_enabled && !mxfp4_enabled) {
         return std::nullopt;
     }
     const std::string desc_str = to_string(desc);
-    if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
-        return target;
+    if (awq_enabled) {
+        if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
+            return target;
+        }
+    }
+    // Exact DeepSeek V4 TP8 group-64 W2 prefill. Swizzle 4 preserves the
+    // baseline output bit-for-bit and improves grouped dispatch, but regresses
+    // the per-expert route, so require grouped prefill as part of the gate.
+    if (mxfp4_enabled
+        && desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_49152x4096x256_1") {
+        return Sm70AwqTp2FastTarget{
+            desc.n, desc.k, 128, 128, 16, 1, 4, true, ""};
+    }
+    // These exact DeepSeek V4 TP8 prefill shapes preserve the baseline output
+    // bit-for-bit. Keep shared_gate_up on the baseline tactic: all faster
+    // candidates tested for that shape changed its FP16 output.
+    if (fp8_enabled) {
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8192x1536x4096_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 128, 128, 16, 1, 4, true, ""};
+        }
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8192x4096x1024_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 128, 128, 16, 1, 4, true, ""};
+        }
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8192x1024x4096_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 128, 128, 16, 1, 3, true, ""};
+        }
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8192x4096x256_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 128, 128, 16, 1, 4, true, ""};
+        }
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8192x8192x1024_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 64, 256, 16, 1, 2, true, ""};
+        }
+    }
+    if (!awq_enabled) {
+        return std::nullopt;
     }
     if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x17408x5120_1") {
         return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 1, 0, false, ""};

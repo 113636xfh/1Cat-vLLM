@@ -68,6 +68,30 @@ def _torch_hc_prenorm_gemm(
     sqrsum[0].copy_(x_float.square().sum(dim=-1))
 
 
+def _select_hc_prenorm_block_config(
+    activation_dtype: torch.dtype,
+    hidden_size: int,
+    hc_mult: int,
+    n_out: int,
+    default_tile_n: int,
+) -> tuple[int, int]:
+    capability = (
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
+    )
+    use_sm70_weight_reuse = (
+        envs.VLLM_SM70_DSV4_MHC_PREFILL_WEIGHT_REUSE
+        and activation_dtype == torch.float16
+        and capability is not None
+        and capability.to_int() == 70
+        and hidden_size == 4096
+        and hc_mult == 4
+        and n_out == 24
+    )
+    if use_sm70_weight_reuse:
+        return 6, 4
+    return default_tile_n, 2
+
+
 def _tilelang_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -94,6 +118,15 @@ def _tilelang_hc_prenorm_gemm(
     assert (x.shape[1] // n_splits) % n_thr == 0
     use_default_config = tile_n == 12 and n_thr == 512
     if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
+        block_tile_n, block_m = _select_hc_prenorm_block_config(
+            activation_dtype,
+            hidden_size,
+            hc_mult,
+            fn.shape[0],
+            tile_n,
+        )
+        if block_m == 4:
+            logger.info_once("SM70 DeepSeek V4 mHC prefill weight-reuse path enabled.")
         hc_prenorm_gemm_block_m_tilelang(
             x,
             fn,
@@ -103,8 +136,8 @@ def _tilelang_hc_prenorm_gemm(
             hc_mult,
             fn.shape[0],
             n_thr,
-            tile_n,
-            2,
+            block_tile_n,
+            block_m,
             use_fp16=use_fp16,
         )
         return

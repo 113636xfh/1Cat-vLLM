@@ -46,6 +46,13 @@ torch::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::Tensor const& cos_sin_cache, int64_t q_head_padded, double eps,
     int64_t cache_block_size);
 
+#ifndef USE_ROCM
+void sm70_deepseek_v4_sparse_attention_hmma(
+    torch::Tensor const& q, torch::Tensor const& kv,
+    torch::Tensor const& indices, torch::Tensor const& lengths,
+    torch::Tensor const& sink, torch::Tensor& out, double scale);
+#endif
+
 void silu_and_mul_per_block_quant(torch::Tensor& out,
                                   torch::Tensor const& input,
                                   torch::Tensor& scales, int64_t group_size,
@@ -499,6 +506,19 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out,
                                     int64_t k,
                                     int64_t n,
                                     int64_t group_size);
+
+void mxfp4_moe_indexed_dense_stage_sm70_out(
+    torch::Tensor out,
+    torch::Tensor input,
+    torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets,
+    torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w,
+    torch::Tensor ptrs_s,
+    int64_t num_experts,
+    int64_t k,
+    int64_t n,
+    int64_t group_size);
 
 void mxfp4_moe_single_token_prepare_w13_sm70_out(
     torch::Tensor gate_up,

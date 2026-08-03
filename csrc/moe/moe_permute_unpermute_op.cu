@@ -32,6 +32,37 @@ int64_t pad_to_multiple_of_16(int64_t value) {
   return (value + 15) / 16 * 16;
 }
 
+__global__ void prepareMoeIndexedRowsKernel(
+    int* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int64_t num_expanded_rows, int topk) {
+  const int64_t expanded_dest_row =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expanded_dest_row >= num_expanded_rows) {
+    return;
+  }
+
+  const int expanded_source_row =
+      expanded_dest_row_to_expanded_source_row[expanded_dest_row];
+  expanded_source_row_to_expanded_dest_row[expanded_source_row] =
+      static_cast<int>(expanded_dest_row);
+  permuted_idx[expanded_dest_row] = expanded_source_row;
+  expanded_dest_row_to_expanded_source_row[expanded_dest_row] =
+      expanded_source_row / topk;
+}
+
+void prepareMoeIndexedRowsKernelLauncher(
+    int* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int64_t num_expanded_rows, int topk, cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>((num_expanded_rows + threads - 1) / threads);
+  prepareMoeIndexedRowsKernel<<<blocks, threads, 0, stream>>>(
+      expanded_dest_row_to_expanded_source_row,
+      expanded_source_row_to_expanded_dest_row, permuted_idx,
+      num_expanded_rows, topk);
+}
+
 }  // namespace
 
 int64_t moe_permute_sort_workspace_size(int64_t num_expanded_rows,
@@ -53,7 +84,8 @@ void moe_permute_impl(
     const std::optional<torch::Tensor>& maybe_sort_workspace,
     const std::optional<torch::Tensor>& maybe_permuted_experts_id,
     const std::optional<torch::Tensor>& maybe_sorted_row_idx,
-    const std::optional<torch::Tensor>& maybe_topk_ids_for_sort) {
+    const std::optional<torch::Tensor>& maybe_topk_ids_for_sort,
+    bool materialize_input) {
   TORCH_CHECK(expert_first_token_offset.scalar_type() == at::ScalarType::Long,
               "expert_first_token_offset must be int64");
   TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Int,
@@ -72,7 +104,10 @@ void moe_permute_impl(
   auto expanded_rows = n_token * topk;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  if (canUseSingleTokenMoePermuteFastPath(
+  TORCH_CHECK(materialize_input || !expert_map.has_value(),
+              "metadata-only MoE permute does not support expert parallelism");
+
+  if (materialize_input && canUseSingleTokenMoePermuteFastPath(
           n_token, topk, expert_map.has_value(), n_expert, n_local_expert)) {
     if (input.scalar_type() == at::ScalarType::Half) {
       singleTokenMoePermuteLauncher<half>(
@@ -139,6 +174,14 @@ void moe_permute_impl(
       get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
       n_local_expert, topk, sorter, get_ptr<int>(sort_workspace), stream);
 
+  if (!materialize_input) {
+    prepareMoeIndexedRowsKernelLauncher(
+        get_ptr<int>(sorted_row_idx), get_ptr<int>(inv_permuted_idx),
+        get_ptr<int>(permuted_idx), expanded_rows, static_cast<int>(topk),
+        stream);
+    return;
+  }
+
   MOE_DISPATCH(input.scalar_type(), [&] {
     expandInputRowsKernelLauncher<scalar_t>(
         get_ptr<scalar_t>(input), get_ptr<scalar_t>(permuted_input),
@@ -161,7 +204,8 @@ void moe_permute(
   moe_permute_impl(input, topk_ids, token_expert_indices, expert_map, n_expert,
                    n_local_expert, topk, permuted_input,
                    expert_first_token_offset, inv_permuted_idx, permuted_idx,
-                   std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+                   std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                   true);
 }
 
 void moe_permute_with_scratch(
@@ -177,7 +221,22 @@ void moe_permute_with_scratch(
                    n_local_expert, topk, permuted_input,
                    expert_first_token_offset, inv_permuted_idx, permuted_idx,
                    sort_workspace, permuted_experts_id, sorted_row_idx,
-                   topk_ids_for_sort);
+                   topk_ids_for_sort, true);
+}
+
+void moe_permute_indexed_with_scratch(
+    const torch::Tensor& input, const torch::Tensor& topk_ids,
+    const torch::Tensor& token_expert_indices, int64_t n_expert,
+    int64_t n_local_expert, int64_t topk, torch::Tensor& permuted_input,
+    torch::Tensor& expert_first_token_offset, torch::Tensor& inv_permuted_idx,
+    torch::Tensor& permuted_idx, torch::Tensor& sort_workspace,
+    torch::Tensor& permuted_experts_id, torch::Tensor& sorted_row_idx,
+    torch::Tensor& topk_ids_for_sort) {
+  moe_permute_impl(input, topk_ids, token_expert_indices, std::nullopt,
+                   n_expert, n_local_expert, topk, permuted_input,
+                   expert_first_token_offset, inv_permuted_idx, permuted_idx,
+                   sort_workspace, permuted_experts_id, sorted_row_idx,
+                   topk_ids_for_sort, false);
 }
 
 void moe_unpermute(
@@ -323,6 +382,19 @@ void moe_permute_with_scratch(
               "moe_permute_with_scratch is not supported on CUDA < 12.0");
 }
 
+void moe_permute_indexed_with_scratch(
+    const torch::Tensor& input, const torch::Tensor& topk_ids,
+    const torch::Tensor& token_expert_indices, int64_t n_expert,
+    int64_t n_local_expert, int64_t topk, torch::Tensor& permuted_input,
+    torch::Tensor& expert_first_token_offset, torch::Tensor& inv_permuted_idx,
+    torch::Tensor& permuted_idx, torch::Tensor& sort_workspace,
+    torch::Tensor& permuted_experts_id, torch::Tensor& sorted_row_idx,
+    torch::Tensor& topk_ids_for_sort) {
+  TORCH_CHECK(
+      false,
+      "moe_permute_indexed_with_scratch is not supported on CUDA < 12.0");
+}
+
 void moe_unpermute(
     const torch::Tensor& permuted_hidden_states,
     const torch::Tensor& topk_weights, const torch::Tensor& inv_permuted_idx,
@@ -344,5 +416,7 @@ bool moe_permute_unpermute_supported() {
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
   m.impl("moe_permute", &moe_permute);
   m.impl("moe_permute_with_scratch", &moe_permute_with_scratch);
+  m.impl("moe_permute_indexed_with_scratch",
+         &moe_permute_indexed_with_scratch);
   m.impl("moe_unpermute", &moe_unpermute);
 }
