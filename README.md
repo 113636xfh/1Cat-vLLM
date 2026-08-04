@@ -7,6 +7,9 @@
 > 路径做了成体系的优化，让更多现代模型场景在 V100 上真正变得可用、
 > 好用、能持续部署。
 >
+> 1Cat-vLLM 将以 Volta 为基础，持续深耕 GPU 算子优化与大模型推理框架，
+> 并逐步扩展至 Turing、Ampere 与 CDNA 平台。
+> 
 > 我们希望把一猫之下在 V100 上的工程经验、优化成果和验证过程贡献给
 > 开源社区，也欢迎继续使用 V100 的个人开发者、工作室和团队一起反馈、
 > 复现和改进。
@@ -360,6 +363,16 @@ python -m pip install -e . --no-build-isolation
 - **Near term:** Complete Volta compatibility and validation for DeepSeek V4, GLM5, and other new model families, while improving long-context serving, quantization, multi-GPU parallelism, and runtime stability.
 - **Mid term:** Expand the Volta model support matrix with a focus on models up to 300B parameters, backed by reproducible performance, quality, and release validation.
 - **Long term:** Build on the Volta foundation and extend hardware support in stages: **Volta → Turing/Ampere → CDNA**, bringing sustainable LLM inference to a broader range of existing accelerators.
+
+## We're Hiring
+
+We are looking for engineers to help build 1Cat-vLLM.
+
+- **Opportunities:** Full-time, internship, and remote
+- **Focus areas:** GPU kernel optimization, LLM inference frameworks, quantization, distributed inference, and performance engineering
+- **Contact:** WeChat `MTCat03`
+
+If you are interested in making modern LLM inference run better on existing accelerators, we would love to hear from you.
 
 ## Repository Notes
 
