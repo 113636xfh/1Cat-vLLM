@@ -23,6 +23,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -816,7 +817,7 @@ def _try_sm70_fa2_d256_prefill(
     ):
         return None
     paged_kv = block_table is not None
-    if paged_kv:
+    if block_table is not None:
         if (
             seqused_k is None
             or cu_seqlens_k is not None
@@ -839,7 +840,14 @@ def _try_sm70_fa2_d256_prefill(
         or not cu_seqlens_k.is_contiguous()
     ):
         return None
-    if torch.cuda.get_device_capability(query.device) != (7, 0):
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    device_capability = current_platform.get_device_capability(device_index)
+    if device_capability is None or (
+        device_capability.major,
+        device_capability.minor,
+    ) != (7, 0):
         return None
 
     splitd_ops = _get_sm70_splitd_d256_ops()

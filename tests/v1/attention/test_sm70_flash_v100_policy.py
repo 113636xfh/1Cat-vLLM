@@ -155,7 +155,7 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
 
     fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
     fake_package = types.ModuleType("vllm.vllm_flash_attn")
-    fake_package.flash_attn_interface = fake_interface
+    fake_package.__dict__["flash_attn_interface"] = fake_interface
     monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
     monkeypatch.setitem(
         sys.modules,
