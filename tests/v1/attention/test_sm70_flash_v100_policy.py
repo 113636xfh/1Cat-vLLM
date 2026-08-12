@@ -138,6 +138,89 @@ def test_flash_v100_priority_is_sm70_only(monkeypatch):
     assert AttentionBackendEnum.FLASH_ATTN_V100 not in backends
 
 
+def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_FLASH_V100_FA2_D256_PREFILL", raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is True
+
+    monkeypatch.setenv("VLLM_FLASH_V100_FA2_D256_PREFILL", "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
+
+
+def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    fake_package = types.ModuleType("vllm.vllm_flash_attn")
+    fake_package.flash_attn_interface = fake_interface
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        fake_interface,
+    )
+
+    fake_ops = SimpleNamespace(_vllm_fa2_C=SimpleNamespace())
+    monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)
+    assert flash_v100._get_sm70_splitd_d256_ops() is None
+
+    dense = object()
+    paged = object()
+    fake_ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd = dense
+    fake_ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd = paged
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
+    assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged)
+
+
+def test_dense_prefill_restores_uniform_batch_view_for_exact_splitd(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_flash_ops",
+        lambda: (object(), None, None, None, None, None, None, None, None),
+    )
+    calls: list[tuple[int, ...]] = []
+
+    def fake_splitd(query, key, value, **kwargs):
+        calls.append(tuple(query.shape))
+        assert query.data_ptr() == flat_query.data_ptr()
+        assert key.data_ptr() == flat_key.data_ptr()
+        assert value.data_ptr() == flat_value.data_ptr()
+        return kwargs["out"]
+
+    routes: list[str] = []
+    monkeypatch.setattr(flash_v100, "_try_sm70_fa2_d256_prefill", fake_splitd)
+    monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+
+    seq_len = 1024
+    flat_query = torch.empty((seq_len, 2, 256), dtype=torch.float16)
+    flat_key = torch.empty((seq_len, 2, 256), dtype=torch.float16)
+    flat_value = torch.empty((seq_len, 2, 256), dtype=torch.float16)
+    output = torch.empty_like(flat_query)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+    result = flash_v100.flash_v100_dense_prefill(
+        query=flat_query,
+        key=flat_key,
+        value=flat_value,
+        output=output,
+        query_start_loc=cu_seqlens,
+        query_start_loc_device=cu_seqlens,
+        num_actual_tokens=seq_len,
+        softmax_scale=0.125,
+    )
+
+    assert result is output
+    assert calls == [(1, seq_len, 2, 256)]
+    assert routes == ["prefill_dense_splitd_d256"]
+
+
 def test_flash_v100_prefill_live_token_mismatch_uses_prefix_path(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 

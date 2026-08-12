@@ -1043,6 +1043,11 @@ def _cuda_arch_at_least(major: int, minor: int = 0) -> bool:
     return any(arch >= (major, minor) for arch in arches)
 
 
+def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
+    arches = _cuda_arches_from_env()
+    return arches is not None and (major, minor) in arches
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -1154,8 +1159,10 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    if _cuda_arch_at_least(8, 0):
+    build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
+    if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if _cuda_arch_at_least(8, 0):
         if _cuda_arch_at_least(9, 0) and (
             USE_PRECOMPILED_EXTENSIONS
             or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
@@ -1169,7 +1176,7 @@ if _is_cuda():
                 name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True
             )
         )
-    else:
+    elif not build_sm70_fa2:
         logger.info(
             "Skipping vllm-flash-attn extension targets for TORCH_CUDA_ARCH_LIST=%s",
             os.environ.get("TORCH_CUDA_ARCH_LIST"),

@@ -1486,7 +1486,14 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
       # vllm-flash-attn should be last as it overwrites some CMake functions
       include(cmake/external_projects/vllm_flash_attn.cmake)
     else()
-      message(STATUS
-        "Skipping vllm-flash-attn external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(VLLM_FLASH_ATTN_SM70_ARCHS
+        "7.0" "${CUDA_ARCHS}")
+      if(VLLM_FLASH_ATTN_SM70_ARCHS)
+        set(VLLM_FLASH_ATTN_SM70 ON)
+        include(cmake/external_projects/vllm_flash_attn.cmake)
+      else()
+        message(STATUS
+          "Skipping vllm-flash-attn external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+      endif()
     endif()
 endif ()
