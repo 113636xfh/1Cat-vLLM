@@ -1196,6 +1196,84 @@ def test_flash_v100_decode_uses_xqa_for_qwen35_tp4_long_context(monkeypatch):
     assert torch.all(output == 1)
 
 
+def test_flash_v100_decode_plans_g6_page784_sawtooth_workspace(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+    partition_hints: list[int | None] = []
+
+    def hit_xqa(*args, **kwargs):
+        partition_hints.append(kwargs.get("partition_size_hint"))
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([180224], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=180224,
+        flash_v100_decode_workspace_seq_capacity_hint=262144,
+        flash_v100_decode_active_num_partitions=torch.tensor([176], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 2, 784, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert partition_hints == [256]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_decode_sawtooth_rollback_preserves_default_planner(
+    monkeypatch,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_page784_sawtooth_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "0")
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.float16)
+
+    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) is None
+
+
+def test_flash_v100_decode_sawtooth_workspace_supports_fp8_kv(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_page784_sawtooth_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.uint8)
+
+    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) == 256
+
+
 def test_flash_v100_decode_keeps_qwen35_tp4_short_context_on_scalar(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 

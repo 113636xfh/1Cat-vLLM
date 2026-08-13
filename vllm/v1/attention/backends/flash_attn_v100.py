@@ -273,6 +273,30 @@ def _decode_partition_size_for_metadata(
     return value
 
 
+def _g6_page784_sawtooth_partition_size_hint(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+) -> int | None:
+    if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+        return None
+    if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
+        return None
+    if (
+        query.shape[0] == 1
+        and query.shape[1] == 6
+        and query.shape[2] == 256
+        and key_cache.shape[1] == 784
+        and key_cache.shape[2] == 1
+        and key_cache.shape[3] == 256
+        and value_cache.shape == key_cache.shape
+    ):
+        # The CUDA graph contains p256 and p1024 nodes and selects between them
+        # from device seq_lens. Plan the larger p256 workspace envelope once.
+        return 256
+    return None
+
+
 def _mtp_context_bucket_partition_size_hint() -> int | None:
     raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
     if raw is None:
@@ -4829,6 +4853,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata=attn_metadata,
                 window_size=window_size,
             )
+            partition_size_hint = _g6_page784_sawtooth_partition_size_hint(
+                query,
+                key_cache,
+                value_cache,
+            )
             self.flash_attn_decode_paged_xqa(
                 query,
                 key_cache,
@@ -4856,6 +4885,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "flash_v100_decode_active_num_partitions",
                     None,
                 ),
+                partition_size_hint=partition_size_hint,
             )
             _record_route("decode_xqa_paged")
             return output

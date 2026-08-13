@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <torch/extension.h>
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 
@@ -42,6 +43,8 @@ constexpr int kXQATCG6DualCtaThreads = 6 * kWarpSize;
 constexpr int kXQARouteAllSeqLens = 0;
 constexpr int kXQARouteShortSeqLens = -1;
 constexpr int kXQARouteLongSeqLens = 1;
+constexpr int kXQARouteP1024Sawtooth = 4;
+constexpr int kXQARouteP256Sawtooth = 5;
 // The dense 256/128-half strides alias Volta shared-memory banks in the
 // WMMA A/B fragment loads. Both padded strides remain 16-byte aligned.
 constexpr int kXQATC256WidePaddedQStride = 264;
@@ -119,6 +122,38 @@ bool xqa_g6_p1024_auto_trace_enabled() {
   return enabled;
 }
 
+bool xqa_g6_p1024_sawtooth_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_g6_p1024_sawtooth_trace_enabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
+}
+
+int xqa_g6_p1024_sawtooth_p1024_mid_seq_len() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN");
+  return value == nullptr ? 111104 : std::max(1, std::atoi(value));
+}
+
+int xqa_g6_p1024_sawtooth_p256_long_seq_len() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN");
+  return value == nullptr ? 147841 : std::max(1, std::atoi(value));
+}
+
+int xqa_g6_p1024_sawtooth_p1024_final_seq_len() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN");
+  return value == nullptr ? 258176 : std::max(1, std::atoi(value));
+}
+
 bool xqa_split_reduce_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE");
   return value != nullptr && value[0] == '1';
@@ -180,6 +215,33 @@ int xqa_split_reduce_dim_tile() {
   }
   const int dim_tile = std::atoi(value);
   return dim_tile == 8 || dim_tile == 16 || dim_tile == 32 ? dim_tile : 8;
+}
+
+template <int SEQ_LEN_ROUTE>
+__device__ __forceinline__ bool xqa_seq_len_route_active(
+    const int seq_len, const int route_seq_len_begin,
+    const int route_seq_len_end, const int route_seq_len_final) {
+  if constexpr (SEQ_LEN_ROUTE == kXQARouteShortSeqLens) {
+    return seq_len < route_seq_len_begin;
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteLongSeqLens) {
+    return seq_len >= route_seq_len_begin;
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteP1024Sawtooth) {
+    return (seq_len >= route_seq_len_begin && seq_len < route_seq_len_end) ||
+           seq_len >= route_seq_len_final;
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteP256Sawtooth) {
+    return seq_len < route_seq_len_begin ||
+           (seq_len >= route_seq_len_end && seq_len < route_seq_len_final);
+  }
+  return true;
+}
+
+__device__ __forceinline__ int xqa_sawtooth_partition_size(
+    const int seq_len, const int p1024_mid_seq_len, const int p256_long_seq_len,
+    const int p1024_final_seq_len) {
+  const bool use_p1024 =
+      (seq_len >= p1024_mid_seq_len && seq_len < p256_long_seq_len) ||
+      seq_len >= p1024_final_seq_len;
+  return use_p1024 ? 1024 : 256;
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -567,8 +629,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int64_t k_token_stride, const int64_t k_head_stride,
         const int64_t v_block_stride, const int64_t v_token_stride,
         const int64_t v_head_stride, const float softmax_scale,
-        const float k_scale, const float v_scale,
-        const int route_seq_len_threshold) {
+        const float k_scale, const float v_scale, const int route_seq_len_begin,
+        const int route_seq_len_end, const int route_seq_len_final) {
   constexpr int D = 256;
   constexpr int WMMA_M = 8;
   constexpr int WMMA_N = 32;
@@ -596,14 +658,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   }
 
   const int seq_len = seq_lens[batch_idx];
-  if constexpr (SEQ_LEN_ROUTE == kXQARouteShortSeqLens) {
-    if (seq_len >= route_seq_len_threshold) {
-      return;
-    }
-  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteLongSeqLens) {
-    if (seq_len < route_seq_len_threshold) {
-      return;
-    }
+  if (!xqa_seq_len_route_active<SEQ_LEN_ROUTE>(seq_len, route_seq_len_begin,
+                                               route_seq_len_end,
+                                               route_seq_len_final)) {
+    return;
   }
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len) {
@@ -1470,12 +1528,14 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   }
 }
 
-template <int PARTITION_SIZE>
+template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 __global__ void flash_attention_decode_xqa_reduce_stats_kernel(
     float* __restrict__ max_logits, float* __restrict__ exp_sums,
     const int* __restrict__ seq_lens, const int batch_size,
     const int max_num_partitions, const int num_heads_q,
-    const int64_t stats_stride0, const int64_t stats_stride1) {
+    const int64_t stats_stride0, const int64_t stats_stride1,
+    const int route_seq_len_begin, const int route_seq_len_end,
+    const int route_seq_len_final) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   if (batch_idx >= batch_size || head_idx >= num_heads_q) {
@@ -1483,8 +1543,18 @@ __global__ void flash_attention_decode_xqa_reduce_stats_kernel(
   }
 
   const int seq_len = seq_lens[batch_idx];
+  if (!xqa_seq_len_route_active<SEQ_LEN_ROUTE>(seq_len, route_seq_len_begin,
+                                               route_seq_len_end,
+                                               route_seq_len_final)) {
+    return;
+  }
+  const int partition_size =
+      PARTITION_SIZE == 0
+          ? xqa_sawtooth_partition_size(seq_len, route_seq_len_begin,
+                                        route_seq_len_end, route_seq_len_final)
+          : PARTITION_SIZE;
   const int num_partitions =
-      min(max_num_partitions, (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
+      min(max_num_partitions, (seq_len + partition_size - 1) / partition_size);
   if (seq_len <= 0 || num_partitions <= 0) {
     return;
   }
@@ -1515,7 +1585,8 @@ __global__ void flash_attention_decode_xqa_reduce_stats_kernel(
   }
 }
 
-template <int D, int PARTITION_SIZE, int D_TILE>
+template <int D, int PARTITION_SIZE, int D_TILE,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 __global__ void flash_attention_decode_xqa_reduce_output_kernel(
     const __half* __restrict__ tmp_out, const float* __restrict__ weights,
     const float* __restrict__ global_sums, const int* __restrict__ seq_lens,
@@ -1524,7 +1595,8 @@ __global__ void flash_attention_decode_xqa_reduce_output_kernel(
     const int64_t tmp_out_stride0, const int64_t tmp_out_stride1,
     const int64_t tmp_out_stride2, const int64_t stats_stride0,
     const int64_t stats_stride1, const int64_t out_stride0,
-    const int64_t out_stride1) {
+    const int64_t out_stride1, const int route_seq_len_begin,
+    const int route_seq_len_end, const int route_seq_len_final) {
   static_assert(D_TILE > 0 && D_TILE <= kWarpSize,
                 "Split-reduce dimension tile must fit in one warp");
   const int batch_idx = blockIdx.x;
@@ -1537,8 +1609,18 @@ __global__ void flash_attention_decode_xqa_reduce_output_kernel(
   const int64_t out_index = static_cast<int64_t>(batch_idx) * out_stride0 +
                             static_cast<int64_t>(head_idx) * out_stride1 + d;
   const int seq_len = seq_lens[batch_idx];
+  if (!xqa_seq_len_route_active<SEQ_LEN_ROUTE>(seq_len, route_seq_len_begin,
+                                               route_seq_len_end,
+                                               route_seq_len_final)) {
+    return;
+  }
+  const int partition_size =
+      PARTITION_SIZE == 0
+          ? xqa_sawtooth_partition_size(seq_len, route_seq_len_begin,
+                                        route_seq_len_end, route_seq_len_final)
+          : PARTITION_SIZE;
   const int num_partitions =
-      min(max_num_partitions, (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
+      min(max_num_partitions, (seq_len + partition_size - 1) / partition_size);
   if (seq_len <= 0 || num_partitions <= 0) {
     out[out_index] = __float2half(0.f);
     return;
@@ -1684,22 +1766,25 @@ void launch_flash_attention_decode_paged(
           out.stride(0), out.stride(1));
 }
 
-template <int PARTITION_SIZE>
+template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 void launch_flash_attention_decode_xqa_split_reduce(
     at::Tensor& out, const at::Tensor& seq_lens, const at::Tensor& tmp_out,
     at::Tensor& max_logits, at::Tensor& exp_sums,
-    const int launch_num_partitions, const int dim_tile, cudaStream_t stream) {
+    const int launch_num_partitions, const int dim_tile, cudaStream_t stream,
+    const int route_seq_len_begin = 0, const int route_seq_len_end = 0,
+    const int route_seq_len_final = 0) {
   const int batch_size = out.size(0);
   const int num_heads_q = out.size(1);
   const dim3 stats_grid(batch_size, num_heads_q, 1);
   const dim3 stats_block(kThreadsPerBlock);
   const size_t stats_shared_mem =
       static_cast<size_t>(launch_num_partitions) * sizeof(float);
-  flash_attention_decode_xqa_reduce_stats_kernel<PARTITION_SIZE>
+  flash_attention_decode_xqa_reduce_stats_kernel<PARTITION_SIZE, SEQ_LEN_ROUTE>
       <<<stats_grid, stats_block, stats_shared_mem, stream>>>(
           max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
           seq_lens.data_ptr<int>(), batch_size, launch_num_partitions,
-          num_heads_q, max_logits.stride(0), max_logits.stride(1));
+          num_heads_q, max_logits.stride(0), max_logits.stride(1),
+          route_seq_len_begin, route_seq_len_end, route_seq_len_final);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 #define LAUNCH_SPLIT_REDUCE_OUTPUT(D_TILE)                                   \
@@ -1708,7 +1793,7 @@ void launch_flash_attention_decode_xqa_split_reduce(
                            (256 + D_TILE - 1) / D_TILE);                     \
     const dim3 output_block(D_TILE);                                         \
     flash_attention_decode_xqa_reduce_output_kernel<256, PARTITION_SIZE,     \
-                                                    D_TILE>                  \
+                                                    D_TILE, SEQ_LEN_ROUTE>   \
         <<<output_grid, output_block, 0, stream>>>(                          \
             reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),   \
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),        \
@@ -1716,7 +1801,8 @@ void launch_flash_attention_decode_xqa_split_reduce(
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size, \
             launch_num_partitions, num_heads_q, tmp_out.stride(0),           \
             tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),      \
-            max_logits.stride(1), out.stride(0), out.stride(1));             \
+            max_logits.stride(1), out.stride(0), out.stride(1),              \
+            route_seq_len_begin, route_seq_len_end, route_seq_len_final);    \
   } while (0)
 
   switch (dim_tile) {
@@ -1746,7 +1832,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& active_num_partitions, const float softmax_scale,
     const float k_scale, const float v_scale, const int launch_num_partitions,
     const bool use_split_reduce, const int split_reduce_dim_tile,
-    cudaStream_t stream, const int route_seq_len_threshold = 0,
+    cudaStream_t stream, const int route_seq_len_begin = 0,
+    const int route_seq_len_end = 0, const int route_seq_len_final = 0,
     const bool launch_reduce = true) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
@@ -1786,7 +1873,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),     \
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
-            softmax_scale, k_scale, v_scale, route_seq_len_threshold);         \
+            softmax_scale, k_scale, v_scale, route_seq_len_begin,              \
+            route_seq_len_end, route_seq_len_final);                           \
   } while (0)
 
   if (k_cache.scalar_type() == at::kByte) {
@@ -2236,22 +2324,41 @@ at::Tensor flash_attention_decode_paged_xqa(
       q.size(0) == 1 && q_per_kv == 6 && partition_size == 1024 &&
       k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
       xqa_g6_p1024_auto_enabled();
+  const bool use_g6_p1024_sawtooth =
+      q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
+      k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
+      xqa_block784_index_enabled() && xqa_g6_p1024_sawtooth_enabled();
   const int g6_p1024_route_seq_len =
       use_g6_p1024_auto ? (at::cuda::getDeviceProperties(q.get_device())
                                ->multiProcessorCount +
                            1) *
                               1024
                         : 0;
+  const int g6_p1024_sawtooth_p1024_mid_seq_len =
+      use_g6_p1024_sawtooth ? xqa_g6_p1024_sawtooth_p1024_mid_seq_len() : 0;
+  const int g6_p1024_sawtooth_p256_long_seq_len =
+      use_g6_p1024_sawtooth ? xqa_g6_p1024_sawtooth_p256_long_seq_len() : 0;
+  const int g6_p1024_sawtooth_p1024_final_seq_len =
+      use_g6_p1024_sawtooth ? xqa_g6_p1024_sawtooth_p1024_final_seq_len() : 0;
+  TORCH_CHECK(
+      !use_g6_p1024_sawtooth || (g6_p1024_sawtooth_p1024_mid_seq_len <
+                                     g6_p1024_sawtooth_p256_long_seq_len &&
+                                 g6_p1024_sawtooth_p256_long_seq_len <
+                                     g6_p1024_sawtooth_p1024_final_seq_len),
+      "Invalid p1024/p256 sawtooth thresholds: ",
+      g6_p1024_sawtooth_p1024_mid_seq_len, ", ",
+      g6_p1024_sawtooth_p256_long_seq_len, ", ",
+      g6_p1024_sawtooth_p1024_final_seq_len);
   const bool use_mtp5_dual_cta =
       q.size(0) == 5 && q_per_kv == 6 && k_cache.size(1) == 1616 &&
       k_cache.size(2) > 0 &&
       kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
       xqa_mtp5_dual_cta_enabled();
   const bool use_g6_dual_cta =
-      use_g6_p1024_auto || use_mtp5_dual_cta ||
+      use_g6_p1024_auto || use_g6_p1024_sawtooth || use_mtp5_dual_cta ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
-  const bool use_split_reduce =
-      use_g6_p1024_auto || (use_g6_dual_cta && xqa_split_reduce_enabled());
+  const bool use_split_reduce = use_g6_p1024_auto || use_g6_p1024_sawtooth ||
+                                (use_g6_dual_cta && xqa_split_reduce_enabled());
   const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
   const bool supports_block16_contiguous_layout =
       supports_block16_index && k_cache.size(2) == 1 &&
@@ -2304,6 +2411,15 @@ at::Tensor flash_attention_decode_paged_xqa(
         g6_p1024_route_seq_len);
     traced_g6_p1024_auto = true;
   }
+  static bool traced_g6_p1024_sawtooth = false;
+  if (xqa_g6_p1024_sawtooth_trace_enabled() && use_g6_p1024_sawtooth &&
+      !traced_g6_p1024_sawtooth) {
+    TORCH_WARN("Flash-V100 XQA p1024/p256 sawtooth route active; thresholds=",
+               g6_p1024_sawtooth_p1024_mid_seq_len, ", ",
+               g6_p1024_sawtooth_p256_long_seq_len, ", ",
+               g6_p1024_sawtooth_p1024_final_seq_len);
+    traced_g6_p1024_sawtooth = true;
+  }
   static bool traced_aligned_padded_smem = false;
   if (xqa_aligned_padded_smem_trace_enabled() && use_aligned_padded_smem &&
       !traced_aligned_padded_smem) {
@@ -2347,21 +2463,49 @@ at::Tensor flash_attention_decode_paged_xqa(
     }                                                                    \
   } while (0)
 
-  if (use_g6_p1024_auto) {
+  if (use_g6_p1024_sawtooth) {
+    const int p1024_launch_num_partitions = (launch_num_partitions + 3) / 4;
+    launch_flash_attention_decode_paged_xqa_tc_256_wide<
+        1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
+        kXQARouteP1024Sawtooth>(
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+        exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+        p1024_launch_num_partitions, false, split_reduce_dim_tile, stream,
+        g6_p1024_sawtooth_p1024_mid_seq_len,
+        g6_p1024_sawtooth_p256_long_seq_len,
+        g6_p1024_sawtooth_p1024_final_seq_len, false);
+    launch_flash_attention_decode_paged_xqa_tc_256_wide<
+        256, 6, true, kXQATCG6DualCtaThreads, 2, 784, false, false,
+        kXQARouteP256Sawtooth>(
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+        exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+        launch_num_partitions, false, split_reduce_dim_tile, stream,
+        g6_p1024_sawtooth_p1024_mid_seq_len,
+        g6_p1024_sawtooth_p256_long_seq_len,
+        g6_p1024_sawtooth_p1024_final_seq_len, false);
+    // Both partition routes write the selected result at the front of the
+    // shared p256 workspace. Select the matching reduction width on device so
+    // one stats/output pair serves every replay length.
+    launch_flash_attention_decode_xqa_split_reduce<0>(
+        out, seq_lens, tmp_out, max_logits, exp_sums, launch_num_partitions,
+        split_reduce_dim_tile, stream, g6_p1024_sawtooth_p1024_mid_seq_len,
+        g6_p1024_sawtooth_p256_long_seq_len,
+        g6_p1024_sawtooth_p1024_final_seq_len);
+  } else if (use_g6_p1024_auto) {
     launch_flash_attention_decode_paged_xqa_tc_256_wide<
         1024, 6, false, kXQATC256WideThreads, 1, 784, false, false,
         kXQARouteShortSeqLens>(
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
         exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
         launch_num_partitions, false, split_reduce_dim_tile, stream,
-        g6_p1024_route_seq_len, false);
+        g6_p1024_route_seq_len, 0, 0, false);
     launch_flash_attention_decode_paged_xqa_tc_256_wide<
         1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
         kXQARouteLongSeqLens>(
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
         exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
         launch_num_partitions, true, split_reduce_dim_tile, stream,
-        g6_p1024_route_seq_len, true);
+        g6_p1024_route_seq_len, 0, 0, true);
   } else if (use_g6_dual_cta) {
     if (use_block784_index) {
       if (partition_size == 1024) {

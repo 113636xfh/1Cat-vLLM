@@ -1112,3 +1112,111 @@ Raw artifacts:
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_fullaccel_compare_i131008_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/p1024_auto_racecheck_rebuilt_i74752.log`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/p1024_auto_memcheck_i262080.log`
+
+## 2026-08-14 Device-Routed P256/P1024 Sawtooth Smoothing
+
+The p1024 two-CTA route removes the original 128K bottleneck, but a fixed
+partition size still leaves large latency steps as the partition grid crosses
+partial CTA waves. A V100 has 72 SMs and this kernel admits two CTAs/SM, so its
+natural full-wave capacity is 144 CTAs. The best partition size changes with
+sequence length: p256 exposes more parallel work when p1024 leaves a partial
+wave, while p1024 avoids p256's own partial-wave and reducer overhead in the
+middle and at the exact 256K endpoint.
+
+The accepted graph contains four nodes for the exact production shape
+`B=1`, `Hq=6`, `Hkv=1`, `D=256`, page size 784:
+
+- one p1024 partition kernel and one p256 partition kernel;
+- one stats reducer and one output reducer shared by both partition routes;
+- device `seq_lens` selects the active partition kernel and reduction width;
+- the graph and KV addresses remain fixed across the complete context range.
+
+The final default routing intervals are:
+
+| sequence interval | partition route |
+|---:|---:|
+| `[1, 111104)` | p256 |
+| `[111104, 147841)` | p1024 |
+| `[147841, 258176)` | p256 |
+| `[258176, max]` | p1024 |
+
+P512 was measured over the same fixed-pointer graph curve and was never the
+fastest route. It is not retained as a graph node. The thresholds can be
+overridden for diagnosis, while
+`VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH=0` restores the previous planner and
+kernel path.
+
+### Fixed-Graph Operator Gate
+
+The following values are CUDA graph replay time for one full Flash-V100
+attention call, including partition work and both reducers. `old p1024` is the
+previous fixed route; `mixed graph` is the four-node device-routed graph.
+
+| sequence length | old p1024 | p256 alone | mixed graph | change versus old |
+|---:|---:|---:|---:|---:|
+| 32K | 0.26701 ms | 0.10453 ms | 0.10624 ms | `-60.21%` |
+| 64K | 0.27794 ms | 0.20889 ms | 0.21083 ms | `-24.15%` |
+| 106K | 0.38151 ms | 0.31738 ms | 0.31946 ms | `-16.26%` |
+| 131K | 0.38728 ms | n/a | 0.38863 ms | `+0.35%` route overhead |
+| 147,856 | 0.49573 ms | 0.48146 ms | 0.48367 ms | `-2.43%` |
+| 155,648 | 0.73600 ms | 0.50864 ms | 0.51096 ms | `-30.58%` |
+| 180,224 | 0.74493 ms | 0.52775 ms | 0.53003 ms | `-28.85%` |
+| 229,376 | 0.75786 ms | 0.71702 ms | 0.71942 ms | `-5.07%` |
+| 262,080 | 0.76719 ms | n/a | 0.76828 ms | `+0.14%` route overhead |
+
+The second boundary is the exact 128-token tile transition. At 147,840 the
+mixed graph keeps p1024 and measures `0.48338 -> 0.48392 ms` (`+0.11%`,
+bitwise equal). At 147,841 it switches to p256 and measures
+`0.49299 -> 0.48337 ms` (`-1.95%`). The earlier 147,856 threshold came from
+the higher-overhead six-node prototype and is superseded.
+
+The validation replays one graph with fixed KV pointers in forward, reverse,
+and permuted sequence orders. FP16 and FP8-e5m2 KV each cover 15 lengths, for
+90 selected-route checks in total. Every selected output is bitwise equal to
+the corresponding standalone p256 or p1024 route. P256 and p1024 themselves
+can differ by at most `1.52587890625e-05` because they use different softmax
+partition boundaries; this is why model-level token equality remains a
+separate required gate.
+
+Compute Sanitizer reports zero racecheck hazards at 155,648 tokens and zero
+memcheck errors at 262,080 tokens. The accepted memcheck excludes allocator
+leak reporting because PyTorch's caching allocator intentionally retains
+blocks after the measured call.
+
+### Full-Acceleration Model Gate
+
+The endpoint A/B uses Qwen3.6-27B-AWQ, TP4, no MTP, 180,160 actual prompt
+tokens and 64 output tokens. TurboMind AWQ, Flash-V100, AOT compile, and
+`FULL_AND_PIECEWISE` CUDA graphs are enabled. Sampling is the official
+`temperature=1.0`, `top_p=0.95`, `top_k=20` policy with seed `20260620`;
+`ignore_eos` only fixes the 64-token timing window.
+
+| true 180K TP4 no-MTP decode | TPOT | steady decode | result |
+|---|---:|---:|---:|
+| previous p1024 route | 27.6712 ms | 36.1387 tok/s | reference |
+| default four-node sawtooth graph | 23.5017 ms | 42.5501 tok/s | `-15.07%` TPOT / `+17.74%` tok/s |
+
+All 64 sampled token IDs and decoded text are identical. Prefill is
+`170.253 -> 170.282 s`, so no prefill gain or regression is attributed to this
+decode-only change. This is a strict token/text gate for the measured request,
+not a broad statistical quality claim.
+
+An isolated empty-GPU startup confirms the route does not reduce KV capacity:
+the engine reports `22.18 GiB` available for KV, `1,374,317` cached tokens, and
+`5.24x` maximum concurrency at 262,144 tokens. A prior `10.39 GiB` observation
+was invalid because workers from the preceding run were still exiting; its
+negative `-10.62 GiB` graph-memory delta exposed that external overlap.
+
+Raw artifacts:
+
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/partition_fixed_graph_full_curve_fp16_20260814.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_four_node_graph_validation_20260814.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_first_threshold_median_scan_20260814.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_second_threshold_median_scan_20260814.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_final_threshold_median_scan_20260814.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_four_node_racecheck_i155648.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/sawtooth_four_node_memcheck_no_leaks_i262080.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_wave_baseline_fullaccel_i180160_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_wave_default_four_node_fullaccel_i180160_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_wave_default_four_node_fullaccel_compare_i180160_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_default_four_node_empty_gpu_memory_smoke_i1024_o1.log`
