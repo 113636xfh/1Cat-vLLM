@@ -167,6 +167,18 @@ def test_sm70_prefill_gather_dense_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE is False
 
 
+def test_sm70_gemma_long_prefill_fused_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_SM70_GEMMA_LONG_PREFILL_FUSED is True
+
+    monkeypatch.setenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_SM70_GEMMA_LONG_PREFILL_FUSED is False
+
+
 def test_sm70_prefill_dense_splitkv3_env_is_default_on(monkeypatch):
     import vllm.envs as envs
 

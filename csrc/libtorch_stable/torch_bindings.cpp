@@ -291,6 +291,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
       "float epsilon) -> ()");
 
+#ifndef USE_ROCM
+  ops.def(
+      "sm70_gemma_long_prefill_fused_add_rms_norm("
+      "Tensor! normalized_out, Tensor! residual_out, Tensor input, "
+      "Tensor residual, Tensor weight, float epsilon) -> ()");
+#endif
+
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
@@ -553,6 +560,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // Layernorm kernels (shared CUDA/ROCm)
   ops.impl("rms_norm", TORCH_BOX(&rms_norm));
   ops.impl("fused_add_rms_norm", TORCH_BOX(&fused_add_rms_norm));
+#ifndef USE_ROCM
+  ops.impl("sm70_gemma_long_prefill_fused_add_rms_norm",
+           TORCH_BOX(&sm70_gemma_long_prefill_fused_add_rms_norm));
+#endif
 
   // Layernorm-quant kernels (shared CUDA/ROCm)
   ops.impl("rms_norm_static_fp8_quant", TORCH_BOX(&rms_norm_static_fp8_quant));

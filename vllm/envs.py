@@ -428,6 +428,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
+    VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_SCHED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_BV: str | None = None
     VLLM_SM70_FUSED_SIGMOID_GATING_WARPS: str | None = None
@@ -2603,6 +2604,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
     "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": lambda: bool(
         int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "0"))
+    ),
+    # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
+    "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": lambda: bool(
+        int(os.getenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "1"))
     ),
     # Experimental SM70 fused sigmoid gating launch schedule. Default-off and
     # BV-only unless WARPS/STAGES are explicitly overridden; multi-warp changes

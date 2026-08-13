@@ -227,6 +227,43 @@ resident service slowed both prefill and decode relative to the clean historic
 baseline, so this result proves route translation but is not a replacement
 release baseline.
 
+## Post-Dense-Projection Trace And Closed P Swizzle
+
+After enabling gathered exact-dense attention, split-KV3, and the exact FP16
+AWQ prefill projections, an Nsight Systems capture of the 64K TP4 request
+measured 21.807 seconds of critical-rank GPU timeline. The matching unprofiled
+prefill result is 20.988843 seconds. The largest device-0 kernel buckets are:
+
+| Bucket | Kernel time | Share of summed kernel time |
+|---|---:|---:|
+| exact FP16 projection GEMMs | 9.912 s | 47.4% |
+| D256 full attention | 5.767 s | 27.6% |
+| NCCL all-reduce | 1.412 s | 6.7% |
+| vectorized elementwise kernels | 0.847 s | 4.0% |
+| TurboMind FP16 GEMM | 0.771 s | 3.7% |
+| FlashQLA GDN | 0.740 s | 3.5% |
+| RMSNorm | 0.517 s | 2.5% |
+
+The full-attention time grows nearly linearly across the 16 prefill chunks:
+the per-layer kernel is 1.701 ms at 4K, 21.113 ms when split-KV3 first selects
+at 32K, and 42.522 ms at 64K. The final chunk sustains about 37.6 causal
+TFLOP/s. KV gather is not a bottleneck.
+
+A follow-up applied the previously useful conflict-free P layout to the final
+TT-PV split-KV3 body. It preserves the exact output hashes and lowers the
+partition kernel from 253 to 251 registers/thread with zero spill, but the
+required accumulator-to-layout warp shuffles are too expensive:
+
+| KV length | Accepted split-KV3 | TT-PV + P swizzle | Regression |
+|---:|---:|---:|---:|
+| 32K | 21.0330 ms | 27.1365 ms | 29.0% |
+| 64K | 42.6716 ms | 55.8776 ms | 30.9% |
+
+This combination is rejected. Do not retry P bank-conflict removal by adding
+shuffle-based accumulator repacking to the TT-PV body. A successor must
+change the native QK accumulator or PV operand ownership so the desired
+shared address is produced without a conversion stream.
+
 ## Numerical And Quality Gates
 
 - Exact Split-D versus generic FA2 has max absolute error `2.4414e-4` and

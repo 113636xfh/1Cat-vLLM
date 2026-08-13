@@ -41127,3 +41127,53 @@ Interpretation:
   `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
 - Detailed rationale, shape table, rejected paths, and artifact names are in
   `docs/design/sm70_awq_long_prefill_exact_dense.md`.
+
+## 2026-08-14 Qwen3.6 long-prefill post-dense trace and P-layout gate
+
+- The accepted gather-to-exact-dense route remains default. Randomized
+  physical pages and the real interleaved K/V allocation are bitwise exact;
+  its 7.47%-10.81% result is an attention-operator gain, while the measured
+  full-model gain is 0.66% at 8K and 1.74% at 64K.
+- The final 64K unprofiled prefill remains 20.988843 seconds after exact FP16
+  AWQ projection preparation. The matching Nsight capture attributes 47.4%
+  of summed critical-rank kernel time to exact FP16 GEMMs, 27.6% to D256 full
+  attention, 6.7% to NCCL, and 3.5% to FlashQLA GDN.
+- Full-attention per-layer time rises from 1.701 ms at the first 4K chunk to
+  42.522 ms at 64K. The final chunk sustains about 37.6 causal TFLOP/s;
+  gather overhead is negligible in the trace.
+- Rejected the conflict-free P layout on the final TT-PV split-KV3 body.
+  Output hashes remain exact and PTXAS improves 253 to 251 registers/thread
+  with zero spill, but 32K regresses 21.0330 to 27.1365 ms and 64K regresses
+  42.6716 to 55.8776 ms. The warp-shuffle conversion stream costs more than
+  the removed shared replay. Do not retry this composition.
+- Artifacts are
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_reference_32k_64k.json`,
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_candidate_32k_64k.json`,
+  and the trace directory
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/awq-prefill-dense-fullmodel/nsys/`.
+
+## 2026-08-14 Exact mixed-dtype Gemma long-prefill fusion
+
+- Accepted a default-on SM70 local fusion for Qwen3.5/Qwen3.6 Gemma residual
+  plus RMSNorm at `M>=256,H=5120`. It preserves the existing NCCL result and
+  reduction order; decode and small tails do not dispatch to it. Rollback is
+  `VLLM_SM70_GEMMA_LONG_PREFILL_FUSED=0`.
+- Production bitwise gates pass `M={256,4096}` with FP16, BF16, and FP32 norm
+  weights. The matched FP16-runtime `M=4096` chain improves from
+  0.8131-0.8141 ms to 0.2806-0.2826 ms (2.88-2.90x); the BF16 specialization
+  has the same result. The final kernel uses 48 registers/thread, 168 bytes
+  shared memory, and no local spill.
+- Matched fixed-clock 64K TP4 three-repeat prefill improves
+  `22.1030 -> 21.3302 s` (-3.50%). All output token hashes match and decode is
+  unchanged within 0.13% noise. The final register-resident production build
+  separately route-hits at 20.1917 seconds with the same 16-token hash.
+- Nsight confirms the initial fused version removed 1.661 seconds of FP32 add,
+  RMSNorm, and conversion work and replaced it with 0.669 seconds of fused
+  execution. The register-resident refinement removes the second residual
+  global read and is separately microbenchmarked.
+- A later trace's rank-1 attention slowdown and 3.117-second NCCL sum are not
+  reproducible: physical GPUs 0-3 measure 44.231/44.301/44.176/44.329 ms for
+  the same `Q4096/KV64K` kernel (0.35% maximum spread). Do not alter collective
+  dispatch from that transient capture.
+- Full method and artifacts are in
+  `docs/design/sm70_gemma_long_prefill_fusion.md`.

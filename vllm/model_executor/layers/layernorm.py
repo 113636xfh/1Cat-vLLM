@@ -19,6 +19,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def _sm70_gemma_long_prefill_available() -> bool:
+    return current_platform.is_device_capability(70)
+
+
 def poly_norm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
@@ -86,6 +91,37 @@ def _sm70_gemma_fused_add_rms_norm_eager_fake(
     )
 
 
+def _sm70_gemma_long_prefill_fused_add_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm import _custom_ops as ops
+
+    normalized_out = torch.empty_like(x)
+    residual_out = torch.empty_like(residual)
+    ops.sm70_gemma_long_prefill_fused_add_rms_norm(
+        normalized_out,
+        residual_out,
+        x,
+        residual,
+        weight,
+        variance_epsilon,
+    )
+    return normalized_out, residual_out
+
+
+def _sm70_gemma_long_prefill_fused_add_rms_norm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, variance_epsilon
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
 direct_register_custom_op(
     op_name="sm70_gemma_rms_norm_eager",
     op_func=_sm70_gemma_rms_norm_eager,
@@ -98,6 +134,13 @@ direct_register_custom_op(
     op_func=_sm70_gemma_fused_add_rms_norm_eager,
     mutates_args=[],
     fake_impl=_sm70_gemma_fused_add_rms_norm_eager_fake,
+)
+
+direct_register_custom_op(
+    op_name="sm70_gemma_long_prefill_fused_add_rms_norm",
+    op_func=_sm70_gemma_long_prefill_fused_add_rms_norm,
+    mutates_args=[],
+    fake_impl=_sm70_gemma_long_prefill_fused_add_rms_norm_fake,
 )
 
 
@@ -259,12 +302,46 @@ class GemmaRMSNorm(CustomOp):
             and x.is_cuda
         )
 
+    def _use_sm70_long_prefill_fused(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> bool:
+        return (
+            envs.VLLM_SM70_GEMMA_LONG_PREFILL_FUSED
+            and residual is not None
+            and x.is_cuda
+            and _sm70_gemma_long_prefill_available()
+            and x.dtype == torch.float16
+            and residual.dtype == torch.float32
+            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.ndim == 2
+            and x.shape[0] >= 256
+            and x.shape[1] == 5120
+            and residual.shape == x.shape
+            and x.is_contiguous()
+            and residual.is_contiguous()
+            and self.weight.is_contiguous()
+        )
+
     def forward_native(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if self._use_sm70_long_prefill_fused(x, residual):
+            assert residual is not None
+            if not torch.compiler.is_compiling():
+                logger.info_once(
+                    "SM70 exact mixed-dtype Gemma RMSNorm long-prefill path active."
+                )
+            return torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
         if self._use_sm70_compile_native(x):
             if residual is None:
                 return self._forward_static_no_residual(
@@ -299,6 +376,18 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._use_sm70_long_prefill_fused(x, residual):
+            assert residual is not None
+            if not torch.compiler.is_compiling():
+                logger.info_once(
+                    "SM70 exact mixed-dtype Gemma RMSNorm long-prefill path active."
+                )
+            return torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
         if (
             envs.VLLM_SM70_GEMMA_RMS_NORM_EAGER
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
