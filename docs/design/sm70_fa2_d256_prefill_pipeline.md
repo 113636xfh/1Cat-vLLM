@@ -4,8 +4,10 @@
 
 Qwen3.6-27B full-attention prefill now uses a dedicated Volta D256 kernel for
 both the first dense chunk and later chunks in the standard interleaved paged
-KV cache. The kernel reads the existing layouts directly and writes into the
-vLLM output tensor without a gather, repack, temporary output, or copy.
+KV cache. The direct paged operator reads that layout without a repack or
+temporary output. For eligible long, single-sequence prefix chunks, the
+dispatcher now gathers logical pages into a reusable exact-dense K/V workspace
+and calls the faster exact dense operator.
 
 The route is enabled by default. Set
 `VLLM_FLASH_V100_FA2_D256_PREFILL=0` to disable it. Dispatch is exact-only:
@@ -13,6 +15,10 @@ unsupported shapes return to the established `FLASH_ATTN_V100` path rather
 than entering an unvalidated generic FA2 fallback. Decode, MTP small-query
 attention, FP8 KV cache, sliding-window attention, and non-causal attention
 are unchanged.
+
+Long-prefix gathering is also enabled by default. Set
+`VLLM_FLASH_V100_PREFILL_GATHER_DENSE=0` to retain direct paged attention.
+Its default thresholds are `Q>=4096` and `KV>=8192`.
 
 ## Accepted Contract
 
@@ -29,7 +35,9 @@ The full-model acceptance workload is:
 The operator requires SM70, FP16, causal full attention, head dimension 256,
 unit inner strides, query length at least 1024, and query/KV lengths divisible
 by 64. The paged route currently accepts one sequence per call and preserves
-the runtime block table. All other cases retain the previous implementation.
+the runtime block table. Gathering further requires one sequence, `Q>=4096`,
+`KV>=8192`, `KV>Q`, no graph capture, and lengths divisible by 64. All other
+cases retain direct paged attention.
 
 ## Kernel Design
 
@@ -128,6 +136,42 @@ load wavefronts fall from 268.0M to 230.0M. Static SASS shrinks from 1,875 to
 1,767 instructions: `LDS.U16` falls from 128 to zero and `PRMT` from 68 to
 four. Tensor active reaches 32.06%. Shared-store conflicts increase, but their
 cost is smaller than the removed transpose/load/permutation chain.
+
+## Long-Prefix Gather-to-Exact-Dense
+
+The production KV allocation is interleaved as
+`[physical_page, K/V, 784, Hkv, D]`; unbinding K and V therefore produces
+non-contiguous views. The accepted path uses the runtime block table to
+`index_select` both views into per-device, per-stream workspaces, slices the
+last page to the exact sequence length, and invokes the same exact N32 dense
+operator. Random physical page order is part of the test, and all outputs are
+bitwise equal to direct paged attention.
+
+The following single-rank microbenchmark uses the validated production binary,
+`Q=4096`, `Hq=6`, `Hkv=1`, D256, FP16, page size 784, and randomized physical
+page order:
+
+| KV length | Direct paged | Gather | Gather + exact dense | Net reduction |
+|---:|---:|---:|---:|---:|
+| 8K | 5.6740 ms | 0.0635 ms | 5.0606 ms | 10.81% |
+| 64K | 50.4571 ms | 0.1654 ms | 46.6877 ms | 7.47% |
+| 128K | 103.8479 ms | 0.2985 ms | 95.0461 ms | 8.48% |
+| 256K | 210.6481 ms | 0.5868 ms | 192.8289 ms | 8.46% |
+
+This is a 7.47-10.81% **attention-operator** reduction, not a 6% whole-model
+claim. The controlled Qwen3.6-27B-AWQ TP4 full-model A/B is:
+
+| Input | Direct paged prefill | Gathered prefill | Saved | Reduction | Quality/route gate |
+|---:|---:|---:|---:|---:|---|
+| 8K | 2.584815 s | 2.567641 s | 17.174 ms | 0.66% | exact tokens; 48 hits/rank |
+| 64K | 26.319437 s | 25.860738 s | 458.699 ms | 1.74% | exact tokens; 480 hits/rank |
+
+The 8K run uses one warmup and two measured requests. The 64K run uses one
+warmup and one measured request. Decode TPOT is unchanged within 0.04%; the
+gate does not select decode. At 256K, geometric workspace growth can retain up
+to about 269.5 MiB per active stream and TP rank for `Hkv=1`, D256, FP16 K/V.
+If allocation fails, dispatch logs once and falls back to direct paged
+attention instead of failing the request.
 
 An adjacent real-model TP4 route check used Qwen3.6-27B-AWQ, 8K input,
 16-token deterministic output, chunk size 4096, FP16 KV, FlashAttentionV100,
@@ -233,7 +277,8 @@ prefill by less than 0.1% relative to that run:
 The next end-to-end bottleneck is TurboMind AWQ GEMM, not D256 attention. A
 representative `4096x8704x5120` gate/up kernel reaches 58.87 tensor TOPS but
 is limited to 12.5% occupancy by 248 registers/thread and 65.55 KiB shared
-memory.
+memory. The retained category trace predates long-prefix gathering; a new 64K
+trace is required before changing another attention structure.
 
 ## Evidence
 
@@ -269,6 +314,8 @@ memory.
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/tt_final_clean_quality.json`
 - Validated runtime binary SHA256:
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
+- Long-prefix gather A/B results and logs:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/gather-dense/results/`
 - Independent clean-build binary SHA256:
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Vendored patch SHA256:
@@ -291,5 +338,7 @@ memory.
 - A KV-major cache allocation did not improve the full model and expanded the
   cache-management blast radius, so it was removed.
 - Chunk size 8192 was 1.50% slower end to end than 4096 in the earlier A/B.
+- Full-D256 tile residency is closed: the spill-free hybrid still regressed
+  64K by 14.97% because integer and LSU instructions rose by 53.7% and 18.6%.
 - Further attention-only work has a small current-model ceiling. Future
   prefill work should first target AWQ GEMM and elementwise overhead.

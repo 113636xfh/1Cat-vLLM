@@ -150,6 +150,274 @@ def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
 
 
+def test_sm70_prefill_gather_dense_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", raising=False)
+    envs.disable_envs_cache()
+
+    assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE is True
+    assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q == 4096
+    assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV == 8192
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE is False
+
+
+def test_prefill_gather_dense_does_not_require_generic_dense_op(monkeypatch):
+    import vllm.envs as envs
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    def paged_prefill(*args, **kwargs):
+        raise AssertionError("constructor test must not execute the paged op")
+
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_flash_ops",
+        lambda: (
+            None,
+            None,
+            None,
+            None,
+            None,
+            paged_prefill,
+            None,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_fp8_e5m2_paged_kv_bridge_op",
+        lambda: None,
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1")
+    envs.disable_envs_cache()
+    try:
+        impl = flash_v100.FlashAttnV100Impl(
+            num_heads=4,
+            head_size=256,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+        )
+    finally:
+        envs.disable_envs_cache()
+
+    assert impl.use_flash_v100_prefill_paged is True
+    assert impl.use_flash_v100_prefill_contig_dense is False
+    assert impl.use_flash_v100_prefill_gather_dense is True
+
+
+def test_prefill_gather_dense_reorders_random_pages_and_reuses_workspace(
+    monkeypatch,
+):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", {})
+    key_cache = torch.arange(5 * 4 * 2, dtype=torch.float16).reshape(5, 4, 1, 2)
+    value_cache = key_cache + 100
+    block_table = torch.tensor([3, 1, 4], dtype=torch.int32)
+
+    first = flash_v100._gather_paged_kv_to_exact_dense(
+        key_cache,
+        value_cache,
+        block_table,
+        seq_len=10,
+    )
+    assert first is not None
+    key_dense, value_dense = first
+    expected_key = torch.cat((key_cache[3], key_cache[1], key_cache[4]))[:10]
+    expected_value = torch.cat((value_cache[3], value_cache[1], value_cache[4]))[:10]
+    assert key_dense.shape == (1, 10, 1, 2)
+    assert torch.equal(key_dense.squeeze(0), expected_key)
+    assert torch.equal(value_dense.squeeze(0), expected_value)
+    first_ptr = key_dense.data_ptr()
+
+    second = flash_v100._gather_paged_kv_to_exact_dense(
+        key_cache,
+        value_cache,
+        block_table,
+        seq_len=8,
+    )
+    assert second is not None
+    assert second[0].data_ptr() == first_ptr
+
+
+def test_prefill_gather_dense_accepts_interleaved_kv_views(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", {})
+    kv_cache = torch.arange(5 * 2 * 4 * 2, dtype=torch.float16).reshape(5, 2, 4, 1, 2)
+    key_cache, value_cache = kv_cache.unbind(1)
+    block_table = torch.tensor([3, 1, 4], dtype=torch.int32)
+
+    assert key_cache.is_contiguous() is False
+    gathered = flash_v100._gather_paged_kv_to_exact_dense(
+        key_cache,
+        value_cache,
+        block_table,
+        seq_len=10,
+    )
+
+    assert gathered is not None
+    key_dense, value_dense = gathered
+    expected_key = torch.cat((key_cache[3], key_cache[1], key_cache[4]))[:10]
+    expected_value = torch.cat((value_cache[3], value_cache[1], value_cache[4]))[:10]
+    assert torch.equal(key_dense.squeeze(0), expected_key)
+    assert torch.equal(value_dense.squeeze(0), expected_value)
+
+
+def test_prefill_gather_dense_falls_back_when_workspace_is_out_of_memory(
+    monkeypatch,
+):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    key_cache = torch.empty((5, 4, 1, 2), dtype=torch.float16)
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", {})
+    monkeypatch.setattr(flash_v100, "_warned_prefill_gather_oom", False)
+
+    def raise_oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("expected test OOM")
+
+    monkeypatch.setattr(flash_v100.torch, "empty", raise_oom)
+
+    assert flash_v100._get_prefill_gather_dense_workspace(key_cache, 3) is None
+    assert flash_v100._warned_prefill_gather_oom is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({"q_len": 2048}, False),
+        ({"seq_len": 4096}, False),
+        ({"seq_len": 8224}, False),
+        ({"num_seqs": 2}, False),
+        ({"causal": False}, False),
+    ],
+)
+def test_prefill_gather_dense_policy_is_evidence_bounded(overrides, expected):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.use_flash_v100_prefill_gather_dense = True
+    impl.prefill_gather_dense_min_q = 4096
+    impl.prefill_gather_dense_min_kv = 8192
+    key_cache = torch.empty((12, 784, 1, 256), dtype=torch.float16)
+    value_cache = torch.empty_like(key_cache)
+    kwargs = {
+        "q_len": 4096,
+        "seq_len": 8192,
+        "head_dim": 256,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "causal": True,
+        "window_size": (-1, -1),
+        "num_seqs": 1,
+        **overrides,
+    }
+
+    assert impl._should_use_prefill_gather_dense(**kwargs) is expected
+
+
+def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
+    monkeypatch,
+):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.num_heads = 6
+    impl.num_kv_heads = 1
+    impl.head_size = 256
+    impl.scale = 0.0625
+    impl.sliding_window = None
+    impl.kv_cache_dtype = "auto"
+    impl.use_flash_v100_decode = False
+    impl.use_decode_paged_prefill = False
+    impl.smallq_decode_max_query_len = 0
+    impl.smallq_decode_max_model_len = 0
+    impl.use_flash_v100_prefill_paged = True
+    impl.use_flash_v100_prefill_bfla = False
+    impl.use_flash_v100_prefill_splitkv = False
+    impl.use_flash_v100_prefill_contig_dense = True
+    impl.prefill_contig_dense_allow_copy = False
+    impl.prefill_contig_dense_min_q = 1536
+    impl.prefill_contig_dense_min_kv = 8192
+    impl.use_flash_v100_prefill_gather_dense = True
+    impl.prefill_gather_dense_min_q = 4096
+    impl.prefill_gather_dense_min_kv = 8192
+    impl.use_fp8_prefill_bridge = False
+    impl.flash_attn_prefill_paged_bfla = None
+    impl.flash_attn_prefill_paged_splitkv = None
+    impl.flash_attn_bhmd_func = None
+    impl.flash_attn_func = None
+
+    query_len = 4096
+    seq_len = 8192
+    page_size = 784
+    num_pages = (seq_len + page_size - 1) // page_size
+    query = torch.empty((query_len, 6, 256), dtype=torch.float16)
+    output = torch.empty_like(query)
+    key_cache = torch.empty((num_pages, page_size, 1, 256), dtype=torch.float16)
+    value_cache = torch.empty_like(key_cache)
+    block_table = torch.arange(num_pages - 1, -1, -1, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        causal=True,
+        num_actual_tokens=query_len,
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, query_len], dtype=torch.int32),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        block_table=block_table,
+        ddtree_parent_ids=None,
+        ddtree_num_tree_tokens_cpu=None,
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    routes = []
+
+    def exact_dense(query_arg, key_arg, value_arg, **kwargs):
+        assert query_arg.shape == (1, query_len, 6, 256)
+        assert key_arg.shape == (1, seq_len, 1, 256)
+        assert value_arg.shape == key_arg.shape
+        kwargs["out"].fill_(5)
+        return kwargs["out"]
+
+    def unexpected_paged(*args, **kwargs):
+        raise AssertionError("eligible long prefill must not call the paged kernel")
+
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", {})
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_splitd_d256_ops",
+        lambda: (object(), object()),
+    )
+    monkeypatch.setattr(flash_v100, "_try_sm70_fa2_d256_prefill", exact_dense)
+    monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+    impl.flash_attn_prefill_paged = unexpected_paged
+
+    result = impl._flash_v100_prefill_with_prefix(
+        layer,
+        query,
+        None,
+        None,
+        (key_cache, value_cache),
+        metadata,
+        output,
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.full_like(output, 5))
+    assert routes == ["prefill_prefix_gather_splitd_d256"]
+
+
 def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
