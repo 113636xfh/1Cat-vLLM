@@ -73,18 +73,18 @@ def _awq_exact_f16_weight(
     qzeros: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
-    """Expand AWQ with the same FP16 bias rounding and FMA as TurboMind."""
+    """Expand exact AWQ as contiguous KxN for a direct FP16 GEMM."""
     k = qweight.shape[0]
     n = qweight.shape[1] * 8
     zeros = _unpack_awq_zeros(qzeros)
-    dense = torch.empty((n, k), dtype=torch.float16, device=qweight.device)
+    dense = torch.empty((k, n), dtype=torch.float16, device=qweight.device)
     for group in range(k // group_size):
         start = group * group_size
         end = start + group_size
         quant = _unpack_awq_gemm_qweight(qweight[start:end])
         scale = scales[group].unsqueeze(0)
         bias = (-zeros[group] * scales[group]).unsqueeze(0)
-        dense[:, start:end].copy_(torch.addcmul(bias, quant, scale).transpose(0, 1))
+        dense[start:end].copy_(torch.addcmul(bias, quant, scale))
     return dense
 
 
@@ -572,7 +572,7 @@ class AWQLinearMethod(LinearMethodBase):
                 logger.info_once(
                     "SM70 AWQ exact-dense TP4 4096-token prefill runtime path active."
                 )
-                out = torch.mm(reshaped_x, prefill_weight.transpose(0, 1))
+                out = torch.mm(reshaped_x, prefill_weight)
                 if bias is not None:
                     out.add_(bias)
                 return out.reshape(out_shape)

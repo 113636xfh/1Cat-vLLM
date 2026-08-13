@@ -68,6 +68,26 @@ Prefill throughput improves by 21.56%. Model residency rises from 6.50 GiB to
 with at least 30 GiB total memory. The explicit 3 GiB KV configuration used
 for acceptance completed without OOM.
 
+## Direct KxN Storage Refinement
+
+The initial implementation stored each expanded weight as contiguous `N x K`
+and transposed that tensor at every `torch.mm` call. The accepted refinement
+materializes contiguous `K x N` once and calls the same FP16 cuBLAS GEMM
+directly. It changes neither dequantization nor the GEMM numerical contract.
+
+- Twenty real TP4 rank/shape cases are bitwise equal to the original layout.
+- Across all five projections, operator latency improves by 2.39%-3.01%
+  (2.58% geometric mean).
+- Nsight Systems records the 3,824 selected projection calls per rank falling
+  from 38.511 to 36.959 seconds in aggregate (`-4.03%`).
+- A fixed-clock 64K full-model A-B-A gate gives a conservative endpoint range
+  of 0.85%-3.07%, with an A-B-A center gain of 1.96%. All nine runs produce
+  the same token hash.
+
+The route retains the existing `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0` rollback;
+there is no separate layout switch because both representations have the same
+memory footprint and the direct layout is exact on every selected TP shard.
+
 ## Rejected Or Deferred Variants
 
 - Fused gate/up plus SiLU epilogue was exact but saved only 0.096 ms/layer,
@@ -87,6 +107,11 @@ for acceptance completed without OOM.
 - `awq-prefill-dense-fullmodel/candidate_i65536.json`
 - `awq-prefill-dense-fullmodel/candidate_all_i65536.json`
 - `ncu_awq_gateup_m4096_tp4.ncu-rep`
+- `awq_exact_dense_kn_layout_tp4_allranks.json`
+- `awq-kn-fullmodel-i65536-clock1530-repeat3.json`
+- `awq-nk-control-fullmodel-i65536-clock1530-repeat3.json`
+- `awq-kn-fullmodel-i65536-clock1530-repeat3-aba.json`
+- `awq-kn-nsys-i65536-clock1530.nsys-rep`
 
 The artifacts are under
 `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/`.

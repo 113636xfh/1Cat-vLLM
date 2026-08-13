@@ -41177,3 +41177,33 @@ Interpretation:
   dispatch from that transient capture.
 - Full method and artifacts are in
   `docs/design/sm70_gemma_long_prefill_fusion.md`.
+
+## 2026-08-14 Exact-dense KxN storage and remaining QKV gate
+
+- Accepted contiguous `K x N` storage for the existing exact FP16 AWQ
+  long-prefill weights. Twenty real TP4 rank/shape cases are bitwise equal;
+  the five projection classes improve by 2.39%-3.01% (2.58% geometric mean).
+- Nsight Systems measures all selected projection calls at
+  `38.511 -> 36.959 s` aggregate (`-4.03%`). A fixed-clock 64K A-B-A endpoint
+  gives a conservative 0.85%-3.07% model-prefill gain, with identical token
+  hashes in all nine runs. The existing exact-dense environment gate remains
+  the rollback.
+- The remaining unquantized full-attention QKV projection is
+  `M4096,K5120,N3584`, 256 calls/rank, and about 3.3% of the latest 64K
+  prefill. cuBLAS is 1.38-1.40x faster but is rejected: every rank differs
+  from the current TurboMind FP32 accumulation result, including millions of
+  FP16 output mismatches. Raising the generic TurboMind tuning ceiling to
+  M4096 is bitwise exact but about 0.6% slower.
+- NCU on the retained `CTA128x128x16` kernel reports 255 registers/thread,
+  12.19% achieved occupancy, 61.08% cycles with no eligible warp, and only
+  10.98% DRAM throughput. The next admissible experiment must target the
+  shared-memory/MIO/scoreboard/barrier path while preserving HMMA and FP32
+  accumulation order; shape tuning and direct cuBLAS are closed.
+- Artifacts are `awq_exact_dense_kn_layout_tp4_allranks.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-nk-control-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3-aba.json`,
+  `awq-kn-nsys-i65536-clock1530.nsys-rep`,
+  `qkv_prefill_cublas_tp4_allranks.json`, and
+  `ncu-qkv-tm-m4096-n3584-k5120-clock1530.ncu-rep` under the retained task
+  artifact directory.

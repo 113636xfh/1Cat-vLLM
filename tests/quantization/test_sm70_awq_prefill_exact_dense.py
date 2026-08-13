@@ -13,9 +13,9 @@ from vllm.model_executor.layers.quantization.awq import (
 
 
 def test_awq_exact_f16_weight_matches_half_fma_rounding():
-    qweight = torch.full((8, 1), 0x11111111, dtype=torch.int32)
-    qzeros = torch.full((1, 1), 0x33333333, dtype=torch.int32)
-    scales = torch.full((1, 8), 0.0001, dtype=torch.float16)
+    qweight = torch.full((8, 2), 0x11111111, dtype=torch.int32)
+    qzeros = torch.full((1, 2), 0x33333333, dtype=torch.int32)
+    scales = torch.full((1, 16), 0.0001, dtype=torch.float16)
 
     actual = _awq_exact_f16_weight(qweight, scales, qzeros, group_size=8)
     quant = torch.ones((), dtype=torch.float16)
@@ -25,6 +25,8 @@ def test_awq_exact_f16_weight_matches_half_fma_rounding():
     expected = torch.addcmul(bias, quant, scale)
     naive = (quant - zero) * scale
 
+    assert actual.shape == (8, 16)
+    assert actual.is_contiguous()
     assert torch.equal(actual, torch.full_like(actual, expected))
     assert expected != naive
 
