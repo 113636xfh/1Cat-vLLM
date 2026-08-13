@@ -19,6 +19,9 @@ are unchanged.
 Long-prefix gathering is also enabled by default. Set
 `VLLM_FLASH_V100_PREFILL_GATHER_DENSE=0` to retain direct paged attention.
 Its default thresholds are `Q>=4096` and `KV>=8192`.
+For the admitted Qwen TP4 shape, gathered dense attention also uses the
+default-on three-way KV partition at `KV>=32768`; set
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3=0` to retain unsplit exact dense.
 
 ## Accepted Contract
 
@@ -37,7 +40,8 @@ unit inner strides, query length at least 1024, and query/KV lengths divisible
 by 64. The paged route currently accepts one sequence per call and preserves
 the runtime block table. Gathering further requires one sequence, `Q>=4096`,
 `KV>=8192`, `KV>Q`, no graph capture, and lengths divisible by 64. All other
-cases retain direct paged attention.
+cases retain direct paged attention. Three-way partitioning further requires
+batch 1, `Q=4096`, `Hq=6`, `Hkv=1`, and `KV>=32768`.
 
 ## Kernel Design
 
@@ -172,6 +176,45 @@ gate does not select decode. At 256K, geometric workspace growth can retain up
 to about 269.5 MiB per active stream and TP rank for `Hkv=1`, D256, FP16 K/V.
 If allocation fails, dispatch logs once and falls back to direct paged
 attention instead of failing the request.
+
+## Accepted Exact-Dense Split-KV3
+
+For the Qwen3.6 TP4 chunk shape (`Q=4096`, `Hq=6`, `Hkv=1`, D256), the exact
+dense kernel launches 384 CTAs on 72 SMs. One-CTA-per-SM residency requires
+six waves and leaves 48 slots unused in the final wave. The accepted default
+for this shape partitions each CTA's visible KV range into three independent
+segments,
+launches 1,152 CTAs (exactly 16 waves), and combines FP32 partial
+numerator/max/sum state in a separate kernel. It does not quantize or truncate
+K/V and retains the accepted N32 body inside each partition.
+
+Clean paired single-rank measurements at 1312 MHz are:
+
+| KV length | Exact dense | Split-KV3 | Throughput gain | Decision |
+|---:|---:|---:|---:|---|
+| 8K | 4.6572 ms | 4.5117 ms | 3.22% | keep the original route |
+| 32K | 22.5864 ms | 21.0775 ms | 7.16% | admit |
+| 64K | 46.4625 ms | 42.7131 ms | 8.78% | admit |
+| 128K | 94.7456 ms | 87.1639 ms | 8.70% | admit |
+
+At 64K, the candidate differs from the accepted FP16 reduction tree by at
+most `3.0518e-5`. Against an FP32 reference over 64 sampled query rows, its
+relative L2 error is `2.8796e-4`, slightly lower than the accepted dense
+kernel's `2.8850e-4`. The same check passes at 128K. PTXAS reports 253
+registers/thread for the partition kernel and 26 for the merge, with zero
+spills for both. The reusable FP32 workspace is about 75.6 MiB per active
+stream and rank for the admitted shape; OOM falls back to exact dense.
+
+The exclusive-GPU Qwen3.6-27B-AWQ TP4 full-model gate measured
+`25.860738 -> 25.514792 s` at 64K, saving 345.946 ms (1.34%) after one warmup.
+Every rank reported 288 split-KV3 kernel hits, and all 16 deterministic output
+token IDs, text, and the token hash matched the gathered exact-dense baseline.
+Decode TPOT remained unchanged at about 21.35 ms.
+
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3` is therefore enabled by default. The
+dispatch remains evidence-bounded to batch 1, `Q=4096`, `Hq=6`, `Hkv=1`,
+D256, FP16 dense K/V, and `KV>=32768`; other shapes continue to use exact
+dense. Set the variable to `0` to disable it.
 
 An adjacent real-model TP4 route check used Qwen3.6-27B-AWQ, 8K input,
 16-token deterministic output, chunk size 4096, FP16 KV, FlashAttentionV100,
@@ -316,6 +359,14 @@ trace is required before changing another attention structure.
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Long-prefix gather A/B results and logs:
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/gather-dense/results/`
+- Split-KV3 clean microbenchmark and FP32-reference gates:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3_n32_gate_32k_128k_clean.json`
+  and
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3_n32_quality_ref_q4096_kv65536.json`
+- Split-KV3 production patch-check binary SHA256:
+  `84571628436990f433572d073c55a85d4910a7db83eb883fcbecceb133b154b4`
+- Split-KV3 exclusive 64K full-model gate:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3-fullmodel/results/candidate_decode_harness_i65536.json`
 - Independent clean-build binary SHA256:
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Vendored patch SHA256:

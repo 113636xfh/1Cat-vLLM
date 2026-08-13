@@ -167,6 +167,21 @@ def test_sm70_prefill_gather_dense_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE is False
 
 
+def test_sm70_prefill_dense_splitkv3_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", raising=False)
+    envs.disable_envs_cache()
+
+    assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3 is True
+    assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV == 32768
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3 is False
+
+
 def test_prefill_gather_dense_does_not_require_generic_dense_op(monkeypatch):
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
@@ -442,7 +457,86 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     fake_ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd = dense
     fake_ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd = paged
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
-    assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged)
+    assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, None)
+
+    splitkv3 = object()
+    fake_ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_splitkv3_fwd = splitkv3
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
+    assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
+
+
+def test_prefill_dense_splitkv3_workspace_reuses_exact_shape(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(flash_v100, "_prefill_dense_splitkv3_workspaces", {})
+    query = torch.empty((1, 2, 3, 4), dtype=torch.float16)
+
+    first = flash_v100._get_prefill_dense_splitkv3_workspace(query)
+    second = flash_v100._get_prefill_dense_splitkv3_workspace(query)
+
+    assert first is not None
+    assert second is not None
+    assert first[0].shape == (3, 1, 2, 3, 4)
+    assert first[1].shape == (3, 1, 2, 3)
+    assert first[0].data_ptr() == second[0].data_ptr()
+    assert first[1].data_ptr() == second[1].data_ptr()
+
+
+def test_prefill_dense_splitkv3_workspace_oom_falls_back(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    query = torch.empty((1, 2, 3, 4), dtype=torch.float16)
+    monkeypatch.setattr(flash_v100, "_prefill_dense_splitkv3_workspaces", {})
+    monkeypatch.setattr(flash_v100, "_warned_prefill_dense_splitkv3_oom", False)
+
+    def raise_oom(*args, **kwargs):
+        raise torch.OutOfMemoryError
+
+    monkeypatch.setattr(flash_v100.torch, "empty", raise_oom)
+
+    assert flash_v100._get_prefill_dense_splitkv3_workspace(query) is None
+    assert flash_v100._warned_prefill_dense_splitkv3_oom is True
+
+
+def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
+    import vllm.envs as envs
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1")
+    envs.disable_envs_cache()
+    query = torch.empty((1, 4096, 6, 256), dtype=torch.float16, device="meta")
+    key = torch.empty((1, 65536, 1, 256), dtype=torch.float16, device="meta")
+    key_32k = torch.empty((1, 32768, 1, 256), dtype=torch.float16, device="meta")
+    key_16k = torch.empty((1, 16384, 1, 256), dtype=torch.float16, device="meta")
+
+    assert flash_v100._should_use_prefill_dense_splitkv3(
+        query,
+        key,
+        max_seqlen_q=4096,
+        max_seqlen_k=65536,
+        splitkv3_op=object(),
+    )
+    assert flash_v100._should_use_prefill_dense_splitkv3(
+        query,
+        key_32k,
+        max_seqlen_q=4096,
+        max_seqlen_k=32768,
+        splitkv3_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_dense_splitkv3(
+        query,
+        key_16k,
+        max_seqlen_q=4096,
+        max_seqlen_k=16384,
+        splitkv3_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_dense_splitkv3(
+        query[:, :, :4],
+        key,
+        max_seqlen_q=4096,
+        max_seqlen_k=65536,
+        splitkv3_op=object(),
+    )
 
 
 def test_dense_prefill_restores_uniform_batch_view_for_exact_splitd(monkeypatch):

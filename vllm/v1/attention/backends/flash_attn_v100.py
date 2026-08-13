@@ -100,6 +100,7 @@ _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
 _warned_prefill_gather_oom = False
+_warned_prefill_dense_splitkv3_oom = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -109,6 +110,7 @@ _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_fa2_d256 = False
+_logged_prefill_dense_splitkv3 = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -141,6 +143,10 @@ _fp8_prefill_bridge_workspaces: dict[
 _prefill_gather_dense_workspaces: dict[
     tuple[int, int, torch.dtype, int, int, int],
     tuple[torch.Tensor, torch.Tensor],
+] = {}
+_prefill_dense_splitkv3_workspaces: dict[
+    tuple[int, int, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
 
 
@@ -740,7 +746,12 @@ def _get_sm70_splitd_d256_ops():
 
         dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
         paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
-        _sm70_splitd_d256_ops = (dense, paged)
+        splitkv3 = getattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_splitd_n32_dense_splitkv3_fwd",
+            None,
+        )
+        _sm70_splitd_d256_ops = (dense, paged, splitkv3)
     except (AttributeError, ImportError, RuntimeError):
         _sm70_splitd_d256_ops = None
     return _sm70_splitd_d256_ops
@@ -777,6 +788,80 @@ def _uniform_cu_seqlens(
     )
     _sm70_fa2_cu_seqlens_cache[cache_key] = (cu_q, cu_k)
     return cu_q, cu_k
+
+
+def _get_prefill_dense_splitkv3_workspace(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    global _warned_prefill_dense_splitkv3_oom
+
+    if _is_cuda_graph_capturing(query):
+        return None
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index() if query.is_cuda else -1
+    stream_id = (
+        int(torch.cuda.current_stream(query.device).cuda_stream) if query.is_cuda else 0
+    )
+    cache_key = (device_index, stream_id, query.dtype)
+    expected_out_shape = (3, *query.shape)
+    expected_stats_shape = (3, *query.shape[:-1])
+    workspace = _prefill_dense_splitkv3_workspaces.get(cache_key)
+    if (
+        workspace is not None
+        and workspace[0].shape == expected_out_shape
+        and workspace[1].shape == expected_stats_shape
+    ):
+        return workspace
+
+    _prefill_dense_splitkv3_workspaces.pop(cache_key, None)
+    workspace = None
+    try:
+        partial_out = torch.empty(
+            expected_out_shape,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        partial_max = torch.empty(
+            expected_stats_shape,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        partial_sum = torch.empty_like(partial_max)
+    except torch.OutOfMemoryError:
+        if not _warned_prefill_dense_splitkv3_oom:
+            logger.warning(
+                "Insufficient memory for the long-prefill split-KV3 FP32 "
+                "workspace; falling back to the exact dense kernel."
+            )
+            _warned_prefill_dense_splitkv3_oom = True
+        return None
+    workspace = (partial_out, partial_max, partial_sum)
+    _prefill_dense_splitkv3_workspaces[cache_key] = workspace
+    return workspace
+
+
+def _should_use_prefill_dense_splitkv3(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    splitkv3_op: Callable[..., torch.Tensor] | None,
+) -> bool:
+    return (
+        envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3
+        and splitkv3_op is not None
+        and query.shape == (1, 4096, 6, 256)
+        and key.ndim == 4
+        and key.shape[0] == 1
+        and key.shape[1] == max_seqlen_k
+        and key.shape[2:] == (1, 256)
+        and max_seqlen_q == 4096
+        and max_seqlen_k >= envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV
+        and max_seqlen_k > max_seqlen_q
+        and not _is_cuda_graph_capturing(query)
+    )
 
 
 def _try_sm70_fa2_d256_prefill(
@@ -864,7 +949,7 @@ def _try_sm70_fa2_d256_prefill(
         and max_seqlen_k % 64 == 0
     )
     if splitd_eligible:
-        dense_op, paged_op = splitd_ops
+        dense_op, paged_op, splitkv3_op = splitd_ops
         splitd_result = None
         if paged_kv:
             splitd_eligible = (
@@ -895,9 +980,41 @@ def _try_sm70_fa2_d256_prefill(
             )
             if splitd_eligible:
                 splitd_out = out if out is not None else torch.empty_like(query)
-                splitd_result = dense_op(
-                    query, key, value, splitd_out, softmax_scale, True
-                )
+                if _should_use_prefill_dense_splitkv3(
+                    query,
+                    key,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    splitkv3_op=splitkv3_op,
+                ):
+                    workspace = _get_prefill_dense_splitkv3_workspace(query)
+                    if workspace is not None:
+                        partial_out, partial_max, partial_sum = workspace
+                        splitd_result = splitkv3_op(
+                            query,
+                            key,
+                            value,
+                            partial_out,
+                            partial_max,
+                            partial_sum,
+                            splitd_out,
+                            softmax_scale,
+                            True,
+                        )
+                        global _logged_prefill_dense_splitkv3
+                        if not _logged_prefill_dense_splitkv3:
+                            logger.info(
+                                "FLASH_ATTN_V100 SM70 exact dense split-KV3 "
+                                "long-prefill route active (q=%d kv=%d).",
+                                max_seqlen_q,
+                                max_seqlen_k,
+                            )
+                            _logged_prefill_dense_splitkv3 = True
+                        _record_route("prefill_dense_splitd_d256_splitkv3_kernel")
+                if splitd_result is None:
+                    splitd_result = dense_op(
+                        query, key, value, splitd_out, softmax_scale, True
+                    )
         if splitd_result is not None:
             result = splitd_result.reshape(query.shape)
             if out is not None:
