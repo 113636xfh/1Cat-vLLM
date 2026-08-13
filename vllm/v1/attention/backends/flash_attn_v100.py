@@ -854,6 +854,195 @@ def flash_v100_dense_prefill(
     return output
 
 
+# 0014: LSE-emitting dense varlen prefill (revives archived 0043 + discharges 0044)
+# ----------------------------------------------------------------------------
+# The SM70 kernel ALWAYS computes the softmax log-sum-exp
+# (flash-attention-v100/kernel/fused_mha_forward.cu:688-692 writes rowmax+log(rowsum),
+# :1149 returns it as outputs[1]). What flash_v100_dense_prefill drops is that LSE,
+# which the MLA context-chunk / prefix-cache merge needs (mla_attention.py:2109-2136,
+# :2305-2312). This op exposes it and additionally accepts an INDEPENDENT cu_seqlens_k,
+# so the cross-attention shape of run_prefill_context_chunk (M new-token queries vs N
+# gathered context keys, M != N, unmasked) is expressible.
+_flash_attn_forward_lse = None
+_flash_attn_forward_lse_checked = False
+
+
+def _get_flash_dense_forward():
+    """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
+    global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
+    if not _flash_attn_forward_lse_checked:
+        _flash_attn_forward_lse_checked = True
+        try:
+            from flash_attn_v100.flash_attn_interface import _flash_attn_forward
+
+            _flash_attn_forward_lse = _flash_attn_forward
+        except (ImportError, AttributeError):
+            _flash_attn_forward_lse = None
+    return _flash_attn_forward_lse
+
+
+def flash_v100_dense_prefill_lse_available() -> bool:
+    return _get_flash_dense_forward() is not None
+
+
+def flash_v100_dense_prefill_lse(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_actual_tokens: int,
+    softmax_scale: float,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flash-V100 dense varlen prefill that also emits the softmax LSE.
+
+    Layouts:
+      query  [T_q, H, D] fp16      output      [T_q, H, D] fp16 (written)
+      key    [T_k, H_kv, D] fp16   softmax_lse [H, T_q] fp32   (written)
+      value  [T_k, H_kv, D] fp16
+    softmax_lse uses FA2's varlen convention [num_heads, total_q] — exactly what
+    merge_attn_states reads (merge_attn_states.py:32-37).
+
+    ===== 0044 DISCHARGE — OPTION (a), applied AT THE BACKEND =====
+    A query row whose key run is EMPTY for this chunk (a sequence contributing no
+    tokens to a later context chunk, or a request with context_len==0 in a batch
+    where others carry context) has no attention result. This op WRITES EVERY
+    query row of output[:num_actual_tokens] — either the kernel result (k_len>0)
+    or an explicit ZERO (k_len==0) — and sets softmax_lse=-inf for the empty rows.
+    No uninitialised/scratch value ever reaches merge_attn_states, so all three
+    corners the merge kernel leaves open are closed AT THE SOURCE:
+      * fall-through (prefix finite, suffix empty): suffix row is 0, not scratch,
+        so merge_attn_states.cu:162 computes p_out*1 + 0*0 = p_out (no NaN*0=NaN);
+      * both-empty guard (:109-131 stores prefix verbatim "expected all zeros"):
+        the prefix WAS zeroed here, so the assumption holds;
+      * symmetric / chunk-0 direct-assign (mla_attention.py:2118-2120) and
+        num_chunks==1: the accumulator row is 0/-inf, not scratch.
+    -inf (not -1e30) is used so the sentinel matches the FA2 varlen contract the
+    merge guard was written against (its isinf checks at merge_attn_states.cu:96-109
+    fire BEFORE any -inf subtraction, and the causal new-tokens LSE it is finally
+    merged against is always finite). Because the empty ROWS are zeroed regardless,
+    the sentinel value cannot reintroduce a NaN on our path — verified on real SM70
+    (patches/0014/poc/mla_merge_corner_gate.py: unmasked leaves NaN in 2/3 requests
+    through the real merge CUDA op; this option-(a) path reconstructs the true
+    attention at rel_rms 2.4e-4 vs the f32 oracle; a negative control that keeps the
+    zeros but drops the -inf sentinel deviates 0.41 and is correctly rejected).
+
+    causal=True is only valid when every sequence has q_len == k_len (self-attn):
+    the SM70 kernel's causal masking for M != N has no validated alignment
+    convention here, so the mismatch is rejected loudly rather than mis-masked.
+    """
+    fwd = _get_flash_dense_forward()
+    if fwd is None:
+        raise RuntimeError("flash_attn_v100 dense LSE prefill op is unavailable")
+
+    query = query[:num_actual_tokens]
+    out_view = output[:num_actual_tokens]
+    lse_view = softmax_lse[:, :num_actual_tokens]
+
+    num_seqs = len(cu_seqlens_q) - 1
+    if num_seqs == 0:
+        return output, softmax_lse
+    if len(cu_seqlens_k) - 1 != num_seqs:
+        raise RuntimeError(
+            "cu_seqlens_q and cu_seqlens_k must describe the same batch: "
+            f"{num_seqs} vs {len(cu_seqlens_k) - 1}"
+        )
+
+    # One host sync for the whole call (0020 synced per sequence inside the loop;
+    # on the 128-user axis that host cost is paid per layer per step).
+    q_off = cu_seqlens_q.tolist()
+    k_off = cu_seqlens_k.tolist()
+
+    window_size_left, window_size_right = window_size
+    num_q_heads, head_dim = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+
+    run_start = 0
+    while run_start < num_seqs:
+        q_len = q_off[run_start + 1] - q_off[run_start]
+        k_len = k_off[run_start + 1] - k_off[run_start]
+        # Batch the maximal run sharing BOTH lengths — the kernel takes a
+        # rectangular [B,H,M,D] x [B,H,N,D] batch.
+        run_end = run_start + 1
+        while (
+            run_end < num_seqs
+            and q_off[run_end + 1] - q_off[run_end] == q_len
+            and k_off[run_end + 1] - k_off[run_end] == k_len
+        ):
+            run_end += 1
+
+        if q_len > 0:
+            qt0, qt1 = q_off[run_start], q_off[run_end]
+            batch_size = run_end - run_start
+
+            if k_len == 0:
+                # 0044 option (a): empty key run -> zero output, -inf LSE, so
+                # merge_attn_states ignores this chunk with no scratch.
+                out_view[qt0:qt1].zero_()
+                lse_view[:, qt0:qt1].fill_(float("-inf"))
+            else:
+                if causal and q_len != k_len:
+                    raise RuntimeError(
+                        "flash_v100_dense_prefill_lse: causal=True requires "
+                        f"q_len == k_len (got {q_len} vs {k_len})"
+                    )
+                kt0, kt1 = k_off[run_start], k_off[run_end]
+
+                # [T,H,D] -> [B,M,H,D] -> [B,H,M,D]: the SM70 fwd reads (B,H,M,D)
+                # (fused_mha_forward.cu:1113) and needs the last dim contiguous.
+                q_batch = (
+                    query[qt0:qt1]
+                    .view(batch_size, q_len, num_q_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                k_batch = (
+                    key[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                v_batch = (
+                    value[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+
+                out_batch, lse_batch, _, _ = fwd(
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    None,
+                    0.0,
+                    softmax_scale,
+                    causal,
+                    window_size_left,
+                    window_size_right,
+                    0.0,
+                    None,
+                    False,  # NOT the P-matrix flag (kernel refuses it); LSE comes
+                    # back as outputs[1] regardless.
+                )
+
+                # [B,H,M,D] -> [B,M,H,D] -> packed [B*M,H,D].
+                out_view[qt0:qt1].copy_(
+                    out_batch.permute(0, 2, 1, 3).reshape(-1, num_q_heads, head_dim)
+                )
+                # [B,H,M] -> [H,B*M], matching FA2's [num_heads, total_q].
+                lse_view[:, qt0:qt1].copy_(
+                    lse_batch.permute(1, 0, 2).reshape(num_q_heads, -1)
+                )
+
+        run_start = run_end
+
+    return output, softmax_lse
+
+
 def _get_flash_turboquant_decode_op():
     """Lazy-load the optional TurboQuant decode op without touching base ops."""
     global _flash_attn_turboquant_decode_checked

@@ -24,6 +24,54 @@ else:
     flash_attn_varlen_func = None  # type: ignore[assignment]
 
 
+@functools.cache
+def _flash_v100_dense_prefill_usable() -> bool:
+    """0014: True iff this device is SM70 with the in-tree Flash-V100 dense
+    prefill op available. On SM70 the vendored FA2 called below can never run
+    (fa_utils stub raises ImportError on first prefill), so this predicate gates
+    an automatic route to the in-tree op. Exact (7,0) match: the flash_attn_v100
+    kernel TORCH_CHECKs sm70 itself. Cached: device + op availability are
+    process-invariant."""
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability[0] != 7 or capability[1] != 0:
+        return False
+    try:
+        from vllm.v1.attention.backends.flash_attn_v100 import (
+            flash_v100_dense_prefill_available,
+        )
+    except ImportError:
+        return False
+    return flash_v100_dense_prefill_available()
+
+
+@functools.cache
+def _flash_v100_dense_prefill_lse_usable() -> bool:
+    """0014: True iff the in-tree Flash-V100 dense op can also emit the LSE.
+    Same SM70 gate as above plus availability of the LSE-capable forward entry.
+    Separate predicate so an older wheel degrades to no-LSE coverage instead of
+    failing the whole route."""
+    if not _flash_v100_dense_prefill_usable():
+        return False
+    try:
+        from vllm.v1.attention.backends.flash_attn_v100 import (
+            flash_v100_dense_prefill_lse_available,
+        )
+    except ImportError:
+        return False
+    return flash_v100_dense_prefill_lse_available()
+
+
+# 0014: head-dim tiles the in-tree Flash-V100 dense prefill kernel instantiates
+# (flash-attention-v100/kernel/fused_mha_forward.cu:1136-1142 `switch (D)`; anything
+# else hits `default: TORCH_CHECK(false, "Unsupported D")`). A uniform MLA head dim
+# outside this set would crash the kernel at runtime, so the SM70 route must not be
+# offered for it. Kept beside the gate that reads it; update in lockstep with the
+# kernel switch (adding `case 192:` for the DeepSeek slice would add 192 here too).
+_SM70_DENSE_PREFILL_HEAD_DIMS = frozenset({16, 32, 64, 128, 256})
+
+
 class FlashAttnPrefillBackend(MLAPrefillBackend):
     """FlashAttention backend for MLA prefill."""
 
@@ -33,7 +81,55 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def is_available(cls) -> bool:
-        return is_flash_attn_varlen_func_available()
+        # SM80+ builds: the vendored FA2/FA3 varlen extension.
+        # SM70/V100 builds are compiled WITHOUT that extension (0013 makes
+        # is_flash_attn_varlen_func_available() honestly False there); on SM70 this
+        # backend serves MLA prefill through the in-tree Flash-V100 dense op instead
+        # (0014, routed in _flash_attn_varlen_diff_headdims). Either presence means a
+        # working MLA-prefill implementation exists. The SM70 route's shape/dtype
+        # constraints are per-config, not device-global, so they are enforced in
+        # validate_configuration (which sees the model's head dims and dtype), not
+        # here.
+        return (
+            is_flash_attn_varlen_func_available()
+            or _flash_v100_dense_prefill_lse_usable()
+        )
+
+    @classmethod
+    def validate_configuration(cls, device_capability, selector_config) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            device_capability, selector_config
+        )
+        # 0014: when the ONLY available implementation is the SM70 in-tree dense
+        # route (FA2 varlen absent, Flash-V100 dense op present), that route computes
+        # only the uniform-head-dim, fp16 slice. Reject anything it cannot run here,
+        # AT SELECTION TIME, so a config the route would fall through on gets a clean
+        # load-time error (0013's guarantee) instead of loading and then crashing at
+        # the first prefill in the raising FA2 stub. On SM80+ this block is inert
+        # (is_flash_attn_varlen_func_available() is True).
+        if (
+            not is_flash_attn_varlen_func_available()
+            and _flash_v100_dense_prefill_lse_usable()
+        ):
+            if selector_config.dtype != torch.float16:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route requires float16 "
+                    f"(got {selector_config.dtype})"
+                )
+            if selector_config.qk_head_dim != selector_config.v_head_dim:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route requires uniform qk/v head "
+                    f"dims (got qk={selector_config.qk_head_dim}, "
+                    f"v={selector_config.v_head_dim}); DeepSeek-style asymmetric "
+                    "MLA (qk=192/v=128) is 0014's deferred slice"
+                )
+            elif selector_config.qk_head_dim not in _SM70_DENSE_PREFILL_HEAD_DIMS:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route has no compiled kernel tile "
+                    f"for head dim {selector_config.qk_head_dim} "
+                    f"(compiled: {sorted(_SM70_DENSE_PREFILL_HEAD_DIMS)})"
+                )
+        return invalid_reasons
 
     def __init__(
         self,
@@ -57,10 +153,26 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
         # Handle the differences between the flash_attn_varlen from
         # flash_attn and the one from vllm_flash_attn
-        assert flash_attn_varlen_func is not None, (
-            "FlashAttnPrefillBackend requires flash_attn_varlen_func. "
-            "Ensure FlashAttnPrefillBackend.is_available() is checked first."
-        )
+        if flash_attn_varlen_func is None:
+            # 0014: SM70/V100 build without the FA2 varlen extension. This backend
+            # serves MLA prefill through the in-tree Flash-V100 dense op instead
+            # (routed at the top of _flash_attn_varlen_diff_headdims), so no FA2
+            # setup is needed. validate_configuration has already guaranteed the
+            # SM70 route is present and shape/dtype-valid for this model; a genuinely
+            # absent op still fails loudly here rather than silently mis-routing.
+            assert _flash_v100_dense_prefill_lse_usable(), (
+                "FlashAttnPrefillBackend requires either flash_attn_varlen_func or "
+                "the SM70 Flash-V100 dense prefill op. Ensure "
+                "FlashAttnPrefillBackend.is_available() is checked first."
+            )
+            self.flash_attn_varlen_func = None
+            self.vllm_flash_attn_version = None
+            # Uniform head dims on this route (validate_configuration enforced qk==v),
+            # so V never needs padding — and the route intercepts before the pad path.
+            self.requires_v_padding = False
+            self._is_vllm_fa = current_platform.is_cuda()
+            return
+
         qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.vllm_flash_attn_version = get_flash_attn_version(head_size=qk_head_dim)
@@ -96,6 +208,97 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         softmax_scale: float | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # ------------------------------------------------------------------
+        # 0014: V100 (SM70) MLA prefill route (revives archived 0020 + 0043).
+        # On SM70 the vendored FA2 call below is a guaranteed ImportError
+        # (fa_utils stub), so when the in-tree Flash-V100 dense op can faithfully
+        # compute this exact call we route to it. Guard sets are EXACT — any call
+        # outside them falls through to the FA2 call, which FAILS LOUDLY on SM70
+        # rather than silently computing wrong values.
+        #
+        # This slice covers the UNIFORM head-dim case (GLM-MoE-Lite MLA: qk==v,
+        # e.g. 256==256). DeepSeek-style diff head dims (qk 192 / v 128) still
+        # fall through and crash on SM70 — that case additionally needs the
+        # FA_V100 `case 192:` build + a pad-V driver and is 0014's deferred slice.
+        cu_q = kwargs.get("cu_seqlens_q")
+        cu_k = kwargs.get("cu_seqlens_k")
+        causal = bool(kwargs.get("causal", False))
+
+        # (0043) LSE-emitting route — the context-chunk / prefix-cache path that
+        # needs the softmax LSE and an INDEPENDENT cu_seqlens_k. Guard: LSE-capable
+        # wheel, fp16, uniform head dims, both cu_seqlens present and same batch,
+        # and causal only with cu_k IS cu_q (masking for M!=N is unvalidated here).
+        if (
+            _flash_v100_dense_prefill_lse_usable()
+            and q.dtype == torch.float16
+            and k.dtype == torch.float16
+            and v.dtype == torch.float16
+            and q.shape[-1] == v.shape[-1]
+            and cu_q is not None
+            and cu_k is not None
+            and cu_q.numel() == cu_k.numel()
+            and (cu_k is cu_q or not causal)
+        ):
+            from vllm.v1.attention.backends.flash_attn_v100 import (
+                flash_v100_dense_prefill_lse,
+            )
+
+            q_c = q.contiguous()
+            out = torch.empty_like(q_c)
+            lse = torch.empty(
+                (q_c.shape[1], q_c.shape[0]),
+                dtype=torch.float32,
+                device=q_c.device,
+            )
+            flash_v100_dense_prefill_lse(
+                q_c,
+                k.contiguous(),
+                v.contiguous(),
+                out,
+                lse,
+                cu_q,
+                cu_k,
+                q_c.shape[0],
+                float(softmax_scale)
+                if softmax_scale is not None
+                else q.shape[-1] ** -0.5,
+                causal=causal,
+            )
+            if return_softmax_lse:
+                return out, lse
+            return out
+
+        # (0020) no-LSE route — the new-tokens self-attention path on wheels that
+        # predate the LSE entry. Requires cu_k IS cu_q and no LSE requested.
+        if (
+            _flash_v100_dense_prefill_usable()
+            and not return_softmax_lse
+            and q.dtype == torch.float16
+            and q.shape[-1] == v.shape[-1]
+            and cu_q is not None
+            and cu_k is cu_q
+        ):
+            from vllm.v1.attention.backends.flash_attn_v100 import (
+                flash_v100_dense_prefill,
+            )
+
+            q_c = q.contiguous()
+            out = torch.empty_like(q_c)
+            flash_v100_dense_prefill(
+                q_c,
+                k.contiguous(),
+                v.contiguous(),
+                out,
+                cu_q,
+                q_c.shape[0],
+                float(softmax_scale)
+                if softmax_scale is not None
+                else q.shape[-1] ** -0.5,
+                causal=causal,
+            )
+            return out
+        # --- end 0014 route -----------------------------------------------
+
         maybe_padded_v = v
         if self.requires_v_padding:
             maybe_padded_v = torch.nn.functional.pad(

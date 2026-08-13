@@ -32,6 +32,31 @@ class MLAPrefillSelectorConfig(NamedTuple):
 
     dtype: torch.dtype
     is_r1_compatible: bool
+    # 0014: MLA head dims, so a backend can reject a shape it cannot serve AT
+    # SELECTION time (the SM70 Flash-V100 dense route only runs uniform qk==v).
+    # Defaulted so non-MLA / older construction sites stay valid; the real MLA
+    # selection site below populates them. Both ints, so the NamedTuple stays
+    # hashable for the @cache on _auto_select_mla_prefill_backend.
+    qk_head_dim: int = 0
+    v_head_dim: int = 0
+
+
+def _mla_head_dims(vllm_config: "VllmConfig") -> tuple[int, int]:
+    """Return (qk_head_dim, v_head_dim) for MLA backend selection.
+
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim, matching
+    deepseek_v2.py:428-431 and the query head dim the prefill kernel dispatches
+    on. Returns (0, 0) when the config exposes no MLA dims — the value is only
+    consulted by backends that gate on it (the SM70 route), for which 0 head dims
+    never satisfy the uniform-and-compiled-tile check.
+    """
+    if vllm_config.model_config is None:
+        return 0, 0
+    hf_text_config = vllm_config.model_config.hf_text_config
+    qk_nope_head_dim = getattr(hf_text_config, "qk_nope_head_dim", 0)
+    qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", 0)
+    v_head_dim = getattr(hf_text_config, "v_head_dim", 0)
+    return qk_nope_head_dim + qk_rope_head_dim, v_head_dim
 
 
 def is_deepseek_r1_mla_compatible(vllm_config: "VllmConfig") -> bool:
@@ -101,9 +126,12 @@ def get_mla_prefill_backend(
 
     attention_config = vllm_config.attention_config
 
+    qk_head_dim, v_head_dim = _mla_head_dims(vllm_config)
     selector_config = MLAPrefillSelectorConfig(
         dtype=vllm_config.model_config.dtype,
         is_r1_compatible=is_deepseek_r1_mla_compatible(vllm_config),
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
     )
 
     if attention_config.mla_prefill_backend is not None:
