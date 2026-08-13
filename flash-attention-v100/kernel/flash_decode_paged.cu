@@ -39,6 +39,9 @@ constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;
 constexpr int kXQATC256WideThreadsPerRow = kWarpSize;
 constexpr int kXQATCG6DualCtaThreads = 6 * kWarpSize;
+constexpr int kXQARouteAllSeqLens = 0;
+constexpr int kXQARouteShortSeqLens = -1;
+constexpr int kXQARouteLongSeqLens = 1;
 // The dense 256/128-half strides alias Volta shared-memory banks in the
 // WMMA A/B fragment loads. Both padded strides remain 16-byte aligned.
 constexpr int kXQATC256WidePaddedQStride = 264;
@@ -101,6 +104,19 @@ bool xqa_mtp5_dual_cta_enabled() {
 bool xqa_g6_dual_cta_dense_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE");
   return value != nullptr && value[0] == '1';
+}
+
+bool xqa_g6_p1024_auto_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_g6_p1024_auto_trace_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
 }
 
 bool xqa_split_reduce_enabled() {
@@ -533,7 +549,8 @@ __global__ void flash_attention_decode_partition_kernel(
 
 template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM, int NUM_THREADS,
           int MIN_BLOCKS_PER_SM, int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
-          bool ALIGNED_PADDED_SMEM, int KV_DTYPE>
+          bool ALIGNED_PADDED_SMEM, int KV_DTYPE,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     flash_attention_decode_xqa_tc_partition_kernel_256_wide(
         const __half* __restrict__ q, const void* __restrict__ k_cache,
@@ -550,7 +567,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int64_t k_token_stride, const int64_t k_head_stride,
         const int64_t v_block_stride, const int64_t v_token_stride,
         const int64_t v_head_stride, const float softmax_scale,
-        const float k_scale, const float v_scale) {
+        const float k_scale, const float v_scale,
+        const int route_seq_len_threshold) {
   constexpr int D = 256;
   constexpr int WMMA_M = 8;
   constexpr int WMMA_N = 32;
@@ -578,6 +596,15 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   }
 
   const int seq_len = seq_lens[batch_idx];
+  if constexpr (SEQ_LEN_ROUTE == kXQARouteShortSeqLens) {
+    if (seq_len >= route_seq_len_threshold) {
+      return;
+    }
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteLongSeqLens) {
+    if (seq_len < route_seq_len_threshold) {
+      return;
+    }
+  }
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len) {
     return;
@@ -1710,7 +1737,8 @@ void launch_flash_attention_decode_xqa_split_reduce(
 template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           int NUM_THREADS = kXQATC256WideThreads, int MIN_BLOCKS_PER_SM = 1,
           int BLOCK_SIZE = 0, bool CONTIGUOUS_HKV1_LAYOUT = false,
-          bool ALIGNED_PADDED_SMEM = false>
+          bool ALIGNED_PADDED_SMEM = false,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -1718,7 +1746,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& active_num_partitions, const float softmax_scale,
     const float k_scale, const float v_scale, const int launch_num_partitions,
     const bool use_split_reduce, const int split_reduce_dim_tile,
-    cudaStream_t stream) {
+    cudaStream_t stream, const int route_seq_len_threshold = 0,
+    const bool launch_reduce = true) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -1732,7 +1761,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
         (void*)flash_attention_decode_xqa_tc_partition_kernel_256_wide<        \
             PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,              \
             MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,             \
-            ALIGNED_PADDED_SMEM, KV_DTYPE>;                                    \
+            ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE>;                     \
     cudaFuncSetAttribute(partition_kernel,                                     \
                          cudaFuncAttributeMaxDynamicSharedMemorySize,          \
                          shared_mem);                                          \
@@ -1744,7 +1773,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     flash_attention_decode_xqa_tc_partition_kernel_256_wide<                   \
         PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,                  \
         MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,                 \
-        ALIGNED_PADDED_SMEM, KV_DTYPE>                                         \
+        ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE>                          \
         <<<partition_grid, NUM_THREADS, shared_mem, stream>>>(                 \
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),           \
             k_cache.data_ptr(), v_cache.data_ptr(),                            \
@@ -1757,7 +1786,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),     \
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
-            softmax_scale, k_scale, v_scale);                                  \
+            softmax_scale, k_scale, v_scale, route_seq_len_threshold);         \
   } while (0)
 
   if (k_cache.scalar_type() == at::kByte) {
@@ -1767,6 +1796,10 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   }
 #undef LAUNCH_XQA_PARTITION
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (!launch_reduce) {
+    return;
+  }
 
   if (use_split_reduce) {
     launch_flash_attention_decode_xqa_split_reduce<PARTITION_SIZE>(
@@ -2199,15 +2232,26 @@ at::Tensor flash_attention_decode_paged_xqa(
   const bool use_g6_dual_cta_dense = !use_padded_smem &&
                                      k_cache.size(1) == 784 &&
                                      xqa_g6_dual_cta_dense_enabled();
+  const bool use_g6_p1024_auto =
+      q.size(0) == 1 && q_per_kv == 6 && partition_size == 1024 &&
+      k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
+      xqa_g6_p1024_auto_enabled();
+  const int g6_p1024_route_seq_len =
+      use_g6_p1024_auto ? (at::cuda::getDeviceProperties(q.get_device())
+                               ->multiProcessorCount +
+                           1) *
+                              1024
+                        : 0;
   const bool use_mtp5_dual_cta =
       q.size(0) == 5 && q_per_kv == 6 && k_cache.size(1) == 1616 &&
       k_cache.size(2) > 0 &&
       kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
       xqa_mtp5_dual_cta_enabled();
   const bool use_g6_dual_cta =
-      use_mtp5_dual_cta ||
+      use_g6_p1024_auto || use_mtp5_dual_cta ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
-  const bool use_split_reduce = use_g6_dual_cta && xqa_split_reduce_enabled();
+  const bool use_split_reduce =
+      use_g6_p1024_auto || (use_g6_dual_cta && xqa_split_reduce_enabled());
   const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
   const bool supports_block16_contiguous_layout =
       supports_block16_index && k_cache.size(2) == 1 &&
@@ -2250,6 +2294,15 @@ at::Tensor flash_attention_decode_paged_xqa(
         "shape [blocks,",
         k_cache.size(1), ",", k_cache.size(2), ",", k_cache.size(3), "]");
     traced_block784_index = true;
+  }
+  static bool traced_g6_p1024_auto = false;
+  if (xqa_g6_p1024_auto_trace_enabled() && use_g6_p1024_auto &&
+      !traced_g6_p1024_auto) {
+    TORCH_WARN(
+        "Flash-V100 XQA p1024 dynamic one/two-CTA route active; "
+        "long-sequence threshold=",
+        g6_p1024_route_seq_len);
+    traced_g6_p1024_auto = true;
   }
   static bool traced_aligned_padded_smem = false;
   if (xqa_aligned_padded_smem_trace_enabled() && use_aligned_padded_smem &&
@@ -2294,9 +2347,38 @@ at::Tensor flash_attention_decode_paged_xqa(
     }                                                                    \
   } while (0)
 
-  if (use_g6_dual_cta) {
+  if (use_g6_p1024_auto) {
+    launch_flash_attention_decode_paged_xqa_tc_256_wide<
+        1024, 6, false, kXQATC256WideThreads, 1, 784, false, false,
+        kXQARouteShortSeqLens>(
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+        exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+        launch_num_partitions, false, split_reduce_dim_tile, stream,
+        g6_p1024_route_seq_len, false);
+    launch_flash_attention_decode_paged_xqa_tc_256_wide<
+        1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
+        kXQARouteLongSeqLens>(
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+        exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+        launch_num_partitions, true, split_reduce_dim_tile, stream,
+        g6_p1024_route_seq_len, true);
+  } else if (use_g6_dual_cta) {
     if (use_block784_index) {
-      if (use_aligned_padded_smem) {
+      if (partition_size == 1024) {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, launch_num_partitions, use_split_reduce,
+            split_reduce_dim_tile, stream);
+      } else if (partition_size == 512) {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            512, 6, false, kXQATCG6DualCtaThreads, 2, 784, false>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, launch_num_partitions, use_split_reduce,
+            split_reduce_dim_tile, stream);
+      } else if (use_aligned_padded_smem) {
         launch_flash_attention_decode_paged_xqa_tc_256_wide<
             256, 6, true, kXQATCG6DualCtaThreads, 2, 784, false, true>(
             q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,

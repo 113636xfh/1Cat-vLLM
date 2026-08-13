@@ -23,6 +23,8 @@ def run_once(
     aligned_padded_smem: bool,
     g6_dual_cta: str,
     inherited_g6_dual_cta: str | None,
+    p1024_auto: str,
+    inherited_p1024_auto: str | None,
     split_reduce: str,
     inherited_split_reduce: str | None,
     seq_len: int,
@@ -43,6 +45,15 @@ def run_once(
     else:
         os.environ["VLLM_FLASH_V100_XQA_G6_DUAL_CTA"] = (
             "1" if g6_dual_cta == "on" else "0"
+        )
+    if p1024_auto == "inherit":
+        if inherited_p1024_auto is None:
+            os.environ.pop("VLLM_FLASH_V100_XQA_G6_P1024_AUTO", None)
+        else:
+            os.environ["VLLM_FLASH_V100_XQA_G6_P1024_AUTO"] = inherited_p1024_auto
+    else:
+        os.environ["VLLM_FLASH_V100_XQA_G6_P1024_AUTO"] = (
+            "1" if p1024_auto == "on" else "0"
         )
     if split_reduce == "inherit":
         if inherited_split_reduce is None:
@@ -78,6 +89,8 @@ def elapsed_ms(
     aligned_padded_smem: bool,
     g6_dual_cta: str,
     inherited_g6_dual_cta: str | None,
+    p1024_auto: str,
+    inherited_p1024_auto: str | None,
     split_reduce: str,
     inherited_split_reduce: str | None,
     seq_len: int,
@@ -98,6 +111,8 @@ def elapsed_ms(
             aligned_padded_smem=aligned_padded_smem,
             g6_dual_cta=g6_dual_cta,
             inherited_g6_dual_cta=inherited_g6_dual_cta,
+            p1024_auto=p1024_auto,
+            inherited_p1024_auto=inherited_p1024_auto,
             split_reduce=split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             seq_len=seq_len,
@@ -120,6 +135,8 @@ def elapsed_ms(
             aligned_padded_smem=aligned_padded_smem,
             g6_dual_cta=g6_dual_cta,
             inherited_g6_dual_cta=inherited_g6_dual_cta,
+            p1024_auto=p1024_auto,
+            inherited_p1024_auto=inherited_p1024_auto,
             split_reduce=split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             seq_len=seq_len,
@@ -133,6 +150,7 @@ def elapsed_ms(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=65539)
+    parser.add_argument("--seed", type=int, default=20260713)
     parser.add_argument(
         "--block-size",
         type=int,
@@ -210,6 +228,18 @@ def main() -> None:
         help="G6 dispatch mode for the candidate call.",
     )
     parser.add_argument(
+        "--baseline-p1024-auto",
+        choices=("inherit", "on", "off"),
+        default="inherit",
+        help="Dynamic p1024 one/two-CTA route for the baseline call.",
+    )
+    parser.add_argument(
+        "--candidate-p1024-auto",
+        choices=("inherit", "on", "off"),
+        default="inherit",
+        help="Dynamic p1024 one/two-CTA route for the candidate call.",
+    )
+    parser.add_argument(
         "--baseline-split-reduce",
         choices=("inherit", "on", "off"),
         default="inherit",
@@ -224,6 +254,7 @@ def main() -> None:
     parser.add_argument("--profile-single", action="store_true")
     args = parser.parse_args()
     inherited_g6_dual_cta = os.environ.get("VLLM_FLASH_V100_XQA_G6_DUAL_CTA")
+    inherited_p1024_auto = os.environ.get("VLLM_FLASH_V100_XQA_G6_P1024_AUTO")
     inherited_split_reduce = os.environ.get("VLLM_FLASH_V100_XQA_SPLIT_REDUCE")
 
     if args.partition_size not in (256, 512, 1024):
@@ -249,8 +280,8 @@ def main() -> None:
         raise ValueError("--candidate-partition-size must be one of 256, 512, 1024")
 
     # Qwen3.6-27B-AWQ TP4 full-attention per-rank shape: Hq=6, Hkv=1, D=256.
-    torch.manual_seed(20260713)
-    torch.cuda.manual_seed_all(20260713)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     block_size, q_heads, kv_heads, head_dim = (
         args.block_size,
         6,
@@ -302,6 +333,12 @@ def main() -> None:
                 else args.baseline_g6_dual_cta
             ),
             inherited_g6_dual_cta=inherited_g6_dual_cta,
+            p1024_auto=(
+                args.candidate_p1024_auto
+                if args.layout == "padded"
+                else args.baseline_p1024_auto
+            ),
+            inherited_p1024_auto=inherited_p1024_auto,
             split_reduce=(
                 args.candidate_split_reduce
                 if args.layout == "padded"
@@ -328,6 +365,8 @@ def main() -> None:
         aligned_padded_smem=args.baseline_aligned_padded_smem,
         g6_dual_cta=args.baseline_g6_dual_cta,
         inherited_g6_dual_cta=inherited_g6_dual_cta,
+        p1024_auto=args.baseline_p1024_auto,
+        inherited_p1024_auto=inherited_p1024_auto,
         split_reduce=args.baseline_split_reduce,
         inherited_split_reduce=inherited_split_reduce,
         seq_len=args.seq_len,
@@ -345,6 +384,8 @@ def main() -> None:
         aligned_padded_smem=args.candidate_aligned_padded_smem,
         g6_dual_cta=args.candidate_g6_dual_cta,
         inherited_g6_dual_cta=inherited_g6_dual_cta,
+        p1024_auto=args.candidate_p1024_auto,
+        inherited_p1024_auto=inherited_p1024_auto,
         split_reduce=args.candidate_split_reduce,
         inherited_split_reduce=inherited_split_reduce,
         seq_len=args.seq_len,
@@ -356,6 +397,7 @@ def main() -> None:
     mismatch_indices = diff_mask.nonzero(as_tuple=False)
     mismatch_count = int(mismatch_indices.size(0))
     result: dict[str, object] = {
+        "seed": args.seed,
         "seq_len": args.seq_len,
         "block_size": block_size,
         "block_table_layout": args.block_table_layout,
@@ -367,6 +409,8 @@ def main() -> None:
         "baseline_aligned_padded_smem": args.baseline_aligned_padded_smem,
         "candidate_g6_dual_cta": args.candidate_g6_dual_cta,
         "baseline_g6_dual_cta": args.baseline_g6_dual_cta,
+        "candidate_p1024_auto": args.candidate_p1024_auto,
+        "baseline_p1024_auto": args.baseline_p1024_auto,
         "candidate_split_reduce": args.candidate_split_reduce,
         "baseline_split_reduce": args.baseline_split_reduce,
         "baseline_padded": baseline_padded,
@@ -410,6 +454,8 @@ def main() -> None:
             aligned_padded_smem=args.baseline_aligned_padded_smem,
             g6_dual_cta=args.baseline_g6_dual_cta,
             inherited_g6_dual_cta=inherited_g6_dual_cta,
+            p1024_auto=args.baseline_p1024_auto,
+            inherited_p1024_auto=inherited_p1024_auto,
             split_reduce=args.baseline_split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             seq_len=args.seq_len,
@@ -430,6 +476,8 @@ def main() -> None:
             aligned_padded_smem=args.candidate_aligned_padded_smem,
             g6_dual_cta=args.candidate_g6_dual_cta,
             inherited_g6_dual_cta=inherited_g6_dual_cta,
+            p1024_auto=args.candidate_p1024_auto,
+            inherited_p1024_auto=inherited_p1024_auto,
             split_reduce=args.candidate_split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             seq_len=args.seq_len,

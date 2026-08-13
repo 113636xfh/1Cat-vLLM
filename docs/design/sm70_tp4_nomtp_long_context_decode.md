@@ -994,3 +994,121 @@ Artifacts:
 - `bench_results/nomtp_long_context_20260713/current_tp4/q1_separate_sp/model_128k/g6_p7_p2d16_i131008_o64.json` (invalid as 128K)
 - `bench_results/nomtp_long_context_20260713/current_tp4/q1_separate_sp/repro_128k_20260713/max131072_modeltokens_i131008_o64.json`
 - `bench_results/nomtp_long_context_20260713/current_tp4/q1_separate_sp/repro_128k_20260713/max131072_modeltokens_i131008_o64.log`
+
+## 2026-08-14 P1024 Dynamic One/Two-CTA Decode Route
+
+This update targets the production p1024 route selected by default at context
+lengths of at least 32K. It does not change the partition size, softmax
+partition boundaries, fp16 probability rounding, or cross-partition reduction
+order. The exact production shape is Qwen3.6-27B-AWQ TP4 full attention:
+`B=1`, `Hq=6`, `Hkv=1`, `D=256`, 784-token KV pages, and fp16 KV cache.
+
+### Root Cause And Design
+
+The original p1024 partition kernel launches one 256-thread CTA per active
+partition. At 128K this gives 128 CTAs on a 72-SM V100, or one full wave plus a
+56-CTA tail. Its 188 registers/thread and 43.26 KB dynamic shared memory allow
+only one resident CTA per SM, leaving too few independent warps to hide the KV
+load latency.
+
+The accepted route captures two partition nodes in the same CUDA graph:
+
+- Below `(SM count + 1) * 1024` tokens, the original 256-thread one-CTA kernel
+  executes and the long kernel returns immediately.
+- At and above that threshold, a 192-thread kernel with
+  `__launch_bounds__(192, 2)` executes and the short kernel returns immediately.
+- On the 72-SM test V100, the boundary is 74,752 tokens. The device `seq_lens`
+  value selects the route at replay time, so one captured graph is valid on
+  both sides of the boundary.
+- The long route specializes the known 784-token page geometry and uses the
+  existing exact split reducer. No host synchronization or graph recapture is
+  introduced.
+
+`VLLM_FLASH_V100_XQA_G6_P1024_AUTO=0` is the A/B rollback. The route is
+default-on only for the exact shape above. G4/G8, other page sizes, other
+partition sizes, and batch sizes greater than one keep their existing paths.
+
+### NCU Result
+
+The following NCU pair is the 131,071-token partition kernel on one V100. It
+compares the original p1024 kernel with the long node of the dynamic route.
+
+| NCU item | p1024 T256 | p1024 page-784 T192 | change |
+|---|---:|---:|---:|
+| partition duration | 538.02 us | 368.06 us | `-31.59%` |
+| registers/thread | 188 | 168 | `-20` |
+| dynamic shared memory | 43.26 KB | 43.26 KB | unchanged |
+| achieved occupancy | 12.49% | 16.94% | `+4.45 pp` |
+| DRAM throughput | 259.63 GB/s | 371.11 GB/s | `+42.94%` |
+| DRAM peak share | 23.03% | 32.85% | `+9.82 pp` |
+| scheduler no-eligible cycles | 76.23% | 71.56% | `-4.67 pp` |
+| CTA waves/SM | 1.78 | 0.89 | removes the partial second wave |
+
+The gain comes from lower register pressure, two-CTA residency, and better
+wave geometry. The kernel remains memory-latency limited rather than reaching
+HBM peak; this is not a claim that long decode is fully optimized.
+
+### CUDA Graph Operator Gate
+
+All rows use the exact TP4 shape and compare the original p1024 route against
+the dynamic route. Outputs are bitwise equal. The discontinuity at 74,752 is
+intentional: shorter contexts retain the original kernel, while longer
+contexts use the two-CTA kernel.
+
+| sequence length | baseline | dynamic route | speedup |
+|---:|---:|---:|---:|
+| 32K | 0.2361 ms | 0.2345 ms | 1.007x |
+| 64K | 0.2492 ms | 0.2461 ms | 1.013x |
+| 74,751 | 0.4676 ms | 0.4621 ms | 1.012x |
+| 74,752 | 0.4636 ms | 0.3226 ms | 1.437x |
+| 96K | 0.4865 ms | 0.3365 ms | 1.445x |
+| 128K | 0.5024 ms | 0.3442 ms | 1.460x |
+| 192K | 0.7477 ms | 0.6632 ms | 1.127x |
+| 256K | 0.9953 ms | 0.6793 ms | 1.465x |
+
+A separate default-policy graph check removed
+`VLLM_FLASH_V100_DECODE_PARTITION_SIZE` entirely. At 131,071 tokens the
+runtime selected p1024 and measured `0.5672 -> 0.3876 ms` (1.463x), with
+bitwise-equal output. This proves the normal long-context default can reach the
+new route without a partition-size override.
+
+Correctness coverage also includes four fresh random seeds with permuted page
+tables, one graph replayed across short and long sequence lengths, and fp16 and
+FP8-e5m2 KV-cache operator checks. All comparisons are bitwise equal.
+Compute Sanitizer reports zero racecheck hazards at the 74,752-token boundary
+and zero memcheck errors at 262,080 tokens.
+
+### Full-Acceleration Model Gate
+
+The accepted endpoint comparison uses the actual 131,008-token prompt and 64
+output tokens on four V100s. Both sides use TurboMind AWQ, Flash-V100, no MTP,
+`enforce_eager=False`, `VLLM_USE_AOT_COMPILE=1`, `VLLM_COMPILE`,
+`FULL_AND_PIECEWISE` graph mode, and FULL decode graph capture. Sampling is
+fixed to the official `temperature=1.0`, `top_p=0.95`, `top_k=20` policy with
+seed `20260620`; `ignore_eos` only fixes the 64-token measurement window.
+
+| true 128K TP4 no-MTP decode | TPOT | steady decode | result |
+|---|---:|---:|---:|
+| p1024 dynamic route disabled | 24.4973 ms | 40.8208 tok/s | reference |
+| p1024 dynamic route enabled | 20.6002 ms | 48.5431 tok/s | `-15.91%` TPOT / `+18.92%` tok/s |
+
+The prompt hashes match and all 64 output token IDs and decoded text are
+identical. Prefill is `101.763 -> 101.309 s`; it is outside this decode-only
+change and no prefill gain is attributed to it. A sampler-logit dump was not
+collected, so this is a strict token/text gate for the measured request rather
+than a broad statistical model-quality claim.
+
+The earlier `no-compile` run was startup diagnosis only and is invalid as a
+performance baseline or acceptance result. It must not be combined with the
+table above. All reported endpoint speedup comes from the full-acceleration
+configuration.
+
+Raw artifacts:
+
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/p1024_t256_i131071.ncu-rep`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/p1024_auto_p784_t192_i131071.ncu-rep`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_baseline_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_auto_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_fullaccel_compare_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/p1024_auto_racecheck_rebuilt_i74752.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/p1024_auto_memcheck_i262080.log`
