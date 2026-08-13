@@ -41107,3 +41107,23 @@ Interpretation:
   Long-window, token-run, malformed-tag, closure, and natural-stop guards are
   unchanged and still reject the P256 failure. Full evidence is in
   `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.
+
+## 2026-08-14 Qwen3.6 TP4 long-prefill exact-dense AWQ projections
+
+- Accepted and defaulted the gather-to-exact-dense Flash-V100 route. Its
+  attention-operator gain is 7.47%-10.81% across 8K-256K; full-model gains
+  measured 0.66% at 8K and 1.74% at 64K with identical output tokens.
+- Added exact three-way split-KV for dense `Q4096,Hq6,Hkv1,D256` attention at
+  KV >= 32K. It improves the attention kernel about 8.7% and the 64K model
+  prefill another 1.34%, with identical output tokens.
+- Added the 32 GB V100 TP4 AWQ exact-dense projection path for five validated
+  Qwen3.6 shapes. It preserves TurboMind's FP16 bias-rounding/FMA dequant
+  order and uses cuBLAS only for full M=4096 chunks; decode and tails retain
+  TurboMind AWQ.
+- Final 64K gate: `25.514792 -> 20.988843 s` prefill, latency `-17.74%`,
+  throughput `+21.56%`, identical 16 token IDs/text/hash, and unchanged TPOT.
+  Model residency is `17.36 GiB/rank`, so default enablement requires at least
+  30 GiB device memory and can be disabled with
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+- Detailed rationale, shape table, rejected paths, and artifact names are in
+  `docs/design/sm70_awq_long_prefill_exact_dense.md`.

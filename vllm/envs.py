@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
+    VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE: Literal["inline", "engine"] = "inline"
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL: int = 5120
@@ -1570,6 +1571,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # epilogue for M=1/TP2 while keeping the existing down_proj/reduce path.
     "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
+    ),
+    # Keep AWQ storage for decode, but retain exactly dequantized FP16 copies
+    # of selected full 4096-token TP4 prefill projections.
+    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
