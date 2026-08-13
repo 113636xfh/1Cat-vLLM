@@ -2506,9 +2506,22 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 common_attn_metadata,
             )
         if not ddtree_tree_verify:
+            # EAGER build path: cap the small-query decode workspace/launch grid
+            # to the runtime max_seq_len, mirroring build_for_cudagraph_capture
+            # (:2431-2445). Without a cap, _update_smallq_decode_metadata stores
+            # the full block-table capacity (== max_model_len worth of blocks) at
+            # smallq_decode_workspace_seq_capacity_hint (:2350), and the interface
+            # then launches ceil(max_model_len/partition_size) partitions where
+            # only ceil(max_seq_len/partition_size) do work (1024 vs 17 at
+            # max_model_len=262144 / S=4224 / ps=256). The cap keeps launch equal
+            # to the runtime coverage; the interface floors it at effective
+            # max_seq_len (_get_decode_plan:165-169), so it can never under-cover.
             self._update_smallq_decode_metadata(
                 attn_metadata,
                 common_attn_metadata,
+                workspace_seq_capacity_cap=(
+                    int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
+                ),
             )
         self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._update_decode_active_num_partitions(attn_metadata, stage="build")
@@ -2544,7 +2557,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             else 0.0
         )
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
+        # EAGER drafting build path: same runtime max_seq_len cap as build()
+        # above, so the drafter hot loop does not over-launch to the full
+        # max_model_len envelope. See build() for the full rationale.
+        self._update_smallq_decode_metadata(
+            attn_metadata,
+            common_attn_metadata,
+            workspace_seq_capacity_cap=(
+                int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
+            ),
+        )
         smallq_ms = (
             (time.perf_counter() - profile_stage_t0) * 1000.0
             if profile_enabled
@@ -5148,6 +5170,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             torch.zeros_like(decode_block_table),
             decode_block_table,
         ).contiguous()
+        # EAGER fallback branch (persistent smallq metadata absent). Cap the
+        # workspace/launch grid to the runtime max_seq_len instead of passing the
+        # raw block-table capacity (== max_model_len worth of blocks), which would
+        # over-launch ceil(max_model_len/ps) partitions where only
+        # ceil(max_seq_len/ps) do work. eager_max_seq_len is computed once (single
+        # device->host sync, was already paid for max_seq_len_hint) and reused; the
+        # interface floors the hint at effective max_seq_len (_get_decode_plan:
+        # 165-169), so the cap can never under-cover the runtime sequences.
+        eager_max_seq_len = int(seq_lens.max().item()) if num_seqs > 0 else None
         self._call_flash_attn_smallq_decode_paged(
             layer,
             query,
@@ -5157,9 +5188,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             decode_seq_lens,
             attn_metadata,
             out=out_view,
-            max_seq_len_hint=(int(seq_lens.max().item()) if num_seqs > 0 else None),
+            max_seq_len_hint=eager_max_seq_len,
             workspace_seq_capacity_hint=(
-                int(block_table.shape[1]) * int(key_cache.shape[1])
+                min(
+                    int(block_table.shape[1]) * int(key_cache.shape[1]),
+                    eager_max_seq_len,
+                )
                 if num_seqs > 0
                 else None
             ),
