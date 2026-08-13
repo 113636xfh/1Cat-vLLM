@@ -114,10 +114,10 @@ index f90a489..90cb40a 100644
 +} // namespace FLASH_NAMESPACE
 diff --git a/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
 new file mode 100644
-index 0000000..1d91f5a
+index 0000000..efa10a6
 --- /dev/null
 +++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,988 @@
 +/******************************************************************************
 + * Copyright (c) 2026, 1CatAI.
 + ******************************************************************************/
@@ -146,6 +146,7 @@ index 0000000..1d91f5a
 +struct Sm70D256SplitDTraits {
 +    using Element = cutlass::half_t;
 +    using MmaAtom = MMA_Atom<SM70_8x8x4_F32F16F16F32_TN>;
++    using PvMmaAtom = MMA_Atom<SM70_8x8x4_F32F16F16F32_TT>;
 +
 +    static constexpr int kHeadDim = 256;
 +    static constexpr int kBlockM = 64;
@@ -171,7 +172,7 @@ index 0000000..1d91f5a
 +        Layout<Shape<_1, _4, _1>>,
 +        Tile<Int<kQkWarpRows>, Int<kBlockN / 4>, _4>>;
 +    using PvTiledMma = TiledMMA<
-+        MmaAtom,
++        PvMmaAtom,
 +        Layout<Shape<_1, _4, _1>>,
 +        Tile<Int<kGroupRows>, Int<kDChunk / 4>, _4>>;
 +    static_assert(decltype(size(QkTiledMma{}))::value == kMmaThreads);
@@ -192,11 +193,13 @@ index 0000000..1d91f5a
 +        Shape<Shape<Int<16>, Int<2>>, Int<kDChunk>>,
 +        Stride<Stride<Int<kDChunk + 4>, Int<16 * (kDChunk + 4) + 16>>,
 +               _1>>;
-+    using SmemLayoutVt = decltype(composition(
-+        SmemLayoutKV{},
-+        make_layout(Shape<Int<kDChunk>, Int<kBlockN>>{}, GenRowMajor{})));
-+    using SmemLayoutVtNoSwizzle =
-+        decltype(get_nonswizzle_portion(SmemLayoutVt{}));
++    // TT PV consumes V as KxD. Row bit 1 is folded into D-address bit 2;
++    // the producer applies the inverse 64-bit-half swap before STS.128.
++    using SmemLayoutV = Layout<
++        Shape<Shape<_2, Int<kBlockN / 2>>,
++              Shape<_32, Int<kDChunk / 32>>>,
++        Stride<Stride<_32, Int<4 * kBlockN>>,
++               Stride<_1, _64>>>;
 +    using SmemLayoutP = Layout<
 +        Shape<Int<kBlockM>, Int<kBlockN>>,
 +        Stride<Int<kBlockN>, _1>>;
@@ -244,6 +247,7 @@ index 0000000..1d91f5a
 +
 +    static constexpr int kQElements = size(SmemLayoutQ{});
 +    static constexpr int kKVElements = size(SmemLayoutKV{});
++    static_assert(size(SmemLayoutV{}) == kKVElements);
 +    static constexpr int kPElements = size(SmemLayoutP{});
 +    static constexpr int kExchangeRows = kMmaGroups * kGroupRows;
 +    static constexpr int kTensorSmemBytes =
@@ -265,6 +269,92 @@ index 0000000..1d91f5a
 +        for (int k = 0; k < size<2>(src); ++k) {
 +            cute::copy(tiled_copy, src(_, m, k), dst(_, m, k));
 +        }
++    }
++}
++
++template <typename RegTensor, typename SmemTensor, typename CoordTensor>
++__device__ __forceinline__ void store_v_fragment_128_swizzled(
++    const RegTensor &source,
++    SmemTensor &destination,
++    const CoordTensor &coordinates) {
++    static_assert(decltype(size<0>(source))::value == 8);
++    static_assert(decltype(size<0>(destination))::value == 8);
++    static_assert(decltype(size<1>(source))::value
++                  == decltype(size<1>(destination))::value);
++    static_assert(decltype(size<2>(source))::value
++                  == decltype(size<2>(destination))::value);
++#pragma unroll
++    for (int k = 0; k < size<2>(source); ++k) {
++#pragma unroll
++        for (int m = 0; m < size<1>(source); ++m) {
++            auto words = recast<uint32_t const>(source(_, m, k));
++            const uint32_t address = static_cast<uint32_t>(
++                __cvta_generic_to_shared(&destination(0, m, k)));
++            const int row = get<0>(coordinates(0, m, k));
++            if (row & 2) {
++                asm volatile(
++                    "st.shared.v4.u32 [%0], {%1, %2, %3, %4};\n"
++                    :: "r"(address), "r"(words(2)), "r"(words(3)),
++                       "r"(words(0)), "r"(words(1)));
++            } else {
++                asm volatile(
++                    "st.shared.v4.u32 [%0], {%1, %2, %3, %4};\n"
++                    :: "r"(address), "r"(words(0)), "r"(words(1)),
++                       "r"(words(2)), "r"(words(3)));
++            }
++        }
++    }
++}
++
++template <typename SmemTensor, typename TensorB>
++__device__ __forceinline__ void load_v_fragment_tt(
++    const SmemTensor &sV,
++    TensorB &b_words,
++    int phase,
++    int lane) {
++    auto *v = sV.data().get();
++    const int d_lane = ((lane & 0x0c) << 1) | ((lane & 0x10) >> 2);
++    const int k = phase * 4 + (lane & 0x03);
++    const int offset = (d_lane ^ ((k & 0x02) << 1))
++        | ((k & 0x01) << 5) | ((k & 0x1e) << 6);
++    const uint32_t address = static_cast<uint32_t>(
++        __cvta_generic_to_shared(v + offset));
++    uint32_t word0;
++    uint32_t word1;
++    uint32_t word2;
++    uint32_t word3;
++    asm volatile(
++        "ld.shared.v2.u32 {%0, %1}, [%4];\n"
++        "ld.shared.v2.u32 {%2, %3}, [%4+128];\n"
++        : "=r"(word0), "=r"(word1), "=r"(word2), "=r"(word3)
++        : "r"(address));
++    b_words(0, 0) = word0;
++    b_words(1, 0) = word1;
++    b_words(0, 1) = word2;
++    b_words(1, 1) = word3;
++}
++
++template <typename TensorO, typename TensorP, typename SmemTensor,
++          typename TiledMma>
++__device__ __forceinline__ void splitd_pv_gemm_tt(
++    TensorO &acc_o,
++    const TensorP &tPrP,
++    const SmemTensor &sV,
++    TiledMma tiled_mma,
++    int lane) {
++    using Element = typename Sm70D256SplitDTraits::Element;
++    using BLayout = Layout<Shape<_4, _2>, Stride<_1, _4>>;
++    auto b = make_tensor<Element>(BLayout{});
++    auto b_words = recast<uint32_t>(b);
++    static_assert(decltype(size<2>(tPrP))::value
++                  == Sm70D256SplitDTraits::kBlockN / 4);
++    static_assert(decltype(size(b))::value == 8);
++    static_assert(decltype(size<0>(b_words))::value == 2);
++    static_assert(decltype(size<1>(b_words))::value == 2);
++#pragma unroll
++    for (int phase = 0; phase < size<2>(tPrP); ++phase) {
++        load_v_fragment_tt(sV, b_words, phase, lane);
++        cute::gemm(tiled_mma, tPrP(_, _, phase), b, acc_o);
 +    }
 +}
 +
@@ -524,15 +614,16 @@ index 0000000..1d91f5a
 +        make_coord(n_block_max, 0));
 +    auto tKgKFirstRaw = gmem_k_thread.partition_S(gKFirst);
 +    auto tKgKFirst = reshape_kv_thread_tensor<PagedKV>(tKgKFirstRaw);
++    int64_t k_thread_tile_base = 0;
 +    if constexpr (PagedKV) {
-+        const int64_t offset = paged_kv_thread_offset<
++        k_thread_tile_base = paged_kv_thread_offset<
 +            Traits::kGmemKThreadsPerRow,
 +            Traits::kGmemKRowsPerThread,
 +            Traits::kGmemKElemsPerLoad>(
 +                tid, n_block_max, 0, page_size, sequence_block_table,
 +                k_outer_stride,
 +                k_row_stride);
-+        tKgKFirst.data() = mK.data() + offset;
++        tKgKFirst.data() = mK.data() + k_thread_tile_base;
 +    }
 +    copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
 +    __syncthreads();
@@ -558,15 +649,9 @@ index 0000000..1d91f5a
 +                auto tKgKNext =
 +                    reshape_kv_thread_tensor<PagedKV>(tKgKNextRaw);
 +                if constexpr (PagedKV) {
-+                    const int64_t offset = paged_kv_thread_offset<
-+                        Traits::kGmemKThreadsPerRow,
-+                        Traits::kGmemKRowsPerThread,
-+                        Traits::kGmemKElemsPerLoad>(
-+                            tid, n_block, d_chunk + 1, page_size,
-+                            sequence_block_table,
-+                            k_outer_stride,
-+                            k_row_stride);
-+                    tKgKNext.data() = mK.data() + offset;
++                    tKgKNext.data() = mK.data()
++                        + k_thread_tile_base
++                        + (d_chunk + 1) * kDChunk;
 +                }
 +                copy_even_tile(gmem_k_copy, tKgKNext, tKrKNext);
 +            }
@@ -609,16 +694,20 @@ index 0000000..1d91f5a
 +            make_stride(v_row_stride, _1{}));
 +        auto sV0 = make_tensor(
 +            make_smem_ptr(kv_smem_ptr),
-+            typename Traits::SmemLayoutKV{});
++            typename Traits::SmemLayoutV{});
 +        auto sV1 = make_tensor(
 +            make_smem_ptr(kv_smem_ptr + Traits::kKVElements),
-+            typename Traits::SmemLayoutKV{});
++            typename Traits::SmemLayoutV{});
 +        auto tVsV0Raw = gmem_v_thread.partition_D(sV0);
 +        auto tVsV1Raw = gmem_v_thread.partition_D(sV1);
 +        auto tVsV0 = reshape_kv_thread_tensor<PagedKV>(tVsV0Raw);
 +        auto tVsV1 = reshape_kv_thread_tensor<PagedKV>(tVsV1Raw);
 +        auto tVrV0 = make_fragment_like(tVsV0);
 +        auto tVrV1 = make_fragment_like(tVsV1);
++        auto cV = make_identity_tensor(
++            Shape<Int<kBlockN>, Int<kDChunk>>{});
++        auto tVcVRaw = gmem_v_thread.partition_S(cV);
++        auto tVcV = reshape_kv_thread_tensor<PagedKV>(tVcVRaw);
 +        auto gV0 = local_tile(
 +            mV,
 +            Shape<Int<kBlockN>, Int<kDChunk>>{},
@@ -631,19 +720,18 @@ index 0000000..1d91f5a
 +        auto tVgV2Raw = gmem_v_thread.partition_S(gV2);
 +        auto tVgV0 = reshape_kv_thread_tensor<PagedKV>(tVgV0Raw);
 +        auto tVgV2 = reshape_kv_thread_tensor<PagedKV>(tVgV2Raw);
++        int64_t v_thread_tile_base = 0;
 +        if constexpr (PagedKV) {
-+            tVgV0.data() = mV.data() + paged_kv_thread_offset<
++            v_thread_tile_base = paged_kv_thread_offset<
 +                Traits::kGmemThreadsPerRow,
 +                Traits::kGmemRowsPerThread,
 +                Traits::kGmemElemsPerLoad>(
 +                    tid, n_block, 0, page_size, sequence_block_table,
 +                    v_outer_stride, v_row_stride);
-+            tVgV2.data() = mV.data() + paged_kv_thread_offset<
-+                Traits::kGmemThreadsPerRow,
-+                Traits::kGmemRowsPerThread,
-+                Traits::kGmemElemsPerLoad>(
-+                    tid, n_block, Traits::kOwnedDChunks, page_size,
-+                    sequence_block_table, v_outer_stride, v_row_stride);
++            tVgV0.data() = mV.data() + v_thread_tile_base;
++            tVgV2.data() = mV.data()
++                + v_thread_tile_base
++                + Traits::kOwnedDChunks * kDChunk;
 +        }
 +        copy_even_tile(gmem_v_copy, tVgV0, tVrV0);
 +        copy_even_tile(gmem_v_copy, tVgV2, tVrV1);
@@ -664,8 +752,8 @@ index 0000000..1d91f5a
 +            row_scale_exchange, mma_group, n_warp, lane,
 +            softmax_scale_log2, n_block == n_block_max);
 +
-+        cute::copy(tVrV0, tVsV0);
-+        cute::copy(tVrV1, tVsV1);
++        store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
++        store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
 +
 +        auto sP = make_tensor(
 +            make_smem_ptr(p_smem_ptr), typename Traits::SmemLayoutP{});
@@ -693,18 +781,11 @@ index 0000000..1d91f5a
 +        auto tVgV1 = reshape_kv_thread_tensor<PagedKV>(tVgV1Raw);
 +        auto tVgV3 = reshape_kv_thread_tensor<PagedKV>(tVgV3Raw);
 +        if constexpr (PagedKV) {
-+            tVgV1.data() = mV.data() + paged_kv_thread_offset<
-+                Traits::kGmemThreadsPerRow,
-+                Traits::kGmemRowsPerThread,
-+                Traits::kGmemElemsPerLoad>(
-+                    tid, n_block, 1, page_size, sequence_block_table,
-+                    v_outer_stride, v_row_stride);
-+            tVgV3.data() = mV.data() + paged_kv_thread_offset<
-+                Traits::kGmemThreadsPerRow,
-+                Traits::kGmemRowsPerThread,
-+                Traits::kGmemElemsPerLoad>(
-+                    tid, n_block, Traits::kOwnedDChunks + 1, page_size,
-+                    sequence_block_table, v_outer_stride, v_row_stride);
++            tVgV1.data() = mV.data()
++                + v_thread_tile_base + kDChunk;
++            tVgV3.data() = mV.data()
++                + v_thread_tile_base
++                + (Traits::kOwnedDChunks + 1) * kDChunk;
 +        }
 +        copy_even_tile(gmem_v_copy, tVgV1, tVrV0);
 +        copy_even_tile(gmem_v_copy, tVgV3, tVrV1);
@@ -735,23 +816,13 @@ index 0000000..1d91f5a
 +            auto sV = make_tensor(
 +                make_smem_ptr(
 +                    kv_smem_ptr + n_warp * Traits::kKVElements),
-+                typename Traits::SmemLayoutKV{});
-+            auto sVt = make_tensor(sV.data(), typename Traits::SmemLayoutVt{});
-+            auto sVtNoSwizzle = make_tensor(
-+                sV.data().get(), typename Traits::SmemLayoutVtNoSwizzle{});
-+            auto tOrV = pv_mma_thread.partition_fragment_B(sVtNoSwizzle);
-+            auto tOsV = pv_mma_thread.partition_B(sVt);
-+            auto smem_copy_v = make_tiled_copy_B(
-+                typename Traits::SmemCopyAtomTransposed{}, pv_tiled_mma);
-+            auto smem_thread_v = smem_copy_v.get_thread_slice(lane);
-+            auto tSsV = smem_thread_v.retile_S(tOsV);
-+            FLASH_NAMESPACE::gemm<true, false>(
-+                acc_o, tPrP, tOrV, tPsP, tSsV, pv_tiled_mma,
-+                smem_copy_p, smem_copy_v, smem_thread_p, smem_thread_v);
++                typename Traits::SmemLayoutV{});
++            splitd_pv_gemm_tt(
++                acc_o, tPrP, sV, pv_tiled_mma, lane);
 +            __syncthreads();
 +            if (d_local + 1 < Traits::kOwnedDChunks) {
-+                cute::copy(tVrV0, tVsV0);
-+                cute::copy(tVrV1, tVsV1);
++                store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
++                store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
 +                __syncthreads();
 +                if (n_block > 0) {
 +                    auto gKNextBlock = local_tile(
@@ -764,7 +835,7 @@ index 0000000..1d91f5a
 +                        reshape_kv_thread_tensor<PagedKV>(
 +                            tKgKNextBlockRaw);
 +                    if constexpr (PagedKV) {
-+                        const int64_t offset = paged_kv_thread_offset<
++                        k_thread_tile_base = paged_kv_thread_offset<
 +                            Traits::kGmemKThreadsPerRow,
 +                            Traits::kGmemKRowsPerThread,
 +                            Traits::kGmemKElemsPerLoad>(
@@ -772,7 +843,8 @@ index 0000000..1d91f5a
 +                                sequence_block_table,
 +                                k_outer_stride,
 +                                k_row_stride);
-+                        tKgKNextBlock.data() = mK.data() + offset;
++                        tKgKNextBlock.data() =
++                            mK.data() + k_thread_tile_base;
 +                    }
 +                    copy_even_tile(
 +                        gmem_k_copy, tKgKNextBlock, tKrKNext);
