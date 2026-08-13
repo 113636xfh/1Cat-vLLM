@@ -49,6 +49,11 @@ The accepted specialization uses:
 - D128 output ownership per warp for PV;
 - the standard FA2 N32 online-softmax order;
 - conflict-aware Q/K/V layouts and software register prefetch;
+- one paged-KV address resolution per K/V N32 tile, with D64 pointers
+  derived by constant column offsets;
+- a Volta `TT` PV tensor-core mapping that consumes V as K-by-D directly;
+- 128-bit conflict-aware V stores and paired 64-bit V loads, removing the
+  previous transpose-path scalar loads and most operand permutation work;
 - FP32 score, online-softmax, and output accumulation;
 - 45,568 bytes of dynamic shared memory.
 
@@ -71,9 +76,10 @@ The paged kernel reads the normal
 `[block, K/V, page, head, dim]` allocation directly, including page size 784.
 No KV-major allocation change is retained.
 
-The final SM70 cubin uses 253 registers/thread for dense and 252 for paged,
-with no spill or local stack. Both remain at one CTA per SM. The gain comes
-from useful D256 parallelism and software scheduling, not higher occupancy.
+The final causal SM70 specialization uses 255 registers/thread with no spill
+or local stack. It remains at one CTA per SM. The gain comes from useful D256
+parallelism, lower operand-movement cost, and software scheduling, not higher
+occupancy.
 
 ## Operator Results
 
@@ -90,6 +96,49 @@ that convention; it is not hardware-executed work.
 
 The 4K and 8K logical rates exceed the original 49-TOPS comparison target.
 The physically meaningful causal rates are reported separately above.
+
+The release comparison below uses the real chunked-prefill shape (`Q=4096`),
+Qwen TP4 heads (`Hq=6`, `Hkv=1`), page size 784, and a fixed 1312 MHz V100
+application clock. `Current 1Cat` is the Flash-V100 extension shipped in
+1Cat-vLLM v1.2.2 at source revision `644d8a7cd0`, not an earlier kernel from
+this research branch. Its extension SHA256 is
+`8582b5b1a72d5ebfd9a35417f267298845195a6846285e26fff7ad9a5905f771`.
+Each entry is the median of two alternating runs after six warmups; both
+variants were measured at exactly the same clock.
+
+| KV length | Current 1Cat v1.2.2 | Final Split-D TT | Latency reduction | Speedup |
+|---:|---:|---:|---:|---:|
+| 8K | 11.1255 ms | 5.0542 ms | 54.57% | 2.20x |
+| 64K | 87.6001 ms | 50.4504 ms | 42.41% | 1.74x |
+| 128K | 174.9729 ms | 103.8420 ms | 40.65% | 1.68x |
+| 256K | 349.6960 ms | 210.7364 ms | 39.74% | 1.66x |
+
+A separate production-clock cross-check at up to 1530 MHz measured 2.20x,
+1.69x, 1.75x, and 1.64x respectively. The fixed-clock table is authoritative
+because the long runs otherwise trigger clock drift.
+
+The final clean build is bitwise identical to the previously accepted exact
+N32 operator at all four lengths. Against the current 1Cat extension, relative
+L2 error is `3.79e-4` at 8K and remains below `4.0e-4` through 256K.
+
+NCU isolates the final TT operand path from the immediately preceding
+address-reuse candidate. At 8K and 1312 MHz, kernel time falls from 5.18 ms to
+5.06 ms while LSU thread instructions fall from 187.1M to 132.5M and shared
+load wavefronts fall from 268.0M to 230.0M. Static SASS shrinks from 1,875 to
+1,767 instructions: `LDS.U16` falls from 128 to zero and `PRMT` from 68 to
+four. Tensor active reaches 32.06%. Shared-store conflicts increase, but their
+cost is smaller than the removed transpose/load/permutation chain.
+
+An adjacent real-model TP4 route check used Qwen3.6-27B-AWQ, 8K input,
+16-token deterministic output, chunk size 4096, FP16 KV, FlashAttentionV100,
+and non-eager FULL_DECODE_ONLY graphs. With an unrelated resident Ray service
+left untouched and a 2 GiB KV reservation, the previous binary measured
+2586.58 ms prefill and the candidate measured 2581.31 ms, a 5.27 ms (0.20%)
+reduction. Every rank reported 48
+`prefill_prefix_paged_splitd_d256` calls and output token hashes matched. The
+resident service slowed both prefill and decode relative to the clean historic
+baseline, so this result proves route translation but is not a replacement
+release baseline.
 
 ## Numerical And Quality Gates
 
@@ -113,6 +162,44 @@ operator error bounds plus official sampled token parity, rather than treating
 the original backend's prompt perplexity as an absolute numerical oracle.
 
 ## Full-Model Result
+
+The final controlled A/B uses Qwen3.6-27B-AWQ, TP4, FP16 KV, chunk size 4096,
+16 generated tokens, no prefix cache, and non-eager compile graphs. Both
+variants use the same source and runtime configuration; only
+`VLLM_FLASH_V100_FA2_D256_PREFILL` changes. Four V100s are fixed at 1312 MHz.
+Each value is the mean of two requests after a per-length warmup.
+
+| Input | Current 1Cat prefill | Final TT prefill | Latency reduction | Current tok/s | Final tok/s | Throughput gain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8K | 2.5722 s | 2.4440 s | 4.99% | 3184.8 | 3351.9 | 5.25% |
+| 64K | 30.2812 s | 25.5058 s | 15.77% | 2164.2 | 2569.5 | 18.72% |
+| 128K | 83.1879 s | 64.5516 s | 22.40% | 1575.6 | 2030.5 | 28.87% |
+| 256K | 256.6722 s | 183.9463 s | 28.33% | 1021.1 | 1424.8 | 39.54% |
+
+The 256K row uses 262,080 input tokens so the final 4,032-token chunk remains
+divisible by 64 and the 16-token generation stays within the model's exact
+262,144-token limit. All measured requests preserve the current 1Cat output
+token hash at every length.
+
+The corresponding no-MTP decode gate uses the model's official sampling
+parameters (`temperature=1.0`, `top_k=20`, `top_p=0.95`) and 256 generated
+tokens. TPOT excludes prefill and the first generated token. The 256K row uses
+261,824 input tokens, leaving 64 tokens below the exact model limit.
+
+| Input | Current 1Cat TPOT | Final TT TPOT | Current tok/s | Final tok/s | Throughput delta |
+|---:|---:|---:|---:|---:|---:|
+| 8K | 15.034 ms | 15.037 ms | 66.52 | 66.50 | -0.02% |
+| 64K | 18.999 ms | 18.985 ms | 52.63 | 52.67 | +0.08% |
+| 128K | 24.072 ms | 24.062 ms | 41.54 | 41.56 | +0.04% |
+| 256K | 33.766 ms | 33.760 ms | 29.62 | 29.62 | +0.02% |
+
+All four 256-token output hashes match. The differences are measurement noise:
+the new D256 operator is gated to prefill queries of at least 1,024 tokens,
+while q=1 decode continues to use the existing paged XQA path. Relative to
+8K, final decode throughput falls 20.8% at 64K, 37.5% at 128K, and 55.5% at
+256K. Reducing that decay requires a separate decode-attention change.
+
+An earlier no-compile 8K route-development run measured:
 
 | Route | Mean prefill | Delta from original | Deterministic tokens |
 |---|---:|---:|---:|
@@ -154,6 +241,18 @@ memory.
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/splitd_n32_final_cuda_gate.json`
 - Stable full-model result:
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_8k_splitd_n32_direct_out.json`
+- Final fixed-clock full-model comparison:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_prefill_current_vs_splitd_tt_fixed1312.json`
+- Final fixed-clock decode comparison:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_decode_current_vs_splitd_tt_fixed1312.json`
+- Current and final full-model raw results:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_prefill_current_1cat_fixed1312.json`
+  and
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_prefill_splitd_tt_fixed1312.json`
+- Current and final decode raw results:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_decode_current_1cat_fixed1312.json`
+  and
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/fullmodel_decode_splitd_tt_fixed1312.json`
 - Official 8K quality result:
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/official_quality/splitd_n32_official_i8k_o128.json`
 - Final N32 ABI default-on 1K quality result:
@@ -162,19 +261,33 @@ memory.
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/official_quality/compare_baseline_splitd_n32_i8k_o128.json`
 - Nsight Systems report:
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/profiles/qwen36_27b_awq_tp4_i8k_splitd_both_exact_prefill.nsys-rep`
+- Fixed-clock current-1Cat comparison:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/current_1cat_v122_vs_tt_vload_fixed1312.json`
+- Final clean-build latency and quality gates:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/tt_final_clean_gate.jsonl`
+  and
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/tt_final_clean_quality.json`
 - Validated runtime binary SHA256:
-  `e31d84095f700aa001f9fe4bb84110cf80ba4ab5142ec8cf4ea75ec8fd0fa5bc`
+  `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Independent clean-build binary SHA256:
-  `58df1e3fd7061d8547fe8e021a77090ac68e35f2ae38b5a715009cf0976b0a9b`
+  `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Vendored patch SHA256:
-  `39c755d2cab8bbbb9503bc73e05fcee3c0bbdadcd9d50e6fcee18d21b31789ed`
+  `7fc34a1fa9d25d7f1c6c1b77382717c4b0f9aba252b486eeb346f3f8cbe4826b`
 
 ## Closed Paths
 
 - N64 combined-softmax Split-D is rejected: fast standalone, but official
   sampled tokens diverge because its FP16 online-softmax order differs.
 - D256 ports that keep all output columns in one warp/CTA exceed practical
-  Volta register or shared-memory limits.
+  Volta instruction-cost limits. A full-head, single-barrier prototype
+  reduced barrier stall to 0.75%, long-scoreboard to 2.52%, and shared-load
+  conflicts to three, but increased LSU instructions by 37% and integer
+  instructions by 80%; its 4.707 ms 8K result loses to address reuse.
+- Split-D warp-pair register-P exchange is rejected. Three bitwise variants
+  ranged from 5.495 ms to 10.664 ms at 8K. The best eliminated all P shared
+  conflicts without changing Tensor instructions, but raised LSU instructions
+  by 16.5% and integer instructions by 26.6%; shuffle/mailbox cost exceeded
+  the conflict reduction.
 - A KV-major cache allocation did not improve the full model and expanded the
   cache-management blast radius, so it was removed.
 - Chunk size 8192 was 1.50% slower end to end than 4096 in the earlier A/B.
