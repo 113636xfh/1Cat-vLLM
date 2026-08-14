@@ -408,7 +408,7 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
         ddtree_num_tree_tokens_cpu=None,
     )
     layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
-    routes = []
+    routes: list[str] = []
 
     def exact_dense(query_arg, key_arg, value_arg, **kwargs):
         assert query_arg.shape == (1, query_len, 6, 256)

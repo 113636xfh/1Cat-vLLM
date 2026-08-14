@@ -16,7 +16,7 @@
 namespace {
 
 #ifndef SM70_LATENCY_PROBE_ITERATIONS
-#define SM70_LATENCY_PROBE_ITERATIONS 128
+  #define SM70_LATENCY_PROBE_ITERATIONS 128
 #endif
 
 constexpr int kThreads = 32;
@@ -37,25 +37,23 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
   check_cuda((expression), #expression, __FILE__, __LINE__)
 
 __device__ __forceinline__ uint32_t pack_half2(float low, float high) {
-  const uint32_t low_bits =
-      __half_as_ushort(__float2half_rn(low));
-  const uint32_t high_bits =
-      __half_as_ushort(__float2half_rn(high));
+  const uint32_t low_bits = __half_as_ushort(__float2half_rn(low));
+  const uint32_t high_bits = __half_as_ushort(__float2half_rn(high));
   return low_bits | (high_bits << 16);
 }
 
-__device__ __forceinline__ void mma_m8n8k4_row_col(
-    float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1,
-    const float (&c)[8]) {
+__device__ __forceinline__ void mma_m8n8k4_row_col(float (&d)[8], uint32_t a0,
+                                                   uint32_t a1, uint32_t b0,
+                                                   uint32_t b1,
+                                                   const float (&c)[8]) {
   asm volatile(
       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, "
       "{%8, %9}, {%10, %11}, {%12, %13, %14, %15, %16, %17, %18, %19};"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]),
-        "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-        "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]),
-        "f"(c[7]));
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]),
+        "=f"(d[6]), "=f"(d[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+        "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
 }
 
 __device__ __forceinline__ uint64_t read_clock() {
@@ -174,8 +172,8 @@ __global__ void dependent_shared_load_probe(uint64_t* cycles, float* sink) {
   sink[lane] = static_cast<float>(index);
 }
 
-__global__ void dependent_global_load_probe(
-    const uint32_t* __restrict__ links, uint64_t* cycles, float* sink) {
+__global__ void dependent_global_load_probe(const uint32_t* __restrict__ links,
+                                            uint64_t* cycles, float* sink) {
   uint32_t index = threadIdx.x;
   const uint64_t start = read_clock();
 #pragma unroll
@@ -268,19 +266,18 @@ std::vector<uint64_t> measure(Launch launch, uint64_t* device_cycles,
 
 void print_cycles(const std::vector<uint64_t>& values, int iterations,
                   int operations_per_iteration) {
-  const double mean = static_cast<double>(
-      std::accumulate(values.begin(), values.end(), uint64_t{0})) /
-      values.size();
+  const double mean = static_cast<double>(std::accumulate(
+                          values.begin(), values.end(), uint64_t{0})) /
+                      values.size();
   const uint64_t median = values[values.size() / 2];
   const double operations =
       static_cast<double>(iterations) * operations_per_iteration;
   std::cout << std::fixed << std::setprecision(6)
             << "{\"min_cycles\":" << values.front()
-            << ",\"median_cycles\":" << median
-            << ",\"mean_cycles\":" << mean
+            << ",\"median_cycles\":" << median << ",\"mean_cycles\":" << mean
             << ",\"max_cycles\":" << values.back()
-            << ",\"median_cycles_per_operation\":"
-            << median / operations << '}';
+            << ",\"median_cycles_per_operation\":" << median / operations
+            << '}';
 }
 
 }  // namespace
@@ -317,9 +314,7 @@ int main(int argc, char** argv) {
   }
   const int iterations = kProbeIterations;
   const auto empty = measure(
-      [&] {
-        empty_loop_probe<<<1, kThreads>>>(device_cycles, device_sink);
-      },
+      [&] { empty_loop_probe<<<1, kThreads>>>(device_cycles, device_sink); },
       device_cycles, arguments.warmup, arguments.samples);
   const auto dependent_hmma = measure(
       [&] {
@@ -333,8 +328,8 @@ int main(int argc, char** argv) {
       device_cycles, arguments.warmup, arguments.samples);
   const auto shared_load = measure(
       [&] {
-        dependent_shared_load_probe<<<1, kThreads>>>(
-            device_cycles, device_sink);
+        dependent_shared_load_probe<<<1, kThreads>>>(device_cycles,
+                                                     device_sink);
       },
       device_cycles, arguments.warmup, arguments.samples);
   const auto global_load = measure(

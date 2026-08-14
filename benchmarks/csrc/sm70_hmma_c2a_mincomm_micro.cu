@@ -45,8 +45,7 @@ __host__ __device__ constexpr int matrix_a_row(int lane) {
   return (lane & 3) + ((lane >> 4) * 4);
 }
 
-__device__ __forceinline__ uint32_t pack_fp32_to_half2(float low,
-                                                        float high) {
+__device__ __forceinline__ uint32_t pack_fp32_to_half2(float low, float high) {
   const uint32_t low_bits = __half_as_ushort(__float2half_rn(low));
   const uint32_t high_bits = __half_as_ushort(__float2half_rn(high));
   return low_bits | (high_bits << 16);
@@ -62,14 +61,12 @@ __device__ __forceinline__ void convert_reference(
 #pragma unroll
     for (int key_in_word = 0; key_in_word < 2; ++key_in_word) {
       const int key = 2 * word + key_in_word;
-      const int source_lane =
-          (lane & 1) | (((key >> 1) & 1) << 1) |
-          (((key >> 3) & 3) << 2) | (lane & 16);
+      const int source_lane = (lane & 1) | (((key >> 1) & 1) << 1) |
+                              (((key >> 3) & 3) << 2) | (lane & 16);
       const int source_reg = key_in_word + 4 * ((key >> 2) & 1);
-      const uint32_t payload = pack_fp32_to_half2(
-          source[source_reg], source[source_reg + 2]);
-      const uint32_t received =
-          __shfl_sync(0xffffffffU, payload, source_lane);
+      const uint32_t payload =
+          pack_fp32_to_half2(source[source_reg], source[source_reg + 2]);
+      const uint32_t received = __shfl_sync(0xffffffffU, payload, source_lane);
       const uint32_t selected =
           target_row_hi ? (received >> 16) : (received & 0xffffU);
       result |= selected << (16 * key_in_word);
@@ -79,20 +76,19 @@ __device__ __forceinline__ void convert_reference(
 }
 
 template <int kRound>
-__device__ __forceinline__ uint32_t minimum_communication_round(
-    const float (&source)[kSourceValues], int lane) {
+__device__ __forceinline__ uint32_t
+minimum_communication_round(const float (&source)[kSourceValues], int lane) {
   constexpr int kSourceWordBase = 4 * ((kRound >> 1) & 1);
   const bool source_row_hi = ((kRound & 1) ^ ((lane >> 1) & 1)) != 0;
-  const float low = source_row_hi ? source[kSourceWordBase + 2]
-                                  : source[kSourceWordBase];
-  const float high = source_row_hi ? source[kSourceWordBase + 3]
-                                   : source[kSourceWordBase + 1];
+  const float low =
+      source_row_hi ? source[kSourceWordBase + 2] : source[kSourceWordBase];
+  const float high =
+      source_row_hi ? source[kSourceWordBase + 3] : source[kSourceWordBase + 1];
   const uint32_t payload = pack_fp32_to_half2(low, high);
   const int target_row_hi = (lane >> 1) & 1;
-  const int source_lane =
-      (lane & 1) |
-      ((((kRound & 1) ^ target_row_hi) & 1) << 1) |
-      (kRound & 12) | (lane & 16);
+  const int source_lane = (lane & 1) |
+                          ((((kRound & 1) ^ target_row_hi) & 1) << 1) |
+                          (kRound & 12) | (lane & 16);
   return __shfl_sync(0xffffffffU, payload, source_lane);
 }
 
@@ -100,8 +96,7 @@ template <int kPhase>
 __device__ __forceinline__ void minimum_communication_phase(
     const float (&source)[kSourceValues], uint32_t (&target)[kTargetWords],
     int lane) {
-  const uint32_t even =
-      minimum_communication_round<2 * kPhase>(source, lane);
+  const uint32_t even = minimum_communication_round<2 * kPhase>(source, lane);
   const uint32_t odd =
       minimum_communication_round<2 * kPhase + 1>(source, lane);
   const bool target_row_hi = ((lane >> 1) & 1) != 0;
@@ -150,15 +145,14 @@ __device__ __forceinline__ void convert_and_store(
 
 }  // namespace
 
-extern "C" __global__ __launch_bounds__(kThreads, 4)
-void sm70_hmma_c2a_reference(const float* __restrict__ source,
-                             uint32_t* __restrict__ target) {
+extern "C" __global__ __launch_bounds__(
+    kThreads, 4) void sm70_hmma_c2a_reference(const float* __restrict__ source,
+                                              uint32_t* __restrict__ target) {
   convert_and_store<false>(source, target);
 }
 
-extern "C" __global__ __launch_bounds__(kThreads, 4)
-void sm70_hmma_c2a_mincomm(const float* __restrict__ source,
-                           uint32_t* __restrict__ target) {
+extern "C" __global__ __launch_bounds__(kThreads, 4) void sm70_hmma_c2a_mincomm(
+    const float* __restrict__ source, uint32_t* __restrict__ target) {
   convert_and_store<true>(source, target);
 }
 
@@ -274,10 +268,8 @@ int main(int argc, char** argv) {
   uint32_t* device_reference = nullptr;
   uint32_t* device_candidate = nullptr;
   CUDA_CHECK(cudaMalloc(&device_source, host_source.size() * sizeof(float)));
-  CUDA_CHECK(
-      cudaMalloc(&device_reference, expected.size() * sizeof(uint32_t)));
-  CUDA_CHECK(
-      cudaMalloc(&device_candidate, expected.size() * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(&device_reference, expected.size() * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(&device_candidate, expected.size() * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemcpy(device_source, host_source.data(),
                         host_source.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
@@ -354,29 +346,27 @@ int main(int argc, char** argv) {
 
   cudaFuncAttributes reference_attributes{};
   cudaFuncAttributes candidate_attributes{};
-  CUDA_CHECK(cudaFuncGetAttributes(&reference_attributes,
-                                   sm70_hmma_c2a_reference));
+  CUDA_CHECK(
+      cudaFuncGetAttributes(&reference_attributes, sm70_hmma_c2a_reference));
   CUDA_CHECK(
       cudaFuncGetAttributes(&candidate_attributes, sm70_hmma_c2a_mincomm));
 
-  const double speedup = 100.0 *
-                         (reference_timing.median_us -
-                          candidate_timing.median_us) /
-                         reference_timing.median_us;
+  const double speedup =
+      100.0 * (reference_timing.median_us - candidate_timing.median_us) /
+      reference_timing.median_us;
   std::cout << "{\n"
             << "  \"device\":\"" << properties.name << "\",\n"
             << "  \"blocks\":" << args.blocks << ",\n"
             << "  \"quality\":{\"reference_expected_mismatches\":"
             << reference_mismatches
-            << ",\"candidate_expected_mismatches\":"
-            << candidate_mismatches << ",\"pair_mismatches\":"
-            << pair_mismatches << "},\n"
+            << ",\"candidate_expected_mismatches\":" << candidate_mismatches
+            << ",\"pair_mismatches\":" << pair_mismatches << "},\n"
             << "  \"resources\":{\"reference\":{\"registers\":"
-            << reference_attributes.numRegs << ",\"local_bytes\":"
-            << reference_attributes.localSizeBytes
-            << "},\"candidate\":{\"registers\":"
-            << candidate_attributes.numRegs << ",\"local_bytes\":"
-            << candidate_attributes.localSizeBytes << "}},\n"
+            << reference_attributes.numRegs
+            << ",\"local_bytes\":" << reference_attributes.localSizeBytes
+            << "},\"candidate\":{\"registers\":" << candidate_attributes.numRegs
+            << ",\"local_bytes\":" << candidate_attributes.localSizeBytes
+            << "}},\n"
             << "  \"timing_us_per_launch\":{\"reference\":";
   print_timing(reference_timing);
   std::cout << ",\"candidate\":";
@@ -396,5 +386,5 @@ int main(int argc, char** argv) {
   cudaFree(device_reference);
   cudaFree(device_source);
   return pair_mismatches == 0 && candidate_mismatches == 0 ? EXIT_SUCCESS
-                                                            : EXIT_FAILURE;
+                                                           : EXIT_FAILURE;
 }

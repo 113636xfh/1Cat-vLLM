@@ -188,10 +188,8 @@ void fused_add_rms_norm(torch::stable::Tensor& input,
 
 #ifndef USE_ROCM
 void sm70_gemma_long_prefill_fused_add_rms_norm(
-    torch::stable::Tensor& normalized_out,
-    torch::stable::Tensor& residual_out,
-    torch::stable::Tensor& input,
-    torch::stable::Tensor& residual,
+    torch::stable::Tensor& normalized_out, torch::stable::Tensor& residual_out,
+    torch::stable::Tensor& input, torch::stable::Tensor& residual,
     torch::stable::Tensor& weight, double epsilon);
 #endif
 

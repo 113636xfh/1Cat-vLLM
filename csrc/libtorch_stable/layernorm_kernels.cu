@@ -1,9 +1,9 @@
 #include <numeric>
 
 #ifndef USE_ROCM
-#include <atomic>
-#include <cuda_bf16.h>
-#include <iostream>
+  #include <atomic>
+  #include <cuda_bf16.h>
+  #include <iostream>
 #endif
 
 #include "torch_utils.h"
@@ -225,13 +225,10 @@ __device__ __forceinline__ float sm70_gemma_weight_to_float(
 template <typename WeightT>
 __global__ void __launch_bounds__(kSm70GemmaLongPrefillThreads, 2)
     sm70_gemma_long_prefill_fused_add_rms_norm_kernel(
-        const half* __restrict__ input,
-        const float* __restrict__ residual,
-        const WeightT* __restrict__ weight,
-        half* __restrict__ normalized_out,
+        const half* __restrict__ input, const float* __restrict__ residual,
+        const WeightT* __restrict__ weight, half* __restrict__ normalized_out,
         float* __restrict__ residual_out, float epsilon) {
-  constexpr int kVectorsPerRow =
-      kSm70GemmaHiddenSize / kSm70GemmaVectorWidth;
+  constexpr int kVectorsPerRow = kSm70GemmaHiddenSize / kSm70GemmaVectorWidth;
   constexpr int kVectorsPerThread =
       kVectorsPerRow / kSm70GemmaLongPrefillThreads;
   static_assert(kVectorsPerRow % kSm70GemmaLongPrefillThreads == 0);
@@ -242,7 +239,7 @@ __global__ void __launch_bounds__(kSm70GemmaLongPrefillThreads, 2)
 
   float4 row_values[kVectorsPerThread];
   float variance = 0.0f;
-#pragma unroll
+  #pragma unroll
   for (int iter = 0; iter < kVectorsPerThread; ++iter) {
     const int vector_idx = threadIdx.x + iter * blockDim.x;
     const Sm70Half4 x = input4[vector_row_offset + vector_idx];
@@ -264,16 +261,14 @@ __global__ void __launch_bounds__(kSm70GemmaLongPrefillThreads, 2)
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
   __shared__ float inverse_rms;
-  variance =
-      BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+  variance = BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
   if (threadIdx.x == 0) {
-    inverse_rms =
-        rsqrtf(variance / kSm70GemmaHiddenSize + epsilon);
+    inverse_rms = rsqrtf(variance / kSm70GemmaHiddenSize + epsilon);
   }
   __syncthreads();
 
   auto* normalized4 = reinterpret_cast<Sm70Half4*>(normalized_out);
-#pragma unroll
+  #pragma unroll
   for (int iter = 0; iter < kVectorsPerThread; ++iter) {
     const int vector_idx = threadIdx.x + iter * blockDim.x;
     const float4 value = row_values[iter];
@@ -405,10 +400,8 @@ void fused_add_rms_norm(torch::stable::Tensor& input,     // [..., hidden_size]
 
 #ifndef USE_ROCM
 void sm70_gemma_long_prefill_fused_add_rms_norm(
-    torch::stable::Tensor& normalized_out,
-    torch::stable::Tensor& residual_out,
-    torch::stable::Tensor& input,
-    torch::stable::Tensor& residual,
+    torch::stable::Tensor& normalized_out, torch::stable::Tensor& residual_out,
+    torch::stable::Tensor& input, torch::stable::Tensor& residual,
     torch::stable::Tensor& weight, double epsilon) {
   using torch::headeronly::ScalarType;
   STD_TORCH_CHECK(input.scalar_type() == ScalarType::Half);
@@ -453,14 +446,12 @@ void sm70_gemma_long_prefill_fused_add_rms_norm(
               << " tokens=" << input.size(0) << std::endl;
   }
   const auto launch = [&]<typename WeightT>(const WeightT* weight_ptr) {
-    vllm::sm70_gemma_long_prefill_fused_add_rms_norm_kernel
-        <<<input.size(0), vllm::kSm70GemmaLongPrefillThreads, 0, stream>>>(
-            reinterpret_cast<const half*>(input.const_data_ptr<c10::Half>()),
-            residual.const_data_ptr<float>(), weight_ptr,
-            reinterpret_cast<half*>(
-                normalized_out.mutable_data_ptr<c10::Half>()),
-            residual_out.mutable_data_ptr<float>(),
-            static_cast<float>(epsilon));
+    vllm::sm70_gemma_long_prefill_fused_add_rms_norm_kernel<<<
+        input.size(0), vllm::kSm70GemmaLongPrefillThreads, 0, stream>>>(
+        reinterpret_cast<const half*>(input.const_data_ptr<c10::Half>()),
+        residual.const_data_ptr<float>(), weight_ptr,
+        reinterpret_cast<half*>(normalized_out.mutable_data_ptr<c10::Half>()),
+        residual_out.mutable_data_ptr<float>(), static_cast<float>(epsilon));
   };
   if (weight.scalar_type() == ScalarType::Half) {
     launch(reinterpret_cast<const half*>(weight.const_data_ptr<c10::Half>()));
