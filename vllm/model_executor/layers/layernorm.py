@@ -95,6 +95,18 @@ def _sm70_gemma_long_prefill_fused_add_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm import _custom_ops as ops
 
+    # A long-prefill example can select this custom op while torch.compile is
+    # tracing a dynamic graph that is later reused for small CUDA Graph capture
+    # sizes. Preserve the normal exact path for those runtime shapes instead of
+    # dispatching the long-prefill kernel below its numerical contract.
+    if x.shape[0] < 256:
+        return _sm70_gemma_fused_add_rms_norm_eager(
+            x,
+            residual,
+            weight,
+            variance_epsilon,
+        )
+
     normalized_out = torch.empty_like(x)
     residual_out = torch.empty_like(residual)
     ops.sm70_gemma_long_prefill_fused_add_rms_norm(

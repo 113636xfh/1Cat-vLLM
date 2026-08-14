@@ -241,6 +241,29 @@ def test_prefill_gather_dense_does_not_require_generic_dense_op(monkeypatch):
     assert impl.use_flash_v100_prefill_gather_dense is True
 
 
+def test_flash_v100_normalizes_resolved_float16_cache_dtype(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(flash_v100, "_get_flash_ops", lambda: (None,) * 9)
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_fp8_e5m2_paged_kv_bridge_op",
+        lambda: None,
+    )
+
+    impl = flash_v100.FlashAttnV100Impl(
+        num_heads=4,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+
+    assert impl.kv_cache_dtype == "auto"
+
+
 def test_prefill_gather_dense_reorders_random_pages_and_reuses_workspace(
     monkeypatch,
 ):

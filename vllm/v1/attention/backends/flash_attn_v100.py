@@ -150,6 +150,12 @@ _prefill_dense_splitkv3_workspaces: dict[
 ] = {}
 
 
+def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
+    # Newer vLLM resolves an explicit FP16 cache to "float16". The vendored
+    # Flash-V100 extension uses "auto" for the same unquantized FP16 layout.
+    return "auto" if kv_cache_dtype == "float16" else kv_cache_dtype
+
+
 def _split_paged_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3095,6 +3101,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
