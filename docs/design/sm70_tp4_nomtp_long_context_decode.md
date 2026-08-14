@@ -1235,18 +1235,18 @@ latency and insufficient independent work, not arithmetic throughput.
 The accepted p1024 specialization changes only QK data movement:
 
 - split D=256 into four K64 panels and ping-pong two shared K buffers;
-- use warps 0-3 as HMMA consumers and warps 4-5 as next-panel producers;
+- use warps 0-3 as HMMA consumers and warps 4-7 as next-panel producers;
 - issue four independent `uint4` global loads before the corresponding shared
   stores, creating a software load queue without `cp.async`;
 - preserve the original HMMA and FP32 accumulation order bit for bit;
 - keep the p256 route and PV arithmetic unchanged.
 
-The experimental dispatch gate is deliberately narrow: q=1, GQA group size 6,
+The default dispatch gate is deliberately narrow: q=1, GQA group size 6,
 D=256, page size 784, Hkv=1, FP16 KV cache, and the p1024 nodes of the accepted
 sawtooth graph. FP8 KV and all other shapes retain the previous implementation.
-The route remains default-off because its isolated model-level gain is too
-small for production promotion. Set `VLLM_FLASH_V100_XQA_G6_QK_PIPELINE=1`
-to opt in and
+`VLLM_FLASH_V100_XQA_G6_QK_PIPELINE=0` restores the previous kernel;
+`VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS=6` selects the earlier diagnostic
+layout. Set
 `VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE=1` to confirm route selection.
 
 ### NCU And Graph Gate
@@ -1255,7 +1255,7 @@ The NCU comparison below covers the exact 262,080-token p1024 partition
 kernel. The complete attention-call gain is smaller because the reducers and
 inactive p256 graph node are unchanged.
 
-| metric | previous p1024 | K64 pipeline | change |
+| metric | previous p1024 | 6-warp K64 pipeline | change |
 |---|---:|---:|---:|
 | partition kernel | 734.592 us | 699.520 us | `-4.78%` |
 | DRAM throughput | 370.33 GB/s | 389.11 GB/s | `+5.07%` |
@@ -1266,11 +1266,27 @@ inactive p256 graph node are unchanged.
 | registers/thread | 168 | 128 | `-23.81%` |
 | barrier cycles/issue | 1.101 | 2.394 | new limiting stall |
 
-Repeated CUDA Graph A/B runs with both execution orders measure a typical
-`3.1%-5.1%` reduction for one whole p1024 attention layer at 128K and 256K.
-Forward, reverse, and permuted block tables are bitwise equal. Racecheck at
-131,071 tokens reports zero hazards and memcheck at 262,080 tokens reports zero
-errors.
+The barrier increase showed that two producer warps were underfeeding four
+HMMA consumer warps. Expanding the CTA from six to eight warps preserves two
+CTAs/SM: the kernel remains at 128 registers/thread and 47.36 KB shared, while
+resident warps increase from 12 to 16 per SM.
+
+| exact 256K partition metric | 6 warp | 8 warp | change |
+|---|---:|---:|---:|
+| partition kernel | 699.520 us | 635.488 us | `-9.15%` |
+| DRAM throughput | 389.11 GB/s | 422.63 GB/s | `+8.62%` |
+| eligible warps/scheduler | 0.5077 | 0.5705 | `+12.36%` |
+| theoretical warp occupancy | 18.75% | 25.00% | `+6.25 pp` |
+| registers/thread | 128 | 128 | unchanged |
+| shared bank conflicts | 4.360 M | 4.412 M | effectively unchanged |
+
+Independent-process CUDA Graph measurements reduce one complete attention
+layer from `0.3410 -> 0.3058 ms` at 128K (`-10.34%`) and from
+`0.6782 -> 0.6033 ms` at 256K (`-11.05%`). The 111104, 147840, and 258176
+p1024 boundaries pass with sequential, reverse, and permuted page tables;
+147841 remains on p256 and is unchanged. All outputs are bitwise equal.
+Racecheck at 131,071 tokens reports zero hazards and memcheck at 262,080 tokens
+reports zero errors.
 
 ### Full-Acceleration Model Gate
 
@@ -1283,15 +1299,15 @@ only fixes the timing window.
 | true 128K TP4 no-MTP decode | TPOT | steady decode | result |
 |---|---:|---:|---:|
 | four-node sawtooth, previous QK | 19.2510 ms | 51.9453 tok/s | reference |
-| four-node sawtooth, K64 pipeline | 19.1831 ms | 52.1292 tok/s | `-0.35%` TPOT / `+0.35%` tok/s |
+| four-node sawtooth, 8-warp K64 pipeline | 18.6765 ms | 53.5432 tok/s | `-2.98%` TPOT / `+3.08%` tok/s |
 
 The prompt hashes, all 64 sampled token IDs, and decoded text are identical;
 neither result is marked corrupted. Prefill changed from `91.803` to
-`92.799 s`, but this decode-only kernel does not execute in prefill, so the
+`95.489 s`, but this decode-only kernel does not execute in prefill, so the
 difference is machine noise and no prefill effect is attributed to the change.
-An earlier `20.6002 -> 19.1831 ms` comparison used the previous standalone
-p1024 planner and a different machine state; it is not an isolated pipeline
-result and must not be reported as this candidate's gain.
+The earlier six-warp result was only `19.2510 -> 19.1831 ms` (`-0.35%`) and was
+not sufficient for default promotion; the accepted endpoint is the isolated
+eight-warp comparison above.
 
 Rejected variants are retained as negative evidence:
 
@@ -1303,17 +1319,25 @@ Rejected variants are retained as negative evidence:
   reduce wall time;
 - extending the pipeline to p256 regressed 110K/180K/256K by `3.1%-5.7%`;
 - FP8-e5m2 KV regressed by `25%-27%` because two producer warps also had to
-  perform conversion, so FP8 is explicitly excluded from this route.
+  perform conversion, so FP8 is explicitly excluded from this route;
+- an eight-warp PV D64 double buffer added barriers and regressed 256K by
+  `0.29%`;
+- guarding `out_acc` initialization did not remove stack allocation and
+  regressed the measured kernel, so it was reverted.
 
 Raw artifacts:
 
 - final rebuilt extension SHA256:
-  `3c1520cb8fa9e5f8f6be4c25cd3bec3bf9eded4e42648f3f2deeeb2a0bb34678`;
+  `03df92b847afa6e809e727b319d314aa61071d5fe8aba1626d62939674b194ae`;
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/sawtooth_final_p1024_q1_i262080_full.ncu-rep`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/qk_k64_stage4_candidate_q1_i262080_full.ncu-rep`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/qk_k64_stage4_8warp_candidate_q1_i262080_full.ncu-rep`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_candidate_racecheck_i131071.log`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_candidate_memcheck_i262080.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_8warp_racecheck_i131071.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_8warp_memcheck_i262080.log`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_auto_fullaccel_i131008_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_off_final_fullaccel_i131008_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_qk_k64_stage4_candidate_fullaccel_i131008_o64.json`
-- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_pipeline_final_compare_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_compare_i131008_o64.json`

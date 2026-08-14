@@ -326,7 +326,15 @@ def main() -> None:
         action="store_true",
         help="Enable the G6 K64 QK pipeline for the baseline call.",
     )
+    parser.add_argument(
+        "--qk-pipeline-warps",
+        type=int,
+        choices=(6, 8),
+        default=8,
+        help="CTA warp count for an enabled G6 K64 QK pipeline.",
+    )
     args = parser.parse_args()
+    os.environ["VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS"] = str(args.qk_pipeline_warps)
     inherited_g6_dual_cta = os.environ.get("VLLM_FLASH_V100_XQA_G6_DUAL_CTA")
     inherited_p1024_auto = os.environ.get("VLLM_FLASH_V100_XQA_G6_P1024_AUTO")
     inherited_split_reduce = os.environ.get("VLLM_FLASH_V100_XQA_SPLIT_REDUCE")
@@ -512,6 +520,7 @@ def main() -> None:
         "p1024_sawtooth": args.p1024_sawtooth,
         "candidate_qk_pipeline": args.candidate_qk_pipeline,
         "baseline_qk_pipeline": args.baseline_qk_pipeline,
+        "qk_pipeline_warps": args.qk_pipeline_warps,
         "q_heads": q_heads,
         "kv_heads": kv_heads,
         "head_dim": head_dim,

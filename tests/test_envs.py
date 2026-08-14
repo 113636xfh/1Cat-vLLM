@@ -122,13 +122,14 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
     bool_defaults = {
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": True,
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": False,
-        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": True,
         "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": False,
     }
-    threshold_defaults = {
+    int_defaults = {
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": 111104,
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": 147841,
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": 258176,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": 8,
     }
 
     for name, expected in bool_defaults.items():
@@ -137,7 +138,7 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
         monkeypatch.setenv(name, "0" if expected else "1")
         assert environment_variables[name]() is not expected
 
-    for name, expected in threshold_defaults.items():
+    for name, expected in int_defaults.items():
         monkeypatch.delenv(name, raising=False)
         assert environment_variables[name]() == expected
         monkeypatch.setenv(name, str(expected + 1))

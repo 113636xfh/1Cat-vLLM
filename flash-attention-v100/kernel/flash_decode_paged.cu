@@ -41,6 +41,7 @@ constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;
 constexpr int kXQATC256WideThreadsPerRow = kWarpSize;
 constexpr int kXQATCG6DualCtaThreads = 6 * kWarpSize;
+constexpr int kXQATCG6Pipeline8WarpThreads = 8 * kWarpSize;
 constexpr int kXQARouteAllSeqLens = 0;
 constexpr int kXQARouteShortSeqLens = -1;
 constexpr int kXQARouteLongSeqLens = 1;
@@ -172,7 +173,12 @@ bool xqa_g6_p1024_sawtooth_enabled() {
 
 bool xqa_g6_qk_pipeline_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
+}
+
+int xqa_g6_qk_pipeline_warps() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS");
+  return value != nullptr && std::atoi(value) == 6 ? 6 : 8;
 }
 
 bool xqa_g6_qk_pipeline_trace_enabled() {
@@ -759,8 +765,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   static_assert(NUM_THREADS >= GROUP_SIZE * kWarpSize,
                 "Each XQA query head requires one full softmax/PV warp");
   static_assert(
-      !QK_SW_PIPELINE || (GROUP_SIZE == 6 && NUM_THREADS == 6 * kWarpSize),
-      "The QK software pipeline requires the six-warp G6 kernel");
+      !QK_SW_PIPELINE || (GROUP_SIZE == 6 && (NUM_THREADS == 6 * kWarpSize ||
+                                              NUM_THREADS == 8 * kWarpSize)),
+      "The QK software pipeline requires a six- or eight-warp G6 "
+      "kernel");
 
   const int batch_idx = blockIdx.x;
   const int kv_head_idx = blockIdx.y;
@@ -2497,6 +2505,8 @@ at::Tensor flash_attention_decode_paged_xqa(
   const bool use_g6_qk_pipeline = use_g6_p1024_sawtooth &&
                                   k_cache.scalar_type() == at::kHalf &&
                                   xqa_g6_qk_pipeline_enabled();
+  const int g6_qk_pipeline_warps =
+      use_g6_qk_pipeline ? xqa_g6_qk_pipeline_warps() : 0;
   const int g6_p1024_route_seq_len =
       use_g6_p1024_auto ? (at::cuda::getDeviceProperties(q.get_device())
                                ->multiProcessorCount +
@@ -2593,7 +2603,9 @@ at::Tensor flash_attention_decode_paged_xqa(
   if (xqa_g6_qk_pipeline_trace_enabled() && use_g6_qk_pipeline &&
       !traced_g6_qk_pipeline) {
     TORCH_WARN(
-        "Flash-V100 XQA G6 fp16-KV QK K64 producer/consumer pipeline active");
+        "Flash-V100 XQA G6 fp16-KV QK K64 producer/consumer "
+        "pipeline active; warps=",
+        g6_qk_pipeline_warps);
     traced_g6_qk_pipeline = true;
   }
   static bool traced_aligned_padded_smem = false;
@@ -2642,15 +2654,27 @@ at::Tensor flash_attention_decode_paged_xqa(
   if (use_g6_p1024_sawtooth) {
     const int p1024_launch_num_partitions = (launch_num_partitions + 3) / 4;
     if (use_g6_qk_pipeline) {
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<
-          1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
-          kXQARouteP1024Sawtooth, true>(
-          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
-          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          p1024_launch_num_partitions, false, split_reduce_dim_tile, stream,
-          g6_p1024_sawtooth_p1024_mid_seq_len,
-          g6_p1024_sawtooth_p256_long_seq_len,
-          g6_p1024_sawtooth_p1024_final_seq_len, false);
+      if (g6_qk_pipeline_warps == 8) {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATCG6Pipeline8WarpThreads, 2, 784, false, false,
+            kXQARouteP1024Sawtooth, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, p1024_launch_num_partitions, false, split_reduce_dim_tile,
+            stream, g6_p1024_sawtooth_p1024_mid_seq_len,
+            g6_p1024_sawtooth_p256_long_seq_len,
+            g6_p1024_sawtooth_p1024_final_seq_len, false);
+      } else {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
+            kXQARouteP1024Sawtooth, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, p1024_launch_num_partitions, false, split_reduce_dim_tile,
+            stream, g6_p1024_sawtooth_p1024_mid_seq_len,
+            g6_p1024_sawtooth_p256_long_seq_len,
+            g6_p1024_sawtooth_p1024_final_seq_len, false);
+      }
     } else {
       launch_flash_attention_decode_paged_xqa_tc_256_wide<
           1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
