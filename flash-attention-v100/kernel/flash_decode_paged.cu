@@ -171,9 +171,13 @@ bool xqa_g6_p1024_sawtooth_enabled() {
   return value == nullptr || value[0] != '0';
 }
 
+bool decode_partition_size_overridden() {
+  return std::getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") != nullptr;
+}
+
 bool xqa_g6_qk_pipeline_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE");
-  return value == nullptr || value[0] != '0';
+  return value != nullptr && value[0] == '1';
 }
 
 int xqa_g6_qk_pipeline_warps() {
@@ -2501,7 +2505,8 @@ at::Tensor flash_attention_decode_paged_xqa(
   const bool use_g6_p1024_sawtooth =
       q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
       k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
-      xqa_block784_index_enabled() && xqa_g6_p1024_sawtooth_enabled();
+      !decode_partition_size_overridden() && xqa_block784_index_enabled() &&
+      xqa_g6_p1024_sawtooth_enabled();
   const bool use_g6_qk_pipeline = use_g6_p1024_sawtooth &&
                                   k_cache.scalar_type() == at::kHalf &&
                                   xqa_g6_qk_pipeline_enabled();

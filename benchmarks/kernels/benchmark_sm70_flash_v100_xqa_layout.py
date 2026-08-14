@@ -69,7 +69,12 @@ def run_once(
         )
     os.environ["VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH"] = "1" if p1024_sawtooth else "0"
     os.environ["VLLM_FLASH_V100_XQA_G6_QK_PIPELINE"] = "1" if qk_pipeline else "0"
-    os.environ["VLLM_FLASH_V100_DECODE_PARTITION_SIZE"] = str(partition_size)
+    if p1024_sawtooth:
+        # The production sawtooth planner reserves a p256 workspace through a
+        # hint while leaving the explicit user override unset.
+        os.environ.pop("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", None)
+    else:
+        os.environ["VLLM_FLASH_V100_DECODE_PARTITION_SIZE"] = str(partition_size)
     return flash_attn_decode_paged_xqa(
         q,
         k_cache,
@@ -79,6 +84,7 @@ def run_once(
         out=out,
         kv_cache_dtype=kv_cache_dtype,
         max_seq_len_hint=seq_len,
+        partition_size_hint=partition_size if p1024_sawtooth else None,
     )
 
 
@@ -314,7 +320,10 @@ def main() -> None:
     parser.add_argument(
         "--p1024-sawtooth",
         action="store_true",
-        help="Enable the device-routed p256/p1024 graph for this call.",
+        help=(
+            "Enable the page-784 device-routed p256/p1024 graph for both calls. "
+            "This also enables the required block784 index specialization."
+        ),
     )
     parser.add_argument(
         "--candidate-qk-pipeline",
@@ -334,6 +343,9 @@ def main() -> None:
         help="CTA warp count for an enabled G6 K64 QK pipeline.",
     )
     args = parser.parse_args()
+    if args.p1024_sawtooth:
+        args.baseline_block784_index = True
+        args.candidate_block784_index = True
     os.environ["VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS"] = str(args.qk_pipeline_warps)
     inherited_g6_dual_cta = os.environ.get("VLLM_FLASH_V100_XQA_G6_DUAL_CTA")
     inherited_p1024_auto = os.environ.get("VLLM_FLASH_V100_XQA_G6_P1024_AUTO")

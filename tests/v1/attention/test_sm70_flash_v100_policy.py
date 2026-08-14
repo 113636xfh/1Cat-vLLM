@@ -1635,6 +1635,21 @@ def test_flash_v100_decode_sawtooth_rollback_preserves_default_planner(
     assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) is None
 
 
+def test_flash_v100_decode_sawtooth_preserves_explicit_partition_override(
+    monkeypatch,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_page784_sawtooth_partition_size_hint,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", "256")
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.float16)
+
+    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) is None
+
+
 def test_flash_v100_decode_sawtooth_workspace_supports_fp8_kv(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import (
         _g6_page784_sawtooth_partition_size_hint,

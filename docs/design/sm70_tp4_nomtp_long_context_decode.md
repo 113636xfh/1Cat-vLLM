@@ -1070,7 +1070,9 @@ A separate default-policy graph check removed
 `VLLM_FLASH_V100_DECODE_PARTITION_SIZE` entirely. At 131,071 tokens the
 runtime selected p1024 and measured `0.5672 -> 0.3876 ms` (1.463x), with
 bitwise-equal output. This proves the normal long-context default can reach the
-new route without a partition-size override.
+new route without a partition-size override. Setting
+`VLLM_FLASH_V100_DECODE_PARTITION_SIZE` explicitly bypasses the sawtooth route
+and preserves the requested fixed partition size.
 
 Correctness coverage also includes four fresh random seeds with permuted page
 tables, one graph replayed across short and long sequence lengths, and fp16 and
@@ -1241,10 +1243,12 @@ The accepted p1024 specialization changes only QK data movement:
 - preserve the original HMMA and FP32 accumulation order bit for bit;
 - keep the p256 route and PV arithmetic unchanged.
 
-The default dispatch gate is deliberately narrow: q=1, GQA group size 6,
+The implementation gate is deliberately narrow: q=1, GQA group size 6,
 D=256, page size 784, Hkv=1, FP16 KV cache, and the p1024 nodes of the accepted
 sawtooth graph. FP8 KV and all other shapes retain the previous implementation.
-`VLLM_FLASH_V100_XQA_G6_QK_PIPELINE=0` restores the previous kernel;
+The QK pipeline remains experimental and defaults off because the exact 256K
+full-model gate below regressed despite isolated attention gains. Set
+`VLLM_FLASH_V100_XQA_G6_QK_PIPELINE=1` to enable it;
 `VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS=6` selects the earlier diagnostic
 layout. Set
 `VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE=1` to confirm route selection.
@@ -1306,8 +1310,8 @@ neither result is marked corrupted. Prefill changed from `91.803` to
 `95.489 s`, but this decode-only kernel does not execute in prefill, so the
 difference is machine noise and no prefill effect is attributed to the change.
 The earlier six-warp result was only `19.2510 -> 19.1831 ms` (`-0.35%`) and was
-not sufficient for default promotion; the accepted endpoint is the isolated
-eight-warp comparison above.
+not sufficient for promotion. The eight-warp route passes this 128K endpoint,
+but the exact 256K endpoint below blocks default promotion.
 
 Rejected variants are retained as negative evidence:
 

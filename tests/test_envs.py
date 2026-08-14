@@ -122,7 +122,7 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
     bool_defaults = {
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": True,
         "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": False,
-        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": True,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": False,
         "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": False,
     }
     int_defaults = {
