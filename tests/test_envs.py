@@ -116,6 +116,35 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
 
 
+def test_flash_v100_g6_sawtooth_pipeline_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bool_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": True,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": False,
+    }
+    int_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": 111104,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": 147841,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": 258176,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": 8,
+    }
+
+    for name, expected_bool in bool_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is expected_bool
+        monkeypatch.setenv(name, "0" if expected_bool else "1")
+        assert environment_variables[name]() is not expected_bool
+
+    for name, expected_int in int_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() == expected_int
+        monkeypatch.setenv(name, str(expected_int + 1))
+        assert environment_variables[name]() == expected_int + 1
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 
