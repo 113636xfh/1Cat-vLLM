@@ -64,6 +64,8 @@ The accepted specialization uses:
 - one paged-KV address resolution per K/V N32 tile, with D64 pointers
   derived by constant column offsets;
 - a Volta `TT` PV tensor-core mapping that consumes V as K-by-D directly;
+- two alternating PV register fragments so the next V shared load overlaps
+  the current phase's HMMA stream;
 - 128-bit conflict-aware V stores and paired 64-bit V loads, removing the
   previous transpose-path scalar loads and most operand permutation work;
 - FP32 score, online-softmax, and output accumulation;
@@ -215,6 +217,11 @@ Decode TPOT remained unchanged at about 21.35 ms.
 dispatch remains evidence-bounded to batch 1, `Q=4096`, `Hq=6`, `Hkv=1`,
 D256, FP16 dense K/V, and `KV>=32768`; other shapes continue to use exact
 dense. Set the variable to `0` to disable it.
+
+The subsequent exhaustive SM70 ownership and instruction-scheduling study is
+recorded in [SM70 HMMA Pipeline Search](sm70_hmma_pipeline_search.md). It
+admits a register-double-buffered PV schedule and closes the minimum-shuffle,
+second-K-lookahead, and conditional-rescale variants with wall-time evidence.
 
 An adjacent real-model TP4 route check used Qwen3.6-27B-AWQ, 8K input,
 16-token deterministic output, chunk size 4096, FP16 KV, FlashAttentionV100,
