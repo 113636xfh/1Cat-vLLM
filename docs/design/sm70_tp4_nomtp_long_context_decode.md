@@ -1220,3 +1220,100 @@ Raw artifacts:
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_wave_default_four_node_fullaccel_i180160_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_wave_default_four_node_fullaccel_compare_i180160_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_default_four_node_empty_gpu_memory_smoke_i1024_o1.log`
+
+## 2026-08-14 FP16 P1024 QK K64 Software Pipeline
+
+NCU on the final 256K q=1 production shape showed that the p1024 partition
+kernel was neither tensor-compute-bound nor at the V100 HBM limit. It spent
+`734.592 us` reading `268.43 MB`, with `32.9%` DRAM throughput, `26.9%` SM
+throughput, `1.53%` tensor-pipe activity, `18.71%` achieved occupancy, and
+`69.52%` of scheduler cycles with no eligible warp. SASS source correlation
+placed `96.9%` of long-scoreboard samples on shared stores immediately after
+global K/V loads. The remaining bottleneck was therefore load-to-shared
+latency and insufficient independent work, not arithmetic throughput.
+
+The accepted p1024 specialization changes only QK data movement:
+
+- split D=256 into four K64 panels and ping-pong two shared K buffers;
+- use warps 0-3 as HMMA consumers and warps 4-5 as next-panel producers;
+- issue four independent `uint4` global loads before the corresponding shared
+  stores, creating a software load queue without `cp.async`;
+- preserve the original HMMA and FP32 accumulation order bit for bit;
+- keep the p256 route and PV arithmetic unchanged.
+
+The experimental dispatch gate is deliberately narrow: q=1, GQA group size 6,
+D=256, page size 784, Hkv=1, FP16 KV cache, and the p1024 nodes of the accepted
+sawtooth graph. FP8 KV and all other shapes retain the previous implementation.
+The route remains default-off because its isolated model-level gain is too
+small for production promotion. Set `VLLM_FLASH_V100_XQA_G6_QK_PIPELINE=1`
+to opt in and
+`VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE=1` to confirm route selection.
+
+### NCU And Graph Gate
+
+The NCU comparison below covers the exact 262,080-token p1024 partition
+kernel. The complete attention-call gain is smaller because the reducers and
+inactive p256 graph node are unchanged.
+
+| metric | previous p1024 | K64 pipeline | change |
+|---|---:|---:|---:|
+| partition kernel | 734.592 us | 699.520 us | `-4.78%` |
+| DRAM throughput | 370.33 GB/s | 389.11 GB/s | `+5.07%` |
+| long-scoreboard cycles/issue | 3.667 | 2.216 | `-39.57%` |
+| shared bank conflicts | 10.654 M | 4.360 M | `-59.08%` |
+| eligible warps/scheduler | 0.4808 | 0.5077 | `+5.59%` |
+| cycles with no eligible warp | 69.52% | 66.69% | `-2.83 pp` |
+| registers/thread | 168 | 128 | `-23.81%` |
+| barrier cycles/issue | 1.101 | 2.394 | new limiting stall |
+
+Repeated CUDA Graph A/B runs with both execution orders measure a typical
+`3.1%-5.1%` reduction for one whole p1024 attention layer at 128K and 256K.
+Forward, reverse, and permuted block tables are bitwise equal. Racecheck at
+131,071 tokens reports zero hazards and memcheck at 262,080 tokens reports zero
+errors.
+
+### Full-Acceleration Model Gate
+
+The endpoint test uses Qwen3.6-27B-AWQ, TP4, no MTP, 131,008 actual input
+tokens, and 64 output tokens. TurboMind AWQ, Flash-V100, AOT compile, and
+`FULL_AND_PIECEWISE` CUDA graphs are enabled. Both sides use official sampling
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed `20260620`; `ignore_eos`
+only fixes the timing window.
+
+| true 128K TP4 no-MTP decode | TPOT | steady decode | result |
+|---|---:|---:|---:|
+| four-node sawtooth, previous QK | 19.2510 ms | 51.9453 tok/s | reference |
+| four-node sawtooth, K64 pipeline | 19.1831 ms | 52.1292 tok/s | `-0.35%` TPOT / `+0.35%` tok/s |
+
+The prompt hashes, all 64 sampled token IDs, and decoded text are identical;
+neither result is marked corrupted. Prefill changed from `91.803` to
+`92.799 s`, but this decode-only kernel does not execute in prefill, so the
+difference is machine noise and no prefill effect is attributed to the change.
+An earlier `20.6002 -> 19.1831 ms` comparison used the previous standalone
+p1024 planner and a different machine state; it is not an isolated pipeline
+result and must not be reported as this candidate's gain.
+
+Rejected variants are retained as negative evidence:
+
+- one-at-a-time producer loads regressed by `36%-38%` because they exposed a
+  serial LDG-to-STS dependency chain;
+- an eight-stage load queue raised registers to 152/thread and reduced the
+  stable gain to about `2%`;
+- register-resident scalar PV accumulation removed local traffic but did not
+  reduce wall time;
+- extending the pipeline to p256 regressed 110K/180K/256K by `3.1%-5.7%`;
+- FP8-e5m2 KV regressed by `25%-27%` because two producer warps also had to
+  perform conversion, so FP8 is explicitly excluded from this route.
+
+Raw artifacts:
+
+- final rebuilt extension SHA256:
+  `3c1520cb8fa9e5f8f6be4c25cd3bec3bf9eded4e42648f3f2deeeb2a0bb34678`;
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/sawtooth_final_p1024_q1_i262080_full.ncu-rep`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/profiles/qk_k64_stage4_candidate_q1_i262080_full.ncu-rep`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_candidate_racecheck_i131071.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/qk_k64_stage4_candidate_memcheck_i262080.log`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_p1024_auto_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_off_final_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_qk_k64_stage4_candidate_fullaccel_i131008_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_pipeline_final_compare_i131008_o64.json`

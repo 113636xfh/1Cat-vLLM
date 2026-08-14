@@ -28,6 +28,8 @@ def run_once(
     split_reduce: str,
     inherited_split_reduce: str | None,
     p1024_sawtooth: bool,
+    qk_pipeline: bool,
+    kv_cache_dtype: str,
     seq_len: int,
     partition_size: int,
 ) -> torch.Tensor:
@@ -66,6 +68,7 @@ def run_once(
             "1" if split_reduce == "on" else "0"
         )
     os.environ["VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH"] = "1" if p1024_sawtooth else "0"
+    os.environ["VLLM_FLASH_V100_XQA_G6_QK_PIPELINE"] = "1" if qk_pipeline else "0"
     os.environ["VLLM_FLASH_V100_DECODE_PARTITION_SIZE"] = str(partition_size)
     return flash_attn_decode_paged_xqa(
         q,
@@ -74,6 +77,7 @@ def run_once(
         block_table,
         seq_lens,
         out=out,
+        kv_cache_dtype=kv_cache_dtype,
         max_seq_len_hint=seq_len,
     )
 
@@ -96,6 +100,8 @@ def elapsed_ms(
     split_reduce: str,
     inherited_split_reduce: str | None,
     p1024_sawtooth: bool,
+    qk_pipeline: bool,
+    kv_cache_dtype: str,
     seq_len: int,
     partition_size: int,
     warmup: int,
@@ -120,6 +126,8 @@ def elapsed_ms(
             split_reduce=split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             p1024_sawtooth=p1024_sawtooth,
+            qk_pipeline=qk_pipeline,
+            kv_cache_dtype=kv_cache_dtype,
             seq_len=seq_len,
             partition_size=partition_size,
         )
@@ -145,6 +153,8 @@ def elapsed_ms(
                 split_reduce=split_reduce,
                 inherited_split_reduce=inherited_split_reduce,
                 p1024_sawtooth=p1024_sawtooth,
+                qk_pipeline=qk_pipeline,
+                kv_cache_dtype=kv_cache_dtype,
                 seq_len=seq_len,
                 partition_size=partition_size,
             )
@@ -176,6 +186,8 @@ def elapsed_ms(
                 split_reduce=split_reduce,
                 inherited_split_reduce=inherited_split_reduce,
                 p1024_sawtooth=p1024_sawtooth,
+                qk_pipeline=qk_pipeline,
+                kv_cache_dtype=kv_cache_dtype,
                 seq_len=seq_len,
                 partition_size=partition_size,
             )
@@ -195,6 +207,11 @@ def main() -> None:
         help="Paged-KV block size; use the model's resolved attention page size.",
     )
     parser.add_argument("--partition-size", type=int, default=256)
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("auto", "fp8_e5m2"),
+        default="auto",
+    )
     parser.add_argument(
         "--candidate-partition-size",
         type=int,
@@ -299,6 +316,16 @@ def main() -> None:
         action="store_true",
         help="Enable the device-routed p256/p1024 graph for this call.",
     )
+    parser.add_argument(
+        "--candidate-qk-pipeline",
+        action="store_true",
+        help="Enable the experimental G6 K64 QK pipeline for the candidate call.",
+    )
+    parser.add_argument(
+        "--baseline-qk-pipeline",
+        action="store_true",
+        help="Enable the G6 K64 QK pipeline for the baseline call.",
+    )
     args = parser.parse_args()
     inherited_g6_dual_cta = os.environ.get("VLLM_FLASH_V100_XQA_G6_DUAL_CTA")
     inherited_p1024_auto = os.environ.get("VLLM_FLASH_V100_XQA_G6_P1024_AUTO")
@@ -337,10 +364,16 @@ def main() -> None:
     )
     blocks = (args.seq_len + block_size - 1) // block_size
     q = torch.randn((1, q_heads, head_dim), device="cuda", dtype=torch.float16)
-    k_cache = torch.randn(
+    k_cache_fp16 = torch.randn(
         (blocks, block_size, kv_heads, head_dim), device="cuda", dtype=torch.float16
     )
-    v_cache = torch.randn_like(k_cache)
+    v_cache_fp16 = torch.randn_like(k_cache_fp16)
+    if args.kv_cache_dtype == "fp8_e5m2":
+        k_cache = k_cache_fp16.to(torch.float8_e5m2).view(torch.uint8)
+        v_cache = v_cache_fp16.to(torch.float8_e5m2).view(torch.uint8)
+    else:
+        k_cache = k_cache_fp16
+        v_cache = v_cache_fp16
     if args.block_table_layout == "sequential":
         block_ids = torch.arange(blocks, device="cuda", dtype=torch.int32)
     elif args.block_table_layout == "reverse":
@@ -393,6 +426,12 @@ def main() -> None:
             ),
             inherited_split_reduce=inherited_split_reduce,
             p1024_sawtooth=args.p1024_sawtooth,
+            qk_pipeline=(
+                args.candidate_qk_pipeline
+                if args.layout == "padded"
+                else args.baseline_qk_pipeline
+            ),
+            kv_cache_dtype=args.kv_cache_dtype,
             seq_len=args.seq_len,
             partition_size=(
                 candidate_partition_size if padded else args.partition_size
@@ -418,6 +457,8 @@ def main() -> None:
         split_reduce=args.baseline_split_reduce,
         inherited_split_reduce=inherited_split_reduce,
         p1024_sawtooth=args.p1024_sawtooth,
+        qk_pipeline=args.baseline_qk_pipeline,
+        kv_cache_dtype=args.kv_cache_dtype,
         seq_len=args.seq_len,
         partition_size=args.partition_size,
     )
@@ -438,6 +479,8 @@ def main() -> None:
         split_reduce=args.candidate_split_reduce,
         inherited_split_reduce=inherited_split_reduce,
         p1024_sawtooth=args.p1024_sawtooth,
+        qk_pipeline=args.candidate_qk_pipeline,
+        kv_cache_dtype=args.kv_cache_dtype,
         seq_len=args.seq_len,
         partition_size=candidate_partition_size,
     )
@@ -467,9 +510,12 @@ def main() -> None:
         "candidate_padded": candidate_padded,
         "cuda_graph": args.cuda_graph,
         "p1024_sawtooth": args.p1024_sawtooth,
+        "candidate_qk_pipeline": args.candidate_qk_pipeline,
+        "baseline_qk_pipeline": args.baseline_qk_pipeline,
         "q_heads": q_heads,
         "kv_heads": kv_heads,
         "head_dim": head_dim,
+        "kv_cache_dtype": args.kv_cache_dtype,
         "active_partitions": (args.seq_len + args.partition_size - 1)
         // args.partition_size,
         "candidate_active_partitions": (args.seq_len + candidate_partition_size - 1)
@@ -511,6 +557,8 @@ def main() -> None:
             split_reduce=args.baseline_split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             p1024_sawtooth=args.p1024_sawtooth,
+            qk_pipeline=args.baseline_qk_pipeline,
+            kv_cache_dtype=args.kv_cache_dtype,
             seq_len=args.seq_len,
             partition_size=args.partition_size,
             warmup=args.warmup,
@@ -535,6 +583,8 @@ def main() -> None:
             split_reduce=args.candidate_split_reduce,
             inherited_split_reduce=inherited_split_reduce,
             p1024_sawtooth=args.p1024_sawtooth,
+            qk_pipeline=args.candidate_qk_pipeline,
+            kv_cache_dtype=args.kv_cache_dtype,
             seq_len=args.seq_len,
             partition_size=candidate_partition_size,
             warmup=args.warmup,

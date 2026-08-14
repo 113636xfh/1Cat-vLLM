@@ -116,6 +116,34 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
 
 
+def test_flash_v100_g6_sawtooth_pipeline_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bool_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": True,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": False,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": False,
+    }
+    threshold_defaults = {
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": 111104,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": 147841,
+        "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": 258176,
+    }
+
+    for name, expected in bool_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is expected
+        monkeypatch.setenv(name, "0" if expected else "1")
+        assert environment_variables[name]() is not expected
+
+    for name, expected in threshold_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() == expected
+        monkeypatch.setenv(name, str(expected + 1))
+        assert environment_variables[name]() == expected + 1
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 
