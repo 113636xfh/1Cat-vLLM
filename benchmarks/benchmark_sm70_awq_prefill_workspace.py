@@ -191,7 +191,7 @@ def main() -> int:
         )
         print(json.dumps(row, sort_keys=True), flush=True)
         rows.append(row)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     weighted = {
         name: sum(row["count"] * row[name] for row in rows)
