@@ -132,17 +132,17 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
         "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": 8,
     }
 
-    for name, expected in bool_defaults.items():
+    for name, expected_bool in bool_defaults.items():
         monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is expected
-        monkeypatch.setenv(name, "0" if expected else "1")
-        assert environment_variables[name]() is not expected
+        assert environment_variables[name]() is expected_bool
+        monkeypatch.setenv(name, "0" if expected_bool else "1")
+        assert environment_variables[name]() is not expected_bool
 
-    for name, expected in int_defaults.items():
+    for name, expected_int in int_defaults.items():
         monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() == expected
-        monkeypatch.setenv(name, str(expected + 1))
-        assert environment_variables[name]() == expected + 1
+        assert environment_variables[name]() == expected_int
+        monkeypatch.setenv(name, str(expected_int + 1))
+        assert environment_variables[name]() == expected_int + 1
 
 
 class TestEnvWithChoices:

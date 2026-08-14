@@ -5662,7 +5662,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # device->host sync, was already paid for max_seq_len_hint) and reused; the
         # interface floors the hint at effective max_seq_len (_get_decode_plan:
         # 165-169), so the cap can never under-cover the runtime sequences.
-        eager_max_seq_len = int(seq_lens.max().item()) if num_seqs > 0 else None
+        if num_seqs > 0:
+            eager_max_seq_len = int(seq_lens.max().item())
+            eager_workspace_seq_capacity_hint = min(
+                int(block_table.shape[1]) * int(key_cache.shape[1]),
+                eager_max_seq_len,
+            )
+        else:
+            eager_max_seq_len = None
+            eager_workspace_seq_capacity_hint = None
         self._call_flash_attn_smallq_decode_paged(
             layer,
             query,
@@ -5673,14 +5681,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             attn_metadata,
             out=out_view,
             max_seq_len_hint=eager_max_seq_len,
-            workspace_seq_capacity_hint=(
-                min(
-                    int(block_table.shape[1]) * int(key_cache.shape[1]),
-                    eager_max_seq_len,
-                )
-                if num_seqs > 0
-                else None
-            ),
+            workspace_seq_capacity_hint=eager_workspace_seq_capacity_hint,
             partition_size_hint=None,
         )
         return output
