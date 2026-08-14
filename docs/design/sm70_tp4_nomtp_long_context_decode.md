@@ -1341,3 +1341,38 @@ Raw artifacts:
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_qk_k64_stage4_candidate_fullaccel_i131008_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_fullaccel_i131008_o64.json`
 - `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_compare_i131008_o64.json`
+
+### Exact 256K Full-Model Gate
+
+The exact-boundary endpoint uses the same Qwen3.6-27B-AWQ TP4, no-MTP,
+official-sampling and full-acceleration contract, with 262,080 input tokens
+and 64 output tokens at `max_model_len=262144`. The clean A/B pair completed
+before any unrelated compiler workload started. All four ranks confirmed the
+eight-warp route when enabled.
+
+| exact 256K TP4 no-MTP decode | prefill | TPOT | steady decode | result |
+|---|---:|---:|---:|---:|
+| previous QK | 327.554 s | 27.7359 ms | 36.0544 tok/s | reference |
+| 8-warp K64 pipeline | 331.261 s | 28.5120 ms | 35.0729 tok/s | `+2.80%` TPOT / `-2.72%` tok/s |
+
+The prompt hashes, all 64 sampled token IDs, and decoded text are identical;
+both requests report `is_corrupted=false`, contain zero token IDs equal to
+zero, and finish normally at the exact 262,144-token boundary. The prefill
+difference is not attributed to this decode-only kernel.
+
+This result blocks claiming the standalone `0.6782 -> 0.6033 ms` attention
+gain as a 256K model-level gain. The likely next question is whether the
+eight-warp kernel's higher resident-warp and bandwidth pressure delays work
+that overlaps it inside the full CUDA graph; that requires a decode-only
+graph-node A/B trace rather than another isolated kernel measurement.
+
+A later prefix-cache repeat is deliberately excluded: an unrelated full-core
+CUDA build started during its final prefill and drove the host into heavy swap.
+The corresponding baseline repeat was stopped before measurement. Neither
+run is acceptance evidence.
+
+Raw artifacts:
+
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_off_final_fullaccel_i262080_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_fullaccel_i262080_o64.json`
+- `/data/minimax-h3/task-cache/1cat-flash-v100-long-decode-20260813/results/model_sawtooth_qk_8warp_final_compare_i262080_o64.json`
