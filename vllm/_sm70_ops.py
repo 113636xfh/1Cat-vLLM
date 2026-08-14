@@ -76,6 +76,28 @@ if hasattr(torch.ops._C, "awq_sm70_prepare"):
         return [tm_weight, tm_scales, meta]
 
 
+def awq_sm70_dequantize_out(
+    out: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("awq_sm70_dequantize_out")(out, qweight, scales, group_size)
+
+
+if hasattr(torch.ops._C, "awq_sm70_dequantize_out"):
+
+    @register_fake("_C::awq_sm70_dequantize_out")
+    def _awq_sm70_dequantize_out_fake(
+        out: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        del out, qweight, scales, group_size
+        return None
+
+
 def uint4_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,

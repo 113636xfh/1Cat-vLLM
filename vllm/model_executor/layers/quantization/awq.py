@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -37,7 +38,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SM70_AWQ_PREFILL_DENSE_M = 4096
-_SM70_AWQ_PREFILL_DENSE_MIN_MEMORY = 30 * 1024**3
 _SM70_AWQ_PREFILL_DENSE_SHAPES = {
     "gate_up_proj": (5120, 8704),
     "down_proj": (4352, 5120),
@@ -45,6 +45,15 @@ _SM70_AWQ_PREFILL_DENSE_SHAPES = {
     "out_proj": (1536, 5120),
     "o_proj": (1536, 5120),
 }
+_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
+    k * n for k, n in _SM70_AWQ_PREFILL_DENSE_SHAPES.values()
+)
+_SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES = (
+    _SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
+)
+_sm70_awq_prefill_dense_workspaces: weakref.WeakValueDictionary[
+    tuple[int, torch.dtype], torch.Tensor
+] = weakref.WeakValueDictionary()
 
 
 def _unpack_awq_gemm_qweight(qweight: torch.Tensor) -> torch.Tensor:
@@ -98,9 +107,30 @@ def _is_sm70_awq_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
     return (layer.qweight.shape[0], layer.qweight.shape[1] * 8) == expected
 
 
-def _has_sm70_awq_prefill_exact_dense_capacity(layer: torch.nn.Module) -> bool:
-    properties = torch.cuda.get_device_properties(layer.qweight.device)
-    return properties.total_memory >= _SM70_AWQ_PREFILL_DENSE_MIN_MEMORY
+def _get_sm70_awq_prefill_exact_dense_workspace(
+    weight: torch.Tensor,
+) -> torch.Tensor | None:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    cache_key = (device_index, torch.float16)
+    workspace = _sm70_awq_prefill_dense_workspaces.get(cache_key)
+    if workspace is not None:
+        return workspace
+    try:
+        workspace = torch.empty(
+            (_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS,),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+    except torch.OutOfMemoryError:
+        logger.warning_once(
+            "Insufficient memory for the bounded SM70 AWQ prefill workspace; "
+            "falling back to TurboMind AWQ."
+        )
+        return None
+    _sm70_awq_prefill_dense_workspaces[cache_key] = workspace
+    return workspace
 
 
 class AWQConfig(QuantizationConfig):
@@ -440,25 +470,9 @@ class AWQLinearMethod(LinearMethodBase):
             envs.VLLM_SM70_AWQ_PREFILL_EXACT_DENSE
             and group_size == 128
             and _is_sm70_awq_prefill_exact_dense_layer(layer)
+            and not use_gated_silu
+            and hasattr(torch.ops._C, "awq_sm70_dequantize_out")
         )
-        if use_prefill_exact_dense and _has_sm70_awq_prefill_exact_dense_capacity(
-            layer
-        ):
-            layer._awq_sm70_prefill_exact_dense_weight = _awq_exact_f16_weight(
-                layer.qweight,
-                layer.scales,
-                layer.qzeros,
-                group_size,
-            )
-            logger.info_once(
-                "SM70 AWQ exact-dense path enabled for selected TP4 "
-                "4096-token prefill projections."
-            )
-        elif use_prefill_exact_dense:
-            logger.info_once(
-                "SM70 AWQ exact-dense prefill path disabled because the GPU "
-                "has less than 30 GiB memory."
-            )
 
         tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
             layer.qweight,
@@ -495,6 +509,14 @@ class AWQLinearMethod(LinearMethodBase):
             torch.empty(0, dtype=tm_scales.dtype, device=tm_weight.device),
             requires_grad=False,
         )
+        if use_prefill_exact_dense:
+            workspace = _get_sm70_awq_prefill_exact_dense_workspace(tm_weight)
+            if workspace is not None:
+                layer._awq_sm70_prefill_exact_dense_workspace = workspace
+                logger.info_once(
+                    "SM70 AWQ exact-dense prefill path enabled with a bounded "
+                    "85 MiB workspace."
+                )
         logger.info_once("SM70 AWQ TurboMind dense path enabled.")
 
     @staticmethod
@@ -563,14 +585,26 @@ class AWQLinearMethod(LinearMethodBase):
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
         if getattr(layer, "_awq_sm70_prepared", False):
             out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * pack_factor,)
-            prefill_weight = getattr(
-                layer, "_awq_sm70_prefill_exact_dense_weight", None
+            prefill_workspace = getattr(
+                layer, "_awq_sm70_prefill_exact_dense_workspace", None
             )
-            if prefill_weight is not None and reshaped_x.shape[0] == (
-                _SM70_AWQ_PREFILL_DENSE_M
+            if (
+                prefill_workspace is not None
+                and reshaped_x.dtype == torch.float16
+                and reshaped_x.shape[0] == _SM70_AWQ_PREFILL_DENSE_M
             ):
                 logger.info_once(
-                    "SM70 AWQ exact-dense TP4 4096-token prefill runtime path active."
+                    "SM70 AWQ bounded-workspace exact-dense TP4 4096-token "
+                    "prefill runtime path active."
+                )
+                k = reshaped_x.shape[1]
+                n = out_shape[-1]
+                prefill_weight = prefill_workspace[: k * n].view(k, n)
+                sm70_ops.awq_sm70_dequantize_out(
+                    prefill_weight,
+                    layer._awq_sm70_weight,
+                    layer._awq_sm70_scales,
+                    layer._awq_sm70_group_size,
                 )
                 out = torch.mm(reshaped_x, prefill_weight)
                 if bias is not None:

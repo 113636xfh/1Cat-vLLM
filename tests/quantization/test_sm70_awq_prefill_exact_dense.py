@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import torch
 
 from vllm.model_executor.layers.quantization.awq import (
+    _SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES,
     _awq_exact_f16_weight,
-    _has_sm70_awq_prefill_exact_dense_capacity,
+    _get_sm70_awq_prefill_exact_dense_workspace,
     _is_sm70_awq_prefill_exact_dense_layer,
+    _sm70_awq_prefill_dense_workspaces,
 )
 
 
@@ -51,19 +53,28 @@ def test_awq_prefill_exact_dense_shape_gate_is_narrow():
     assert not _is_sm70_awq_prefill_exact_dense_layer(layer)
 
 
-def test_awq_prefill_exact_dense_requires_32gb_v100(monkeypatch):
-    layer = SimpleNamespace(qweight=SimpleNamespace(device="cuda:0"))
+def test_awq_prefill_exact_dense_workspace_is_bounded():
+    assert _SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES == 85 * 1024**2
 
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(total_memory=16 * 1024**3),
-    )
-    assert not _has_sm70_awq_prefill_exact_dense_capacity(layer)
 
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(total_memory=32 * 1024**3),
-    )
-    assert _has_sm70_awq_prefill_exact_dense_capacity(layer)
+def test_awq_prefill_exact_dense_workspace_is_reused(monkeypatch):
+    workspace = torch.empty(1, dtype=torch.float16)
+    allocations = []
+
+    def fake_empty(shape, *, dtype, device):
+        allocations.append((shape, dtype, device))
+        return workspace
+
+    _sm70_awq_prefill_dense_workspaces.clear()
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    weight = SimpleNamespace(device=torch.device("cuda:0"))
+
+    try:
+        first = _get_sm70_awq_prefill_exact_dense_workspace(weight)
+        second = _get_sm70_awq_prefill_exact_dense_workspace(weight)
+
+        assert first is workspace
+        assert second is workspace
+        assert len(allocations) == 1
+    finally:
+        _sm70_awq_prefill_dense_workspaces.clear()

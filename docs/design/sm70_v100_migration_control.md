@@ -41207,3 +41207,25 @@ Interpretation:
   `qkv_prefill_cublas_tp4_allranks.json`, and
   `ncu-qkv-tm-m4096-n3584-k5120-clock1530.ncu-rep` under the retained task
   artifact directory.
+
+## 2026-08-14 Bounded-memory AWQ exact-dense prefill
+
+- Replaced 10.60 GiB/rank of permanent FP16 projection copies with one shared
+  85 MiB `K x N` workspace. A production CUDA op reverses the TurboMind
+  K8/N32 layout and reproduces its FP16 bias plus FMA dequantization exactly
+  before cuBLAS. OOM falls back to TurboMind; the old 30 GiB device gate is no
+  longer required.
+- All 20 real Qwen3.6-27B-AWQ TP4 rank/shape cases are bitwise equal for both
+  dequantized weights and final GEMM outputs. Weighted microbench speedup over
+  TurboMind is 1.47x-1.54x; dequantization adds about 24-25 ms per full chunk.
+- Same-source model residency is `6.50 -> 6.59 GiB/rank`, available KV is
+  `20.49 -> 20.41 GiB/rank`, and 131K maximum concurrency is
+  `10.01x -> 9.97x`. The former resident implementation measured 16.77 GiB
+  model memory and only 10.34 GiB available KV.
+- Fixed-clock 64K full-model A-B-A with official sampling gives
+  `20.900 -> 24.774 -> 21.241 s` for candidate-control-candidate. Two-repeat
+  means are `24.048 -> 20.338 s` (-15.43%); all 64 output token IDs, text, and
+  hashes match, while decode TPOT is unchanged within noise.
+- Evidence is under `workspace-production/` in the retained task artifact
+  directory. The rollback remains
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.

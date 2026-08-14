@@ -1573,8 +1573,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
     ),
-    # Keep AWQ storage for decode, but retain exactly dequantized FP16 copies
-    # of selected full 4096-token TP4 prefill projections.
+    # Expand selected full 4096-token TP4 AWQ projections into one reusable
+    # bounded FP16 workspace before their exact dense GEMM.
     "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
     ),
