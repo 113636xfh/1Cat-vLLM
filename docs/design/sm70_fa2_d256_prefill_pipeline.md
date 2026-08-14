@@ -4,8 +4,10 @@
 
 Qwen3.6-27B full-attention prefill now uses a dedicated Volta D256 kernel for
 both the first dense chunk and later chunks in the standard interleaved paged
-KV cache. The kernel reads the existing layouts directly and writes into the
-vLLM output tensor without a gather, repack, temporary output, or copy.
+KV cache. The direct paged operator reads that layout without a repack or
+temporary output. For eligible long, single-sequence prefix chunks, the
+dispatcher now gathers logical pages into a reusable exact-dense K/V workspace
+and calls the faster exact dense operator.
 
 The route is enabled by default. Set
 `VLLM_FLASH_V100_FA2_D256_PREFILL=0` to disable it. Dispatch is exact-only:
@@ -13,6 +15,13 @@ unsupported shapes return to the established `FLASH_ATTN_V100` path rather
 than entering an unvalidated generic FA2 fallback. Decode, MTP small-query
 attention, FP8 KV cache, sliding-window attention, and non-causal attention
 are unchanged.
+
+Long-prefix gathering is also enabled by default. Set
+`VLLM_FLASH_V100_PREFILL_GATHER_DENSE=0` to retain direct paged attention.
+Its default thresholds are `Q>=4096` and `KV>=8192`.
+For the admitted Qwen TP4 shape, gathered dense attention also uses the
+default-on three-way KV partition at `KV>=32768`; set
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3=0` to retain unsplit exact dense.
 
 ## Accepted Contract
 
@@ -29,7 +38,10 @@ The full-model acceptance workload is:
 The operator requires SM70, FP16, causal full attention, head dimension 256,
 unit inner strides, query length at least 1024, and query/KV lengths divisible
 by 64. The paged route currently accepts one sequence per call and preserves
-the runtime block table. All other cases retain the previous implementation.
+the runtime block table. Gathering further requires one sequence, `Q>=4096`,
+`KV>=8192`, `KV>Q`, no graph capture, and lengths divisible by 64. All other
+cases retain direct paged attention. Three-way partitioning further requires
+batch 1, `Q=4096`, `Hq=6`, `Hkv=1`, and `KV>=32768`.
 
 ## Kernel Design
 
@@ -52,6 +64,8 @@ The accepted specialization uses:
 - one paged-KV address resolution per K/V N32 tile, with D64 pointers
   derived by constant column offsets;
 - a Volta `TT` PV tensor-core mapping that consumes V as K-by-D directly;
+- two alternating PV register fragments so the next V shared load overlaps
+  the current phase's HMMA stream;
 - 128-bit conflict-aware V stores and paired 64-bit V loads, removing the
   previous transpose-path scalar loads and most operand permutation work;
 - FP32 score, online-softmax, and output accumulation;
@@ -129,6 +143,86 @@ load wavefronts fall from 268.0M to 230.0M. Static SASS shrinks from 1,875 to
 four. Tensor active reaches 32.06%. Shared-store conflicts increase, but their
 cost is smaller than the removed transpose/load/permutation chain.
 
+## Long-Prefix Gather-to-Exact-Dense
+
+The production KV allocation is interleaved as
+`[physical_page, K/V, 784, Hkv, D]`; unbinding K and V therefore produces
+non-contiguous views. The accepted path uses the runtime block table to
+`index_select` both views into per-device, per-stream workspaces, slices the
+last page to the exact sequence length, and invokes the same exact N32 dense
+operator. Random physical page order is part of the test, and all outputs are
+bitwise equal to direct paged attention.
+
+The following single-rank microbenchmark uses the validated production binary,
+`Q=4096`, `Hq=6`, `Hkv=1`, D256, FP16, page size 784, and randomized physical
+page order:
+
+| KV length | Direct paged | Gather | Gather + exact dense | Net reduction |
+|---:|---:|---:|---:|---:|
+| 8K | 5.6740 ms | 0.0635 ms | 5.0606 ms | 10.81% |
+| 64K | 50.4571 ms | 0.1654 ms | 46.6877 ms | 7.47% |
+| 128K | 103.8479 ms | 0.2985 ms | 95.0461 ms | 8.48% |
+| 256K | 210.6481 ms | 0.5868 ms | 192.8289 ms | 8.46% |
+
+This is a 7.47-10.81% **attention-operator** reduction, not a 6% whole-model
+claim. The controlled Qwen3.6-27B-AWQ TP4 full-model A/B is:
+
+| Input | Direct paged prefill | Gathered prefill | Saved | Reduction | Quality/route gate |
+|---:|---:|---:|---:|---:|---|
+| 8K | 2.584815 s | 2.567641 s | 17.174 ms | 0.66% | exact tokens; 48 hits/rank |
+| 64K | 26.319437 s | 25.860738 s | 458.699 ms | 1.74% | exact tokens; 480 hits/rank |
+
+The 8K run uses one warmup and two measured requests. The 64K run uses one
+warmup and one measured request. Decode TPOT is unchanged within 0.04%; the
+gate does not select decode. At 256K, geometric workspace growth can retain up
+to about 269.5 MiB per active stream and TP rank for `Hkv=1`, D256, FP16 K/V.
+If allocation fails, dispatch logs once and falls back to direct paged
+attention instead of failing the request.
+
+## Accepted Exact-Dense Split-KV3
+
+For the Qwen3.6 TP4 chunk shape (`Q=4096`, `Hq=6`, `Hkv=1`, D256), the exact
+dense kernel launches 384 CTAs on 72 SMs. One-CTA-per-SM residency requires
+six waves and leaves 48 slots unused in the final wave. The accepted default
+for this shape partitions each CTA's visible KV range into three independent
+segments,
+launches 1,152 CTAs (exactly 16 waves), and combines FP32 partial
+numerator/max/sum state in a separate kernel. It does not quantize or truncate
+K/V and retains the accepted N32 body inside each partition.
+
+Clean paired single-rank measurements at 1312 MHz are:
+
+| KV length | Exact dense | Split-KV3 | Throughput gain | Decision |
+|---:|---:|---:|---:|---|
+| 8K | 4.6572 ms | 4.5117 ms | 3.22% | keep the original route |
+| 32K | 22.5864 ms | 21.0775 ms | 7.16% | admit |
+| 64K | 46.4625 ms | 42.7131 ms | 8.78% | admit |
+| 128K | 94.7456 ms | 87.1639 ms | 8.70% | admit |
+
+At 64K, the candidate differs from the accepted FP16 reduction tree by at
+most `3.0518e-5`. Against an FP32 reference over 64 sampled query rows, its
+relative L2 error is `2.8796e-4`, slightly lower than the accepted dense
+kernel's `2.8850e-4`. The same check passes at 128K. PTXAS reports 253
+registers/thread for the partition kernel and 26 for the merge, with zero
+spills for both. The reusable FP32 workspace is about 75.6 MiB per active
+stream and rank for the admitted shape; OOM falls back to exact dense.
+
+The exclusive-GPU Qwen3.6-27B-AWQ TP4 full-model gate measured
+`25.860738 -> 25.514792 s` at 64K, saving 345.946 ms (1.34%) after one warmup.
+Every rank reported 288 split-KV3 kernel hits, and all 16 deterministic output
+token IDs, text, and the token hash matched the gathered exact-dense baseline.
+Decode TPOT remained unchanged at about 21.35 ms.
+
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3` is therefore enabled by default. The
+dispatch remains evidence-bounded to batch 1, `Q=4096`, `Hq=6`, `Hkv=1`,
+D256, FP16 dense K/V, and `KV>=32768`; other shapes continue to use exact
+dense. Set the variable to `0` to disable it.
+
+The subsequent exhaustive SM70 ownership and instruction-scheduling study is
+recorded in [SM70 HMMA Pipeline Search](sm70_hmma_pipeline_search.md). It
+admits a register-double-buffered PV schedule and closes the minimum-shuffle,
+second-K-lookahead, and conditional-rescale variants with wall-time evidence.
+
 An adjacent real-model TP4 route check used Qwen3.6-27B-AWQ, 8K input,
 16-token deterministic output, chunk size 4096, FP16 KV, FlashAttentionV100,
 and non-eager FULL_DECODE_ONLY graphs. With an unrelated resident Ray service
@@ -139,6 +233,43 @@ reduction. Every rank reported 48
 resident service slowed both prefill and decode relative to the clean historic
 baseline, so this result proves route translation but is not a replacement
 release baseline.
+
+## Post-Dense-Projection Trace And Closed P Swizzle
+
+After enabling gathered exact-dense attention, split-KV3, and the exact FP16
+AWQ prefill projections, an Nsight Systems capture of the 64K TP4 request
+measured 21.807 seconds of critical-rank GPU timeline. The matching unprofiled
+prefill result is 20.988843 seconds. The largest device-0 kernel buckets are:
+
+| Bucket | Kernel time | Share of summed kernel time |
+|---|---:|---:|
+| exact FP16 projection GEMMs | 9.912 s | 47.4% |
+| D256 full attention | 5.767 s | 27.6% |
+| NCCL all-reduce | 1.412 s | 6.7% |
+| vectorized elementwise kernels | 0.847 s | 4.0% |
+| TurboMind FP16 GEMM | 0.771 s | 3.7% |
+| FlashQLA GDN | 0.740 s | 3.5% |
+| RMSNorm | 0.517 s | 2.5% |
+
+The full-attention time grows nearly linearly across the 16 prefill chunks:
+the per-layer kernel is 1.701 ms at 4K, 21.113 ms when split-KV3 first selects
+at 32K, and 42.522 ms at 64K. The final chunk sustains about 37.6 causal
+TFLOP/s. KV gather is not a bottleneck.
+
+A follow-up applied the previously useful conflict-free P layout to the final
+TT-PV split-KV3 body. It preserves the exact output hashes and lowers the
+partition kernel from 253 to 251 registers/thread with zero spill, but the
+required accumulator-to-layout warp shuffles are too expensive:
+
+| KV length | Accepted split-KV3 | TT-PV + P swizzle | Regression |
+|---:|---:|---:|---:|
+| 32K | 21.0330 ms | 27.1365 ms | 29.0% |
+| 64K | 42.6716 ms | 55.8776 ms | 30.9% |
+
+This combination is rejected. Do not retry P bank-conflict removal by adding
+shuffle-based accumulator repacking to the TT-PV body. A successor must
+change the native QK accumulator or PV operand ownership so the desired
+shared address is produced without a conversion stream.
 
 ## Numerical And Quality Gates
 
@@ -233,7 +364,8 @@ prefill by less than 0.1% relative to that run:
 The next end-to-end bottleneck is TurboMind AWQ GEMM, not D256 attention. A
 representative `4096x8704x5120` gate/up kernel reaches 58.87 tensor TOPS but
 is limited to 12.5% occupancy by 248 registers/thread and 65.55 KiB shared
-memory.
+memory. The retained category trace predates long-prefix gathering; a new 64K
+trace is required before changing another attention structure.
 
 ## Evidence
 
@@ -269,6 +401,16 @@ memory.
   `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/qwen/tt_final_clean_quality.json`
 - Validated runtime binary SHA256:
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
+- Long-prefix gather A/B results and logs:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/gather-dense/results/`
+- Split-KV3 clean microbenchmark and FP32-reference gates:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3_n32_gate_32k_128k_clean.json`
+  and
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3_n32_quality_ref_q4096_kv65536.json`
+- Split-KV3 production patch-check binary SHA256:
+  `84571628436990f433572d073c55a85d4910a7db83eb883fcbecceb133b154b4`
+- Split-KV3 exclusive 64K full-model gate:
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/splitkv3-fullmodel/results/candidate_decode_harness_i65536.json`
 - Independent clean-build binary SHA256:
   `91bd8ec125459411da57d5f6d111e6760573a717d3c8ab0f2161752dc6cdb084`
 - Vendored patch SHA256:
@@ -291,5 +433,7 @@ memory.
 - A KV-major cache allocation did not improve the full model and expanded the
   cache-management blast radius, so it was removed.
 - Chunk size 8192 was 1.50% slower end to end than 4096 in the earlier A/B.
+- Full-D256 tile residency is closed: the spill-free hybrid still regressed
+  64K by 14.97% because integer and LSU instructions rose by 53.7% and 18.6%.
 - Further attention-only work has a small current-model ceiling. Future
   prefill work should first target AWQ GEMM and elementwise overhead.

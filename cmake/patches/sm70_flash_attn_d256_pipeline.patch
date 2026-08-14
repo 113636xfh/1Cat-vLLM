@@ -117,7 +117,7 @@ new file mode 100644
 index 0000000..efa10a6
 --- /dev/null
 +++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,1016 @@
 +/******************************************************************************
 + * Copyright (c) 2026, 1CatAI.
 + ******************************************************************************/
@@ -334,6 +334,33 @@ index 0000000..efa10a6
 +    b_words(1, 1) = word3;
 +}
 +
++template <int kPhase, typename TensorO, typename TensorP,
++          typename SmemTensor, typename TiledMma, typename TensorB,
++          typename TensorBWords, typename TensorBNext,
++          typename TensorBNextWords>
++__device__ __forceinline__ void splitd_pv_gemm_tt_phase(
++    TensorO &acc_o,
++    const TensorP &tPrP,
++    const SmemTensor &sV,
++    TensorB &current_b,
++    TensorBWords &current_b_words,
++    TensorBNext &next_b,
++    TensorBNextWords &next_b_words,
++    TiledMma tiled_mma,
++    int lane) {
++    constexpr int kPhases = decltype(size<2>(tPrP))::value;
++    static_assert(kPhase < kPhases);
++    if constexpr (kPhase + 1 < kPhases) {
++        load_v_fragment_tt(sV, next_b_words, kPhase + 1, lane);
++    }
++    cute::gemm(tiled_mma, tPrP(_, _, kPhase), current_b, acc_o);
++    if constexpr (kPhase + 1 < kPhases) {
++        splitd_pv_gemm_tt_phase<kPhase + 1>(
++            acc_o, tPrP, sV, next_b, next_b_words,
++            current_b, current_b_words, tiled_mma, lane);
++    }
++}
++
 +template <typename TensorO, typename TensorP, typename SmemTensor,
 +          typename TiledMma>
 +__device__ __forceinline__ void splitd_pv_gemm_tt(
@@ -344,18 +371,19 @@ index 0000000..efa10a6
 +    int lane) {
 +    using Element = typename Sm70D256SplitDTraits::Element;
 +    using BLayout = Layout<Shape<_4, _2>, Stride<_1, _4>>;
-+    auto b = make_tensor<Element>(BLayout{});
-+    auto b_words = recast<uint32_t>(b);
++    auto b0 = make_tensor<Element>(BLayout{});
++    auto b1 = make_tensor<Element>(BLayout{});
++    auto b0_words = recast<uint32_t>(b0);
++    auto b1_words = recast<uint32_t>(b1);
 +    static_assert(decltype(size<2>(tPrP))::value
 +                  == Sm70D256SplitDTraits::kBlockN / 4);
-+    static_assert(decltype(size(b))::value == 8);
-+    static_assert(decltype(size<0>(b_words))::value == 2);
-+    static_assert(decltype(size<1>(b_words))::value == 2);
-+#pragma unroll
-+    for (int phase = 0; phase < size<2>(tPrP); ++phase) {
-+        load_v_fragment_tt(sV, b_words, phase, lane);
-+        cute::gemm(tiled_mma, tPrP(_, _, phase), b, acc_o);
-+    }
++    static_assert(decltype(size(b0))::value == 8);
++    static_assert(decltype(size<0>(b0_words))::value == 2);
++    static_assert(decltype(size<1>(b0_words))::value == 2);
++    load_v_fragment_tt(sV, b0_words, 0, lane);
++    splitd_pv_gemm_tt_phase<0>(
++        acc_o, tPrP, sV, b0, b0_words, b1, b1_words,
++        tiled_mma, lane);
 +}
 +
 +template <bool PagedKV, typename Tensor>

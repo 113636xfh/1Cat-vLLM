@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
+    VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE: Literal["inline", "engine"] = "inline"
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL: int = 5120
@@ -289,6 +290,11 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY: bool = False
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q: int = 1536
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV: int = 8192
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE: bool = True
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q: int = 4096
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV: int = 8192
+    VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3: bool = True
+    VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -430,6 +436,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
+    VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_SCHED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_BV: str | None = None
     VLLM_SM70_FUSED_SIGMOID_GATING_WARPS: str | None = None
@@ -1574,6 +1581,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
     ),
+    # Expand selected full 4096-token TP4 AWQ projections into one reusable
+    # bounded FP16 workspace before their exact dense GEMM.
+    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
+    ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -2121,6 +2133,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV": lambda: int(
         os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV", "8192")
     ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1"))
+    ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", "4096")
+    ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", "8192")
+    ),
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1"))
+    ),
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", "32768")
+    ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))
     ),
@@ -2618,6 +2645,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
     "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": lambda: bool(
         int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "0"))
+    ),
+    # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
+    "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": lambda: bool(
+        int(os.getenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "1"))
     ),
     # Experimental SM70 fused sigmoid gating launch schedule. Default-off and
     # BV-only unless WARPS/STAGES are explicitly overridden; multi-warp changes

@@ -41107,3 +41107,125 @@ Interpretation:
   Long-window, token-run, malformed-tag, closure, and natural-stop guards are
   unchanged and still reject the P256 failure. Full evidence is in
   `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.
+
+## 2026-08-14 Qwen3.6 TP4 long-prefill exact-dense AWQ projections
+
+- Accepted and defaulted the gather-to-exact-dense Flash-V100 route. Its
+  attention-operator gain is 7.47%-10.81% across 8K-256K; full-model gains
+  measured 0.66% at 8K and 1.74% at 64K with identical output tokens.
+- Added exact three-way split-KV for dense `Q4096,Hq6,Hkv1,D256` attention at
+  KV >= 32K. It improves the attention kernel about 8.7% and the 64K model
+  prefill another 1.34%, with identical output tokens.
+- Added the 32 GB V100 TP4 AWQ exact-dense projection path for five validated
+  Qwen3.6 shapes. It preserves TurboMind's FP16 bias-rounding/FMA dequant
+  order and uses cuBLAS only for full M=4096 chunks; decode and tails retain
+  TurboMind AWQ.
+- Final 64K gate: `25.514792 -> 20.988843 s` prefill, latency `-17.74%`,
+  throughput `+21.56%`, identical 16 token IDs/text/hash, and unchanged TPOT.
+  Model residency is `17.36 GiB/rank`, so default enablement requires at least
+  30 GiB device memory and can be disabled with
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+- Detailed rationale, shape table, rejected paths, and artifact names are in
+  `docs/design/sm70_awq_long_prefill_exact_dense.md`.
+
+## 2026-08-14 Qwen3.6 long-prefill post-dense trace and P-layout gate
+
+- The accepted gather-to-exact-dense route remains default. Randomized
+  physical pages and the real interleaved K/V allocation are bitwise exact;
+  its 7.47%-10.81% result is an attention-operator gain, while the measured
+  full-model gain is 0.66% at 8K and 1.74% at 64K.
+- The final 64K unprofiled prefill remains 20.988843 seconds after exact FP16
+  AWQ projection preparation. The matching Nsight capture attributes 47.4%
+  of summed critical-rank kernel time to exact FP16 GEMMs, 27.6% to D256 full
+  attention, 6.7% to NCCL, and 3.5% to FlashQLA GDN.
+- Full-attention per-layer time rises from 1.701 ms at the first 4K chunk to
+  42.522 ms at 64K. The final chunk sustains about 37.6 causal TFLOP/s;
+  gather overhead is negligible in the trace.
+- Rejected the conflict-free P layout on the final TT-PV split-KV3 body.
+  Output hashes remain exact and PTXAS improves 253 to 251 registers/thread
+  with zero spill, but 32K regresses 21.0330 to 27.1365 ms and 64K regresses
+  42.6716 to 55.8776 ms. The warp-shuffle conversion stream costs more than
+  the removed shared replay. Do not retry this composition.
+- Artifacts are
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_reference_32k_64k.json`,
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_candidate_32k_64k.json`,
+  and the trace directory
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/awq-prefill-dense-fullmodel/nsys/`.
+
+## 2026-08-14 Exact mixed-dtype Gemma long-prefill fusion
+
+- Accepted a default-on SM70 local fusion for Qwen3.5/Qwen3.6 Gemma residual
+  plus RMSNorm at `M>=256,H=5120`. It preserves the existing NCCL result and
+  reduction order; decode and small tails do not dispatch to it. Rollback is
+  `VLLM_SM70_GEMMA_LONG_PREFILL_FUSED=0`.
+- Production bitwise gates pass `M={256,4096}` with FP16, BF16, and FP32 norm
+  weights. The matched FP16-runtime `M=4096` chain improves from
+  0.8131-0.8141 ms to 0.2806-0.2826 ms (2.88-2.90x); the BF16 specialization
+  has the same result. The final kernel uses 48 registers/thread, 168 bytes
+  shared memory, and no local spill.
+- Matched fixed-clock 64K TP4 three-repeat prefill improves
+  `22.1030 -> 21.3302 s` (-3.50%). All output token hashes match and decode is
+  unchanged within 0.13% noise. The final register-resident production build
+  separately route-hits at 20.1917 seconds with the same 16-token hash.
+- Nsight confirms the initial fused version removed 1.661 seconds of FP32 add,
+  RMSNorm, and conversion work and replaced it with 0.669 seconds of fused
+  execution. The register-resident refinement removes the second residual
+  global read and is separately microbenchmarked.
+- A later trace's rank-1 attention slowdown and 3.117-second NCCL sum are not
+  reproducible: physical GPUs 0-3 measure 44.231/44.301/44.176/44.329 ms for
+  the same `Q4096/KV64K` kernel (0.35% maximum spread). Do not alter collective
+  dispatch from that transient capture.
+- Full method and artifacts are in
+  `docs/design/sm70_gemma_long_prefill_fusion.md`.
+
+## 2026-08-14 Exact-dense KxN storage and remaining QKV gate
+
+- Accepted contiguous `K x N` storage for the existing exact FP16 AWQ
+  long-prefill weights. Twenty real TP4 rank/shape cases are bitwise equal;
+  the five projection classes improve by 2.39%-3.01% (2.58% geometric mean).
+- Nsight Systems measures all selected projection calls at
+  `38.511 -> 36.959 s` aggregate (`-4.03%`). A fixed-clock 64K A-B-A endpoint
+  gives a conservative 0.85%-3.07% model-prefill gain, with identical token
+  hashes in all nine runs. The existing exact-dense environment gate remains
+  the rollback.
+- The remaining unquantized full-attention QKV projection is
+  `M4096,K5120,N3584`, 256 calls/rank, and about 3.3% of the latest 64K
+  prefill. cuBLAS is 1.38-1.40x faster but is rejected: every rank differs
+  from the current TurboMind FP32 accumulation result, including millions of
+  FP16 output mismatches. Raising the generic TurboMind tuning ceiling to
+  M4096 is bitwise exact but about 0.6% slower.
+- NCU on the retained `CTA128x128x16` kernel reports 255 registers/thread,
+  12.19% achieved occupancy, 61.08% cycles with no eligible warp, and only
+  10.98% DRAM throughput. The next admissible experiment must target the
+  shared-memory/MIO/scoreboard/barrier path while preserving HMMA and FP32
+  accumulation order; shape tuning and direct cuBLAS are closed.
+- Artifacts are `awq_exact_dense_kn_layout_tp4_allranks.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-nk-control-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3-aba.json`,
+  `awq-kn-nsys-i65536-clock1530.nsys-rep`,
+  `qkv_prefill_cublas_tp4_allranks.json`, and
+  `ncu-qkv-tm-m4096-n3584-k5120-clock1530.ncu-rep` under the retained task
+  artifact directory.
+
+## 2026-08-14 Bounded-memory AWQ exact-dense prefill
+
+- Replaced 10.60 GiB/rank of permanent FP16 projection copies with one shared
+  85 MiB `K x N` workspace. A production CUDA op reverses the TurboMind
+  K8/N32 layout and reproduces its FP16 bias plus FMA dequantization exactly
+  before cuBLAS. OOM falls back to TurboMind; the old 30 GiB device gate is no
+  longer required.
+- All 20 real Qwen3.6-27B-AWQ TP4 rank/shape cases are bitwise equal for both
+  dequantized weights and final GEMM outputs. Weighted microbench speedup over
+  TurboMind is 1.47x-1.54x; dequantization adds about 24-25 ms per full chunk.
+- Same-source model residency is `6.50 -> 6.59 GiB/rank`, available KV is
+  `20.49 -> 20.41 GiB/rank`, and 131K maximum concurrency is
+  `10.01x -> 9.97x`. The former resident implementation measured 16.77 GiB
+  model memory and only 10.34 GiB available KV.
+- Fixed-clock 64K full-model A-B-A with official sampling gives
+  `20.900 -> 24.774 -> 21.241 s` for candidate-control-candidate. Two-repeat
+  means are `24.048 -> 20.338 s` (-15.43%); all 64 output token IDs, text, and
+  hashes match, while decode TPOT is unchanged within noise.
+- Evidence is under `workspace-production/` in the retained task artifact
+  directory. The rollback remains
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
