@@ -12,10 +12,15 @@
 > 开源社区，也欢迎仍在使用 V100 的个人开发者、工作室和团队参与测试、
 > 复现、反馈和共建，让这批依然有价值的算力继续发挥作用。
 
-1Cat-vLLM is a **Tesla V100 / SM70** focused vLLM fork for serving modern
-Qwen-class AWQ and experimental FP8 models on Volta GPUs. It integrates
-TurboMind-derived SM70 kernels, a V100 FlashAttention path, runtime defaults
-for long-context serving, and OpenAI-compatible API fixes for common clients.
+1Cat-vLLM is a vLLM engineering fork focused on **SM70 / Tesla V100**.
+Rather than targeting every hardware platform, it fills and optimizes the
+critical inference paths required by modern models on Volta, including
+quantized inference, attention backends, long-context serving, MTP speculative
+decoding, CUDA Graph execution, distributed communication, runtime policies,
+and deployment tooling.
+
+The goal is to make models such as Qwen and DeepSeek not merely runnable on
+V100, but deployable, reproducible, and continuously optimizable.
 
 ## Project Focus
 
@@ -29,8 +34,9 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - **DeepSeek V4 Flash**: supports running the original, unmodified DeepSeek V4
   Flash weights across eight GPUs.
 - **Day-0 Qwen3.8-27B support**: native Day-0 support for Qwen3.8-27B.
-- **Quantization support**: all supported models can use FP8, NVFP4, MXFP4,
-  AWQ, and GPTQ formats.
+- **Quantization support**: FP8, NVFP4, MXFP4, AWQ, and GPTQ inference paths
+  are included for supported model and hardware combinations. Availability
+  and production status vary by checkpoint and runtime route.
 - **Long-context serving**: public profiles default to 256K context where the
   model and memory budget allow it.
 - **MTP serving**: Qwen3.6-class MTP speculative decoding remains available as
@@ -48,7 +54,7 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
-- `Qwen/Qwen3.8-27B`  for latest model avaliable
+- `Qwen/Qwen3.8-27B` for the latest supported Qwen release
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
@@ -64,6 +70,7 @@ validation.
 | --- | --- |
 | 4 x Tesla V100 32 GB | Main public reference target |
 | 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
+| 8 x Tesla V100 32 GB | DeepSeek V4 Flash original-checkpoint TP8 target |
 
 Typical model placement:
 
@@ -72,6 +79,10 @@ Typical model placement:
   the long-context public default.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
 - `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
+- `DeepSeek-V4-Flash`: the original mixed MXFP4/FP8 checkpoint is supported
+  on eight 32 GB V100 GPUs with TP8.
+- `Qwen3.8-27B`: supported natively from Day 0, with validated FP16 and FP8
+  serving paths.
 
 Multimodal defaults:
 
@@ -362,11 +373,11 @@ python -m pip install -e . --no-build-isolation
 
 ## Repository Notes
 
-- Upstream project: [vLLM](https://github.com/vllm-project/vllm)
-- This fork focuses on SM70 AWQ support, V100-oriented attention/runtime
-  tuning, and experimental FP8/MTP/DFlash validation paths.
-- Prebuilt wheels are the public installation path.
-- Source builds are for development and kernel work.
+- This fork focuses on SM70 quantized inference, V100-oriented attention and
+  long-context tuning, model-specific runtime and deployment paths, and
+  continued MTP and DFlash research.
+- Production status is route-specific. Use the documented public profiles and
+  validated release matrices as the source of truth.
 
 ## Acknowledgements
 
