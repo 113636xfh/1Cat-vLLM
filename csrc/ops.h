@@ -116,6 +116,11 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor _kernel,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
 
+void fp8_sm70_dequantize_out(torch::Tensor out,
+                             torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             int64_t group_size);
+
 std::vector<torch::Tensor> mxfp4_sm70_prepare(torch::Tensor _kernel,
                                               torch::Tensor _scaling_factors,
                                               int64_t group_size,
@@ -168,6 +173,17 @@ void fp8_gemm_sm70_out(torch::Tensor out,
                        int64_t k_ld,
                        int64_t q_ld,
                        bool gated_silu);
+
+void fp8_gemm_sm70_prefill_dispatch_out(torch::Tensor out,
+                                        torch::Tensor dense_weight,
+                                        torch::Tensor _in_feats,
+                                        torch::Tensor _kernel,
+                                        torch::Tensor _scaling_factors,
+                                        int64_t group_size,
+                                        int64_t k_ld,
+                                        int64_t q_ld,
+                                        bool gated_silu,
+                                        int64_t min_prefill_m);
 
 void mxfp4_gemm_sm70_out(torch::Tensor out,
                          torch::Tensor _in_feats,

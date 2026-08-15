@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
+    VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -1585,6 +1586,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bounded FP16 workspace before their exact dense GEMM.
     "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
+    ),
+    # Expand selected large-M TP4 FP8 projections into one reusable bounded
+    # FP16 workspace before their exact dense GEMM. The allowlist and M gate
+    # keep decode, tails, and numerically unsafe QKV projections on TurboMind.
+    "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP

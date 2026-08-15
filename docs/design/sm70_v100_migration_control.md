@@ -41242,3 +41242,17 @@ Interpretation:
   target remains explicitly unmeasured.
 - Full configuration, performance tables, quality evidence, limitations, and
   artifact paths are in `docs/design/sm70_qwen38_130_acceptance.md`.
+
+## 2026-08-15 Qwen3.8 FP8 compile-safe long-prefill projections
+
+- Fixed a false route hit where `torch.compile` folded a Python large-M
+  branch and left every measured FP8 projection on TurboMind. The accepted
+  opaque CUDA op selects TurboMind below M3920 and exact dense above it.
+- The default is restricted to TP4 gate/up/down/output shapes. It uses one
+  shared 85 MiB FP16 workspace; QKV, decode, and tails remain unchanged.
+- Matched 32K/128K/256K throughput improves 22.36%/12.94%/7.25% with exact
+  control output hashes. Final 128K/256K prefill is 2446.5/1602.0 tok/s.
+- Q15680 split-KV3 was rejected: only 0.85%-1.80% attention gain, about
+  290 MiB/rank extra workspace, and non-bitwise output.
+- Detailed route gates, full sweep, tests, rejected paths, and artifacts are
+  in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.

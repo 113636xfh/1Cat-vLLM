@@ -2368,6 +2368,109 @@ void awq_sm70_dequantize_out(torch::Tensor output, torch::Tensor packed_weight,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+constexpr int kFp8PrefillDequantThreads = 256;
+constexpr int kFp8QuantValuesPerWord = 8;
+constexpr int kFp8OutputColumnsPerTile = 32;
+
+__global__ void fp8_sm70_dequantize_kernel(
+    __half* __restrict__ output, const uint8_t* __restrict__ packed_weight,
+    const __half* __restrict__ packed_scales, int k, int n, int group_size) {
+  const int64_t word_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t word_count =
+      static_cast<int64_t>(k) * n / kFp8QuantValuesPerWord;
+  if (word_index >= word_count) {
+    return;
+  }
+
+  const int words_per_n_tile = k / kFp8QuantValuesPerWord;
+  const int n_in_tile =
+      static_cast<int>(word_index % kFp8OutputColumnsPerTile);
+  const int64_t tile_word = word_index / kFp8OutputColumnsPerTile;
+  const int k_word = static_cast<int>(tile_word % words_per_n_tile);
+  const int n_tile = static_cast<int>(tile_word / words_per_n_tile);
+  const int col = n_tile * kFp8OutputColumnsPerTile + n_in_tile;
+  const int k_base = k_word * kFp8QuantValuesPerWord;
+  const int group = k_base / group_size;
+
+  const uint2 quant = reinterpret_cast<const uint2*>(packed_weight)[word_index];
+  const auto& quant_lo = reinterpret_cast<
+      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.x);
+  const auto& quant_hi = reinterpret_cast<
+      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.y);
+  const auto half_lo = turbomind::cvt_f16x4_e4m3(quant_lo);
+  const auto half_hi = turbomind::cvt_f16x4_e4m3(quant_hi);
+  const __half scale = packed_scales[static_cast<int64_t>(group) * n + col];
+
+  // cvt_f16x4_e4m3 reverses the converter's physical [0, 2, 1, 3]
+  // byte order and returns each logical K4 in-order.
+  output[static_cast<int64_t>(k_base + 0) * n + col] =
+      __hmul(half_lo[0], scale);
+  output[static_cast<int64_t>(k_base + 1) * n + col] =
+      __hmul(half_lo[1], scale);
+  output[static_cast<int64_t>(k_base + 2) * n + col] =
+      __hmul(half_lo[2], scale);
+  output[static_cast<int64_t>(k_base + 3) * n + col] =
+      __hmul(half_lo[3], scale);
+  output[static_cast<int64_t>(k_base + 4) * n + col] =
+      __hmul(half_hi[0], scale);
+  output[static_cast<int64_t>(k_base + 5) * n + col] =
+      __hmul(half_hi[1], scale);
+  output[static_cast<int64_t>(k_base + 6) * n + col] =
+      __hmul(half_hi[2], scale);
+  output[static_cast<int64_t>(k_base + 7) * n + col] =
+      __hmul(half_hi[3], scale);
+}
+
+void fp8_sm70_dequantize_out(torch::Tensor output,
+                             torch::Tensor packed_weight,
+                             torch::Tensor packed_scales,
+                             int64_t group_size) {
+  TORCH_CHECK(
+      output.is_cuda() && packed_weight.is_cuda() && packed_scales.is_cuda(),
+      "SM70 FP8 prefill dequant expects CUDA tensors.");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat16 &&
+                  packed_weight.scalar_type() == torch::kUInt8 &&
+                  packed_scales.scalar_type() == torch::kFloat16,
+              "SM70 FP8 prefill dequant dtype mismatch.");
+  TORCH_CHECK(
+      output.dim() == 2 && packed_weight.dim() == 2 && packed_scales.dim() == 2,
+      "SM70 FP8 prefill dequant expects rank-2 tensors.");
+  TORCH_CHECK(output.is_contiguous() && packed_weight.is_contiguous() &&
+                  packed_scales.is_contiguous(),
+              "SM70 FP8 prefill dequant expects contiguous tensors.");
+  TORCH_CHECK(group_size == 128,
+              "SM70 FP8 prefill dequant requires group_size=128.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
+  const int64_t k = output.size(0);
+  const int64_t n = output.size(1);
+  TORCH_CHECK(k % group_size == 0 &&
+                  k % kFp8QuantValuesPerWord == 0 &&
+                  n % kFp8OutputColumnsPerTile == 0,
+              "SM70 FP8 prefill dequant shape alignment mismatch.");
+  TORCH_CHECK(packed_weight.numel() == k * n,
+              "SM70 FP8 prefill packed-weight shape mismatch.");
+  TORCH_CHECK(
+      packed_scales.size(0) == k / group_size && packed_scales.size(1) == n,
+      "SM70 FP8 prefill packed-scale shape mismatch.");
+  TORCH_CHECK(output.device() == packed_weight.device() &&
+                  output.device() == packed_scales.device(),
+              "SM70 FP8 prefill tensors must share a device.");
+
+  const int64_t words = packed_weight.numel() / kFp8QuantValuesPerWord;
+  const int blocks = static_cast<int>(
+      (words + kFp8PrefillDequantThreads - 1) / kFp8PrefillDequantThreads);
+  fp8_sm70_dequantize_kernel<<<blocks, kFp8PrefillDequantThreads, 0,
+                               at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+      packed_weight.data_ptr<uint8_t>(),
+      reinterpret_cast<const __half*>(packed_scales.data_ptr<at::Half>()),
+      static_cast<int>(k), static_cast<int>(n),
+      static_cast<int>(group_size));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 torch::Tensor interleave_gated_silu_cols(torch::Tensor tensor) {
   const int64_t n = tensor.size(-1);
   TORCH_CHECK((n % 2) == 0,
@@ -3413,6 +3516,31 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                           desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
                           desc_D, workspace_holder.workspace, stream);
   TORCH_CHECK(ec == 0, "fp8_gemm_sm70: TurboMind GEMM failed.");
+}
+
+void fp8_gemm_sm70_prefill_dispatch_out(
+    torch::Tensor out, torch::Tensor dense_weight, torch::Tensor in_feats,
+    torch::Tensor tm_weight, torch::Tensor tm_scales, int64_t group_size,
+    int64_t k_ld, int64_t q_ld, bool gated_silu, int64_t min_prefill_m) {
+  if (in_feats.size(0) < min_prefill_m) {
+    fp8_gemm_sm70_out(out, in_feats, tm_weight, tm_scales, group_size, k_ld,
+                      q_ld, gated_silu);
+    return;
+  }
+
+  TORCH_CHECK(in_feats.dim() == 2 && dense_weight.dim() == 2,
+              "SM70 FP8 prefill dispatch expects rank-2 input and workspace.");
+  TORCH_CHECK(dense_weight.size(0) == in_feats.size(1) &&
+                  dense_weight.size(1) == tm_weight.size(1),
+              "SM70 FP8 prefill dispatch workspace shape mismatch.");
+  fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, group_size);
+  if (gated_silu) {
+    auto gate_up = at::mm(in_feats, dense_weight);
+    sm70_silu_and_mul_interleaved_fp16_out(out, gate_up);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  at::mm_out(out, in_feats, dense_weight);
 }
 
 void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
@@ -4678,6 +4806,13 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor _kernel,
                                           interleave_gated_silu);
 }
 
+void fp8_sm70_dequantize_out(torch::Tensor out, torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             int64_t group_size) {
+  vllm::awq_sm70::fp8_sm70_dequantize_out(out, _kernel, _scaling_factors,
+                                          group_size);
+}
+
 std::vector<torch::Tensor> mxfp4_sm70_prepare(torch::Tensor _kernel,
                                               torch::Tensor _scaling_factors,
                                               int64_t group_size,
@@ -4738,6 +4873,15 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        bool gated_silu) {
   vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
                                     group_size, k_ld, q_ld, gated_silu);
+}
+
+void fp8_gemm_sm70_prefill_dispatch_out(
+    torch::Tensor out, torch::Tensor dense_weight, torch::Tensor _in_feats,
+    torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
+    int64_t k_ld, int64_t q_ld, bool gated_silu, int64_t min_prefill_m) {
+  vllm::awq_sm70::fp8_gemm_sm70_prefill_dispatch_out(
+      out, dense_weight, _in_feats, _kernel, _scaling_factors, group_size, k_ld,
+      q_ld, gated_silu, min_prefill_m);
 }
 
 void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,

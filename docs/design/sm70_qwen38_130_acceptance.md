@@ -30,22 +30,27 @@ Date: 2026-08-15
 - The benchmark harness records official sampling, generated-token count,
   natural-stop state, TTFT/prefill, pure decode TPOT, acceptance length, route
   policy, and token hashes.
+- Large-M TP4 FP8 gate/up/down/output projections now use a compile-safe
+  runtime exact-dense dispatch with one shared 85 MiB workspace. Decode,
+  tails, and numerically unsafe QKV shapes retain TurboMind.
 
 ## No-MTP Long Context
 
-The FP16-KV production sweep uses repeated official-sampling requests. The
-FP8-KV sweep uses a generation suffix and produces 256 tokens at every point.
+The FP16-KV prefill column is the final no-MTP chunk-15680 route. The 1K-64K
+rows are two-repeat cold-cache means; 128K and 256K are one cold-cache request.
+Decode columns retain the official-sampling release sweep. The FP8-KV sweep
+uses a generation suffix and produces 256 tokens at every point.
 
 | Context | FP16 KV prefill tok/s | FP16 KV decode tok/s | FP8 KV prefill tok/s | FP8 KV decode tok/s |
 |---:|---:|---:|---:|---:|
-| 1K | 2550.2 | 65.05 | 3430.8 | 66.36 |
-| 4K | 3093.7 | 63.35 | 3591.3 | 65.61 |
-| 8K | 2884.0 | 64.04 | 2995.9 | 65.50 |
-| 16K | 2677.8 | 63.90 | 2797.0 | 65.36 |
-| 32K | 2341.9 | 60.07* | 2516.2 | 59.97 |
-| 64K | 1995.8 | 58.44* | 2063.4 | 52.30 |
-| 128K | 1501.6 | 46.95 | 1519.6 | 42.35 |
-| 256K | 1004.7 | 36.96 | 1007.1 | 31.49 |
+| 1K | 2515.1 | 65.05 | 3430.8 | 66.36 |
+| 4K | 3847.8 | 63.35 | 3591.3 | 65.61 |
+| 8K | 3725.4 | 64.04 | 2995.9 | 65.50 |
+| 16K | 3901.6 | 63.90 | 2797.0 | 65.36 |
+| 32K | 3437.2 | 60.07* | 2516.2 | 59.97 |
+| 64K | 2851.7 | 58.44* | 2063.4 | 52.30 |
+| 128K | 2446.5 | 46.95 | 1519.6 | 42.35 |
+| 256K | 1602.0 | 36.96 | 1007.1 | 31.49 |
 
 `*` The FP16-KV 32K and 64K requests naturally stopped after 2 and 17 output
 tokens. Keep those rows as route checks, not high-confidence decode means.
@@ -117,3 +122,6 @@ Artifacts are rooted at
 `/data/minimax-h3/task-cache/qwen38-130-acceptance-20260815`. Retained groups
 are `context/`, `concurrency/`, `mtp/`, `correctness/`, `profiles/nsys/`,
 `compat/`, `build/final-wheel/`, and `logs/`.
+
+The corrected FP8 prefill implementation, A/B results, and retained profiles
+are documented in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.

@@ -170,6 +170,28 @@ if hasattr(torch.ops._C, "fp8_sm70_prepare"):
         return [tm_weight, tm_scales, meta]
 
 
+def fp8_sm70_dequantize_out(
+    out: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("fp8_sm70_dequantize_out")(out, qweight, scales, group_size)
+
+
+if hasattr(torch.ops._C, "fp8_sm70_dequantize_out"):
+
+    @register_fake("_C::fp8_sm70_dequantize_out")
+    def _fp8_sm70_dequantize_out_fake(
+        out: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        del out, qweight, scales, group_size
+        return None
+
+
 def mxfp4_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -395,6 +417,50 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         k_ld: int,
         q_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_gemm_sm70_prefill_dispatch_out(
+    out: torch.Tensor,
+    dense_weight: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+) -> None:
+    _op("fp8_gemm_sm70_prefill_dispatch_out")(
+        out,
+        dense_weight,
+        input,
+        qweight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        gated_silu,
+        min_prefill_m,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out"):
+
+    @register_fake("_C::fp8_gemm_sm70_prefill_dispatch_out")
+    def _fp8_gemm_sm70_prefill_dispatch_out_fake(
+        out: torch.Tensor,
+        dense_weight: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+        min_prefill_m: int,
     ) -> None:
         return None
 

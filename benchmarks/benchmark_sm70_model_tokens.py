@@ -464,6 +464,10 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_FP8_DENSE_GATED_SILU",
         True,
     )
+    fp8_prefill_exact_dense = _env_bool(
+        "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
+        True,
+    )
     nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
     mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)
     fp8_dequant_fallback = _env_bool("VLLM_SM70_FP8_DEQUANT_FALLBACK", True)
@@ -516,6 +520,10 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "VLLM_SM70_FP8_DENSE_GATED_SILU"
         ),
         "fp8_dense_gated_silu_effective": fp8_dense_gated_silu,
+        "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": os.environ.get(
+            "VLLM_SM70_FP8_PREFILL_EXACT_DENSE"
+        ),
+        "fp8_prefill_exact_dense_effective": fp8_prefill_exact_dense,
         "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get("VLLM_SM70_NVFP4_TURBOMIND"),
         "nvfp4_turbomind_effective": nvfp4_turbomind,
         "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get("VLLM_SM70_MXFP4_TURBOMIND"),
