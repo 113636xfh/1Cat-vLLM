@@ -36,7 +36,9 @@ def test_dynamic_draft_vocab_is_the_default_mtp_route(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT", "1")
 
     config = resolve_mtp_draft_vocab_config(
-        "mtp", model_architecture="Qwen3_5ForConditionalGeneration"
+        "mtp",
+        model_architecture="Qwen3_5ForConditionalGeneration",
+        model_name_or_path="Qwen/Qwen3.6-27B",
     )
 
     assert config.using_defaults
@@ -67,6 +69,7 @@ def test_dynamic_draft_vocab_default_selects_tp4_asset(monkeypatch) -> None:
         "mtp",
         tensor_parallel_size=4,
         model_architecture="Qwen3_5ForConditionalGeneration",
+        model_name_or_path="/models/Qwen3.6-27B-AWQ",
     )
 
     assert config.using_defaults
@@ -87,15 +90,20 @@ def test_dynamic_draft_vocab_default_can_be_disabled(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("model_architecture", "tensor_parallel_size"),
+    ("model_architecture", "tensor_parallel_size", "model_name_or_path"),
     [
-        ("DeepseekV4ForCausalLM", 8),
-        ("Qwen3_5ForConditionalGeneration", 8),
-        ("Qwen3_5MoeForConditionalGeneration", 4),
+        ("DeepseekV4ForCausalLM", 8, "deepseek-ai/DeepSeek-V4"),
+        ("Qwen3_5ForConditionalGeneration", 8, "Qwen/Qwen3.6-27B"),
+        ("Qwen3_5MoeForConditionalGeneration", 4, "Qwen/Qwen3.6-35B-A3B"),
+        ("Qwen3_5ForConditionalGeneration", 4, "Qwen/Qwen3.8-27B"),
+        ("Qwen3_5ForConditionalGeneration", 4, None),
     ],
 )
 def test_dynamic_draft_vocab_default_is_model_and_tp_specific(
-    monkeypatch, model_architecture: str, tensor_parallel_size: int
+    monkeypatch,
+    model_architecture: str,
+    tensor_parallel_size: int,
+    model_name_or_path: str | None,
 ) -> None:
     monkeypatch.setenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT", "1")
 
@@ -103,6 +111,7 @@ def test_dynamic_draft_vocab_default_is_model_and_tp_specific(
         "mtp",
         tensor_parallel_size=tensor_parallel_size,
         model_architecture=model_architecture,
+        model_name_or_path=model_name_or_path,
     )
 
     assert not config.using_defaults

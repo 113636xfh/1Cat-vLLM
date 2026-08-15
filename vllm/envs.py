@@ -338,7 +338,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN: int = 111104
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN: int = 147841
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN: int = 258176
-    VLLM_FLASH_V100_XQA_G6_QK_PIPELINE: bool = False
+    VLLM_FLASH_V100_XQA_G6_QK_PIPELINE: bool = True
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS: int = 8
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
     VLLM_FLASH_V100_TRACE_DECODE_ACTIVE: bool = False
@@ -1015,10 +1015,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
     # If set, vllm will use precompiled native binaries (*.so and vllm-rs).
-    "VLLM_USE_PRECOMPILED": lambda: (
-        os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
-        or bool(os.environ.get("VLLM_PRECOMPILED_WHEEL_LOCATION"))
-    ),
+    "VLLM_USE_PRECOMPILED": lambda: os.environ.get("VLLM_USE_PRECOMPILED", "")
+    .strip()
+    .lower()
+    in ("1", "true"),
     # If set, vllm will use the precompiled Rust frontend binary (vllm-rs).
     "VLLM_USE_PRECOMPILED_RUST": lambda: (
         os.environ.get("VLLM_USE_PRECOMPILED_RUST", "").strip().lower() in ("1", "true")
@@ -2298,7 +2298,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "0"))
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": lambda: int(
         os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")

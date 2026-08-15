@@ -585,6 +585,14 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE",
         1024,
     )
+    g6_qk_pipeline = _env_bool(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE",
+        True,
+    )
+    g6_qk_pipeline_warps = _env_int(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS",
+        8,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -660,6 +668,17 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"
         ),
         "mtp5_xqa_partition_size_effective": mtp5_xqa_partition_size,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE"
+        ),
+        "g6_qk_pipeline_effective": g6_qk_pipeline,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS"
+        ),
+        "g6_qk_pipeline_warps_effective": g6_qk_pipeline_warps,
+        "g6_qk_pipeline_mid_only_policy": (
+            g6_qk_pipeline and g6_qk_pipeline_warps == 8
+        ),
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta
@@ -1201,6 +1220,7 @@ def _enable_diagnostics_after_load() -> None:
 def _make_prompt_token_ids(
     tokenizer: Any,
     prompt_base: str,
+    prompt_suffix: str,
     input_len: int,
 ) -> list[int]:
     if input_len <= 0:
@@ -1209,11 +1229,15 @@ def _make_prompt_token_ids(
     chunk = tokenizer.encode(prompt_base, add_special_tokens=False)
     if not chunk:
         raise ValueError("--prompt-base produced no tokens")
+    suffix = tokenizer.encode(prompt_suffix, add_special_tokens=False)
+    if len(suffix) > input_len:
+        raise ValueError("--prompt-suffix is longer than --input-len")
 
     repeated: list[int] = []
-    while len(repeated) < input_len:
+    prefix_len = input_len - len(suffix)
+    while len(repeated) < prefix_len:
         repeated.extend(chunk)
-    return repeated[:input_len]
+    return repeated[:prefix_len] + suffix
 
 
 def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -1224,6 +1248,9 @@ def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "input_len": args.input_len,
                 "output_len": args.output_len,
                 "prompt_base": args.prompt_base,
+                "prompt_suffix": args.prompt_suffix,
+                "warmup": args.warmup,
+                "repeat": args.repeat,
             }
         ]
 
@@ -1237,14 +1264,24 @@ def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             raise ValueError(f"case {index} must be an object")
         input_len = int(raw_case.get("input_len", args.input_len))
         output_len = int(raw_case.get("output_len", args.output_len))
+        warmup = int(raw_case.get("warmup", args.warmup))
+        repeat = int(raw_case.get("repeat", args.repeat))
+        if warmup < 0:
+            raise ValueError(f"case {index} warmup must be non-negative")
+        if repeat <= 0:
+            raise ValueError(f"case {index} repeat must be positive")
         name = str(raw_case.get("name", f"case_{index}"))
         prompt_base = str(raw_case.get("prompt_base", args.prompt_base))
+        prompt_suffix = str(raw_case.get("prompt_suffix", args.prompt_suffix))
         cases.append(
             {
                 "name": name,
                 "input_len": input_len,
                 "output_len": output_len,
                 "prompt_base": prompt_base,
+                "prompt_suffix": prompt_suffix,
+                "warmup": warmup,
+                "repeat": repeat,
             }
         )
     return cases
@@ -1398,7 +1435,15 @@ def _diff_spec_metrics(
     )
 
 
-def _run_once(llm: Any, prompt: dict[str, list[int]], sampling_params: Any) -> dict:
+def _run_once(
+    llm: Any,
+    prompt: dict[str, list[int]],
+    sampling_params: Any,
+    *,
+    reset_prefix_cache: bool = False,
+) -> dict:
+    if reset_prefix_cache and not llm.reset_prefix_cache():
+        raise RuntimeError("Failed to reset the prefix cache before measurement.")
     request_prompt = {"prompt_token_ids": list(prompt["prompt_token_ids"])}
     spec_metrics_before = _spec_metrics_snapshot(llm)
     start = time.perf_counter()
@@ -1507,6 +1552,8 @@ def _write_results(
         "engine_kwargs": llm_kwargs,
         "sampling_params": first_case["sampling_params"],
         "cuda_profile_repeat": args.cuda_profile_repeat,
+        "reset_prefix_cache_before_case": args.reset_prefix_cache_before_case,
+        "reset_prefix_cache_between_runs": args.reset_prefix_cache_between_runs,
         "prompt": first_case["prompt"],
         "load_seconds": load_seconds,
         "warmups": first_case["warmups"],
@@ -1531,7 +1578,8 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional JSON list of cases with name/input_len/output_len/"
-            "prompt_base. Loads the model once and runs every case."
+            "prompt_base/prompt_suffix/warmup/repeat. Loads the model once and "
+            "runs every case."
         ),
     )
     parser.add_argument("--warmup", type=int, default=1)
@@ -1545,10 +1593,36 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reset-prefix-cache-before-case",
+        action="store_true",
+        help=(
+            "Reset prefix and Mamba caches once before each case. Warmups are "
+            "cold, while measured repeats may reuse that case's prefix."
+        ),
+    )
+    parser.add_argument(
+        "--reset-prefix-cache-between-runs",
+        action="store_true",
+        help=(
+            "Reset prefix and Mamba caches before every warmup and measured "
+            "request. This preserves production Mamba align mode without "
+            "turning repeated benchmark prompts into prefix-cache hits."
+        ),
+    )
+    parser.add_argument(
         "--prompt-base",
         default=(
             "This fixed benchmark prompt is used to create a deterministic "
             "tokenized input for single-request decode measurement. "
+        ),
+    )
+    parser.add_argument(
+        "--prompt-suffix",
+        default="",
+        help=(
+            "Text kept at the end of every exact-length prompt. Use this for "
+            "a stable generation instruction while --prompt-base pads the "
+            "preceding context."
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1615,6 +1689,10 @@ def main() -> int:
         raise ValueError("--repeat must be positive")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
+    if args.reset_prefix_cache_before_case and args.reset_prefix_cache_between_runs:
+        raise ValueError(
+            "Choose only one prefix-cache reset mode: before-case or between-runs."
+        )
 
     import torch
     from transformers import AutoTokenizer
@@ -1632,6 +1710,7 @@ def main() -> int:
         prompt_token_ids = _make_prompt_token_ids(
             tokenizer,
             raw_case["prompt_base"],
+            raw_case["prompt_suffix"],
             raw_case["input_len"],
         )
         cases.append(
@@ -1682,10 +1761,6 @@ def main() -> int:
 
     case_results = []
     for case in cases:
-        warmups = [
-            _run_once(llm, case["prompt"], case["sampling_params"])
-            for _ in range(args.warmup)
-        ]
         case_results.append(
             {
                 "name": case["name"],
@@ -1705,13 +1780,30 @@ def main() -> int:
                     "logprobs": args.logprobs if args.logprobs != 0 else None,
                     "seed": args.seed,
                 },
-                "warmups": warmups,
+                "requested_warmups": case["warmup"],
+                "requested_repeats": case["repeat"],
+                "warmups": [],
                 "repeats": [],
                 "summary": {},
             }
         )
 
     if args.cuda_profile_repeat:
+        # Warm every case before starting the profiler so the capture contains
+        # measured repeats only. Normal sweeps warm each case immediately
+        # before measuring it, allowing checkpoints to be written promptly.
+        for case, result in zip(cases, case_results):
+            if args.reset_prefix_cache_before_case and not llm.reset_prefix_cache():
+                raise RuntimeError("Failed to reset the prefix cache before case.")
+            result["warmups"] = [
+                _run_once(
+                    llm,
+                    case["prompt"],
+                    case["sampling_params"],
+                    reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                )
+                for _ in range(case["warmup"])
+            ]
         try:
             llm.start_profile()
         except Exception as exc:
@@ -1723,9 +1815,26 @@ def main() -> int:
             ) from exc
     try:
         for case, result in zip(cases, case_results):
+            if not args.cuda_profile_repeat:
+                if args.reset_prefix_cache_before_case and not llm.reset_prefix_cache():
+                    raise RuntimeError("Failed to reset the prefix cache before case.")
+                result["warmups"] = [
+                    _run_once(
+                        llm,
+                        case["prompt"],
+                        case["sampling_params"],
+                        reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                    )
+                    for _ in range(case["warmup"])
+                ]
             repeats = [
-                _run_once(llm, case["prompt"], case["sampling_params"])
-                for _ in range(args.repeat)
+                _run_once(
+                    llm,
+                    case["prompt"],
+                    case["sampling_params"],
+                    reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                )
+                for _ in range(case["repeat"])
             ]
             result["repeats"] = repeats
             result["summary"] = _summarize(repeats)

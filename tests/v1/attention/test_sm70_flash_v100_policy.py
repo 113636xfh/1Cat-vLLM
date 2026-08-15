@@ -853,7 +853,11 @@ def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
 
     assert torch.equal(
         capture_metadata.smallq_decode_seq_lens,
-        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        torch.tensor(
+            [1, 2, 3, 4],
+            dtype=torch.int32,
+            device=capture_metadata.smallq_decode_seq_lens.device,
+        ),
     )
 
     runtime_common = create_common_attn_metadata(
@@ -1010,7 +1014,11 @@ def test_flash_v100_smallq_metadata_masks_cudagraph_padding(
 
     assert torch.equal(
         attn_metadata.smallq_decode_seq_lens,
-        torch.tensor([6, 7, 8, 6, 7, 0], dtype=torch.int32),
+        torch.tensor(
+            [6, 7, 8, 6, 7, 0],
+            dtype=torch.int32,
+            device=attn_metadata.smallq_decode_seq_lens.device,
+        ),
     )
     assert torch.equal(
         attn_metadata.smallq_decode_block_table[-1],
@@ -1064,6 +1072,28 @@ def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
 
     with pytest.raises(RuntimeError, match="persistent buffer capacity"):
         builder.build(0, runtime_common)
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        (1, [1, 2]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (8, [1, 2, 4, 8]),
+        (12, [1, 2, 4, 8, 12]),
+        (16, [1, 2, 4, 8, 16]),
+        (256, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
+    max_num_seqs: int,
+    expected: list[int],
+):
+    from vllm.config.vllm import _sm70_nomtp_cudagraph_capture_sizes
+
+    assert _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs) == expected
 
 
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(

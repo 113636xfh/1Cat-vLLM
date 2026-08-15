@@ -41229,3 +41229,16 @@ Interpretation:
 - Evidence is under `workspace-production/` in the retained task artifact
   directory. The rollback remains
   `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+
+## 2026-08-15 Qwen3.8-27B 1.3.0 release acceptance
+
+- Accepted Qwen3.8-27B-FP8 TP4 no-MTP long-context, concurrency, MTP4,
+  FP8-KV, exact-256K-boundary, API quality, and final-wheel gates.
+- Defaulted the proven mid-range G6 XQA QK pipeline, extended no-MTP graph
+  request shapes through 16, restricted the Qwen3.6 draft-vocabulary asset so
+  Qwen3.8 uses full vocabulary, and bundled FlashQLA SM70 into the wheel.
+- Qwen3.6-35B-A3B-AWQ TP2 loads from the final wheel and passes official
+  1K/256 and 4K/1024 checks. No 35B FP8 checkpoint is available, so that speed
+  target remains explicitly unmeasured.
+- Full configuration, performance tables, quality evidence, limitations, and
+  artifact paths are in `docs/design/sm70_qwen38_130_acceptance.md`.

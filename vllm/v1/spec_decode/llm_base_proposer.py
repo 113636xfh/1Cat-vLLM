@@ -236,6 +236,7 @@ class SpecDecodeBaseProposer:
             self.method,
             vllm_config.parallel_config.tensor_parallel_size,
             vllm_config.model_config.architecture,
+            vllm_config.model_config.model,
         )
         if draft_vocab_config.gpu_lru_enabled:
             if self.max_batch_size != 1:
@@ -2254,6 +2255,7 @@ class SpecDecodeBaseProposer:
             self.method,
             self.vllm_config.parallel_config.tensor_parallel_size,
             self.vllm_config.model_config.architecture,
+            self.vllm_config.model_config.model,
         )
         ranking_path = vocab_config.ranking_path
         shortlist_size = vocab_config.shortlist_size

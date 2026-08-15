@@ -48,12 +48,23 @@ class MTPDraftVocabConfig:
 
 _DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 _DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES = frozenset((2, 4))
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_MODEL_MARKER = "qwen3.6-27b"
+
+
+def _matches_default_dynamic_draft_vocab_model(
+    model_name_or_path: str | None,
+) -> bool:
+    if model_name_or_path is None:
+        return False
+    normalized = model_name_or_path.casefold().replace("_", "-")
+    return _DEFAULT_DYNAMIC_DRAFT_VOCAB_MODEL_MARKER in normalized
 
 
 def resolve_mtp_draft_vocab_config(
     method: str,
     tensor_parallel_size: int = 2,
     model_architecture: str | None = None,
+    model_name_or_path: str | None = None,
 ) -> MTPDraftVocabConfig:
     """Resolve explicit controls or the model-specific default MTP vocabulary."""
     config = MTPDraftVocabConfig(
@@ -84,6 +95,7 @@ def resolve_mtp_draft_vocab_config(
         or explicit_config
         or model_architecture != _DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE
         or tensor_parallel_size not in _DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES
+        or not _matches_default_dynamic_draft_vocab_model(model_name_or_path)
     ):
         return config
 

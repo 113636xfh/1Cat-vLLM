@@ -793,6 +793,14 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE",
         1024,
     )
+    g6_qk_pipeline = _env_bool(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE",
+        True,
+    )
+    g6_qk_pipeline_warps = _env_int(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS",
+        8,
+    )
     prefill_d256_output_stride_268 = _env_bool(
         "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268",
         True,
@@ -860,6 +868,17 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"
         ),
         "mtp5_xqa_partition_size_effective": mtp5_xqa_partition_size,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE"
+        ),
+        "g6_qk_pipeline_effective": g6_qk_pipeline,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS"
+        ),
+        "g6_qk_pipeline_warps_effective": g6_qk_pipeline_warps,
+        "g6_qk_pipeline_mid_only_policy": (
+            g6_qk_pipeline and g6_qk_pipeline_warps == 8
+        ),
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta
