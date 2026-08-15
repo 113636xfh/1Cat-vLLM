@@ -25,6 +25,11 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - **V100 FlashAttention path**: `FLASH_ATTN_V100` decode and prefill backend
   for Volta GPUs, with SM70 compile-graph, guarded XQA decode, and D=256
   paged-prefix low-smem fast paths enabled by default.
+- **DeepSeek V4 Flash**: supports running the original, unmodified DeepSeek V4
+  Flash weights across eight GPUs.
+- **Day-0 Qwen3.8-27B support**: native Day-0 support for Qwen3.8-27B.
+- **Quantization support**: all supported models can use FP8, NVFP4, MXFP4,
+  AWQ, and GPTQ formats.
 - **Long-context serving**: public profiles default to 256K context where the
   model and memory budget allow it.
 - **MTP serving**: Qwen3.6-class MTP speculative decoding remains available as
@@ -42,6 +47,7 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
+- `Qwen/Qwen3.8-27B`  for latest model avaliable
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
