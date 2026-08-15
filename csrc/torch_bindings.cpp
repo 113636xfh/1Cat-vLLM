@@ -239,7 +239,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
-      "Tensor(b!) dense_weight, Tensor _in_feats, Tensor _kernel, "
+      "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu, int min_prefill_m) -> ()");
   ops.impl("fp8_gemm_sm70_prefill_dispatch_out", torch::kCUDA,

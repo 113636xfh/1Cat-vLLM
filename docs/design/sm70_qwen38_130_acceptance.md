@@ -31,8 +31,9 @@ Date: 2026-08-15
   natural-stop state, TTFT/prefill, pure decode TPOT, acceptance length, route
   policy, and token hashes.
 - Large-M TP4 FP8 gate/up/down/output projections now use a compile-safe
-  runtime exact-dense dispatch with one shared 85 MiB workspace. Decode,
-  tails, and numerically unsafe QKV shapes retain TurboMind.
+  runtime exact-dense dispatch with one shared 85 MiB workspace. The workspace
+  address is passed as an integer so it is not copied into compiled graph
+  inputs. Decode, tails, and numerically unsafe QKV shapes retain TurboMind.
 
 ## No-MTP Long Context
 
@@ -71,19 +72,23 @@ no counter-derived bottleneck claim is made for this release.
 ## Concurrency
 
 All rows use 64 requests of exact 1K input and 256 output tokens with official
-sampling. Every request completed successfully.
+sampling. Prompt seeds differ between rows to prevent cross-row prefix-cache
+reuse. Every request completed successfully.
 
-| Concurrency | Old output tok/s | Accepted output tok/s | Gain | Mean TPOT |
-|---:|---:|---:|---:|---:|
-| 1 | 59.90 | 60.06 | +0.27% | 15.24 ms |
-| 2 | 107.13 | 107.00 | -0.12% | 16.47 ms |
-| 4 | 51.08 | 193.66 | +279.15% | 16.79 ms |
-| 8 | 95.60 | 296.35 | +209.99% | 18.48 ms |
-| 16 | 167.49 | 383.00 | +128.68% | 26.90 ms |
+| Concurrency | Prior accepted tok/s | Current tok/s | Change | Scale | Efficiency | Mean / P99 TPOT |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 60.06 | 60.44 | +0.63% | 1.00x | 100.0% | 15.16 / 15.32 ms |
+| 2 | 107.00 | 108.72 | +1.61% | 1.80x | 89.9% | 16.29 / 17.13 ms |
+| 4 | 193.66 | 192.39 | -0.65% | 3.18x | 79.6% | 16.88 / 19.58 ms |
+| 8 | 296.35 | 309.70 | +4.50% | 5.12x | 64.0% | 18.16 / 24.55 ms |
+| 16 | 383.00 | 412.35 | +7.66% | 6.82x | 42.6% | 23.03 / 38.57 ms |
 
-At concurrency 16 all four GPUs remain at 100% SM busy and about 51-52%
-memory busy. Remaining non-linear scaling is a saturated high-M kernel issue,
-not an idle-GPU or missing graph-shape issue.
+The first concurrency-4 run measured 188.68 tok/s; its independent repeat
+measured 192.39 tok/s and is reported above. Across the timed intervals all
+four V100s average 98.0-99.8% SM busy. Average memory busy falls from 50.7% at
+concurrency 1 to 38.3% at concurrency 16 while power rises from 194.7 to
+229.8 W/GPU. Remaining non-linear scaling is a high-M execution-efficiency
+issue, not an idle-GPU or missing graph-shape issue.
 
 ## MTP And Quality
 
@@ -99,6 +104,9 @@ not an idle-GPU or missing graph-shape issue.
   and `node --check`. One long stochastic seed repeated after about 6377 tokens;
   another bounded run naturally stopped at 7894 tokens. Treat this as a model
   sampling risk, not deterministic token or HTML-tag corruption.
+- The corrected FP8 workspace ABI passes a 6278-token natural prompt: it
+  follows the final four-line instruction, emits no replacement characters,
+  and stops naturally after 47 tokens.
 
 ## Wheel And Compatibility
 
@@ -125,3 +133,5 @@ are `context/`, `concurrency/`, `mtp/`, `correctness/`, `profiles/nsys/`,
 
 The corrected FP8 prefill implementation, A/B results, and retained profiles
 are documented in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.
+The pointer-fix and concurrency artifacts are rooted at
+`/data/minimax-h3/task-cache/qwen38-130-concurrency-latest-20260815`.

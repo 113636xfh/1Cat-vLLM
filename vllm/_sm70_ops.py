@@ -423,7 +423,7 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
 
 def fp8_gemm_sm70_prefill_dispatch_out(
     out: torch.Tensor,
-    dense_weight: torch.Tensor,
+    dense_weight_ptr: int,
     input: torch.Tensor,
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -435,7 +435,7 @@ def fp8_gemm_sm70_prefill_dispatch_out(
 ) -> None:
     _op("fp8_gemm_sm70_prefill_dispatch_out")(
         out,
-        dense_weight,
+        dense_weight_ptr,
         input,
         qweight,
         scales,
@@ -452,7 +452,7 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out"):
     @register_fake("_C::fp8_gemm_sm70_prefill_dispatch_out")
     def _fp8_gemm_sm70_prefill_dispatch_out_fake(
         out: torch.Tensor,
-        dense_weight: torch.Tensor,
+        dense_weight_ptr: int,
         input: torch.Tensor,
         qweight: torch.Tensor,
         scales: torch.Tensor,
@@ -462,6 +462,7 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out"):
         gated_silu: bool,
         min_prefill_m: int,
     ) -> None:
+        del dense_weight_ptr
         return None
 
 

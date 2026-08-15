@@ -80,7 +80,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
 
     def fake_dispatch(
         out,
-        dense_weight,
+        dense_weight_ptr,
         input,
         qweight,
         scales,
@@ -90,6 +90,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
         gated_silu,
         min_prefill_m,
     ):
+        assert dense_weight_ptr == 42
         calls.append((input.shape[0], min_prefill_m, gated_silu))
         out.zero_()
 
@@ -106,7 +107,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
         weight_scale_inv=torch.empty((1, 6), dtype=torch.float16),
         sm70_fp8_k_ld=4,
         sm70_fp8_q_ld=6,
-        _sm70_fp8_prefill_exact_dense_workspace=torch.empty(24, dtype=torch.float16),
+        sm70_fp8_prefill_exact_dense_workspace_ptr=42,
     )
     method = SimpleNamespace()
 

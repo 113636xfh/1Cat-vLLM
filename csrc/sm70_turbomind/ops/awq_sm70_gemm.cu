@@ -3519,7 +3519,7 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
-    torch::Tensor out, torch::Tensor dense_weight, torch::Tensor in_feats,
+    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor in_feats,
     torch::Tensor tm_weight, torch::Tensor tm_scales, int64_t group_size,
     int64_t k_ld, int64_t q_ld, bool gated_silu, int64_t min_prefill_m) {
   if (in_feats.size(0) < min_prefill_m) {
@@ -3528,11 +3528,11 @@ void fp8_gemm_sm70_prefill_dispatch_out(
     return;
   }
 
-  TORCH_CHECK(in_feats.dim() == 2 && dense_weight.dim() == 2,
+  TORCH_CHECK(in_feats.dim() == 2 && dense_weight_ptr != 0,
               "SM70 FP8 prefill dispatch expects rank-2 input and workspace.");
-  TORCH_CHECK(dense_weight.size(0) == in_feats.size(1) &&
-                  dense_weight.size(1) == tm_weight.size(1),
-              "SM70 FP8 prefill dispatch workspace shape mismatch.");
+  auto dense_weight = torch::from_blob(
+      reinterpret_cast<void*>(dense_weight_ptr),
+      {in_feats.size(1), tm_weight.size(1)}, in_feats.options());
   fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, group_size);
   if (gated_silu) {
     auto gate_up = at::mm(in_feats, dense_weight);
@@ -4876,12 +4876,12 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
-    torch::Tensor out, torch::Tensor dense_weight, torch::Tensor _in_feats,
+    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
     int64_t k_ld, int64_t q_ld, bool gated_silu, int64_t min_prefill_m) {
   vllm::awq_sm70::fp8_gemm_sm70_prefill_dispatch_out(
-      out, dense_weight, _in_feats, _kernel, _scaling_factors, group_size, k_ld,
-      q_ld, gated_silu, min_prefill_m);
+      out, dense_weight_ptr, _in_feats, _kernel, _scaling_factors, group_size,
+      k_ld, q_ld, gated_silu, min_prefill_m);
 }
 
 void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,

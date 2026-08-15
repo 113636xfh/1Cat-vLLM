@@ -23,6 +23,15 @@ The accepted implementation places the M decision in the opaque CUDA op
 layout into one shared 85 MiB FP16 KxN workspace, then uses `mm_out` or the
 exact gated-SiLU epilogue. M below 3920 stays in TurboMind.
 
+The first implementation passed a view of that workspace as a Tensor argument.
+Inductor lifted the large Tensor into the compiled graph and CUDA graph input
+handling reduced 1K/256 single-request throughput from about 60 to 19 tok/s;
+graph memory also grew from 0.26 to about 0.42 GiB/rank. The corrected ABI
+passes the stable CUDA address as an integer. A process-global strong reference
+keeps one workspace alive per device, and the C++ op only wraps that address for
+M at or above the threshold. Small-M decode returns to TurboMind before the
+workspace is wrapped.
+
 The default allowlist is TP4 plus the exact `(K,N)` shape for
 `gate_up_proj`, `down_proj`, `out_proj`, and `o_proj`. `qkv_proj` and
 `in_proj_qkvz` remain excluded because direct dense evaluation changed FP16
@@ -52,6 +61,19 @@ Matched chunk-15680 control and candidate requests preserve output hashes.
 | 128K | 53.575 s | 2446.5 |
 | 256K* | 163.472 s | 1602.0 |
 
+The corrected pointer ABI preserves decode and concurrency performance. These
+results use 64 independent 1K/256 requests per row and official sampling. Each
+row completed 64/64 requests; concurrency 4 was repeated because its first run
+measured 188.68 tok/s.
+
+| Concurrency | Output tok/s | Scale vs C1 | Parallel efficiency | Mean TPOT | P99 TPOT |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 60.44 | 1.00x | 100.0% | 15.16 ms | 15.32 ms |
+| 2 | 108.72 | 1.80x | 89.9% | 16.29 ms | 17.13 ms |
+| 4 | 192.39 | 3.18x | 79.6% | 16.88 ms | 19.58 ms |
+| 8 | 309.70 | 5.12x | 64.0% | 18.16 ms | 24.55 ms |
+| 16 | 412.35 | 6.82x | 42.6% | 23.03 ms | 38.57 ms |
+
 The remembered 128K/256K reference was Qwen3.6-27B-AWQ without prefix
 caching: 2517.6/1655.0 tok/s, not a same-model Qwen3.8-FP8 result. The current
 Qwen3.8 production contract is within 2.8%/3.2% of that cross-model reference.
@@ -62,8 +84,15 @@ Qwen3.8 production contract is within 2.8%/3.2% of that cross-model reference.
   projections.
 - 32K, 128K, and 256K candidate output hashes exactly match their controls.
   All short-sweep repeats also have stable hashes and `is_corrupted=false`.
+- The pointer-ABI microbenchmark is bitwise equal at M=1 and M=3920. M=1 is
+  0.01636 ms direct versus 0.01666 ms through dispatch; M=3920 is 1.062 ms
+  direct versus 0.800 ms through dispatch (1.33x).
+- A 6278-token natural prompt follows its final instruction, emits coherent
+  text, and stops naturally after 47 tokens on the corrected full-graph path.
 - Model residency is 7.57 GiB/rank. The 85 MiB shared workspace leaves
   19.18 GiB/rank for KV and an estimated 4.70x 256K cache capacity.
+- CUDA graph capture uses 0.26 GiB/rank after the pointer fix, matching the
+  exact-dense-off control instead of the regressed 0.42 GiB/rank path.
 - Compiled microbenchmarks prove both M=784 and M=3920 reach the same runtime
   dispatch op. M3920 and M7840 improve 1.31x and 1.46x with zero mismatch.
 
@@ -81,3 +110,4 @@ Qwen3.8 production contract is within 2.8%/3.2% of that cross-model reference.
 - Candidate short sweep: `/data/minimax-h3/task-cache/qwen38-130-prefill-recovery-20260815/candidate-dispatch/results/short-1k-64k.json`
 - Candidate long sweep: `/data/minimax-h3/task-cache/qwen38-130-prefill-recovery-20260815/candidate-dispatch/results/long-128k-256k.json`
 - Route trace: `/data/minimax-h3/task-cache/qwen38-130-prefill-recovery-20260815/candidate-dispatch/nsys/qwen38_fp8_dispatch_tp4_i32k_r2.nsys-rep`
+- Decode/concurrency regression fix: `/data/minimax-h3/task-cache/qwen38-130-concurrency-latest-20260815`

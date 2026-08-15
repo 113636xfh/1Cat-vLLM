@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import weakref
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -113,9 +112,8 @@ _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
 _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES = (
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
 )
-_sm70_fp8_prefill_dense_workspaces: weakref.WeakValueDictionary[
-    tuple[int, torch.dtype], torch.Tensor
-] = weakref.WeakValueDictionary()
+# Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
+_sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
 def _is_sm70_fp8_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
@@ -638,7 +636,9 @@ class Fp8LinearMethod(LinearMethodBase):
             ):
                 workspace = _get_sm70_fp8_prefill_exact_dense_workspace(tm_weight)
                 if workspace is not None:
-                    layer._sm70_fp8_prefill_exact_dense_workspace = workspace
+                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
+                        workspace.data_ptr()
+                    )
                     logger.info_once(
                         "SM70 FP8 exact-dense prefill path enabled with a bounded "
                         "85 MiB workspace."
@@ -800,16 +800,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 device=x.device,
                 dtype=x.dtype,
             )
-            prefill_workspace = getattr(
-                layer, "_sm70_fp8_prefill_exact_dense_workspace", None
+            prefill_workspace_ptr = getattr(
+                layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
             )
-            if prefill_workspace is not None and x_2d.dtype == torch.float16:
-                k = x_2d.shape[1]
-                n = layer.output_size_per_partition
-                prefill_weight = prefill_workspace[: k * n].view(k, n)
+            if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
                 sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
                     out_2d,
-                    prefill_weight,
+                    prefill_workspace_ptr,
                     x_2d,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -916,17 +913,13 @@ class Fp8LinearMethod(LinearMethodBase):
             scales = layer.sm70_fp8_gated_silu_scales
             k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
             q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
-        prefill_workspace = getattr(
-            layer, "_sm70_fp8_prefill_exact_dense_workspace", None
+        prefill_workspace_ptr = getattr(
+            layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
         )
-        if prefill_workspace is not None and x_2d.dtype == torch.float16:
-            n = layer.output_size_per_partition
-            prefill_weight = prefill_workspace[: x_2d.shape[1] * n].view(
-                x_2d.shape[1], n
-            )
+        if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
             sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
                 out_2d,
-                prefill_weight,
+                prefill_workspace_ptr,
                 x_2d,
                 weight,
                 scales,
