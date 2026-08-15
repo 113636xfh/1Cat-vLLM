@@ -756,6 +756,11 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       QK_SW_PIPELINE,
       XQATCQKPipelineSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>,
       XQATCSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>>;
+  // Keep the softmax P matrix in fp32 through the PV stage when KV precision
+  // is high enough that the fp16 round-trip rounding dominates (fp16 KV). On
+  // fp8_e5m2 KV the ~10-12% KV-quant error swamps it, so keep the original
+  // fp16-P store bit-exact there (the else arms below). Compile-time only.
+  constexpr bool kKeepPfp32 = (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16);
   constexpr int q_global_stride_uint4 = D / 8;
   constexpr int q_smem_stride_uint4 = SmemLayout::kQStride / 8;
   constexpr int kv_smem_stride_uint4 = SmemLayout::kKVStride / 8;
@@ -996,6 +1001,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       const unsigned mask = 0xffffffffu;
       float* sS_row_f = sS + row * kXQATCBlockN;
       __half* sP_row_h = sP + row * kXQATCBlockN;
+      float* sP_row_f = sS + row * kXQATCBlockN;  // 0012: fp32 P alias (fp16-KV)
       const int vec_cols = valid_k_rows >> 2;
       const int tail_start = vec_cols << 2;
       const int vec_col = thread_in_row;
@@ -1032,8 +1038,12 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
         const float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
         thread_sum += (e0 + e1) + (e2 + e3);
-        packed_exp0 = __float22half2_rn(make_float2(e0, e1));
-        packed_exp1 = __float22half2_rn(make_float2(e2, e3));
+        if constexpr (kKeepPfp32) {
+          reinterpret_cast<float4*>(sP_row_f)[vec_col] = make_float4(e0, e1, e2, e3);
+        } else {
+          packed_exp0 = __float22half2_rn(make_float2(e0, e1));
+          packed_exp1 = __float22half2_rn(make_float2(e2, e3));
+        }
       }
 
 #pragma unroll
@@ -1042,8 +1052,12 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const float v = (c < valid_k_rows) ? sS_row_f[c] : kXQANegInf;
         const float e = __expf(fmaxf(v - new_max, -80.0f));
         thread_sum += (c < valid_k_rows) ? e : 0.0f;
-        sP_row_h[c] =
-            (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
+        if constexpr (kKeepPfp32) {
+          sP_row_f[c] = (c < valid_k_rows) ? e : 0.0f;
+        } else {
+          sP_row_h[c] =
+              (c < valid_k_rows) ? __float2half_rn(e) : __float2half(0.f);
+        }
       }
 
 #pragma unroll
@@ -1058,12 +1072,15 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         row_sum_reg = exp_diff * old_sum + row_sum;
         row_max_reg = new_max;
       }
-      __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
-      if (vec_col < vec_cols) {
-        const int base_offset = vec_col * 2;
-        sP_half2[base_offset] = packed_exp0;
-        sP_half2[base_offset + 1] = packed_exp1;
+      if constexpr (!kKeepPfp32) {
+        __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
+        if (vec_col < vec_cols) {
+          const int base_offset = vec_col * 2;
+          sP_half2[base_offset] = packed_exp0;
+          sP_half2[base_offset + 1] = packed_exp1;
+        }
       }
+      // 0012 (fp16 KV): vec P store folded into the exp block above (fp32 float4)
 
       if (block_n > 0) {
 #pragma unroll
@@ -1098,12 +1115,18 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         if (tid < GROUP_SIZE * kXQATC256WideThreadsPerRow) {
           const int row = tid / kXQATC256WideThreadsPerRow;
           const __half* sP_row = sP + row * kXQATCBlockN + kv_tile_start;
+          const float* sP_row_f = sS + row * kXQATCBlockN + kv_tile_start;
 #pragma unroll
           for (int token = 0; token < kXQATCBlockN; ++token) {
             if (token >= valid_kv_tile_rows) {
               break;
             }
-            const float prob = __half2float(sP_row[token]);
+            float prob;
+            if constexpr (kKeepPfp32) {
+              prob = sP_row_f[token];
+            } else {
+              prob = __half2float(sP_row[token]);
+            }
             const __half* sV_row = sV + token * SmemLayout::kKVStride;
 #pragma unroll
             for (int d_iter = 0; d_iter < (kPVPanelDim / kWarpSize); ++d_iter) {
