@@ -369,7 +369,16 @@ python -m pip install -e . --no-build-isolation
 
 ![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-6.png)
 
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
+> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请联系微信号：YM_isi。
+
+## Roadmap
+
+1Cat-vLLM will continue to prioritize Tesla V100 / SM70, making modern LLM inference more usable, stable, and deployable on existing GPUs.
+
+- **Near term:** Complete Volta compatibility and validation for DeepSeek V4, GLM5, and other new model families, while improving long-context serving, quantization, multi-GPU parallelism, and runtime stability.
+- **Mid term:** Expand the Volta model support matrix with a focus on models up to 300B parameters, backed by reproducible performance, quality, and release validation.
+- **Long term:** Build on the Volta foundation and extend hardware support in stages: **Volta → Turing/Ampere → CDNA**, bringing sustainable LLM inference to a broader range of existing accelerators.
+
 
 ## Repository Notes
 
