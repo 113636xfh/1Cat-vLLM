@@ -349,7 +349,7 @@ def _time_cuda_call(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     times_ms: list[float] = []
     for _ in range(iters):
@@ -639,7 +639,7 @@ def _capture_outputs(
 ) -> dict[str, torch.Tensor]:
     for prepared in prepared_cases:
         prepared.run()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return {
         prepared.case.label: prepared.output.detach().cpu().clone()
         for prepared in prepared_cases
@@ -710,19 +710,23 @@ def _run_gated_silu_candidate(
     gate_up = torch.empty((m, n), dtype=torch.float16, device=device)
     baseline = torch.empty((m, out_features), dtype=torch.float16, device=device)
     fused = torch.empty_like(baseline)
+    has_standard_silu = hasattr(torch.ops._C, "silu_and_mul")
 
     def run_baseline() -> None:
         ops.awq_gemm_sm70_out(
             gate_up,
             x,
-            tm_weight,
-            tm_scales,
+            tm_weight if has_standard_silu else fused_weight,
+            tm_scales if has_standard_silu else fused_scales,
             group_size,
-            k_ld,
-            q_ld,
+            k_ld if has_standard_silu else fused_k_ld,
+            q_ld if has_standard_silu else fused_q_ld,
             False,
         )
-        torch.ops._C.silu_and_mul(baseline, gate_up)
+        if has_standard_silu:
+            torch.ops._C.silu_and_mul(baseline, gate_up)
+        else:
+            torch.ops._C.silu_and_mul_interleaved(baseline, gate_up)
 
     def run_fused() -> None:
         ops.awq_gemm_sm70_out(
@@ -738,7 +742,7 @@ def _run_gated_silu_candidate(
 
     run_baseline()
     run_fused()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     diff = (baseline - fused).float().abs()
     baseline_timing = _time_cuda_call(run_baseline, device, warmup, iters)
     fused_timing = _time_cuda_call(run_fused, device, warmup, iters)
@@ -756,6 +760,7 @@ def _run_gated_silu_candidate(
         "group_size": group_size,
         "tp_size": tp_size,
         "tp_rank": tp_rank,
+        "baseline_layout": "standard" if has_standard_silu else "interleaved",
         "baseline_gate_up_plus_silu": baseline_timing,
         "fused_gated_silu": fused_timing,
         "delta_mean_us": delta_us,
