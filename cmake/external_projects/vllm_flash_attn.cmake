@@ -35,6 +35,23 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           ${VLLM_FLASH_ATTN_SRC_DIR}
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
+elseif(VLLM_FLASH_ATTN_SM70)
+  find_program(PATCH_EXECUTABLE patch REQUIRED)
+  FetchContent_Declare(
+          vllm-flash-attn
+          GIT_REPOSITORY https://github.com/zhinianqin/flash-attention-v100.git
+          GIT_TAG c2eda5e6115b98c3ba4bfd181570668742eece22
+          GIT_PROGRESS TRUE
+          GIT_SUBMODULES csrc/cutlass
+          GIT_SUBMODULES_RECURSE TRUE
+          PATCH_COMMAND
+            ${PATCH_EXECUTABLE} --batch --forward -p1 -l
+            -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_pipeline.patch
+          COMMAND
+            ${PATCH_EXECUTABLE} --batch --forward -p1 -l
+            -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_splitkv3.patch
+          BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+  )
 else()
   FetchContent_Declare(
           vllm-flash-attn
