@@ -6216,14 +6216,11 @@ void awq_moe_single_token_sm70_out(
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       intermediate, compact_input, expert_offsets, dst_w13_ptrs_w_rows,
       dst_w13_ptrs_s_rows, top_k, w13_k, w13_n, group_size, true);
-  const bool use_weighted_reduce_epilogue = out.size(1) == w2_n;
-  if (use_weighted_reduce_epilogue) {
-    awq_moe_gemm_sm70_out_impl(sorted_output, intermediate, expert_offsets,
-                               dst_w2_ptrs_w_rows, dst_w2_ptrs_s_rows, top_k,
-                               w2_k, w2_n, group_size, false, torch::Tensor(),
-                               true, out, sorted_weights, true);
-    return;
-  }
+  // The weighted-reduce GEMM epilogue accumulates expert CTAs into the same
+  // FP16 output with atomicAdd. CTA arrival order is not deterministic, so
+  // repeated greedy requests can drift even with identical inputs. Materialize
+  // the eight expert rows and reduce them below in a fixed route order with
+  // FP32 FMA accumulation.
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       sorted_output, intermediate, expert_offsets, dst_w2_ptrs_w_rows,
       dst_w2_ptrs_s_rows, top_k, w2_k, w2_n, group_size, false);

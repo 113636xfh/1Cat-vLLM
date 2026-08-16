@@ -41507,3 +41507,53 @@ Interpretation:
   `MagicMock` during lazy custom-op import, followed by duplicate Torch-op
   registration; its other 10 tests pass. Do not treat those import-pollution
   failures as MLA numerical evidence.
+
+## 2026-08-16 Qwen3.6 35B AWQ compact-reduce determinism repair
+
+- Reproduced a real no-MTP output-quality defect on Qwen3.6-35B-A3B-AWQ,
+  TP2 V100, FP16 KV, greedy decoding, and the accepted Flash-V100/compile-graph
+  route. Identical requests could agree twice and then diverge on the third
+  request, typically after 156-226 output tokens. This is not the expected
+  numerical difference between FP8 KV and FP16 KV: FP8 KV was not used in this
+  reproduction.
+- Focused exclusions showed that the instability remained with CUDA Graph and
+  compile disabled, asynchronous scheduling disabled, custom all-reduce
+  disabled, TRITON_ATTN selected, and FlashQLA GDN decode disabled. Disabling
+  only `VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT` restored three-request
+  token identity, but reduced the diagnostic short-request decode result from
+  about 97-98 to 83.09 tok/s. Keep that switch as an isolation control, not as
+  the production repair.
+- The compact W2 path used `StoreMoeWeightedReduce`, where eight expert CTAs
+  independently performed FP16 `atomicAdd` operations into the same output
+  row. CTA arrival order is unspecified, and rounding after each FP16 atomic
+  made the result depend on scheduling. The small per-layer drift accumulated
+  until a low-margin greedy token flipped.
+- The repair retains compact W13 and W2 GEMMs, materializes the eight sorted
+  expert rows, and invokes the existing fixed route-order half2 reduction with
+  FP32 FMA accumulation. It removes only the early weighted atomic epilogue;
+  attention, GDN, routing weights, quantized weights, and FP16 KV math are
+  unchanged.
+- Operator checks at layers 1, 20, and 39 covered round-robin routing and
+  single experts 0, 17, and 255. All 24 fused-W13/SILU and final-weighted-output
+  reports were bitwise exact against the ordered reference, with no NaNs and no
+  nonzero elements. Evidence is
+  `/data/minimax-h3/task-cache/awq-deterministic-reduce-20260816/op-layers1-20-39-patterns.json`.
+- The exact control and repaired `_C` binaries have SHA256
+  `8df401ad...d3e9` and `c81a45e8...2127`. With compact, Flash-V100,
+  compile/CUDA Graph, custom all-reduce, and asynchronous scheduling all left
+  enabled, the control produced three different 256-token greedy hashes:
+  `7f235c1e...1211`, `83f78a66...f7aa`, and `9b907780...ecc9`. The repaired
+  binary produced `e385f7e8...90dd` three times and passed both full and
+  steady-state exact-token gates.
+- A matched 512-input/256-output performance request reported 255 steady decode
+  tokens. Pure decode was 97.262188 tok/s for the atomic control and 97.691431
+  tok/s for the ordered repair (`+0.441%`, neutral noise rather than a
+  regression). Prefill/TTFT were not included in that comparison. Artifacts
+  are `fullmodel-atomic-speed256.json` and `fullmodel-fixed-speed256.json`
+  under
+  `/data/minimax-h3/task-cache/awq-deterministic-reduce-20260816/`.
+- Hardened `run_sm70_quality_speed_matrix.py` to retain output token IDs and
+  require three same-process greedy requests instead of two. It also reports
+  the last-two-request steady-state result separately. The earlier two-request
+  gate could miss this scheduler-order defect and must not be cited as
+  sufficient evidence for the compact route.
