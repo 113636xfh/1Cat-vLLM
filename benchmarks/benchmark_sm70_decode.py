@@ -9,6 +9,7 @@ and SM70 gates so old-vs-latest no-MTP decode comparisons are reproducible.
 
 import argparse
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -36,6 +37,50 @@ def _module_file(module_name: str) -> str | None:
 def _module_realpath(module_name: str) -> str | None:
     module_file = _module_file(module_name)
     return str(Path(module_file).resolve()) if module_file is not None else None
+
+
+def _sm70_fa2_d256_prefill_status(torch: Any) -> dict[str, Any]:
+    """Report whether the vendored FA2 library exposes exact SM70 D256 ops."""
+    required_ops = (
+        "sm70_d256_splitd_n32_dense_fwd",
+        "sm70_d256_splitd_n32_paged_fwd",
+    )
+    optional_ops = ("sm70_d256_splitd_n32_dense_splitkv3_fwd",)
+    try:
+        importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        return {
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "extension_file": None,
+            "extension_realpath": None,
+            "required_ops": {name: False for name in required_ops},
+            "optional_ops": {name: False for name in optional_ops},
+        }
+
+    extension_file = _module_file("vllm.vllm_flash_attn._vllm_fa2_C")
+    namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    required_status = {
+        name: namespace is not None and hasattr(namespace, name)
+        for name in required_ops
+    }
+    optional_status = {
+        name: namespace is not None and hasattr(namespace, name)
+        for name in optional_ops
+    }
+    missing_ops = [name for name, present in required_status.items() if not present]
+    return {
+        "available": not missing_ops,
+        "error": None
+        if not missing_ops
+        else "missing required operators: " + ", ".join(missing_ops),
+        "extension_file": extension_file,
+        "extension_realpath": (
+            str(Path(extension_file).resolve()) if extension_file is not None else None
+        ),
+        "required_ops": required_status,
+        "optional_ops": optional_status,
+    }
 
 
 def _parse_scalar(value: str) -> Any:
@@ -1609,6 +1654,7 @@ def _write_results(
             "python_file": _module_file("flash_attn_v100"),
             "cuda_extension_file": _module_file("flash_attn_v100_cuda"),
             "cuda_extension_realpath": _module_realpath("flash_attn_v100_cuda"),
+            "fa2_d256_prefill": _sm70_fa2_d256_prefill_status(torch),
         },
         "torch": {
             "version": torch.__version__,
@@ -1760,6 +1806,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wrap only measured repeats in cudaProfilerStart/Stop.",
     )
+    parser.add_argument(
+        "--require-sm70-fa2-d256-prefill",
+        action="store_true",
+        help=(
+            "Fail before model loading unless the active vendored FA2 extension "
+            "exports the exact SM70 D256 dense and paged prefill operators."
+        ),
+    )
     parser.add_argument("--engine-arg", action="append", default=[])
     return parser.parse_args()
 
@@ -1780,6 +1834,14 @@ def main() -> int:
 
     import vllm
     from vllm import LLM, SamplingParams
+
+    if args.require_sm70_fa2_d256_prefill:
+        fa2_status = _sm70_fa2_d256_prefill_status(torch)
+        if not fa2_status["available"]:
+            raise RuntimeError(
+                "Required SM70 FA2 D256 prefill route is unavailable: "
+                f"{fa2_status['error']}"
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model),

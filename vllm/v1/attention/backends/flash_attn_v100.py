@@ -828,8 +828,17 @@ def _get_sm70_splitd_d256_ops():
             None,
         )
         _sm70_splitd_d256_ops = (dense, paged, splitkv3)
-    except (AttributeError, ImportError, RuntimeError):
+    except (AttributeError, ImportError, RuntimeError) as exc:
         _sm70_splitd_d256_ops = None
+        logger.warning_once(
+            "SM70 D256 exact-prefill operators are unavailable (%s: %s). "
+            "Long prefill will use a slower fallback. Verify that the active "
+            "vllm package contains a loadable _vllm_fa2_C extension with the "
+            "sm70_d256_splitd_n32_dense_fwd and "
+            "sm70_d256_splitd_n32_paged_fwd operators.",
+            type(exc).__name__,
+            exc,
+        )
     return _sm70_splitd_d256_ops
 
 

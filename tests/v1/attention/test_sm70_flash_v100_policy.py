@@ -674,10 +674,18 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     )
 
     fake_ops = SimpleNamespace(_vllm_fa2_C=SimpleNamespace())
+    warnings: list[str] = []
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
+    monkeypatch.setattr(
+        flash_v100.logger,
+        "warning_once",
+        lambda message, *args: warnings.append(message % args),
+    )
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)
     assert flash_v100._get_sm70_splitd_d256_ops() is None
+    assert len(warnings) == 1
+    assert "sm70_d256_splitd_n32_dense_fwd" in warnings[0]
 
     dense = object()
     paged = object()
