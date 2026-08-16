@@ -47,6 +47,8 @@ constexpr int kXQARouteShortSeqLens = -1;
 constexpr int kXQARouteLongSeqLens = 1;
 constexpr int kXQARouteP1024Sawtooth = 4;
 constexpr int kXQARouteP256Sawtooth = 5;
+constexpr int kXQARouteP1024SawtoothMid = 6;
+constexpr int kXQARouteP1024SawtoothFinal = 7;
 // The dense 256/128-half strides alias Volta shared-memory banks in the
 // WMMA A/B fragment loads. Both padded strides remain 16-byte aligned.
 constexpr int kXQATC256WidePaddedQStride = 264;
@@ -143,6 +145,46 @@ bool xqa_g6_dual_cta_enabled() {
   return value != nullptr && value[0] == '1';
 }
 
+bool xqa_e5m2_g6_dual_cta_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_e5m2_g6_split_reduce_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_e5m2_partition_page_ids_enabled() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_e5m2_pair_load_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD");
+  return value == nullptr || value[0] != '0';
+}
+
+int xqa_e5m2_p1024_begin() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN");
+  return value == nullptr ? 61633 : std::max(1, std::atoi(value));
+}
+
+int xqa_e5m2_scalar_xqa_seq_len() {
+  const char* value = std::getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN");
+  return value == nullptr ? 16384 : std::max(1, std::atoi(value));
+}
+
+bool xqa_e5m2_g6_dual_cta_trace_enabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
+}
+
 bool xqa_mtp5_dual_cta_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA");
   return value == nullptr || value[0] == '1';
@@ -177,7 +219,7 @@ bool decode_partition_size_overridden() {
 
 bool xqa_g6_qk_pipeline_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 
 int xqa_g6_qk_pipeline_warps() {
@@ -297,6 +339,10 @@ __device__ __forceinline__ bool xqa_seq_len_route_active(
   } else if constexpr (SEQ_LEN_ROUTE == kXQARouteP256Sawtooth) {
     return seq_len < route_seq_len_begin ||
            (seq_len >= route_seq_len_end && seq_len < route_seq_len_final);
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteP1024SawtoothMid) {
+    return seq_len >= route_seq_len_begin && seq_len < route_seq_len_end;
+  } else if constexpr (SEQ_LEN_ROUTE == kXQARouteP1024SawtoothFinal) {
+    return seq_len >= route_seq_len_final;
   }
   return true;
 }
@@ -443,7 +489,8 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT, int NUM_THREADS,
-          int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16>
+          int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16,
+          bool E5M2_PAIR_LOAD = false>
 __device__ __forceinline__ void load_xqa_tc_kv_panel(
     __half* __restrict__ shared_kv, const void* __restrict__ kv_cache,
     const int* __restrict__ page_ids, const int valid_kv_tile_rows,
@@ -452,17 +499,65 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx = threadIdx.x) {
-  const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
-  for (int copy_idx = copy_thread_idx; copy_idx < copy_count;
-       copy_idx += NUM_THREADS) {
-    const int row = copy_idx / panel_d_stride_uint4;
-    const int vec_col = copy_idx % panel_d_stride_uint4;
-    shared_vec[row * kv_smem_stride_uint4 + vec_col] =
-        load_xqa_tc_kv_vector<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, KV_DTYPE>(
-            kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
-            tile_page_offset, kv_tile_start, block_size, kv_head_idx,
-            block_stride, token_stride, head_stride, panel_offset);
+  if constexpr (E5M2_PAIR_LOAD) {
+    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+                  "Paired XQA loads are only valid for FP8 E5M2 KV");
+    const int pair_stride = panel_d_stride_uint4 / 2;
+    const int pair_count = valid_kv_tile_rows * pair_stride;
+    for (int pair_idx = copy_thread_idx; pair_idx < pair_count;
+         pair_idx += NUM_THREADS) {
+      const int row = pair_idx / pair_stride;
+      const int vec_pair = pair_idx % pair_stride;
+      const int token_offset = tile_page_offset + kv_tile_start + row;
+      int logical_block;
+      int block_offset;
+      if constexpr (BLOCK_SIZE == 16) {
+        logical_block = token_offset >> 4;
+        block_offset = token_offset & 15;
+      } else if constexpr (BLOCK_SIZE == 784) {
+        logical_block = token_offset / 784;
+        block_offset = token_offset - logical_block * 784;
+      } else {
+        logical_block = token_offset / block_size;
+        block_offset = token_offset % block_size;
+      }
+      const int physical_block = page_ids[logical_block];
+      int64_t physical_offset;
+      if constexpr (CONTIGUOUS_HKV1_LAYOUT) {
+        constexpr int kHeadDim = 256;
+        constexpr int kBlockStride = 16 * kHeadDim;
+        physical_offset = static_cast<int64_t>(physical_block) * kBlockStride +
+                          static_cast<int64_t>(block_offset) * kHeadDim +
+                          panel_offset;
+      } else {
+        physical_offset = static_cast<int64_t>(physical_block) * block_stride +
+                          static_cast<int64_t>(block_offset) * token_stride +
+                          static_cast<int64_t>(kv_head_idx) * head_stride +
+                          panel_offset;
+      }
+      const uint4 raw = __ldg(reinterpret_cast<const uint4*>(kv_cache) +
+                              physical_offset / 16 + vec_pair);
+      const int shared_offset = row * kv_smem_stride_uint4 + vec_pair * 2;
+      const uint64_t raw_lo =
+          static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
+      shared_vec[shared_offset] = fp8_e5m2_vector_to_half8(raw_lo);
+      const uint64_t raw_hi =
+          static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
+      shared_vec[shared_offset + 1] = fp8_e5m2_vector_to_half8(raw_hi);
+    }
+  } else {
+    const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
+    for (int copy_idx = copy_thread_idx; copy_idx < copy_count;
+         copy_idx += NUM_THREADS) {
+      const int row = copy_idx / panel_d_stride_uint4;
+      const int vec_col = copy_idx % panel_d_stride_uint4;
+      shared_vec[row * kv_smem_stride_uint4 + vec_col] =
+          load_xqa_tc_kv_vector<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, KV_DTYPE>(
+              kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
+              tile_page_offset, kv_tile_start, block_size, kv_head_idx,
+              block_stride, token_stride, head_stride, panel_offset);
+    }
   }
 }
 
@@ -567,7 +662,8 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
   }
 }
 
-template <int D, int PARTITION_SIZE, int KV_DTYPE>
+template <int D, int PARTITION_SIZE, int KV_DTYPE,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, __half* __restrict__ tmp_out,
@@ -584,7 +680,8 @@ __global__ void flash_attention_decode_partition_kernel(
     const int64_t v_block_stride, const int64_t v_token_stride,
     const int64_t v_head_stride, const float softmax_scale, const float k_scale,
     const float v_scale, const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right, const int route_seq_len_begin,
+    const int route_seq_len_end, const int route_seq_len_final) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -595,6 +692,11 @@ __global__ void flash_attention_decode_partition_kernel(
   }
 
   const int seq_len = seq_lens[batch_idx];
+  if (!xqa_seq_len_route_active<SEQ_LEN_ROUTE>(seq_len, route_seq_len_begin,
+                                               route_seq_len_end,
+                                               route_seq_len_final)) {
+    return;
+  }
   const int start_token_idx = partition_idx * PARTITION_SIZE;
   if (seq_len <= 0 || start_token_idx >= seq_len) {
     return;
@@ -724,7 +826,8 @@ __global__ void flash_attention_decode_partition_kernel(
 template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM, int NUM_THREADS,
           int MIN_BLOCKS_PER_SM, int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           bool ALIGNED_PADDED_SMEM, int KV_DTYPE,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
+          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false>
 __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     flash_attention_decode_xqa_tc_partition_kernel_256_wide(
         const __half* __restrict__ q, const void* __restrict__ k_cache,
@@ -778,7 +881,6 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
                                               NUM_THREADS == 8 * kWarpSize)),
       "The QK software pipeline requires a six- or eight-warp G6 "
       "kernel");
-
   const int batch_idx = blockIdx.x;
   const int kv_head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -855,14 +957,29 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   }
   __syncthreads();
 
+  int partition_start_page = 0;
+  int partition_page_offset = 0;
+  if constexpr (PARTITION_PAGE_IDS) {
+    partition_start_page = start_token_idx / block_size;
+    partition_page_offset = start_token_idx - partition_start_page * block_size;
+    const int partition_page_count =
+        (partition_page_offset + part_tokens + block_size - 1) / block_size;
+    for (int idx = tid; idx < partition_page_count; idx += NUM_THREADS) {
+      smem.page_ids[idx] = __ldg(&block_table_seq[partition_start_page + idx]);
+    }
+    __syncthreads();
+  }
+
   for (int block_n = 0; block_n < num_k_tiles; ++block_n) {
     const int tile_token_start = start_token_idx + block_n * kXQATCBlockN;
     const int valid_k_rows =
         min(kXQATCBlockN, part_tokens - block_n * kXQATCBlockN);
-    int start_page;
+    int start_page = partition_start_page;
     int tile_page_offset;
-    int page_count;
-    if constexpr (BLOCK_SIZE == 16) {
+    int page_count = 0;
+    if constexpr (PARTITION_PAGE_IDS) {
+      tile_page_offset = partition_page_offset + block_n * kXQATCBlockN;
+    } else if constexpr (BLOCK_SIZE == 16) {
       start_page = tile_token_start >> 4;
       tile_page_offset = tile_token_start & 15;
       page_count = (tile_page_offset + valid_k_rows + 15) >> 4;
@@ -877,10 +994,12 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
           (tile_page_offset + valid_k_rows + block_size - 1) / block_size;
     }
 
-    for (int idx = tid; idx < page_count; idx += NUM_THREADS) {
-      smem.page_ids[idx] = __ldg(&block_table_seq[start_page + idx]);
+    if constexpr (!PARTITION_PAGE_IDS) {
+      for (int idx = tid; idx < page_count; idx += NUM_THREADS) {
+        smem.page_ids[idx] = __ldg(&block_table_seq[start_page + idx]);
+      }
+      __syncthreads();
     }
-    __syncthreads();
 
     for (int kv_tile_start = 0; kv_tile_start < valid_k_rows;
          kv_tile_start += kXQATCBlockN) {
@@ -949,7 +1068,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         for (int panel_idx = 0; panel_idx < kNumQKPanels; ++panel_idx) {
           const int panel_offset = panel_idx * kQKPanelDim;
           load_xqa_tc_kv_panel<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, NUM_THREADS,
-                               KV_DTYPE>(
+                               KV_DTYPE, E5M2_PAIR_LOAD>(
               sK, k_cache, smem.page_ids, valid_kv_tile_rows,
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
@@ -1098,7 +1217,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int valid_kv_tile_rows =
             min(kXQATCBlockN, valid_k_rows - kv_tile_start);
         load_xqa_tc_kv_panel<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, NUM_THREADS,
-                             KV_DTYPE>(
+                             KV_DTYPE, E5M2_PAIR_LOAD>(
             sV, v_cache, smem.page_ids, valid_kv_tile_rows,
             pv_panel_d_stride_uint4, kv_smem_stride_uint4, tile_page_offset,
             kv_tile_start, block_size, kv_head_idx, v_block_stride,
@@ -1916,7 +2035,8 @@ __global__ void flash_attention_decode_qk_scores_kernel(
   }
 }
 
-template <int D, int PARTITION_SIZE, int KV_DTYPE>
+template <int D, int PARTITION_SIZE, int KV_DTYPE,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
 void launch_flash_attention_decode_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -1924,7 +2044,9 @@ void launch_flash_attention_decode_paged(
     const at::Tensor& active_num_partitions, const float softmax_scale,
     const int launch_num_partitions, const float k_scale, const float v_scale,
     const int window_size_left, const int window_size_right,
-    cudaStream_t stream) {
+    cudaStream_t stream, const int route_seq_len_begin = 0,
+    const int route_seq_len_end = 0, const int route_seq_len_final = 0,
+    const bool launch_reduce = true) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -1938,7 +2060,8 @@ void launch_flash_attention_decode_paged(
   const size_t reduce_shared_mem =
       static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
 
-  flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE>
+  flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE,
+                                          SEQ_LEN_ROUTE>
       <<<partition_grid, block, 0, stream>>>(
           reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
           k_cache.data_ptr(), v_cache.data_ptr(),
@@ -1951,7 +2074,12 @@ void launch_flash_attention_decode_paged(
           tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
           k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
           v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-          softmax_scale, k_scale, v_scale, window_size_left, window_size_right);
+          softmax_scale, k_scale, v_scale, window_size_left, window_size_right,
+          route_seq_len_begin, route_seq_len_end, route_seq_len_final);
+
+  if (!launch_reduce) {
+    return;
+  }
 
   flash_attention_decode_reduce_kernel<D, PARTITION_SIZE>
       <<<reduce_grid, block, reduce_shared_mem, stream>>>(
@@ -2022,7 +2150,8 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           int NUM_THREADS = kXQATC256WideThreads, int MIN_BLOCKS_PER_SM = 1,
           int BLOCK_SIZE = 0, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool ALIGNED_PADDED_SMEM = false,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
+          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -2049,7 +2178,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
         (void*)flash_attention_decode_xqa_tc_partition_kernel_256_wide<        \
             PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,              \
             MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,             \
-            ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE>;     \
+            ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,      \
+            PARTITION_PAGE_IDS, E5M2_PAIR_LOAD>;                               \
     cudaFuncSetAttribute(partition_kernel,                                     \
                          cudaFuncAttributeMaxDynamicSharedMemorySize,          \
                          shared_mem);                                          \
@@ -2061,7 +2191,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     flash_attention_decode_xqa_tc_partition_kernel_256_wide<                   \
         PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,                  \
         MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,                 \
-        ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE>          \
+        ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,          \
+        PARTITION_PAGE_IDS, E5M2_PAIR_LOAD>                                    \
         <<<partition_grid, NUM_THREADS, shared_mem, stream>>>(                 \
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),           \
             k_cache.data_ptr(), v_cache.data_ptr(),                            \
@@ -2078,7 +2209,11 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             route_seq_len_end, route_seq_len_final);                           \
   } while (0)
 
-  if (k_cache.scalar_type() == at::kByte) {
+  if constexpr (E5M2_PAIR_LOAD) {
+    TORCH_CHECK(k_cache.scalar_type() == at::kByte,
+                "Paired XQA loads require FP8 E5M2 KV cache");
+    LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
+  } else if (k_cache.scalar_type() == at::kByte) {
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
   } else {
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP16);
@@ -2561,10 +2696,46 @@ at::Tensor flash_attention_decode_paged_xqa(
       k_cache.size(2) > 0 &&
       kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
       xqa_mtp5_dual_cta_enabled();
+  const bool use_e5m2_g6_dual_cta =
+      q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
+      k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+      k_cache.size(2) == 1 && k_cache.scalar_type() == at::kByte &&
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
+      !decode_partition_size_overridden() && xqa_e5m2_g6_dual_cta_enabled() &&
+      xqa_e5m2_g6_split_reduce_enabled();
+  const int e5m2_g6_dual_cta_seq_len =
+      use_e5m2_g6_dual_cta
+          ? at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount *
+                    1024 +
+                1
+          : 0;
+  const int e5m2_p1024_begin =
+      use_e5m2_g6_dual_cta ? xqa_e5m2_p1024_begin() : 0;
+  const int e5m2_scalar_xqa_seq_len =
+      use_e5m2_g6_dual_cta
+          ? std::min(xqa_e5m2_scalar_xqa_seq_len(), e5m2_p1024_begin)
+          : 0;
+  TORCH_CHECK(
+      !use_e5m2_g6_dual_cta || e5m2_p1024_begin < e5m2_g6_dual_cta_seq_len,
+      "Invalid E5M2 G6 partition thresholds: ", e5m2_p1024_begin, ", ",
+      e5m2_g6_dual_cta_seq_len);
+  const int e5m2_p1024_launch_num_partitions = (launch_num_partitions + 3) / 4;
+  const int e5m2_p1024_one_cta_launch_num_partitions =
+      use_e5m2_g6_dual_cta
+          ? std::min(e5m2_p1024_launch_num_partitions,
+                     at::cuda::getDeviceProperties(q.get_device())
+                         ->multiProcessorCount)
+          : 0;
+  const bool use_e5m2_partition_page_ids =
+      use_e5m2_g6_dual_cta && xqa_e5m2_partition_page_ids_enabled();
+  const bool use_e5m2_pair_load =
+      use_e5m2_partition_page_ids && xqa_e5m2_pair_load_enabled();
   const bool use_g6_dual_cta =
       use_g6_p1024_auto || use_g6_p1024_sawtooth || use_mtp5_dual_cta ||
+      use_e5m2_g6_dual_cta ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
   const bool use_split_reduce = use_g6_p1024_auto || use_g6_p1024_sawtooth ||
+                                use_e5m2_g6_dual_cta ||
                                 (use_g6_dual_cta && xqa_split_reduce_enabled());
   const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
   const bool supports_block16_contiguous_layout =
@@ -2632,9 +2803,24 @@ at::Tensor flash_attention_decode_paged_xqa(
       !traced_g6_qk_pipeline) {
     TORCH_WARN(
         "Flash-V100 XQA G6 fp16-KV QK K64 producer/consumer "
-        "pipeline active; warps=",
+        "pipeline active for the mid p1024 range with baseline final-range "
+        "fallback; warps=",
         g6_qk_pipeline_warps);
     traced_g6_qk_pipeline = true;
+  }
+  static bool traced_e5m2_g6_dual_cta = false;
+  if (xqa_e5m2_g6_dual_cta_trace_enabled() && use_e5m2_g6_dual_cta &&
+      !traced_e5m2_g6_dual_cta) {
+    TORCH_WARN(
+        "Flash-V100 XQA E5M2 G6 device-side p256/p1024 route active; "
+        "thresholds=",
+        e5m2_p1024_begin, ", ", e5m2_g6_dual_cta_seq_len, ", KV shape [blocks,",
+        k_cache.size(1), ",", k_cache.size(2), ",", k_cache.size(3),
+        "], split_reduce=", use_split_reduce,
+        ", partition_page_ids=", use_e5m2_partition_page_ids,
+        ", pair_load=", use_e5m2_pair_load,
+        ", scalar_xqa_seq_len=", e5m2_scalar_xqa_seq_len);
+    traced_e5m2_g6_dual_cta = true;
   }
   static bool traced_aligned_padded_smem = false;
   if (xqa_aligned_padded_smem_trace_enabled() && use_aligned_padded_smem &&
@@ -2679,13 +2865,102 @@ at::Tensor flash_attention_decode_paged_xqa(
     }                                                                    \
   } while (0)
 
-  if (use_g6_p1024_sawtooth) {
+  if (use_e5m2_g6_dual_cta) {
+    launch_flash_attention_decode_paged<
+        256, 256, flash_v100::KV_CACHE_DTYPE_FP8_E5M2, kXQARouteShortSeqLens>(
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+        exp_sums, active_num_partitions, softmax_scale, launch_num_partitions,
+        k_scale, v_scale, window_size_left, window_size_right, stream,
+        e5m2_scalar_xqa_seq_len, 0, 0, false);
+    if (use_e5m2_pair_load) {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid, false, true, true>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, split_reduce_dim_tile, stream,
+          e5m2_scalar_xqa_seq_len, e5m2_p1024_begin, 0, false);
+    } else if (use_e5m2_partition_page_ids) {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid, false, true>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, split_reduce_dim_tile, stream,
+          e5m2_scalar_xqa_seq_len, e5m2_p1024_begin, 0, false);
+    } else {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, split_reduce_dim_tile, stream,
+          e5m2_scalar_xqa_seq_len, e5m2_p1024_begin, 0, false);
+    }
+    if (use_e5m2_partition_page_ids) {
+      if (use_e5m2_pair_load) {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATC256WideThreads, 1, 0, false, false,
+            kXQARouteP1024SawtoothMid, false, true, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, e5m2_p1024_one_cta_launch_num_partitions, false,
+            split_reduce_dim_tile, stream, e5m2_p1024_begin,
+            e5m2_g6_dual_cta_seq_len, 0, false);
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATCG6DualCtaThreads, 2, 0, false, false,
+            kXQARouteLongSeqLens, false, true, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, e5m2_p1024_launch_num_partitions, false,
+            split_reduce_dim_tile, stream, e5m2_g6_dual_cta_seq_len, 0, 0,
+            false);
+      } else {
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATC256WideThreads, 1, 0, false, false,
+            kXQARouteP1024SawtoothMid, false, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, e5m2_p1024_one_cta_launch_num_partitions, false,
+            split_reduce_dim_tile, stream, e5m2_p1024_begin,
+            e5m2_g6_dual_cta_seq_len, 0, false);
+        launch_flash_attention_decode_paged_xqa_tc_256_wide<
+            1024, 6, false, kXQATCG6DualCtaThreads, 2, 0, false, false,
+            kXQARouteLongSeqLens, false, true>(
+            q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
+            v_scale, e5m2_p1024_launch_num_partitions, false,
+            split_reduce_dim_tile, stream, e5m2_g6_dual_cta_seq_len, 0, 0,
+            false);
+      }
+    } else {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          1024, 6, false, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteP1024SawtoothMid>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          e5m2_p1024_one_cta_launch_num_partitions, false,
+          split_reduce_dim_tile, stream, e5m2_p1024_begin,
+          e5m2_g6_dual_cta_seq_len, 0, false);
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          1024, 6, false, kXQATCG6DualCtaThreads, 2, 0, false, false,
+          kXQARouteLongSeqLens>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          e5m2_p1024_launch_num_partitions, false, split_reduce_dim_tile,
+          stream, e5m2_g6_dual_cta_seq_len, 0, 0, false);
+    }
+    launch_flash_attention_decode_xqa_split_reduce<0>(
+        out, seq_lens, tmp_out, max_logits, exp_sums, launch_num_partitions,
+        split_reduce_dim_tile, stream, e5m2_p1024_begin,
+        e5m2_g6_dual_cta_seq_len, e5m2_g6_dual_cta_seq_len);
+  } else if (use_g6_p1024_sawtooth) {
     const int p1024_launch_num_partitions = (launch_num_partitions + 3) / 4;
     if (use_g6_qk_pipeline) {
       if (g6_qk_pipeline_warps == 8) {
         launch_flash_attention_decode_paged_xqa_tc_256_wide<
             1024, 6, false, kXQATCG6Pipeline8WarpThreads, 2, 784, false, false,
-            kXQARouteP1024Sawtooth, true>(
+            kXQARouteP1024SawtoothMid, true>(
             q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
             max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
             v_scale, p1024_launch_num_partitions, false, split_reduce_dim_tile,
@@ -2695,7 +2970,7 @@ at::Tensor flash_attention_decode_paged_xqa(
       } else {
         launch_flash_attention_decode_paged_xqa_tc_256_wide<
             1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
-            kXQARouteP1024Sawtooth, true>(
+            kXQARouteP1024SawtoothMid, true>(
             q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
             max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale,
             v_scale, p1024_launch_num_partitions, false, split_reduce_dim_tile,
@@ -2703,6 +2978,15 @@ at::Tensor flash_attention_decode_paged_xqa(
             g6_p1024_sawtooth_p256_long_seq_len,
             g6_p1024_sawtooth_p1024_final_seq_len, false);
       }
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,
+          kXQARouteP1024SawtoothFinal>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          p1024_launch_num_partitions, false, split_reduce_dim_tile, stream,
+          g6_p1024_sawtooth_p1024_mid_seq_len,
+          g6_p1024_sawtooth_p256_long_seq_len,
+          g6_p1024_sawtooth_p1024_final_seq_len, false);
     } else {
       launch_flash_attention_decode_paged_xqa_tc_256_wide<
           1024, 6, false, kXQATCG6DualCtaThreads, 2, 784, false, false,

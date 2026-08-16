@@ -6,9 +6,40 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+from vllm.v1.attention.ops.triton_decode_attention import (
+    _decode_grouped_block_size,
+    decode_attention_fwd,
+)
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("is_hip", "is_mla", "block_dmodel", "is_sm70", "expected"),
+    [
+        (True, False, 128, False, 16),
+        (False, True, 512, True, 16),
+        (False, True, 512, False, 32),
+        (False, True, 256, True, 32),
+        (False, False, 512, True, 32),
+    ],
+)
+def test_decode_grouped_block_size_is_sm70_scoped(
+    is_hip,
+    is_mla,
+    block_dmodel,
+    is_sm70,
+    expected,
+):
+    assert (
+        _decode_grouped_block_size(
+            is_hip=is_hip,
+            is_mla=is_mla,
+            block_dmodel=block_dmodel,
+            is_sm70=is_sm70,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize("B", [3, 5])

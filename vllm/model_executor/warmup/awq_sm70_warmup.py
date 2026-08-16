@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -50,7 +51,11 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
         and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS
         and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY
     )
-    fp8_dynamic = has_fp8_dense and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+    fp8_dynamic = (
+        has_fp8_dense
+        and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+        and not envs.VLLM_SM70_FP8_REUSE_IMPORTED_CACHE
+    )
     mxfp4_dynamic = (
         "mxfp4" in fp4_kinds or has_mxfp4_moe
     ) and envs.VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES
@@ -100,6 +105,79 @@ def _save_lut_cache(device: torch.device, skip_export: bool = False) -> int:
     except Exception as exc:
         logger.warning("SM70 GEMM LUT export failed to %s (%s).", path, exc)
         return 0
+
+
+def _export_lut_bytes(device: torch.device) -> tuple[bytes | None, int]:
+    if not hasattr(torch.ops._C, "sm70_gemm_export_cache"):
+        return None, 0
+    device_hint = torch.empty(0, dtype=torch.uint8, device=device)
+    with tempfile.TemporaryDirectory(prefix="vllm-sm70-gemm-export-") as tmpdir:
+        path = Path(tmpdir) / "gemm-lut.bin"
+        records = int(sm70_ops.sm70_gemm_export_cache(device_hint, str(path)))
+        if records <= 0 or not path.exists():
+            return None, records
+        return path.read_bytes(), records
+
+
+def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
+    if not hasattr(torch.ops._C, "sm70_gemm_import_cache"):
+        return 0
+    device_hint = torch.empty(0, dtype=torch.uint8, device=device)
+    with tempfile.TemporaryDirectory(prefix="vllm-sm70-gemm-import-") as tmpdir:
+        path = Path(tmpdir) / "gemm-lut.bin"
+        path.write_bytes(payload)
+        return int(sm70_ops.sm70_gemm_import_cache(device_hint, str(path)))
+
+
+def _warmup_fp8_dense_layers_coordinated(
+    layers: list[tuple[torch.nn.Module, bool]],
+    m_values: list[int],
+    device: torch.device,
+) -> int:
+    if not layers:
+        return 0
+    if (
+        not envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+        or not envs.VLLM_SM70_FP8_COORDINATED_TUNING
+    ):
+        return _warmup_fp8_dense_layers(layers, m_values)
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    if tp_group.world_size <= 1:
+        return _warmup_fp8_dense_layers(layers, m_values)
+
+    is_leader = tp_group.rank_in_group == 0
+    if is_leader:
+        _warmup_fp8_dense_layers(layers, m_values)
+        torch.accelerator.synchronize(device)
+        payload, exported_records = _export_lut_bytes(device)
+    else:
+        payload = None
+        exported_records = 0
+
+    payload = tp_group.broadcast_object(payload, src=0)
+    if payload is None:
+        logger.warning(
+            "SM70 FP8 coordinated tuning produced no LUT; rank %d is "
+            "falling back to local tuning.",
+            tp_group.rank_in_group,
+        )
+        return _warmup_fp8_dense_layers(layers, m_values)
+
+    imported_records = (
+        exported_records if is_leader else _import_lut_bytes(device, payload)
+    )
+    tp_group.barrier()
+    calls = _warmup_fp8_dense_layers(layers, m_values)
+    torch.accelerator.synchronize(device)
+    logger.info(
+        "SM70 FP8 coordinated tuning loaded %d rank0 LUT records on rank %d.",
+        imported_records,
+        tp_group.rank_in_group,
+    )
+    return calls
 
 
 def _silu_and_mul_w13(
@@ -708,7 +786,9 @@ def sm70_awq_warmup(worker: Worker) -> None:
         return
 
     device = worker.device
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (7, 0):
+    if device is None or device.type != "cuda":
+        return
+    if torch.cuda.get_device_capability(device) != (7, 0):
         return
 
     model = worker.get_model()
@@ -761,12 +841,16 @@ def sm70_awq_warmup(worker: Worker) -> None:
     )
     with torch.inference_mode():
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
-        fp8_dense_calls = _warmup_fp8_dense_layers(fp8_dense_layers, m_values)
+        fp8_dense_calls = _warmup_fp8_dense_layers_coordinated(
+            fp8_dense_layers,
+            m_values,
+            device,
+        )
         fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
         moe_stage_calls = _warmup_moe_dense_stage_layers(moe_layers, moe_token_counts)
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
         mxfp4_moe_stage_calls = _warmup_mxfp4_moe_b1_layers(mxfp4_moe_layers)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     logger.info(
         "SM70 TurboMind warmup finished (%d AWQ dense calls, %d FP8 dense "
         "calls, %d FP4 dense calls, %d MoE stage calls, "
