@@ -41317,3 +41317,33 @@ Interpretation:
   `/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/results/qwen38-27b-fp8-mtp4-control-off-tp4-e5m2-64k-o512-warm.json`.
   Do not repeat the older release-vs-candidate comparison as evidence for this
   compile entry.
+
+## 2026-08-16 XQA FP16 probability-handoff audit
+
+- Audited PR 210 on current main `4ba41b32ac`. The change keeps softmax
+  probabilities in FP32 through the scalar PV loop only for FP16 KV. The
+  FP8-E5M2 instantiations retain the existing FP16 probability handoff.
+- The quality contract does not require FP8-KV greedy output to equal FP16-KV
+  greedy output. The relevant gates here were same-build repeat stability,
+  same-quantized-cache candidate/control equality, finite output, bounded
+  scalar/XQA differences, and error against an FP64 attention oracle.
+- Five controlled FP16 shapes covered G4/G6/G8, partitions 256/512/1024,
+  partial tiles, block sizes 16/784/1616, and a five-row MTP-verifier shape.
+  Candidate/control FP64 RMS ratios were 0.835, 0.862, 0.850, 0.868, and
+  0.856. Two default-production G6/block784 shapes at 16K and 64K had ratios
+  0.863 and 0.874. Thus every tested FP16 shape improved by 12.6%-16.5%.
+- Four controlled and two default-production E5M2 shapes were bitwise
+  identical between candidate and control across all 15,360 output elements.
+  All 13 FP16/E5M2 cases were finite and bitwise repeatable across four runs.
+  Resource usage was identical for every compiled kernel instantiation.
+- Swapped-GPU concurrent A/B timing at FP16 G6/block784/65,539, 500 measured
+  calls per lane, produced candidate/control medians of 0.294912/0.296960 ms,
+  0.295936/0.295936 ms, and 0.299008/0.295936 ms. The observed range
+  (-0.7% to +1.0%) is neutral measurement noise; no decode regression was
+  established.
+- Raw builds, outputs, JSON, logs, resource tables, and the standalone audit
+  harness are retained under
+  `/data/minimax-h3/task-cache/pr210-xqa-fp32-p-audit-20260816/`. Do not rerun
+  full-model FP8-vs-FP16 greedy equality for this change: the E5M2 binary path
+  is compile-time unchanged and has already passed the stronger same-cache
+  bitwise A/B gate.

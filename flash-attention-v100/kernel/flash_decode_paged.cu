@@ -859,10 +859,9 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       QK_SW_PIPELINE,
       XQATCQKPipelineSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>,
       XQATCSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>>;
-  // Keep the softmax P matrix in fp32 through the PV stage when KV precision
-  // is high enough that the fp16 round-trip rounding dominates (fp16 KV). On
-  // fp8_e5m2 KV the ~10-12% KV-quant error swamps it, so keep the original
-  // fp16-P store bit-exact there (the else arms below). Compile-time only.
+  // Keep softmax P in fp32 through PV for fp16 KV, avoiding a half round-trip.
+  // Preserve the half-P path for fp8_e5m2 so quantized-cache behavior remains
+  // bit-exact. This branch is resolved entirely at compile time.
   constexpr bool kKeepPfp32 = (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16);
   constexpr int q_global_stride_uint4 = D / 8;
   constexpr int q_smem_stride_uint4 = SmemLayout::kQStride / 8;
@@ -1120,7 +1119,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       const unsigned mask = 0xffffffffu;
       float* sS_row_f = sS + row * kXQATCBlockN;
       __half* sP_row_h = sP + row * kXQATCBlockN;
-      float* sP_row_f = sS + row * kXQATCBlockN;  // 0012: fp32 P alias (fp16-KV)
+      float* sP_row_f = sS + row * kXQATCBlockN;
       const int vec_cols = valid_k_rows >> 2;
       const int tail_start = vec_cols << 2;
       const int vec_col = thread_in_row;
@@ -1158,7 +1157,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
         thread_sum += (e0 + e1) + (e2 + e3);
         if constexpr (kKeepPfp32) {
-          reinterpret_cast<float4*>(sP_row_f)[vec_col] = make_float4(e0, e1, e2, e3);
+          reinterpret_cast<float4*>(sP_row_f)[vec_col] =
+              make_float4(e0, e1, e2, e3);
         } else {
           packed_exp0 = __float22half2_rn(make_float2(e0, e1));
           packed_exp1 = __float22half2_rn(make_float2(e2, e3));
@@ -1199,7 +1199,6 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
           sP_half2[base_offset + 1] = packed_exp1;
         }
       }
-      // 0012 (fp16 KV): vec P store folded into the exp block above (fp32 float4)
 
       if (block_n > 0) {
 #pragma unroll
