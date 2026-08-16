@@ -1,7 +1,8 @@
-# 1Cat-vLLM 1.2.2
+# 1Cat-vLLM 1.3.0
 
-1Cat-vLLM 1.2.2 improves V100/SM70 long-context attention, FP8 KV cache,
-and Qwen3.6 MTP4 performance. It supersedes 1.2.1.
+1Cat-vLLM 1.3.0 improves V100/SM70 long-context attention, FP8 KV cache,
+Qwen3.6 MTP4 performance, and adds validated Qwen3.8-27B FP8 support. It
+supersedes 1.2.2.
 
 ## Highlights
 
@@ -14,7 +15,7 @@ and Qwen3.6 MTP4 performance. It supersedes 1.2.1.
   exact output on the accepted prefill paths.
 - Fixed stale CUDA Graph partition metadata so decode scans the live KV length.
 
-| Matched path | Before | 1.2.2 | Change |
+| Matched path | Before | 1.3.0 | Change |
 | --- | ---: | ---: | ---: |
 | FP16 paged-prefill operator, 64K | `43.605 ms` | `31.717 ms` | `-27.26%` |
 | 27B-AWQ TP4 full-model prefill, 64K | `47.9785 s` | `33.0984 s` | `-31.01%` |
@@ -56,6 +57,7 @@ TP2 FP8-weight baseline by `+22.24%` to `53.693 tok/s` at 128K.
 | Qwen3.6-27B | FP8 | 2/4 | supported | supported |
 | Qwen3.6-35B-A3B | AWQ | 2/4 | supported | supported fallback |
 | Qwen3.6-35B-A3B | FP8 | 2/4 | supported | supported fallback |
+| Qwen3.8-27B | FP8 | 4 | supported | supported |
 | Qwen3.5-27B | NVFP4 | 4 | supported | no valid MTP weights |
 
 FP8 KV decode overhead at 64K is within 0.49%-1.16% of matched FP16 KV across
@@ -65,8 +67,10 @@ the accepted matrix. TurboMind remains the production SM70 quantization path.
 
 - The wheel now includes Flash-V100, paged-KV utilities, vLLM CUDA extensions,
   TurboMind SM70 kernels, and the complete FlashQLA Python/CUDA source package.
-- FlashQLA no longer requires an external source checkout. Its first JIT build
-  still requires a compatible CUDA toolkit and C++ compiler.
+- The wheel bundles the precompiled SM70 FlashQLA extension, so a supported
+  wheel install does not invoke NVCC at runtime. Editable/source installs may
+  use the explicit FlashQLA JIT fallback and therefore require a compatible
+  CUDA toolkit and C++ compiler.
 - All tracked Python files pass Ruff. The release change set also passes
   formatting, typos, mypy, SPDX, configuration, and backend documentation
   checks.
@@ -78,6 +82,12 @@ the accepted matrix. TurboMind remains the production SM70 quantization path.
 - The exact dual-CTA verifier currently targets the G6 FP8-KV shape; other
   shapes use exact fallbacks.
 - `FLASHINFER_SM70` and BFLA sparse prefill remain explicit experimental paths.
+- SM70 Flash-V100 disables saved AOT graph-cache reload by default because a
+  cached-artifact reload can cause deterministic greedy-token drift. This
+  preserves output quality but increases cold-start compilation time.
+- MTP is opt-in. Its first request can compile Triton helper kernels for a
+  previously unseen shape, causing a cold latency spike; warm it before
+  accepting production traffic.
 
 ## Build Target
 
