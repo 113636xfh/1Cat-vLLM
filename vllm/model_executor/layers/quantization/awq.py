@@ -631,6 +631,17 @@ class AWQLinearMethod(LinearMethodBase):
                     .transpose(1, 2)
                     .reshape(reshaped_x.shape[0], out_shape[-1])
                 )
+        elif current_platform.is_cuda() and current_platform.is_device_capability(70):
+            # The classic AWQ GEMM is unsupported on SM70, while its dequantize
+            # fallback can produce NaNs there. Use the architecture-independent
+            # Triton dequantizer for Marlin-ineligible V100 layers.
+            from vllm.model_executor.layers.quantization.awq_triton import (
+                awq_dequantize_triton,
+            )
+
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            out = awq_dequantize_triton(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
         elif FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
             # Batch invariant mode requires torch.matmul path for Triton override.
             out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
