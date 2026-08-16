@@ -406,6 +406,17 @@ class DynamicDraftVocabRuntime(StaticDraftVocabRuntime):
         )
         if self.tp_group is None or any(tensor is None for tensor in tensors):
             raise RuntimeError("Dynamic fused proposal buffers are not initialized.")
+        assert self.prepared_base_weight is not None
+        assert self.fused_base_values is not None
+        assert self.fused_base_ids is not None
+        assert self.fused_tail_logits is not None
+        assert self.fused_local_pairs is not None
+        assert self.fused_gathered_pairs is not None
+        assert self.fused_sampled_tokens is not None
+        assert self.fused_sparse_ids is not None
+        assert self.fused_sparse_probs is not None
+        assert self.fused_exponentials is not None
+        assert self.fused_dense_probs is not None
 
         sm70_ops = _get_sm70_ops()
         sm70_ops.sm70_f16_lm_head_top20_tc_out(
@@ -801,7 +812,7 @@ def initialize_static_draft_vocab(
             input_split_sizes=input_splits,
             group=tp_group.device_group,
         )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     fingerprints = payload.get("fingerprints")
     ranking_fingerprint = None
@@ -1063,5 +1074,5 @@ def initialize_dynamic_draft_vocab(
         )
     else:
         runtime._refresh_tail()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return runtime
