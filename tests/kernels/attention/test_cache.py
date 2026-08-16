@@ -703,9 +703,59 @@ def test_reshape_and_cache_flash_fp8_e5m2_smoke(
             expected_key[block_idx, :, block_offset, :] = key[i]
             expected_value[block_idx, :, block_offset, :] = value[i]
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(dequant(key_cache), expected_key)
     assert torch.equal(dequant(value_cache), expected_value)
+
+
+@torch.inference_mode()
+def test_reshape_and_cache_flash_fp8_e5m2_unit_scale_all_fp16_bits() -> None:
+    if torch.accelerator.device_count() == 0:
+        pytest.skip("CUDA is required for FP8 KV cache reshape")
+
+    device = "cuda:0"
+    bits = torch.arange(65536, device=device, dtype=torch.int32).to(torch.int16)
+    key = bits.view(torch.float16).reshape(-1, 1, 1).contiguous()
+    value = key.clone()
+    block_size = 16
+    cache = torch.empty(
+        (2, 65536 // block_size, block_size, 1, 1),
+        device=device,
+        dtype=torch.uint8,
+    )
+    slots = torch.arange(65536, device=device, dtype=torch.int64)
+    scale = torch.ones(1, device=device, dtype=torch.float32)
+
+    ops.reshape_and_cache_flash(
+        key,
+        value,
+        cache[0],
+        cache[1],
+        slots,
+        "fp8_e5m2",
+        scale,
+        scale,
+    )
+
+    bits_i32 = bits.to(torch.int32) & 0xFFFF
+    sign = (bits_i32 >> 8) & 0x80
+    magnitude = bits_i32 & 0x7FFF
+    exponent = magnitude >> 10
+    mantissa = magnitude & 0x3FF
+    truncated = magnitude >> 8
+    remainder = magnitude & 0xFF
+    rounded = truncated + (
+        (remainder > 0x80) | ((remainder == 0x80) & ((truncated & 1) != 0))
+    ).to(torch.int32)
+    finite = torch.minimum(rounded, torch.full_like(rounded, 0x7B)) | sign
+    expected = torch.where(
+        exponent == 0x1F,
+        torch.where(mantissa != 0, torch.full_like(sign, 0x7F), sign | 0x7B),
+        finite,
+    ).to(torch.uint8)
+
+    assert torch.equal(cache[0].flatten(), expected)
+    assert torch.equal(cache[1].flatten(), expected)
 
 
 def _create_mla_cache(

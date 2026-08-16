@@ -39,6 +39,19 @@ from vllm.triton_utils import tl, triton
 
 is_hip_ = current_platform.is_rocm()
 
+
+def _decode_grouped_block_size(
+    *,
+    is_hip: bool,
+    is_mla: bool,
+    block_dmodel: int,
+    is_sm70: bool,
+) -> int:
+    if is_hip or (is_mla and block_dmodel >= 512 and is_sm70):
+        return 16
+    return 32
+
+
 logger = logging.getLogger(__name__)
 
 # Only print the following warnings when triton version < 3.2.0.
@@ -478,9 +491,21 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    BLOCK = 32
-    if is_hip_:
-        BLOCK = 16
+    # Patch 0103: BLOCK=16 for HIP (original) and for MLA-large on SM70 (V100).
+    # On SM70 at BLOCK=32 the stage-1 kernel needs 102,400 B of smem (Triton
+    # stages dot operands as fp32 on sm70: peak = 4 B x [BLOCK_H*(BLOCK_DMODEL+
+    # BLOCK_DPE) + BLOCK*BLOCK_DMODEL]) against the 98,304 B hardware limit ->
+    # OutOfResources on the first decode. BLOCK=16 fits (69,632 B) and won the
+    # tiling bench vs BN32/BH8 (spill catastrophe) and BN16/BH8 (loses at
+    # saturated grids) at 128-user shapes. num_stages is a no-op here (no
+    # cp.async on sm70 - KV loads cannot be multi-buffered); leave it alone.
+    # Proof + bench: patches/0103-mla-triton-decode-smem/poc/.
+    BLOCK = _decode_grouped_block_size(
+        is_hip=is_hip_,
+        is_mla=is_mla,
+        block_dmodel=BLOCK_DMODEL,
+        is_sm70=current_platform.is_device_capability(70),
+    )
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[-2]

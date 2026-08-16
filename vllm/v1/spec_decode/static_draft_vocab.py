@@ -46,11 +46,27 @@ class MTPDraftVocabConfig:
     using_defaults: bool = False
 
 
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES = frozenset((2, 4))
+_DEFAULT_DYNAMIC_DRAFT_VOCAB_MODEL_MARKER = "qwen3.6-27b"
+
+
+def _matches_default_dynamic_draft_vocab_model(
+    model_name_or_path: str | None,
+) -> bool:
+    if model_name_or_path is None:
+        return False
+    normalized = model_name_or_path.casefold().replace("_", "-")
+    return _DEFAULT_DYNAMIC_DRAFT_VOCAB_MODEL_MARKER in normalized
+
+
 def resolve_mtp_draft_vocab_config(
     method: str,
     tensor_parallel_size: int = 2,
+    model_architecture: str | None = None,
+    model_name_or_path: str | None = None,
 ) -> MTPDraftVocabConfig:
-    """Resolve explicit vocabulary controls or the default MTP GPU-LRU route."""
+    """Resolve explicit controls or the model-specific default MTP vocabulary."""
     config = MTPDraftVocabConfig(
         ranking_path=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING,
         shortlist_size=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE,
@@ -77,6 +93,9 @@ def resolve_mtp_draft_vocab_config(
         method != "mtp"
         or not envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT
         or explicit_config
+        or model_architecture != _DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE
+        or tensor_parallel_size not in _DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES
+        or not _matches_default_dynamic_draft_vocab_model(model_name_or_path)
     ):
         return config
 
@@ -387,6 +406,17 @@ class DynamicDraftVocabRuntime(StaticDraftVocabRuntime):
         )
         if self.tp_group is None or any(tensor is None for tensor in tensors):
             raise RuntimeError("Dynamic fused proposal buffers are not initialized.")
+        assert self.prepared_base_weight is not None
+        assert self.fused_base_values is not None
+        assert self.fused_base_ids is not None
+        assert self.fused_tail_logits is not None
+        assert self.fused_local_pairs is not None
+        assert self.fused_gathered_pairs is not None
+        assert self.fused_sampled_tokens is not None
+        assert self.fused_sparse_ids is not None
+        assert self.fused_sparse_probs is not None
+        assert self.fused_exponentials is not None
+        assert self.fused_dense_probs is not None
 
         sm70_ops = _get_sm70_ops()
         sm70_ops.sm70_f16_lm_head_top20_tc_out(
@@ -782,7 +812,7 @@ def initialize_static_draft_vocab(
             input_split_sizes=input_splits,
             group=tp_group.device_group,
         )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     fingerprints = payload.get("fingerprints")
     ranking_fingerprint = None
@@ -1044,5 +1074,5 @@ def initialize_dynamic_draft_vocab(
         )
     else:
         runtime._refresh_tail()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return runtime

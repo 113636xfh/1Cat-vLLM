@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
+    VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE: Literal["inline", "engine"] = "inline"
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL: int = 5120
@@ -149,9 +150,12 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS: int = 4
     VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS: int = 0
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
+    VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
+    VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -164,6 +168,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
+    VLLM_SM70_DSV4_FP16_GEMV: bool = False
+    VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
@@ -193,6 +199,16 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
+    VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
+    VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
+    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
+    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -202,6 +218,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = True
     VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH: bool = True
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
+    VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -221,6 +238,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
+    VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
     VLLM_SM70_REJECTION_PROFILE: bool = False
     VLLM_SM70_REJECTION_PROFILE_INTERVAL: int = 20
@@ -257,7 +275,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
-    VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 8192
+    VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
     VLLM_FLASH_V100_DENSE_D256_LOW_SMEM: bool = False
     VLLM_FLASH_V100_DENSE_D256_WMMA_QK: bool = True
@@ -270,10 +288,16 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268: bool = True
     VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK: bool = True
     VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV: bool = True
+    VLLM_FLASH_V100_FA2_D256_PREFILL: bool = True
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE: bool = True
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY: bool = False
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q: int = 1536
     VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV: int = 8192
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE: bool = True
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q: int = 4096
+    VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV: int = 8192
+    VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3: bool = True
+    VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -312,6 +336,20 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
+    VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH: bool = True
+    VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE: bool = False
+    VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN: int = 111104
+    VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN: int = 147841
+    VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN: int = 258176
+    VLLM_FLASH_V100_XQA_G6_QK_PIPELINE: bool = True
+    VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS: int = 8
+    VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
+    VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA: bool = True
+    VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE: bool = True
+    VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN: int = 61633
+    VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS: bool = True
+    VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD: bool = True
+    VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE: bool = False
     VLLM_FLASH_V100_TRACE_DECODE_ACTIVE: bool = False
     VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED: bool = True
     VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR: str | None = None
@@ -407,6 +445,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
+    VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_SCHED: bool = True
     VLLM_SM70_FUSED_SIGMOID_GATING_BV: str | None = None
     VLLM_SM70_FUSED_SIGMOID_GATING_WARPS: str | None = None
@@ -1551,6 +1590,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
     ),
+    # Expand selected full 4096-token TP4 AWQ projections into one reusable
+    # bounded FP16 workspace before their exact dense GEMM.
+    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
+    ),
+    # Expand selected large-M TP4 FP8 projections into one reusable bounded
+    # FP16 workspace before their exact dense GEMM. The allowlist and M gate
+    # keep decode, tails, and numerically unsafe QKV projections on TurboMind.
+    "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
+    ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -1592,6 +1642,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
+    ),
+    "VLLM_SM70_FP8_COORDINATED_TUNING": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1"))
+    ),
+    "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
@@ -1636,6 +1692,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")
+    ),
+    "VLLM_SM70_DSV4_FP16_GEMV": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
+    ),
+    "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
@@ -1773,6 +1835,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
     ),
+    # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
+    # opt-in until full-model token and long-output quality gates pass.
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))
+    ),
+    "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
+    ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
     # then executed by the unquantized Triton MoE path. Keep this default-off:
@@ -1810,6 +1886,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH", "1"))
     ),
+    # DeepSeek V4 batch-one MXFP4 decode has six routed slots but 256 local
+    # experts. Dispatch only those six fixed graph slots; expert IDs remain
+    # device tensors and can change between CUDA Graph replays.
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
+    ),
+    # Extend the graph-safe active-expert route beyond B1. Values above eight
+    # are clamped by the exact DeepSeek V4 verifier buffer contract.
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS": lambda: max(
+        1, int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS", "8"))
+    ),
+    # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
+    # TurboMind launch. The C++ route reads this value directly as well.
+    "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "0"))
+    ),
+    # Experimental verifier-M8 grouped dispatch. This collapses the fixed 48
+    # active-expert stage calls into one TurboMind grouped launch.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
+    ),
+    # Use deterministic W13/W2 tactics for the fixed 48 one-row
+    # verifier groups instead of relying on capture-time autotune stability.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR", "1"))
+    ),
+    # Skip the generic 256-expert sort/permute/unpermute pipeline for the
+    # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
+    "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "0"))
+    ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
     # while skipping inactive experts; this route is default-on after the
@@ -1822,6 +1929,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routed) instead of materializing shared+routed before TP allreduce.
     "VLLM_SM70_MOE_ADD_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0"))
+    ),
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
@@ -1896,6 +2006,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
     ),
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
+    "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
+        "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
+    ),
     "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": lambda: os.getenv(
         "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"
     ),
@@ -1988,7 +2101,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))
     ),
     "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "8192")
+        os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")
     ),
     "VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16", "0"))
@@ -2026,6 +2139,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV", "1"))
     ),
+    "VLLM_FLASH_V100_FA2_D256_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_FA2_D256_PREFILL", "1"))
+    ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE", "1"))
     ),
@@ -2037,6 +2153,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV": lambda: int(
         os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV", "8192")
+    ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1"))
+    ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", "4096")
+    ),
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", "8192")
+    ),
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1"))
+    ),
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", "32768")
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))
@@ -2162,6 +2293,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": lambda: int(
+        os.getenv(
+            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN",
+            "111104",
+        )
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": lambda: int(
+        os.getenv(
+            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN",
+            "147841",
+        )
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": lambda: int(
+        os.getenv(
+            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN",
+            "258176",
+        )
+    ),
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": lambda: int(
+        os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")
+    ),
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": lambda: int(
+        os.getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "61633")
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))
     ),
     "VLLM_FLASH_V100_TRACE_DECODE_ACTIVE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0"))
@@ -2502,6 +2684,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
     "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": lambda: bool(
         int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "0"))
+    ),
+    # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
+    "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": lambda: bool(
+        int(os.getenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "1"))
     ),
     # Experimental SM70 fused sigmoid gating launch schedule. Default-off and
     # BV-only unless WARPS/STAGES are explicitly overridden; multi-warp changes
