@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import ClassVar, cast
+from typing import ClassVar, TypedDict, cast
 
 import torch
 
@@ -32,6 +32,16 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+
+
+class _DeepseekV4MetadataFields(TypedDict, total=False):
+    prefill_seq_lens: torch.Tensor
+    prefill_seq_lens_cpu: torch.Tensor
+    prefill_gather_lens: torch.Tensor
+    prefill_query_lens_cpu: torch.Tensor
+    prefill_window_size: int
+    prefill_max_model_len: int
+    prefill_max_num_batched_tokens: int
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -506,7 +516,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
-    ) -> dict[str, torch.Tensor | int | None]:
+    ) -> _DeepseekV4MetadataFields:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
         Returns a dict of keyword arguments to pass to the
@@ -515,7 +525,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         Note: C128A topk indices are computed by the FlashMLASparse builder
         (which owns the C128A block_table), not here.
         """
-        result: dict[str, torch.Tensor | int | None] = {}
+        result: _DeepseekV4MetadataFields = {}
 
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:

@@ -385,12 +385,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 continue
 
             is_layer_param = name.startswith("model.layers.")
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if not is_layer_param or weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(param, loaded_weight, stacked_shard_id)
                 loaded_params.add(name)
                 break
             else:
@@ -408,8 +408,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )
                 param = params_dict[name]
-                loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, loaded_weight)
+                weight_loader: Callable[..., object] = (
+                    getattr(param, "weight_loader", None) or default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
         for layer in self.model.layers:

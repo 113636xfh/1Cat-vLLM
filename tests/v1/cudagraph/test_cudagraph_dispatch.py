@@ -401,6 +401,94 @@ class TestCudagraphDispatcher:
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
+    def test_fp8_e5m2_decode_context_bucket_is_shape_derived_on_sm70(self, monkeypatch):
+        monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.cache_config.cache_dtype = "fp8_e5m2"
+        config.attention_config.backend = None
+        config.model_config.max_model_len = 262144
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        assert dispatcher.sm70_fp8_kv_decode_context_buckets == (8192,)
+        bounded = BatchDescriptor(
+            num_tokens=1,
+            num_reqs=1,
+            uniform=True,
+            attention_context_bucket=8192,
+        )
+        assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=8192,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == bounded
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=8193,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True)
+
+    @pytest.mark.parametrize("cache_dtype", ("auto", "fp8_e4m3"))
+    def test_fp8_e5m2_decode_context_bucket_does_not_match_other_cache_dtypes(
+        self, monkeypatch, cache_dtype
+    ):
+        monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.cache_config.cache_dtype = cache_dtype
+        config.model_config.max_model_len = 262144
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+        ):
+            dispatcher = CudagraphDispatcher(config)
+
+        assert not dispatcher.sm70_fp8_kv_decode_context_buckets
+
+    def test_fp8_e5m2_decode_context_bucket_explicit_empty_disables(self, monkeypatch):
+        monkeypatch.setenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", "")
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.cache_config.cache_dtype = "fp8_e5m2"
+
+        dispatcher = CudagraphDispatcher(config)
+
+        assert not dispatcher.sm70_fp8_kv_decode_context_buckets
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

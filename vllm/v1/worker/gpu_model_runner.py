@@ -1363,6 +1363,7 @@ class GPUModelRunner(
             (self.speculative_config.method or "") if self.speculative_config else "",
             self.parallel_config.tensor_parallel_size,
             self.model_config.architecture,
+            self.model_config.model,
         )
         self.dynamic_draft_vocab_prefill_topk = draft_vocab_config.prefill_topk
         validate_dynamic_draft_vocab_prefill_topk(

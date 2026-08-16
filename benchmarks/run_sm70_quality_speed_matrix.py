@@ -300,6 +300,12 @@ def _max_repeated_window(text: str, width: int) -> int:
         window = normalized[idx : idx + width]
         if len(window.strip()) < width // 2:
             continue
+        # Homogeneous runs are checked independently by
+        # _longest_same_char_run. Counting their overlapping windows makes
+        # ordinary code separators such as "=====" look quadratically
+        # repetitive.
+        if len(set(window)) == 1:
+            continue
         counts[window] = counts.get(window, 0) + 1
     return max(counts.values(), default=0)
 

@@ -150,6 +150,111 @@ def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
 
 
+def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    names = (
+        "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA",
+        "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE",
+        "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS",
+        "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA is True
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is True
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is True
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is True
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN == 61633
+
+    for name in names:
+        monkeypatch.setenv(name, "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA is False
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is False
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is False
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is False
+
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "49152")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN == 49152
+
+
+def test_sm70_flash_v100_fp8_alias_resolves_to_e5m2(monkeypatch):
+    import vllm.engine.arg_utils as arg_utils
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_SM70_FLASH_ATTN_V100", raising=False)
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        arg_utils,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+        ),
+    )
+
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8", "fp8")
+        == "fp8_e5m2"
+    )
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8_e4m3", "fp8_e4m3")
+        == "fp8_e4m3"
+    )
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("auto", "fp8_e4m3")
+        == "fp8_e4m3"
+    )
+
+
+def test_fp8_alias_keeps_upstream_e4m3_semantics_without_sm70_flash(
+    monkeypatch,
+):
+    import vllm.engine.arg_utils as arg_utils
+    import vllm.envs as envs
+
+    monkeypatch.setenv("VLLM_SM70_FLASH_ATTN_V100", "0")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        arg_utils,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+        ),
+    )
+
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8", "fp8") == "fp8"
+    )
+
+
+def test_fp8_alias_is_not_rewritten_outside_nvidia_cuda(monkeypatch):
+    import vllm.engine.arg_utils as arg_utils
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_SM70_FLASH_ATTN_V100", raising=False)
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        arg_utils,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: False,
+            get_device_capability=lambda: pytest.fail(
+                "non-CUDA platforms must not query an NVIDIA capability"
+            ),
+        ),
+    )
+
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8", "fp8") == "fp8"
+    )
+
+
 def test_sm70_prefill_gather_dense_env_is_default_on(monkeypatch):
     import vllm.envs as envs
 
@@ -239,6 +344,29 @@ def test_prefill_gather_dense_does_not_require_generic_dense_op(monkeypatch):
     assert impl.use_flash_v100_prefill_paged is True
     assert impl.use_flash_v100_prefill_contig_dense is False
     assert impl.use_flash_v100_prefill_gather_dense is True
+
+
+def test_flash_v100_normalizes_resolved_float16_cache_dtype(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setattr(flash_v100, "_get_flash_ops", lambda: (None,) * 9)
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_fp8_e5m2_paged_kv_bridge_op",
+        lambda: None,
+    )
+
+    impl = flash_v100.FlashAttnV100Impl(
+        num_heads=4,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="float16",
+    )
+
+    assert impl.kv_cache_dtype == "auto"
 
 
 def test_prefill_gather_dense_reorders_random_pages_and_reuses_workspace(
@@ -830,7 +958,11 @@ def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
 
     assert torch.equal(
         capture_metadata.smallq_decode_seq_lens,
-        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        torch.tensor(
+            [1, 2, 3, 4],
+            dtype=torch.int32,
+            device=capture_metadata.smallq_decode_seq_lens.device,
+        ),
     )
 
     runtime_common = create_common_attn_metadata(
@@ -987,7 +1119,11 @@ def test_flash_v100_smallq_metadata_masks_cudagraph_padding(
 
     assert torch.equal(
         attn_metadata.smallq_decode_seq_lens,
-        torch.tensor([6, 7, 8, 6, 7, 0], dtype=torch.int32),
+        torch.tensor(
+            [6, 7, 8, 6, 7, 0],
+            dtype=torch.int32,
+            device=attn_metadata.smallq_decode_seq_lens.device,
+        ),
     )
     assert torch.equal(
         attn_metadata.smallq_decode_block_table[-1],
@@ -1041,6 +1177,28 @@ def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
 
     with pytest.raises(RuntimeError, match="persistent buffer capacity"):
         builder.build(0, runtime_common)
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        (1, [1, 2]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (8, [1, 2, 4, 8]),
+        (12, [1, 2, 4, 8, 12]),
+        (16, [1, 2, 4, 8, 16]),
+        (256, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
+    max_num_seqs: int,
+    expected: list[int],
+):
+    from vllm.config.vllm import _sm70_nomtp_cudagraph_capture_sizes
+
+    assert _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs) == expected
 
 
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(
@@ -1267,7 +1425,9 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
     ("num_heads", "seq_len", "expected_route"),
     (
         (6, 4096, "scalar"),
-        (6, 8192, "xqa"),
+        (6, 8192, "scalar"),
+        (6, 16383, "scalar"),
+        (6, 16384, "xqa"),
         (4, 65536, "scalar"),
         (8, 65536, "xqa"),
     ),
@@ -1349,18 +1509,123 @@ def test_flash_v100_fp8_prefill_bridge_accepts_mtp_aligned_tail():
     )
 
 
-def test_flash_v100_fp8_xqa_graph_capture_marker_forces_xqa(monkeypatch):
+def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.scale = 256**-0.5
+    bridge_calls = []
+    exact_calls = []
+
+    def bridge_op(*args):
+        bridge_calls.append(args)
+
+    def exact_op(query, key, value, **kwargs):
+        exact_calls.append((query, key, value, kwargs))
+        kwargs["out"].fill_(3)
+        return kwargs["out"]
+
+    impl.fp8_e5m2_paged_kv_to_fp16 = bridge_op
+    impl.flash_attn_prefill_paged = lambda *args, **kwargs: pytest.fail(
+        "dense exact path unexpectedly fell back to paged prefill"
+    )
+    key_workspace = torch.empty((1, 784, 1, 256), dtype=torch.float16)
+    value_workspace = torch.empty_like(key_workspace)
+    output_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    monkeypatch.setattr(
+        mod,
+        "_get_fp8_prefill_bridge_workspace",
+        lambda key_cache, required_blocks: (
+            key_workspace,
+            value_workspace,
+            output_block_table,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_uniform_cu_seqlens",
+        lambda *args, **kwargs: (
+            torch.tensor([0, 64], dtype=torch.int32),
+            torch.tensor([0, 64], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(mod, "_try_sm70_fa2_d256_prefill", exact_op)
+
+    query = torch.zeros((1, 64, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 64, 1, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+    block_table = torch.tensor([[0]], dtype=torch.int32)
+    seq_lens = torch.tensor([64], dtype=torch.int32)
+    out = torch.zeros_like(query)
+
+    result = impl._run_fp8_prefill_bridge(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        seq_len=64,
+        k_scale=1.0,
+        v_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        out=out,
+    )
+
+    assert result is not None
+    assert result[0] is out
+    assert result[1] is True
+    assert len(bridge_calls) == 1
+    assert len(exact_calls) == 1
+    _, dense_key, dense_value, kwargs = exact_calls[0]
+    assert dense_key.shape == (1, 64, 1, 256)
+    assert dense_value.shape == dense_key.shape
+    assert dense_key.is_contiguous()
+    assert dense_value.is_contiguous()
+    assert kwargs["cu_seqlens_k"] is not None
+    assert kwargs.get("block_table") is None
+    assert torch.all(out == 3)
+
+
+def test_flash_v100_fp8_prefill_bridge_workspace_oom_falls_back(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    key_cache = torch.zeros((1, 1568, 1, 33), dtype=torch.uint8)
+    mod._fp8_prefill_bridge_workspaces.clear()
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device: SimpleNamespace(cuda_stream=17),
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *args, **kwargs: (_ for _ in ()).throw(torch.OutOfMemoryError()),
+    )
+
+    assert mod._get_fp8_prefill_bridge_workspace(key_cache, 2) is None
+
+
+@pytest.mark.parametrize(
+    ("static_seq_hint", "expected"),
+    ((8192, False), (16384, True), (262144, True)),
+)
+def test_flash_v100_fp8_xqa_graph_capture_uses_static_context_hint(
+    monkeypatch, static_seq_hint, expected
+):
     from vllm.v1.attention.backends import flash_attn_v100 as mod
 
     monkeypatch.setattr(mod, "_is_cuda_graph_capturing", lambda query: False)
     metadata = SimpleNamespace(
         flash_v100_cudagraph_capture=True,
         flash_v100_decode_max_seq_len_hint=1,
-        flash_v100_static_decode_seq_hint=262144,
-        flash_v100_decode_workspace_seq_capacity_hint=262144,
+        flash_v100_static_decode_seq_hint=static_seq_hint,
+        flash_v100_decode_workspace_seq_capacity_hint=static_seq_hint,
     )
 
-    assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1))
+    assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1)) is expected
 
 
 def test_flash_v100_mtp5_dual_cta_partition_policy(monkeypatch):
@@ -1624,7 +1889,7 @@ def test_flash_v100_decode_sawtooth_rollback_preserves_default_planner(
     monkeypatch,
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import (
-        _g6_page784_sawtooth_partition_size_hint,
+        _g6_aligned_page_partition_size_hint,
     )
 
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
@@ -1632,14 +1897,17 @@ def test_flash_v100_decode_sawtooth_rollback_preserves_default_planner(
     query = torch.zeros((1, 6, 256), dtype=torch.float16)
     key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.float16)
 
-    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) is None
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "auto")
+        is None
+    )
 
 
 def test_flash_v100_decode_sawtooth_preserves_explicit_partition_override(
     monkeypatch,
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import (
-        _g6_page784_sawtooth_partition_size_hint,
+        _g6_aligned_page_partition_size_hint,
     )
 
     monkeypatch.setenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", "256")
@@ -1647,20 +1915,89 @@ def test_flash_v100_decode_sawtooth_preserves_explicit_partition_override(
     query = torch.zeros((1, 6, 256), dtype=torch.float16)
     key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.float16)
 
-    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) is None
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "auto")
+        is None
+    )
 
 
 def test_flash_v100_decode_sawtooth_workspace_supports_fp8_kv(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import (
-        _g6_page784_sawtooth_partition_size_hint,
+        _g6_aligned_page_partition_size_hint,
     )
 
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
     monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
     query = torch.zeros((1, 6, 256), dtype=torch.float16)
-    key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.uint8)
+    key_cache = torch.zeros((1, 784, 1, 256), dtype=torch.float16)
 
-    assert _g6_page784_sawtooth_partition_size_hint(query, key_cache, key_cache) == 256
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "auto") == 256
+    )
+
+
+def test_flash_v100_decode_e5m2_aligned_page_plans_p256_workspace(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_aligned_page_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 1568, 1, 256), dtype=torch.uint8)
+
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e5m2")
+        == 256
+    )
+
+
+def test_flash_v100_decode_e5m2_partition_hint_is_page_size_generic(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_aligned_page_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 1616, 1, 256), dtype=torch.uint8)
+
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e5m2")
+        == 256
+    )
+
+
+def test_flash_v100_decode_e5m2_keeps_small_pages_on_default_planner(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_aligned_page_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 16, 1, 256), dtype=torch.uint8)
+
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e5m2")
+        is None
+    )
+
+
+def test_flash_v100_decode_e4m3_does_not_use_e5m2_partition_hint(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _g6_aligned_page_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", raising=False)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((1, 1568, 1, 256), dtype=torch.uint8)
+
+    assert (
+        _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e4m3")
+        is None
+    )
 
 
 def test_flash_v100_decode_keeps_qwen35_tp4_short_context_on_scalar(monkeypatch):

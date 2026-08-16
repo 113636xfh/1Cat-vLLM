@@ -41229,3 +41229,91 @@ Interpretation:
 - Evidence is under `workspace-production/` in the retained task artifact
   directory. The rollback remains
   `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+
+## 2026-08-15 Qwen3.8-27B 1.3.0 release acceptance
+
+- Accepted Qwen3.8-27B-FP8 TP4 no-MTP long-context, concurrency, MTP4,
+  FP8-KV, exact-256K-boundary, API quality, and final-wheel gates.
+- Defaulted the proven mid-range G6 XQA QK pipeline, extended no-MTP graph
+  request shapes through 16, restricted the Qwen3.6 draft-vocabulary asset so
+  Qwen3.8 uses full vocabulary, and bundled FlashQLA SM70 into the wheel.
+- Qwen3.6-35B-A3B-AWQ TP2 loads from the final wheel and passes official
+  1K/256 and 4K/1024 checks. No 35B FP8 checkpoint is available, so that speed
+  target remains explicitly unmeasured.
+- Full configuration, performance tables, quality evidence, limitations, and
+  artifact paths are in `docs/design/sm70_qwen38_130_acceptance.md`.
+
+## 2026-08-15 Qwen3.8 FP8 compile-safe long-prefill projections
+
+- Fixed a false route hit where `torch.compile` folded a Python large-M
+  branch and left every measured FP8 projection on TurboMind. The accepted
+  opaque CUDA op selects TurboMind below M3920 and exact dense above it.
+- The default is restricted to TP4 gate/up/down/output shapes. It uses one
+  shared 85 MiB FP16 workspace; QKV, decode, and tails remain unchanged.
+- Matched 32K/128K/256K throughput improves 22.36%/12.94%/7.25% with exact
+  control output hashes. Final 128K/256K prefill is 2446.5/1602.0 tok/s.
+- Q15680 split-KV3 was rejected: only 0.85%-1.80% attention gain, about
+  290 MiB/rank extra workspace, and non-bitwise output.
+- Detailed route gates, full sweep, tests, rejected paths, and artifacts are
+  in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.
+
+## 2026-08-16 Qwen3.8 output-quality audit
+
+- Audited PR 212 head `7f409a7727` on Qwen3.8-27B-FP8, TP4 V100, max length
+  32768, official sampling, and the fixed 74-token macOS code prompt. Do not
+  repeat the earlier 1K/8K smokes as long-form quality evidence.
+- Natural-stop output gates passed no-MTP/FP16 KV (24,441 tokens),
+  no-MTP/E5M2 KV (25,055), MTP4/FP16 KV (25,753), and MTP4/E5M2 KV (18,642).
+  Every output contains complete HTML/CSS/JavaScript, closed tags and code
+  fences, no replacement characters, and no semantic long-block repetition.
+- Same-seed duplicate requests were byte-identical for all four paths. Long
+  prefix-cache probes remained byte-identical after 4,704, 4,896, and 6,464
+  cached tokens in the no-MTP/FP16, MTP4/FP16, and MTP4/E5M2 lanes.
+- Qwen3.8 TP4 XQA-vs-scalar operator checks at the 4095/4096/4097 boundary,
+  6272, 8192, and 16384 stayed within `6.1035e-5` maximum absolute difference
+  for FP16 and E5M2 KV. The MTP five-row, partition-1024 checks have the same
+  bound. The full MTP services logged the automatic GDN full-forward quality
+  guard and actual route hit.
+- A no-MTP-vs-MTP FP16 greedy comparison first diverges at output index 179.
+  The no-MTP top two tokens are tied at returned precision; the MTP target
+  top-1 leads by only 0.015625 and the verifier selects that target top-1.
+  This is a low-margin M=1/M=5 floating-point-order flip, not evidence that MTP
+  accepted a non-target draft token.
+- The serving/release gates falsely counted each overlapping 20/50-character
+  window inside decorative `=====` comments. On the MTP4/E5M2 output this
+  produced `repeat20=1064` and `repeat50=224`; excluding homogeneous windows
+  yields 28/28 while the independent same-character-run gate remains active.
+- The historical 8192-token no-MTP/FP16 artifact that degenerates after about
+  token 6377 predates the new E5M2 work and has no retained request seed. Keep
+  it as an unmatched regression sample; do not attribute it to FP8 KV, XQA,
+  MTP, or sampling without a matched reproduction.
+
+## 2026-08-16 Rejected MTP chunked-prefill compile entry
+
+- PR 213 proposed a second compiled Qwen target entry that bypassed the
+  automatic full-forward GDN guard only while every scheduled request was an
+  unfinished prefill chunk. Its 64K output was healthy, but its claimed
+  `22.5%-24.3%` prefill improvement compared against an older release artifact
+  rather than a same-source control.
+- A matched Qwen3.8-27B-FP8 TP4 control used MTP4, E5M2 KV, 65,517 prompt
+  tokens, 8,192-token prefill chunks, max length 262,144, seed 20260815,
+  official sampling, GPU memory utilization 0.88, and one warmup followed by
+  prefix/Mamba cache reset. The only changed setting was
+  `VLLM_SM70_MTP_PREFILL_STANDARD_GDN`.
+- The proposed entry took 24.428544 s for prefill. The disabled control took
+  24.284061 s, so enabling the entry added 0.144483 s (`+0.595%`) rather than
+  recovering the claimed release gap. Both lanes stopped naturally, retained
+  all three long-context sentinels, passed the corruption/repetition gate, and
+  reproduced their warmup text exactly. Cross-route token identity was not
+  required.
+- The additional entry also raised observed engine initialization from
+  117.93 s to 166.12 s because it compiled a second target graph. PR 213 was
+  closed without merge: the older comparison was confounded by other source
+  changes, while the matched result showed no runtime benefit to justify the
+  startup and maintenance cost.
+- Evidence is
+  `/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/results/qwen38-27b-fp8-mtp4-candidate-tp4-e5m2-64k-o512-warm.json`
+  and
+  `/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/results/qwen38-27b-fp8-mtp4-control-off-tp4-e5m2-64k-o512-warm.json`.
+  Do not repeat the older release-vs-candidate comparison as evidence for this
+  compile entry.

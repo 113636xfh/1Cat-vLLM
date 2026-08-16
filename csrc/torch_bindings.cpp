@@ -191,6 +191,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_sm70_prepare", torch::kCUDA, &fp8_sm70_prepare);
 
   ops.def(
+      "fp8_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size) -> ()");
+  ops.impl("fp8_sm70_dequantize_out", torch::kCUDA,
+           &fp8_sm70_dequantize_out);
+
+  ops.def(
       "mxfp4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
       "int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("mxfp4_sm70_prepare", torch::kCUDA, &mxfp4_sm70_prepare);
@@ -230,6 +236,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
+      "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu, int min_prefill_m) -> ()");
+  ops.impl("fp8_gemm_sm70_prefill_dispatch_out", torch::kCUDA,
+           &fp8_gemm_sm70_prefill_dispatch_out);
 
   ops.def(
       "mxfp4_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "

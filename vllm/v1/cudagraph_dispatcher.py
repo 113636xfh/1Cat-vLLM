@@ -79,6 +79,65 @@ def _get_sm70_dsv4_decode_context_buckets(
     return (bucket,)
 
 
+def _get_sm70_fp8_kv_decode_context_buckets(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    """Select a scalar-only short graph for the SM70 E5M2 D256 route."""
+    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
+    if env_name in os.environ:
+        return _get_sm70_context_buckets(env_name)
+    if vllm_config.speculative_config is not None:
+        return ()
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    ):
+        return ()
+    if not envs.VLLM_SM70_FLASH_ATTN_V100:
+        return ()
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if getattr(cache_config, "cache_dtype", None) != "fp8_e5m2":
+        return ()
+
+    attention_config = getattr(vllm_config, "attention_config", None)
+    attention_backend = getattr(attention_config, "backend", None)
+    attention_backend_name = getattr(attention_backend, "name", attention_backend)
+    if attention_backend is not None and attention_backend_name not in (
+        "FLASH_ATTN_V100",
+        "FLASHINFER_SM70",
+    ):
+        return ()
+
+    model_config = vllm_config.model_config
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
+    num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
+    head_dim = getattr(hf_text_config, "head_dim", None)
+    if not (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads == 0
+        and num_attention_heads // num_key_value_heads in (6, 8)
+        and head_dim == 256
+    ):
+        return ()
+
+    bucket = 8192
+    max_model_len = getattr(model_config, "max_model_len", None)
+    if not isinstance(max_model_len, int) or max_model_len <= bucket:
+        return ()
+    logger.info_once(
+        "Auto-enabling the SM70 E5M2 KV short-context decode CUDA graph "
+        "at %d tokens. This keeps the short D256 GQA graph scalar-only while "
+        "the unbounded graph retains the long-context XQA routes. Set %s "
+        "explicitly to override or to an empty value to disable.",
+        bucket,
+        env_name,
+    )
+    return (bucket,)
+
+
 class CudagraphDispatcher:
     """
     Runtime cudagraph dispatcher to dispatch keys for multiple set of
@@ -111,6 +170,9 @@ class CudagraphDispatcher:
         )
         self.sm70_dsv4_decode_context_buckets = _get_sm70_dsv4_decode_context_buckets(
             vllm_config
+        )
+        self.sm70_fp8_kv_decode_context_buckets = (
+            _get_sm70_fp8_kv_decode_context_buckets(vllm_config)
         )
         self._logged_sm70_context_bucket = False
 
@@ -248,7 +310,12 @@ class CudagraphDispatcher:
     def _active_context_buckets(self) -> tuple[int, ...]:
         if self.uniform_decode_query_len > 1:
             return self.sm70_mtp_context_buckets
-        return self.sm70_dsv4_decode_context_buckets
+        return tuple(
+            sorted(
+                set(self.sm70_dsv4_decode_context_buckets)
+                | set(self.sm70_fp8_kv_decode_context_buckets)
+            )
+        )
 
     @property
     def has_attention_context_buckets(self) -> bool:
