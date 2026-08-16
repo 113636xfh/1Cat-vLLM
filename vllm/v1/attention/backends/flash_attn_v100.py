@@ -1329,6 +1329,188 @@ def flash_v100_dense_prefill(
     return output
 
 
+# MLA context-chunk prefill needs the LSE that the dense SM70 kernel already
+# computes, plus independent Q and K sequence metadata for M != N attention.
+_flash_attn_forward_lse: Callable[..., tuple[torch.Tensor, ...]] | None = None
+_flash_attn_forward_lse_checked = False
+
+
+def _get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+    """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
+    global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
+    if not _flash_attn_forward_lse_checked:
+        _flash_attn_forward_lse_checked = True
+        try:
+            from flash_attn_v100.flash_attn_interface import _flash_attn_forward
+
+            _flash_attn_forward_lse = _flash_attn_forward
+        except (ImportError, AttributeError):
+            _flash_attn_forward_lse = None
+    return _flash_attn_forward_lse
+
+
+def flash_v100_dense_prefill_lse_available() -> bool:
+    return _get_flash_dense_forward() is not None
+
+
+def flash_v100_dense_prefill_lse(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_actual_tokens: int,
+    softmax_scale: float,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flash-V100 dense varlen prefill that also emits the softmax LSE.
+
+    Inputs use packed ``[tokens, heads, dim]`` layout and ``softmax_lse`` uses
+    the FA2 ``[query_heads, total_query_tokens]`` convention. Empty key segments
+    produce zero output and ``-inf`` LSE, making them neutral when attention
+    states are merged. Causal calls require equal Q/K lengths for every sequence.
+    """
+    fwd = _get_flash_dense_forward()
+    if fwd is None:
+        raise RuntimeError("flash_attn_v100 dense LSE prefill op is unavailable")
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("dense LSE prefill expects packed [T, H, D] Q/K/V")
+    if (
+        query.dtype != torch.float16
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+    ):
+        raise TypeError("dense LSE prefill requires fp16 Q/K/V")
+    if query.device != key.device or query.device != value.device:
+        raise ValueError("dense LSE prefill Q/K/V must share a device")
+    if key.shape != value.shape:
+        raise ValueError("dense LSE prefill K/V shapes must match")
+    if query.shape[2] != key.shape[2]:
+        raise ValueError("dense LSE prefill Q/K/V head dimensions must match")
+    if key.shape[1] <= 0 or query.shape[1] % key.shape[1] != 0:
+        raise ValueError("dense LSE prefill has an invalid Q/K head mapping")
+    if output.shape != query.shape or output.dtype != query.dtype:
+        raise ValueError("dense LSE prefill output must match the query")
+    if output.device != query.device:
+        raise ValueError("dense LSE prefill output must share the query device")
+    if softmax_lse.shape != (query.shape[1], query.shape[0]):
+        raise ValueError("dense LSE prefill LSE must have shape [Hq, Tq]")
+    if softmax_lse.dtype != torch.float32 or softmax_lse.device != query.device:
+        raise ValueError("dense LSE prefill LSE must be fp32 on the query device")
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+        raise ValueError("dense LSE prefill sequence metadata must be one-dimensional")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError("Q/K sequence metadata must describe the same batch")
+    if num_actual_tokens < 0 or num_actual_tokens > query.shape[0]:
+        raise ValueError("num_actual_tokens is outside the query bounds")
+
+    # A single device-to-host transfer replaces per-sequence scalar syncs.
+    q_off = cu_seqlens_q.tolist()
+    k_off = cu_seqlens_k.tolist()
+    if not q_off or q_off[0] != 0 or k_off[0] != 0:
+        raise ValueError("Q/K sequence offsets must start at zero")
+    if any(a > b for a, b in zip(q_off, q_off[1:])) or any(
+        a > b for a, b in zip(k_off, k_off[1:])
+    ):
+        raise ValueError("Q/K sequence offsets must be nondecreasing")
+    if q_off[-1] != num_actual_tokens:
+        raise ValueError("Q sequence offsets must cover every actual query token")
+    if k_off[-1] != key.shape[0]:
+        raise ValueError("K sequence offsets must cover every packed key/value token")
+
+    query = query[:num_actual_tokens]
+    out_view = output[:num_actual_tokens]
+    lse_view = softmax_lse[:, :num_actual_tokens]
+    num_seqs = len(q_off) - 1
+    if num_seqs == 0:
+        return output, softmax_lse
+
+    window_size_left, window_size_right = window_size
+    num_q_heads, head_dim = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+
+    run_start = 0
+    while run_start < num_seqs:
+        q_len = q_off[run_start + 1] - q_off[run_start]
+        k_len = k_off[run_start + 1] - k_off[run_start]
+        # Batch the maximal run sharing BOTH lengths — the kernel takes a
+        # rectangular [B,H,M,D] x [B,H,N,D] batch.
+        run_end = run_start + 1
+        while (
+            run_end < num_seqs
+            and q_off[run_end + 1] - q_off[run_end] == q_len
+            and k_off[run_end + 1] - k_off[run_end] == k_len
+        ):
+            run_end += 1
+
+        if q_len > 0:
+            qt0, qt1 = q_off[run_start], q_off[run_end]
+            batch_size = run_end - run_start
+
+            if k_len == 0:
+                # This is the neutral element expected by merge_attn_states.
+                out_view[qt0:qt1].zero_()
+                lse_view[:, qt0:qt1].fill_(float("-inf"))
+            else:
+                if causal and q_len != k_len:
+                    raise RuntimeError(
+                        "flash_v100_dense_prefill_lse: causal=True requires "
+                        f"q_len == k_len (got {q_len} vs {k_len})"
+                    )
+                kt0, kt1 = k_off[run_start], k_off[run_end]
+
+                # [T,H,D] -> [B,M,H,D] -> [B,H,M,D].
+                q_batch = (
+                    query[qt0:qt1]
+                    .view(batch_size, q_len, num_q_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                k_batch = (
+                    key[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                v_batch = (
+                    value[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+
+                out_batch, lse_batch, _, _ = fwd(
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    None,
+                    0.0,
+                    softmax_scale,
+                    causal,
+                    window_size_left,
+                    window_size_right,
+                    0.0,
+                    None,
+                    False,
+                )
+
+                # [B,H,M,D] -> [B,M,H,D] -> packed [B*M,H,D].
+                out_view[qt0:qt1].copy_(
+                    out_batch.permute(0, 2, 1, 3).reshape(-1, num_q_heads, head_dim)
+                )
+                # [B,H,M] -> [H,B*M], matching FA2's [num_heads, total_q].
+                lse_view[:, qt0:qt1].copy_(
+                    lse_batch.permute(1, 0, 2).reshape(num_q_heads, -1)
+                )
+
+        run_start = run_end
+
+    return output, softmax_lse
+
+
 def _get_flash_turboquant_decode_op():
     """Lazy-load the optional TurboQuant decode op without touching base ops."""
     global _flash_attn_turboquant_decode_checked
