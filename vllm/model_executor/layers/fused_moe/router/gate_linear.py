@@ -3,6 +3,7 @@
 import torch
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
@@ -93,6 +94,15 @@ class GateLinear(ReplicatedLinear):
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         import vllm._custom_ops as ops
+
+        if envs.VLLM_SM70_DSV4_FP16_GEMV and self.out_dtype is not None:
+            from vllm.models.deepseek_v4.sm70.gemv import (
+                maybe_sm70_dsv4_fp16_gemv,
+            )
+
+            output = maybe_sm70_dsv4_fp16_gemv(x, self.weight, self.out_dtype)
+            if output is not None:
+                return output, None
 
         # Tier 1: DSV3 specialized kernel
         if self.allow_dsv3_router_gemm and x.shape[0] <= 16:

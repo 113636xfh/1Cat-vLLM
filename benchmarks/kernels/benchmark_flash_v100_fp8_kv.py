@@ -45,9 +45,11 @@ PREFILL_VARIANTS = (
 DECODE_VARIANTS = (
     "fp16_b784_xqa",
     "fp16_b784_scalar",
+    "fp16_b1568_xqa",
     "fp16_b1568_scalar",
     "fp16_b1616_xqa",
     "fp16_b1616_scalar",
+    "fp8_b16_xqa",
     "fp8_b784_xqa",
     "fp8_b784_scalar",
     "fp8_b1568_xqa",
