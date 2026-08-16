@@ -41347,3 +41347,52 @@ Interpretation:
   full-model FP8-vs-FP16 greedy equality for this change: the E5M2 binary path
   is compile-time unchanged and has already passed the stronger same-cache
   bitwise A/B gate.
+
+## 2026-08-16 AWQ fallback and Marlin split-K quality audit
+
+- Audited PR 204 on current main `d879e2580a` with CUDA 12.8, Torch
+  2.10.0+cu128, and V100 SM70. The AWQ fallback and Marlin split-K changes
+  were treated as separate quality fixes even though they arrived in one PR.
+- The classic AWQ fallback is genuinely broken on SM70, not merely different
+  from an FP16 greedy reference. Its M=1 GEMM returned finite but uninitialized
+  values with alternating hashes and about 3.2 RMS error; its M=300 dequantize
+  path produced 19,200 NaNs in 38,400 output elements. Triton dequantize plus
+  matmul was finite, repeat-bit-exact, and had 0/`8.14e-5` RMS error at M=1/300
+  against the matching half reference. The fallback is restricted to exact
+  CUDA capability 7.0; CUDA SM60/SM75 and non-CUDA platforms retain their
+  existing route. Five platform-dispatch regression cases cover this gate.
+- The Marlin candidate/control binaries differ only in the seven dense SM70
+  launchers and shared split-K epilogue. Their SHA256 values are
+  `92c267fe...392` and `d8dcbf50...96ff`. Production Qwen AWQ
+  `M={1,16,48,96,128}, N=4352, K=5120, group=128` used the same packed weight,
+  activation, CTA geometry, metadata layout, and FP32 reference in both
+  processes. Split-1 output was bitwise identical between binaries.
+- Candidate/control split-K RMS ratios at M=1/16/48/96 were
+  0.750/0.760/0.849/0.853, reducing error by 14.7%-25.0% and bringing it back
+  to the split-1 floor. Across 50 eager repeats, the maximum output spread fell
+  from `0.0039-0.0059` to `0.00024-0.00195`. FP32 atomic order is still not
+  bitwise deterministic, but both error and instability are strictly smaller
+  than the existing FP16 atomic route.
+- Independent split-8 gates for uint4b8, uint8b128, uint8, FP8, and NVFP4 all
+  passed. Candidate RMS was 22.5%-59.9% lower than control, remained within the
+  corresponding split-1 numerical floor, and reduced maximum repeat spread
+  from about `0.0039-0.0059` to `3.05e-5-9.77e-4`. CUDA Graph capture/replay
+  passed for every valid format and for production AWQ M=1/M=48.
+- Swapped-GPU concurrent M=48 timing was candidate `0.12716/0.12726 ms` versus
+  control `0.13175/0.13144 ms`; graph replay was `0.12299/0.12296 ms` versus
+  `0.12771/0.12781 ms`. Thus the quality fix is about 3%-4% faster in this
+  matched gate, not a performance regression. Production M=1/M=48 split
+  kernels retain 128 registers/thread and zero local spill; split-1 resources
+  are unchanged. The narrow kernel uses 12 registers/thread.
+- A new SM70 regression test passes on the candidate and fails on the exact
+  control because control split-8 RMS is more than twice the split-1 floor.
+  Raw binaries, fixed inputs, outputs, JSON, resource tables, build logs, and
+  audit harnesses are retained under
+  `/data/minimax-h3/task-cache/pr204-awq-marlin-audit-20260816/`.
+- This audit also exposed an independent pre-existing MXFP4 coverage defect.
+  The SM70 dispatcher accepts only FP16 activation/output, while the generic
+  test matrix admits MXFP4 only with BF16, which the dispatcher rejects. Under
+  FP16, E8M0 scale bytes at or below 112 are currently clamped to zero by the
+  SM70 fast decoder and can produce severe reference error. This invalid path
+  was excluded from PR 204 acceptance and requires a separate fix and PR; do
+  not cite the rejected BF16 run or the invalid FP16 result as split-K evidence.
