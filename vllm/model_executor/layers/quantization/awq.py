@@ -631,6 +631,25 @@ class AWQLinearMethod(LinearMethodBase):
                     .transpose(1, 2)
                     .reshape(reshaped_x.shape[0], out_shape[-1])
                 )
+        elif not current_platform.has_device_capability(75):
+            # SM70 (V100): both classic AWQ kernels are silently broken here.
+            # ops.awq_gemm's kernel is `#if __CUDA_ARCH__ < 750 assert(false)`;
+            # in a release (NDEBUG) build the assert is compiled out, leaving an
+            # EMPTY kernel that writes nothing and returns uninitialised memory.
+            # ops.awq_dequantize (dequantize_weights) has no arch guard but still
+            # returns NaN on SM70 (measured: all-zero input yields [nan,0,...]).
+            # This path is reached when VLLM_SM70_QUANT_BACKEND=marlin forces the
+            # Marlin backend (so the layer loads and turbomind is off) but a layer
+            # is Marlin-ineligible and falls back to AWQLinearMethod. Route it
+            # through the arch-agnostic triton dequant, which is present on every
+            # build and numerically matches an fp32 reference on SM70. (patch 0040)
+            from vllm.model_executor.layers.quantization.awq_triton import (
+                awq_dequantize_triton,
+            )
+
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            out = awq_dequantize_triton(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
         elif FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
             # Batch invariant mode requires torch.matmul path for Triton override.
             out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
