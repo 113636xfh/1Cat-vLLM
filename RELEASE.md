@@ -67,8 +67,10 @@ the accepted matrix. TurboMind remains the production SM70 quantization path.
 
 - The wheel now includes Flash-V100, paged-KV utilities, vLLM CUDA extensions,
   TurboMind SM70 kernels, and the complete FlashQLA Python/CUDA source package.
-- FlashQLA no longer requires an external source checkout. Its first JIT build
-  still requires a compatible CUDA toolkit and C++ compiler.
+- The wheel bundles the precompiled SM70 FlashQLA extension, so a supported
+  wheel install does not invoke NVCC at runtime. Editable/source installs may
+  use the explicit FlashQLA JIT fallback and therefore require a compatible
+  CUDA toolkit and C++ compiler.
 - All tracked Python files pass Ruff. The release change set also passes
   formatting, typos, mypy, SPDX, configuration, and backend documentation
   checks.
@@ -80,6 +82,12 @@ the accepted matrix. TurboMind remains the production SM70 quantization path.
 - The exact dual-CTA verifier currently targets the G6 FP8-KV shape; other
   shapes use exact fallbacks.
 - `FLASHINFER_SM70` and BFLA sparse prefill remain explicit experimental paths.
+- SM70 Flash-V100 disables saved AOT graph-cache reload by default because a
+  cached-artifact reload can cause deterministic greedy-token drift. This
+  preserves output quality but increases cold-start compilation time.
+- MTP is opt-in. Its first request can compile Triton helper kernels for a
+  previously unseen shape, causing a cold latency spike; warm it before
+  accepting production traffic.
 
 ## Build Target
 

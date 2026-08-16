@@ -131,13 +131,20 @@ issue, not an idle-GPU or missing graph-shape issue.
 ## Wheel And Compatibility
 
 - Wheel: `1cat_vllm-1.3.0-cp312-cp312-linux_x86_64.whl`.
-- SHA256: `df4275918461c67cb8af2c489a097cf5c7424e37706396267690094007eafdab`.
+- SHA256: `38d894460540b42dc480fed2a3c3fbb6600ecc1d3fe3e6e32054d4a766a03ff4`.
 - A cloned environment imports vLLM 1.3.0 from site-packages with Torch
   2.10.0+cu128. `_moe_C.moe_permute_sort_workspace_size` is present.
 - The wheel contains `_C`, `_C_stable_libtorch`, `_moe_C`, Flash-V100,
   vLLM FA2, and `flash_qla_sm70_gdn_strided.so`.
 - A clean-cache MTP4 plus FP8-KV boundary run does not create
   `TORCH_EXTENSIONS_DIR`, proving FlashQLA does not invoke NVCC at runtime.
+- The 2026-08-17 release candidate was rebuilt from the accepted SM70 source,
+  installed into a fresh Python 3.12 environment, and served Qwen3.8-27B-FP8
+  TP4 with the `fp8` shorthand resolving to E5M2. In both no-MTP and MTP4
+  lanes, repeated fixed-seed greedy responses were byte-identical and official
+  sampling stopped naturally without replacement characters. MTP's first
+  request may still JIT Triton helper kernels; this is a cold-latency concern,
+  not a numerical-output difference.
 - Qwen3.6-35B-A3B-AWQ TP2 final-wheel checks pass. Official 1K/256 and
   4K/1024 pure decode are 95.63 and 95.29 tok/s (10.457 and 10.494 ms TPOT),
   with complete, non-corrupted outputs and the TurboMind AWQ MoE route.
