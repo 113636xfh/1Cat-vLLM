@@ -41557,3 +41557,117 @@ Interpretation:
   the last-two-request steady-state result separately. The earlier two-request
   gate could miss this scheduler-order defect and must not be cited as
   sufficient evidence for the compact route.
+
+## 2026-08-16 PR 203 per-expert dispatch audit
+
+- The original PR 203 remains closed and unmerged. Its Python wiring had three
+  correctness defects before performance could be judged: the ordinary FP8
+  wrapper referenced an undefined name, the per-expert override was not
+  forwarded, and fake/custom-op schemas disagreed with the real signatures.
+- After repairing those issues only in the audit worktree, the original
+  `total_slots // num_experts` dispatch estimate changed FP16 output bits and
+  regressed skewed routes. It was rejected. A conservative diagnostic estimate
+  used a floor of 32 and a load factor of 16, bounded by total slots.
+- The conservative operator candidate introduced zero difference from the
+  control across 16 measured and two CUDA Graph skew cases. AWQ mean speedups
+  were 1.3106x for W13 and 2.1440x for W2; FP8 means were 1.7490x and 1.6245x.
+  Extreme-skew minima were 0.977x/0.928x for AWQ and 1.184x/0.858x for FP8, so
+  not every isolated shape improved.
+- Batch-one full-model requests do not exercise this override and therefore
+  cannot accept or reject it. Attempts to create a batch-32 end-to-end gate
+  reached the current Flash-V100 FULL-graph route limitation at startup; eager
+  or Triton fallback was not substituted because that would change the route
+  under review. Evidence is retained under
+  `/data/minimax-h3/task-cache/pr203-per-expert-audit-20260816/`.
+- Decision: do not merge either the original or conservative candidate. A new
+  proposal needs a supported multi-request Flash-V100 CUDA Graph route and a
+  matched pure-decode plus output-quality gate. Do not repeat batch-one runs as
+  PR 203 evidence.
+
+## 2026-08-16 PR 166 NVFP4 scale-convention rejection
+
+- PR 166 combined ModelOpt admission, hybrid GDN policy, MoE fallback, W4A4
+  routing, documentation, and a data-dependent NVFP4 scale rewrite. The branch
+  conflicted with current main, while its Marlin/EMULATION fallback and several
+  routing pieces had already been superseded by newer mainline code.
+- The blocking quality defect was the rule
+  `max(abs(weight_scale)) < 1 => weight_global_scale = 1`. Block and global
+  scales are multiplicatively non-identifiable without checkpoint-format
+  metadata. Running the PR's actual helper on a valid CT-style example with an
+  FP8-representable block scale of 0.5, disk global 100, and FP4 value 2 changed
+  the correct `2 * 0.5 / 100 = 0.01` dequantized value to
+  `2 * 0.5 * 1 = 1.0`, a 100x error.
+- Both compressed-tensors W4A16 and W4A4 called the rewrite before the exact
+  SM70 TurboMind check. The heuristic therefore also changed non-SM70
+  Marlin/CUTLASS behavior despite its SM70 name. The added tests asserted the
+  assumed heuristic result rather than comparing against an independent
+  checkpoint-format or real-layer oracle.
+- Paris and integer-arithmetic smokes, graph pins, or greedy MTP configuration
+  do not validate a format-level scale rewrite. PR 166 was closed without
+  merge. Any future ModelOpt-on-SM70 admission must be a narrow exact-device
+  change and use explicit checkpoint provenance plus real-layer dequant/logit
+  comparison; magnitude guessing is not acceptable.
+
+## 2026-08-16 D128 paged-prefill determinism repair
+
+- The historical issue 98 reproduction showed up to 0.19 run-to-run FP16
+  output spread for identical D128 paged-prefill inputs. The FP32 WMMA
+  accumulator in `fused_mha_forward_paged.cu` began at a 16-byte boundary,
+  while WMMA matrix load/store requires 256-bit alignment. This is undefined
+  behavior and can perturb a low-margin greedy continuation after prefill.
+- PR 123 had the correct alignment repair but lacked its required physical
+  V100 gate. It was ported to current main as PR 226, with an explicit 32-byte
+  accumulator alignment, aligned dynamic shared base, compile-time offset
+  assertion, and a six-replay regression using the current accelerator API.
+- CUDA 12.8/Torch 2.9.1 built the current-source SM70 extension successfully.
+  On a V100-SXM2-16GB, direct-extension and public-wrapper runs at L=300 and
+  L=512 were bitwise identical across all six replays; the focused pytest
+  reported 2 passed.
+- Independent FP32 causal-GQA checks were finite. L=300 had maximum/mean
+  absolute error `8.6689e-4`/`3.2426e-5` and cosine `0.99999994`; L=512 had
+  `1.09625e-3`/`2.6168e-5` and cosine `1.0`. PR 226 merged at
+  `f2a7937c7061e24454e7c4650f4036188033bbb4`; PR 123 was then closed as
+  superseded.
+
+## 2026-08-16 open-PR backlog disposition
+
+- Audited every open PR against current main. The open count was reduced from
+  54 to zero before this control-document update. No Draft or dependency PR was
+  merged merely because it was default-off or conflict-free.
+- Merged the current, independently useful fixes and baseline pieces: PRs 122,
+  124, 125, 127, 130, 138, 142-147, 149-151, 154-158, and the V100-gated
+  quality repair 226. Earlier in the same audit, PRs 141, 224, and 225 and the
+  audited replacements 216, 218, 219, 221, and 223 were also merged.
+- Closed branches already contained by newer main, including the TileLang,
+  FlashQLA loader, CLI version, draft-vocabulary synchronization, warmup
+  synchronization, non-MTP graph-sizing, and original paged-prefill PRs.
+- Closed conflicting formatter/mypy/documentation snapshots rather than
+  resolving old mechanical changes across newer quality-critical kernels.
+  These checks must be regenerated from current main if their debt remains.
+- Closed DeepSeek V4 experiments whose own records said rejected, WIP,
+  default-off without the required GPU gate, or full-model text quality not
+  passed. Closed the 171-package Dependabot group and four unvalidated
+  individual major/lower-bound updates; dependency churn is not output-quality
+  evidence and requires bounded compatibility PRs.
+
+## 2026-08-16 current-main static-baseline audit
+
+- Re-ran the full manual pre-commit workflow from the post-backlog main. Ruff
+  lint, actionlint, CUDA/ROCm/XPU/docs pip-compile, nightly Torch lock sync,
+  mypy on Python 3.10/3.11/3.12/3.13, ShellCheck, PNG lint, root lazy imports,
+  filename checks, Docker graph/version checks, configuration validation,
+  attention-backend documentation, and the remaining policy hooks passed.
+- Focused current-main regressions also passed: 13 version tests, five
+  Anthropic inline-system conversions, two SM70 large-head shared-memory guard
+  tests, and the Qwen3-Coder compressed-tensors MoE post-load test. The
+  dependency PR's CI log confirms every pip-compile variant passed.
+- Remaining failures are static mechanical debt, not model-output failures:
+  Ruff would reformat 69 Python files; typos reports 18 occurrences in the
+  TurboMind vendor and Flash-V100 sources; clang-format and markdownlint still
+  have current-main deltas; SPDX headers remain incomplete; forbidden-import
+  checks identify three files; and the accelerator-policy hook identifies 22
+  remaining call sites, primarily newer DeepSeek/benchmark files.
+- Do not infer a numerical or route regression from this CI result. Regenerate
+  formatter changes from current main and keep large C/CUDA formatter work
+  separate from accepted kernel repairs. Small policy substitutions still need
+  their own current-source static/argument-equivalence checks before merge.
