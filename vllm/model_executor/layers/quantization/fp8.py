@@ -1240,9 +1240,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_input_scale: torch.Tensor | None,
         w2_input_scale: torch.Tensor | None,
     ) -> None:
+        fp8_backend = self.fp8_backend
+        assert fp8_backend is not None
         # Shuffle weights to runtime format.
         w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
-            fp8_backend=self.fp8_backend,
+            fp8_backend=fp8_backend,
             layer=layer,
             w13=w13,
             w2=w2,
@@ -1260,7 +1262,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
         # AITER backend requires weights to be marked as shuffled.
-        if self.fp8_backend == Fp8MoeBackend.AITER:
+        if fp8_backend == Fp8MoeBackend.AITER:
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
@@ -1270,7 +1272,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.moe_kernel = make_fp8_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
-                fp8_backend=self.fp8_backend,
+                fp8_backend=fp8_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
@@ -1408,13 +1410,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        fp8_backend = self.fp8_backend
+        assert fp8_backend is not None
         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")
         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
         a1_scale = layer.w13_input_scale
         a2_scale = layer.w2_input_scale
 
         quant_config = make_fp8_moe_quant_config(
-            fp8_backend=self.fp8_backend,
+            fp8_backend=fp8_backend,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
