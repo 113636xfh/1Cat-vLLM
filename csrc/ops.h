@@ -101,6 +101,10 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
 
+void awq_sm70_dequantize_out(torch::Tensor out, torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             int64_t group_size);
+
 std::vector<torch::Tensor> uint4_sm70_prepare(torch::Tensor _kernel,
                                               torch::Tensor _scaling_factors,
                                               torch::Tensor _zeros,
@@ -111,6 +115,11 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor _kernel,
                                             torch::Tensor _scaling_factors,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
+
+void fp8_sm70_dequantize_out(torch::Tensor out,
+                             torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             int64_t group_size);
 
 std::vector<torch::Tensor> mxfp4_sm70_prepare(torch::Tensor _kernel,
                                               torch::Tensor _scaling_factors,
@@ -164,6 +173,11 @@ void fp8_gemm_sm70_out(torch::Tensor out,
                        int64_t k_ld,
                        int64_t q_ld,
                        bool gated_silu);
+
+void fp8_gemm_sm70_prefill_dispatch_out(
+    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
+    torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
+    int64_t k_ld, int64_t q_ld, bool gated_silu, int64_t min_prefill_m);
 
 void mxfp4_gemm_sm70_out(torch::Tensor out,
                          torch::Tensor _in_feats,
@@ -488,6 +502,32 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out,
                                   int64_t k,
                                   int64_t n,
                                   int64_t group_size);
+
+void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out,
+                                    torch::Tensor input,
+                                    torch::Tensor expert_offsets,
+                                    torch::Tensor dense_expert_ids,
+                                    torch::Tensor ptrs_w,
+                                    torch::Tensor ptrs_s,
+                                    int64_t num_experts,
+                                    int64_t k,
+                                    int64_t n,
+                                    int64_t group_size);
+
+void mxfp4_moe_single_token_prepare_w13_sm70_out(
+    torch::Tensor gate_up,
+    torch::Tensor compact_input,
+    torch::Tensor x,
+    torch::Tensor topk_ids,
+    torch::Tensor w13_ptrs_w,
+    torch::Tensor w13_ptrs_s,
+    torch::Tensor expert_offsets,
+    torch::Tensor inv_permuted_idx,
+    torch::Tensor sorted_expert_ids,
+    int64_t w13_k,
+    int64_t w13_n,
+    int64_t group_size,
+    int64_t hidden_logical_size);
 
 void fp8_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out,
