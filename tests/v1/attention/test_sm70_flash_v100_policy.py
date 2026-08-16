@@ -104,6 +104,93 @@ def test_split_paged_kv_cache_prefers_standard_axis_for_two_blocks():
     assert torch.equal(value_cache, kv_cache[:, 1])
 
 
+def test_sm70_mla_prefill_rejects_unsupported_configs(monkeypatch):
+    from vllm.v1.attention.backends.mla.prefill import flash_attn as mod
+
+    monkeypatch.setattr(mod, "_is_sm70_flash_v100_platform", lambda: True)
+    monkeypatch.setattr(mod, "_flash_v100_dense_prefill_lse_usable", lambda: True)
+    # The generic CUDA predicate can report a stub as available. SM70 selection
+    # must remain independent of it.
+    monkeypatch.setattr(mod, "is_flash_attn_varlen_func_available", lambda: True)
+    capability = SimpleNamespace(major=7, minor=0)
+
+    def reasons(dtype=torch.float16, qk_head_dim=256, v_head_dim=256):
+        config = SimpleNamespace(
+            dtype=dtype,
+            is_r1_compatible=False,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
+        )
+        return mod.FlashAttnPrefillBackend.validate_configuration(capability, config)
+
+    assert reasons() == []
+    assert any(
+        "uniform" in reason for reason in reasons(qk_head_dim=192, v_head_dim=128)
+    )
+    assert any(
+        "no compiled kernel" in reason
+        for reason in reasons(qk_head_dim=80, v_head_dim=80)
+    )
+    assert any("requires float16" in reason for reason in reasons(dtype=torch.bfloat16))
+
+
+def test_sm70_mla_selector_extracts_uniform_head_dims():
+    from vllm.v1.attention.backends.mla.prefill.selector import _mla_head_dims
+
+    hf_text_config = SimpleNamespace(
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=hf_text_config)
+    )
+
+    assert _mla_head_dims(vllm_config) == (256, 256)
+
+
+def test_sm70_mla_prefill_accepts_equal_independent_causal_metadata(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as flash_mod
+    from vllm.v1.attention.backends.mla.prefill import flash_attn as mod
+
+    monkeypatch.setattr(mod, "_is_sm70_flash_v100_platform", lambda: True)
+    monkeypatch.setattr(mod, "_flash_v100_dense_prefill_lse_usable", lambda: True)
+
+    calls = []
+
+    def dense_lse(query, key, value, output, softmax_lse, *args, **kwargs):
+        calls.append((args, kwargs))
+        output.copy_(value.expand_as(output))
+        softmax_lse.zero_()
+        return output, softmax_lse
+
+    monkeypatch.setattr(flash_mod, "flash_v100_dense_prefill_lse", dense_lse)
+    impl = object.__new__(mod.FlashAttnPrefillBackend)
+    impl.flash_attn_varlen_func = lambda *args, **kwargs: pytest.fail(
+        "SM70 MLA prefill fell through to the unsupported FA2 stub"
+    )
+
+    query = torch.zeros((3, 1, 256), dtype=torch.float16)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    cu_q = torch.tensor([0, 3], dtype=torch.int32)
+    cu_k = cu_q.clone()
+
+    output, lse = impl._flash_attn_varlen_diff_headdims(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        causal=True,
+        return_softmax_lse=True,
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(output, value)
+    assert torch.count_nonzero(lse) == 0
+
+
 def test_sm70_flash_v100_priority_can_be_disabled(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FLASH_ATTN_V100", "0")
     _get_backend_priorities, DeviceCapability, AttentionBackendEnum = _load_selector()

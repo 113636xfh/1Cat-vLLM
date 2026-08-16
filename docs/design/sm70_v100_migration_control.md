@@ -41442,3 +41442,68 @@ Interpretation:
   pytest logs, swapped-GPU JSON, and standalone audit harnesses are retained
   under
   `/data/minimax-h3/task-cache/mxfp4-e8m0-subnormal-20260816/`.
+
+## 2026-08-16 FP8 E5M2 KV scale and decode-quality follow-up
+
+- The quality contract remains quantization-aware: FP8 KV and FP16 KV greedy
+  token identity is not required. The decisive checks are correct E5M2 byte
+  storage and scale semantics, finite output, repeat stability, bounded
+  independent-reader differences, and comparison with an FP64 oracle.
+- `reshape_and_cache_flash` was checked with non-unit tensor scales and
+  per-head scales. The stored E5M2 bytes were bitwise identical to the
+  PyTorch quantization reference in every case; no scale inversion, omitted
+  scale, head-indexing error, or byte-layout mismatch was found.
+- Scalar and XQA readers were checked at G6/D256, block 1616, and sequence
+  length 16385. With K/V scales 0.75/1.25, both routes were finite and
+  bitwise repeatable; their maximum difference was `3.0518e-5`, while maximum
+  FP64 errors were `1.8593e-5` (scalar) and `1.7135e-5` (XQA). With scales
+  0.015625/0.03125, the route difference was `4.7684e-7` and FP64 error was
+  about `3.44e-7`.
+- A wider pre-existing G6/block-1568/sequence-2049 test produced one scalar/XQA
+  difference of `1.2207e-4`. This is exactly one adjacent FP16 output step at
+  that magnitude: scalar was `-0.1254883`, XQA was `-0.1256104`, and the FP64
+  reference was `-0.1255173`. Relative RMS errors were `2.93e-4` and
+  `3.50e-4`; neither path showed corruption. The regression gate now retains
+  its `1e-4` absolute tolerance near zero but permits one representable FP16
+  output ULP, while retaining the independent mean-error bound.
+- Combined with the four long-output no-MTP/MTP x FP16/E5M2 lanes above, this
+  audit found no unexpected FP8 KV quality bug. Do not reopen an issue solely
+  because an FP8-KV greedy stream differs from FP16-KV; require a matched
+  violation of one of the numerical or stability gates.
+
+## 2026-08-16 PR 200 SM70 MLA prefill audit
+
+- PR 200's availability goal is valid, but its original load-time guard was
+  ineffective on the real V100 build. `is_flash_attn_varlen_func_available()`
+  returned true whenever the platform was CUDA even when importing
+  `vllm_flash_attn` had failed and the exported function was only an
+  always-raising stub. Consequently 192/128 asymmetric MLA, uncompiled head
+  dim 80, and BF16 configurations returned no rejection reasons and would
+  fail only at first prefill.
+- The audited route now detects exact SM70 explicitly, bases availability on
+  the Flash-V100 dense-LSE entry, and always applies the FP16, uniform-head,
+  and compiled-tile checks during selection. On a real V100, 256/256 FP16 is
+  accepted; 192/128 FP16, 80/80 FP16, and 256/256 BF16 are rejected at load
+  time with specific reasons.
+- The original causal dispatch also used Python object identity for the Q/K
+  cumulative-offset tensors. Independent tensors containing identical
+  offsets therefore fell through to the unavailable FA2 stub. The SM70 path
+  is now selected explicitly and validates offset values; it no longer relies
+  on tensor identity.
+- The dense-LSE driver validates dtype, packed layout, devices, head mapping,
+  complete monotonic Q/K metadata, output and LSE buffers, and unsupported
+  attention options. Empty-key rows are written as zero output with `-inf`
+  LSE so they are neutral in `merge_attn_states`; no uninitialized row is
+  allowed to reach the merge.
+- V100 context-chunk coverage used independent query lengths 3/2/4 and key
+  lengths 5/0/3 at GQA Hq4/Hkv2/D256. Output was repeat-bitwise-exact, the
+  empty-key request was exactly zero/`-inf`, relative RMS versus FP64 was
+  `1.3478e-4`, and finite LSE maximum error was `1.286e-6`. Causal packed
+  lengths 1/3/5 had output RMS `1.3075e-4` and LSE maximum error
+  `1.519e-6` versus FP64.
+- The complete SM70 policy suite passes 82/82 and the complete varlen/layout
+  GPU suite passes 20/20. The general MLA selector suite has three unrelated
+  V100 test-harness failures caused by patching `current_platform` with a
+  `MagicMock` during lazy custom-op import, followed by duplicate Torch-op
+  registration; its other 10 tests pass. Do not treat those import-pollution
+  failures as MLA numerical evidence.
