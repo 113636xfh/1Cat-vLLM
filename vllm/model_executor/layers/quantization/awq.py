@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -35,6 +36,101 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+_SM70_AWQ_PREFILL_DENSE_M = 4096
+_SM70_AWQ_PREFILL_DENSE_SHAPES = {
+    "gate_up_proj": (5120, 8704),
+    "down_proj": (4352, 5120),
+    "in_proj_qkvz": (5120, 4096),
+    "out_proj": (1536, 5120),
+    "o_proj": (1536, 5120),
+}
+_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
+    k * n for k, n in _SM70_AWQ_PREFILL_DENSE_SHAPES.values()
+)
+_SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES = (
+    _SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
+)
+_sm70_awq_prefill_dense_workspaces: weakref.WeakValueDictionary[
+    tuple[int, torch.dtype], torch.Tensor
+] = weakref.WeakValueDictionary()
+
+
+def _unpack_awq_gemm_qweight(qweight: torch.Tensor) -> torch.Tensor:
+    values = [((qweight >> (4 * i)) & 0xF).to(torch.float16) for i in range(8)]
+    k = qweight.shape[0]
+    n = qweight.shape[1] * 8
+    return (
+        torch.stack(values, dim=-1)
+        .reshape(-1)
+        .reshape(n, k // 8, 2, 4)
+        .permute(0, 1, 3, 2)
+        .contiguous()
+        .reshape(k, n)
+    )
+
+
+def _unpack_awq_zeros(qzeros: torch.Tensor) -> torch.Tensor:
+    order = (0, 4, 1, 5, 2, 6, 3, 7)
+    values = [((qzeros >> (4 * i)) & 0xF).to(torch.float16) for i in order]
+    return torch.stack(values, dim=-1).reshape(qzeros.shape[0], -1)
+
+
+def _awq_exact_f16_weight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Expand exact AWQ as contiguous KxN for a direct FP16 GEMM."""
+    k = qweight.shape[0]
+    n = qweight.shape[1] * 8
+    zeros = _unpack_awq_zeros(qzeros)
+    dense = torch.empty((k, n), dtype=torch.float16, device=qweight.device)
+    for group in range(k // group_size):
+        start = group * group_size
+        end = start + group_size
+        quant = _unpack_awq_gemm_qweight(qweight[start:end])
+        scale = scales[group].unsqueeze(0)
+        bias = (-zeros[group] * scales[group]).unsqueeze(0)
+        dense[start:end].copy_(torch.addcmul(bias, quant, scale))
+    return dense
+
+
+def _is_sm70_awq_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
+    if getattr(layer, "tp_size", 1) != 4:
+        return False
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    expected = _SM70_AWQ_PREFILL_DENSE_SHAPES.get(suffix)
+    if expected is None:
+        return False
+    return (layer.qweight.shape[0], layer.qweight.shape[1] * 8) == expected
+
+
+def _get_sm70_awq_prefill_exact_dense_workspace(
+    weight: torch.Tensor,
+) -> torch.Tensor | None:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    cache_key = (device_index, torch.float16)
+    workspace = _sm70_awq_prefill_dense_workspaces.get(cache_key)
+    if workspace is not None:
+        return workspace
+    try:
+        workspace = torch.empty(
+            (_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS,),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+    except torch.OutOfMemoryError:
+        logger.warning_once(
+            "Insufficient memory for the bounded SM70 AWQ prefill workspace; "
+            "falling back to TurboMind AWQ."
+        )
+        return None
+    _sm70_awq_prefill_dense_workspaces[cache_key] = workspace
+    return workspace
 
 
 class AWQConfig(QuantizationConfig):
@@ -370,6 +466,14 @@ class AWQLinearMethod(LinearMethodBase):
         is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
         use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_AWQ_MLP_ENGINE
 
+        use_prefill_exact_dense = (
+            envs.VLLM_SM70_AWQ_PREFILL_EXACT_DENSE
+            and group_size == 128
+            and _is_sm70_awq_prefill_exact_dense_layer(layer)
+            and not use_gated_silu
+            and hasattr(torch.ops._C, "awq_sm70_dequantize_out")
+        )
+
         tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
             layer.qweight,
             layer.scales,
@@ -405,6 +509,14 @@ class AWQLinearMethod(LinearMethodBase):
             torch.empty(0, dtype=tm_scales.dtype, device=tm_weight.device),
             requires_grad=False,
         )
+        if use_prefill_exact_dense:
+            workspace = _get_sm70_awq_prefill_exact_dense_workspace(tm_weight)
+            if workspace is not None:
+                layer._awq_sm70_prefill_exact_dense_workspace = workspace
+                logger.info_once(
+                    "SM70 AWQ exact-dense prefill path enabled with a bounded "
+                    "85 MiB workspace."
+                )
         logger.info_once("SM70 AWQ TurboMind dense path enabled.")
 
     @staticmethod
@@ -473,6 +585,31 @@ class AWQLinearMethod(LinearMethodBase):
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
         if getattr(layer, "_awq_sm70_prepared", False):
             out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * pack_factor,)
+            prefill_workspace = getattr(
+                layer, "_awq_sm70_prefill_exact_dense_workspace", None
+            )
+            if (
+                prefill_workspace is not None
+                and reshaped_x.dtype == torch.float16
+                and reshaped_x.shape[0] == _SM70_AWQ_PREFILL_DENSE_M
+            ):
+                logger.info_once(
+                    "SM70 AWQ bounded-workspace exact-dense TP4 4096-token "
+                    "prefill runtime path active."
+                )
+                k = reshaped_x.shape[1]
+                n = out_shape[-1]
+                prefill_weight = prefill_workspace[: k * n].view(k, n)
+                sm70_ops.awq_sm70_dequantize_out(
+                    prefill_weight,
+                    layer._awq_sm70_weight,
+                    layer._awq_sm70_scales,
+                    layer._awq_sm70_group_size,
+                )
+                out = torch.mm(reshaped_x, prefill_weight)
+                if bias is not None:
+                    out.add_(bias)
+                return out.reshape(out_shape)
             out = torch.empty(
                 (reshaped_x.shape[0], out_shape[-1]),
                 dtype=x.dtype,
@@ -494,6 +631,17 @@ class AWQLinearMethod(LinearMethodBase):
                     .transpose(1, 2)
                     .reshape(reshaped_x.shape[0], out_shape[-1])
                 )
+        elif current_platform.is_cuda() and current_platform.is_device_capability(70):
+            # The classic AWQ GEMM is unsupported on SM70, while its dequantize
+            # fallback can produce NaNs there. Use the architecture-independent
+            # Triton dequantizer for Marlin-ineligible V100 layers.
+            from vllm.model_executor.layers.quantization.awq_triton import (
+                awq_dequantize_triton,
+            )
+
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            out = awq_dequantize_triton(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
         elif FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
             # Batch invariant mode requires torch.matmul path for Triton override.
             out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)

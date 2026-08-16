@@ -213,6 +213,17 @@ def _get_decode_plan(
         ),
         workspace_num_partitions=workspace_num_partitions,
     )
+    # Invariant, by construction: actual <= launch <= workspace. Both partition
+    # counts divide by the same positive partition_size, and
+    # effective_workspace_seq_capacity is floored to >= effective_max_seq_len
+    # above (:164-168), so workspace_num_partitions >= runtime_num_partitions;
+    # launch_num_partitions is one of those two. A check of that inequality HERE
+    # would be a tautology that can never fire (it compares three quantities all
+    # derived from the same hints), so it is NOT placed here. The coverage that
+    # actually matters -- launch >= ceil(true seq_lens.max()/ps) -- can only be
+    # checked where the real per-sequence lengths are known, which is the caller
+    # wrappers flash_attn_decode_paged / _xqa; see
+    # _assert_decode_launch_covers_seq_lens.
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         device_index,
@@ -231,6 +242,57 @@ def _get_decode_plan(
             return cached
         _decode_plan_cache[key] = plan
     return plan
+
+
+def _assert_decode_launch_covers_seq_lens(
+    plan: "_DecodePlan",
+    seq_lens: torch.Tensor | None,
+    *,
+    workspace_seq_capacity_hint: int | None,
+) -> None:
+    """Lower-bound coverage guard with REAL rejecting power (DISCIPLINE §3).
+
+    Unlike an inequality among quantities all derived from the same hint (a
+    by-construction tautology inside `_get_decode_plan`), this compares the
+    launched partition count against the batch's TRUE longest sequence, read
+    from the device ``seq_lens`` tensor -- a source INDEPENDENT of the capacity
+    hint. It therefore fires exactly when a capacity hint understates the real
+    max seq_len and the launch grid would silently truncate the longest
+    sequence (the corruption 0007's adversarial probe demonstrated, 328x rms).
+
+    Scope, and why it is scoped: it runs only when a ``workspace_seq_capacity_
+    hint`` was supplied -- the small-query / static-decode path where
+    ``launch_num_partitions == workspace_num_partitions`` can be driven below
+    coverage by a wrong hint, including this patch's own cap arithmetic. Plain
+    q=1 decode passes ``workspace_seq_capacity_hint=None`` (build() ->
+    _attach_decode_shape_hints, static_decode=False), so ``launch == runtime ==
+    ceil(effective_max_seq_len/ps)`` and there is no device sync on the hot
+    path. The q=1 path's own coverage is safe by construction (its hint is
+    ``seq_lens_cpu.max()`` for the same eager forward) and is out of this
+    finding's scope, so it is deliberately NOT guarded here. Skipped under CUDA
+    graph capture, where a ``.item()`` sync is illegal and the captured grid is
+    already sized to the full workspace envelope (:170-182), which covers any
+    runtime seq_len.
+    """
+    if workspace_seq_capacity_hint is None or _cuda_graph_capture_active():
+        return
+    if seq_lens is None or seq_lens.numel() == 0:
+        return
+    true_max_seq_len = int(seq_lens.max().item())
+    required_num_partitions = max(
+        1,
+        (true_max_seq_len + plan.partition_size - 1) // plan.partition_size,
+    )
+    if plan.launch_num_partitions < required_num_partitions:
+        raise RuntimeError(
+            "decode launch grid under-covers the batch: launch_num_partitions="
+            f"{plan.launch_num_partitions} < required={required_num_partitions} "
+            f"to cover max seq_len={true_max_seq_len} "
+            f"(partition_size={plan.partition_size}, "
+            f"workspace_seq_capacity_hint={workspace_seq_capacity_hint}). "
+            "A capacity hint understated the real sequence length; the longest "
+            "sequence would be silently truncated."
+        )
 
 
 def _get_decode_workspace_for_plan(
@@ -863,6 +925,11 @@ def flash_attn_decode_paged(
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
     )
+    _assert_decode_launch_covers_seq_lens(
+        plan,
+        seq_lens,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+    )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -949,6 +1016,11 @@ def flash_attn_decode_paged_xqa(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
+    )
+    _assert_decode_launch_covers_seq_lens(
+        plan,
+        seq_lens,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
