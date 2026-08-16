@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 FLASH_ATTN_V100_ROOT = ROOT_DIR / "flash-attention-v100"
 FLASH_ATTN_V100_PACKAGE = FLASH_ATTN_V100_ROOT / "flash_attn_v100"
+FLASH_QLA_SM70_ROOT = (
+    ROOT_DIR / "flash_qla" / "ops" / "gated_delta_rule" / "chunk" / "sm70"
+)
 ONECAT_TORCH_CU128_URLS = {
     "torch==2.10.0": (
         "torch @ https://download.pytorch.org/whl/cu128/"
@@ -205,6 +208,50 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
         dst_ext = dst_pkg / matches[-1].name
         shutil.copy2(matches[-1], dst_ext)
         remove_rpath(dst_ext)
+
+
+def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
+    """Precompile the SM70 GDN extension so runtime never requires NVCC."""
+    if not _cuda_arch_contains(7, 0):
+        return
+
+    src = FLASH_QLA_SM70_ROOT / "csrc" / "gdn_forward.cu"
+    if not src.exists():
+        raise RuntimeError(f"SM70 FlashQLA source is missing: {src}")
+
+    from torch.utils.cpp_extension import load as load_torch_extension
+
+    extension_build_dir = Path(build_temp) / "flash_qla_sm70_gdn_strided"
+    extension_build_dir.mkdir(parents=True, exist_ok=True)
+    previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+    try:
+        extension = load_torch_extension(
+            name="flash_qla_sm70_gdn_strided",
+            sources=[str(src)],
+            build_directory=str(extension_build_dir),
+            extra_cuda_cflags=[
+                "-O3",
+                "-gencode=arch=compute_70,code=sm_70",
+            ],
+            extra_cflags=["-O3"],
+            with_cuda=True,
+            verbose=bool(int(os.environ.get("FLASH_QLA_SM70_VERBOSE_BUILD", "0"))),
+        )
+    finally:
+        if previous_arch_list is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch_list
+
+    dst_pkg = (
+        Path(build_lib) / "flash_qla" / "ops" / "gated_delta_rule" / "chunk" / "sm70"
+    )
+    dst_pkg.mkdir(parents=True, exist_ok=True)
+    dst_ext = dst_pkg / Path(extension.__file__).name
+    shutil.copy2(extension.__file__, dst_ext)
+    remove_rpath(dst_ext)
+    logger.info("Bundled SM70 FlashQLA extension into wheel: %s", dst_ext)
 
 
 def remove_rpath(path: Path) -> None:
@@ -424,6 +471,7 @@ class cmake_build_ext(build_ext):
 
         if _is_cuda():
             bundle_flash_attn_v100(self.build_lib)
+            bundle_flash_qla_sm70(self.build_lib, self.build_temp)
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
@@ -1224,6 +1272,7 @@ package_data = {
     "flash_qla": [
         "LICENSE",
         "ops/gated_delta_rule/chunk/sm70/csrc/*.cu",
+        "ops/gated_delta_rule/chunk/sm70/*.so",
     ],
     "flash_attn_v100": [
         "*.so",

@@ -66,3 +66,133 @@ def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
     assert all(call.group_size == 128 for call in calls)
     assert all(call.k_ld == 128 and call.q_ld == 64 for call in calls)
     assert all(not call.gated_silu for call in calls)
+
+
+def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+
+    calls = []
+    broadcasts = []
+    barriers = []
+
+    def broadcast_object(payload, src):
+        broadcasts.append((payload, src))
+        return payload
+
+    def warmup_layers(layers, m_values):
+        calls.append((layers, m_values))
+        return 5
+
+    tp_group = SimpleNamespace(
+        world_size=4,
+        rank_in_group=0,
+        broadcast_object=broadcast_object,
+        barrier=lambda: barriers.append(True),
+    )
+    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
+    warmup.envs.disable_envs_cache()
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        warmup,
+        "_warmup_fp8_dense_layers",
+        warmup_layers,
+    )
+    monkeypatch.setattr(warmup, "_export_lut_bytes", lambda device: (b"lut", 7))
+    monkeypatch.setattr(
+        warmup,
+        "_import_lut_bytes",
+        lambda device, payload: (_ for _ in ()).throw(AssertionError()),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+
+    layers = [(nn.Module(), False)]
+    count = warmup._warmup_fp8_dense_layers_coordinated(
+        layers,
+        [1, 4],
+        torch.device("cuda:0"),
+    )
+
+    assert count == 5
+    assert calls == [(layers, [1, 4]), (layers, [1, 4])]
+    assert broadcasts == [(b"lut", 0)]
+    assert barriers == [True]
+
+
+def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
+    import vllm.distributed.parallel_state as parallel_state
+
+    calls = []
+    imports = []
+    barriers = []
+
+    def warmup_layers(layers, m_values):
+        calls.append((layers, m_values))
+        return 5
+
+    def import_lut(device, payload):
+        imports.append((device, payload))
+        return 7
+
+    tp_group = SimpleNamespace(
+        world_size=4,
+        rank_in_group=2,
+        broadcast_object=lambda payload, src: b"lut",
+        barrier=lambda: barriers.append(True),
+    )
+    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
+    warmup.envs.disable_envs_cache()
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        warmup,
+        "_warmup_fp8_dense_layers",
+        warmup_layers,
+    )
+    monkeypatch.setattr(
+        warmup,
+        "_export_lut_bytes",
+        lambda device: (_ for _ in ()).throw(AssertionError()),
+    )
+    monkeypatch.setattr(
+        warmup,
+        "_import_lut_bytes",
+        import_lut,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+
+    layers = [(nn.Module(), False)]
+    count = warmup._warmup_fp8_dense_layers_coordinated(
+        layers,
+        [1, 4],
+        torch.device("cuda:2"),
+    )
+
+    assert count == 5
+    assert calls == [(layers, [1, 4])]
+    assert imports == [(torch.device("cuda:2"), b"lut")]
+    assert barriers == [True]
+
+
+def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "1")
+    warmup.envs.disable_envs_cache()
+
+    assert not warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
+        has_awq_dense=False,
+        has_fp8_dense=True,
+        fp4_kinds=set(),
+    )
+
+
+def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+    monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
+    warmup.envs.disable_envs_cache()
+
+    assert warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
+        has_awq_dense=False,
+        has_fp8_dense=True,
+        fp4_kinds=set(),
+    )
