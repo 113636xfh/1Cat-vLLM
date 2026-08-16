@@ -24,6 +24,33 @@ else:
     flash_attn_varlen_func = None  # type: ignore[assignment]
 
 
+def _is_sm70_flash_v100_platform() -> bool:
+    """Return whether this process is running on an exact SM70 CUDA device."""
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and tuple(capability) == (7, 0)
+
+
+@functools.cache
+def _flash_v100_dense_prefill_lse_usable() -> bool:
+    """Return whether the SM70 dense prefill entry can emit softmax LSE."""
+    if not _is_sm70_flash_v100_platform():
+        return False
+    try:
+        from vllm.v1.attention.backends.flash_attn_v100 import (
+            flash_v100_dense_prefill_lse_available,
+        )
+    except ImportError:
+        return False
+    return flash_v100_dense_prefill_lse_available()
+
+
+# Head dimensions instantiated by fused_mha_forward.cu. Keep this in sync with
+# the kernel dispatch switch so unsupported models are rejected during selection.
+_SM70_DENSE_PREFILL_HEAD_DIMS = frozenset({16, 32, 64, 128, 256})
+
+
 class FlashAttnPrefillBackend(MLAPrefillBackend):
     """FlashAttention backend for MLA prefill."""
 
@@ -33,7 +60,37 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def is_available(cls) -> bool:
+        # The generic CUDA availability predicate can be true on V100 even when
+        # it resolves to an unsupported FA2 stub. Select the in-tree implementation
+        # explicitly on SM70 and retain the normal FA2/FA3 behavior elsewhere.
+        if _is_sm70_flash_v100_platform():
+            return _flash_v100_dense_prefill_lse_usable()
         return is_flash_attn_varlen_func_available()
+
+    @classmethod
+    def validate_configuration(cls, device_capability, selector_config) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            device_capability, selector_config
+        )
+        if _is_sm70_flash_v100_platform():
+            if selector_config.dtype != torch.float16:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route requires float16 "
+                    f"(got {selector_config.dtype})"
+                )
+            if selector_config.qk_head_dim != selector_config.v_head_dim:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route requires uniform qk/v head "
+                    f"dims (got qk={selector_config.qk_head_dim}, "
+                    f"v={selector_config.v_head_dim})"
+                )
+            elif selector_config.qk_head_dim not in _SM70_DENSE_PREFILL_HEAD_DIMS:
+                invalid_reasons.append(
+                    "SM70 Flash-V100 MLA prefill route has no compiled kernel tile "
+                    f"for head dim {selector_config.qk_head_dim} "
+                    f"(compiled: {sorted(_SM70_DENSE_PREFILL_HEAD_DIMS)})"
+                )
+        return invalid_reasons
 
     def __init__(
         self,
@@ -55,12 +112,24 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             vllm_config=vllm_config,
         )
 
+        if _is_sm70_flash_v100_platform():
+            assert _flash_v100_dense_prefill_lse_usable(), (
+                "The SM70 FlashAttention MLA prefill route requires the "
+                "Flash-V100 dense LSE entry."
+            )
+            self.flash_attn_varlen_func = None
+            self.vllm_flash_attn_version = None
+            self.requires_v_padding = False
+            self._is_vllm_fa = True
+            return
+
         # Handle the differences between the flash_attn_varlen from
-        # flash_attn and the one from vllm_flash_attn
+        # flash_attn and the one from vllm_flash_attn.
         assert flash_attn_varlen_func is not None, (
             "FlashAttnPrefillBackend requires flash_attn_varlen_func. "
             "Ensure FlashAttnPrefillBackend.is_available() is checked first."
         )
+
         qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.flash_attn_varlen_func = flash_attn_varlen_func
         self.vllm_flash_attn_version = get_flash_attn_version(head_size=qk_head_dim)
@@ -96,6 +165,66 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         softmax_scale: float | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if _is_sm70_flash_v100_platform():
+            cu_q = kwargs.get("cu_seqlens_q")
+            cu_k = kwargs.get("cu_seqlens_k")
+            causal = bool(kwargs.get("causal", False))
+            window_size = tuple(kwargs.get("window_size", (-1, -1)))
+            if not _flash_v100_dense_prefill_lse_usable():
+                raise RuntimeError("Flash-V100 dense LSE prefill is unavailable")
+            if q.dtype != torch.float16 or k.dtype != q.dtype or v.dtype != q.dtype:
+                raise TypeError("SM70 Flash-V100 MLA prefill requires fp16 Q/K/V")
+            if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+                raise ValueError("SM70 Flash-V100 MLA prefill expects [T, H, D] Q/K/V")
+            if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+                raise ValueError(
+                    "SM70 Flash-V100 MLA prefill requires uniform Q/K/V head dims"
+                )
+            if k.shape[1] != v.shape[1] or q.shape[1] % k.shape[1] != 0:
+                raise ValueError(
+                    "SM70 Flash-V100 MLA prefill has invalid Q/K/V head mapping"
+                )
+            if cu_q is None or cu_k is None or cu_q.numel() != cu_k.numel():
+                raise ValueError(
+                    "SM70 Flash-V100 MLA prefill requires matching Q/K metadata"
+                )
+            if float(kwargs.get("dropout_p", 0.0)) != 0.0:
+                raise ValueError("SM70 Flash-V100 MLA prefill does not support dropout")
+            if kwargs.get("alibi_slopes") is not None:
+                raise ValueError("SM70 Flash-V100 MLA prefill does not support ALiBi")
+            if float(kwargs.get("softcap", 0.0)) != 0.0:
+                raise ValueError("SM70 Flash-V100 MLA prefill does not support softcap")
+
+            from vllm.v1.attention.backends.flash_attn_v100 import (
+                flash_v100_dense_prefill_lse,
+            )
+
+            q_c = q.contiguous()
+            out = torch.empty_like(q_c)
+            lse = torch.empty(
+                (q_c.shape[1], q_c.shape[0]),
+                dtype=torch.float32,
+                device=q_c.device,
+            )
+            flash_v100_dense_prefill_lse(
+                q_c,
+                k.contiguous(),
+                v.contiguous(),
+                out,
+                lse,
+                cu_q,
+                cu_k,
+                q_c.shape[0],
+                float(softmax_scale)
+                if softmax_scale is not None
+                else q.shape[-1] ** -0.5,
+                causal=causal,
+                window_size=window_size,
+            )
+            if return_softmax_lse:
+                return out, lse
+            return out
+
         maybe_padded_v = v
         if self.requires_v_padding:
             maybe_padded_v = torch.nn.functional.pad(
@@ -111,7 +240,9 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         if envs.VLLM_BATCH_INVARIANT:
             kwargs["num_splits"] = 1
 
-        attn_out = self.flash_attn_varlen_func(
+        flash_attn_varlen_func = self.flash_attn_varlen_func
+        assert flash_attn_varlen_func is not None
+        attn_out = flash_attn_varlen_func(
             q=q,
             k=k,
             v=maybe_padded_v,

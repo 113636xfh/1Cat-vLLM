@@ -15,6 +15,17 @@ from vllm.utils.torch_utils import set_random_seed
 DEVICE = current_platform.device_type
 
 
+def _mhc_test_dtype() -> torch.dtype:
+    if current_platform.is_cuda() and torch.cuda.is_available():
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.to_int() < 80:
+            return torch.float16
+    return torch.bfloat16
+
+
+MHC_DTYPE = _mhc_test_dtype()
+
+
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
     x = x.softmax(-1) + eps
     x = x / (x.sum(-2, keepdim=True) + eps)
@@ -63,7 +74,7 @@ def mhc_pre_ref(
         res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
     )
 
-    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    layer_input = (residual * pre_mix).sum(-2).to(residual.dtype)
 
     return post_mix, res_mix, layer_input
 
@@ -76,7 +87,7 @@ def mhc_post_ref(
 ) -> torch.Tensor:
     """mHC post reference kernel from tilelang repo: https://github.com/tile-ai/tilelang/blob/d135bd1cd2d2eee74fbb41dd0a0831a427194c86/examples/deepseek_mhc/example_mhc_post.py#L68"""
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(residual.dtype)
 
 
 def hc_head_ref(
@@ -93,7 +104,9 @@ def hc_head_ref(
     )
     pre_mix = torch.nn.functional.linear(residual_norm, fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
-    return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).bfloat16()
+    return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).to(
+        residual.dtype
+    )
 
 
 @pytest.mark.skipif(
@@ -107,7 +120,7 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
-    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=MHC_DTYPE)
     hc_mult2 = hc_mult * hc_mult
     hc_mult3 = 2 * hc_mult + hc_mult2
     fn = (
@@ -175,7 +188,7 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
 
     hc_mult = 4
     hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
-    x = torch.randn((num_tokens, hc_mult * hidden_size), dtype=torch.bfloat16)
+    x = torch.randn((num_tokens, hc_mult * hidden_size), dtype=MHC_DTYPE)
     fn = torch.randn((hc_mult3, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
     out_ref = torch.empty((1, num_tokens, hc_mult3), dtype=torch.float32)
     sqrsum_ref = torch.empty((1, num_tokens), dtype=torch.float32)
@@ -200,8 +213,8 @@ def test_mhc_post_tilelang(num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
-    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
-    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    x = torch.randn((num_tokens, hidden_size), dtype=MHC_DTYPE)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=MHC_DTYPE)
     post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
     comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
 
@@ -227,8 +240,8 @@ def test_mhc_fused_post_pre(num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
-    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
-    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    x = torch.randn((num_tokens, hidden_size), dtype=MHC_DTYPE)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=MHC_DTYPE)
     post_layer_mix = torch.randn((num_tokens, hc_mult, 1), dtype=torch.float32)
     comb_res_mix = torch.randn((num_tokens, hc_mult, hc_mult), dtype=torch.float32)
 
@@ -295,13 +308,13 @@ def test_hc_head_triton(num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
-    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=MHC_DTYPE)
     fn = torch.randn((hc_mult, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
     hc_scale = torch.randn((1,), dtype=torch.float32) * 0.1
     hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
     rms_eps = hc_eps = 1e-6
 
-    out = torch.empty((num_tokens, hidden_size), dtype=torch.bfloat16)
+    out = torch.empty((num_tokens, hidden_size), dtype=MHC_DTYPE)
     out.fill_(float("nan"))
 
     result = torch.ops.vllm.hc_head_triton(
@@ -334,7 +347,7 @@ def test_hc_head_tilelang(num_tokens, hidden_size, hc_mult):
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
-    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+    residual = torch.randn((num_tokens, hc_mult, hidden_size), dtype=MHC_DTYPE)
     fn = torch.randn((hc_mult, hc_mult * hidden_size), dtype=torch.float32) * 1e-4
     hc_scale = torch.randn((1,), dtype=torch.float32) * 0.1
     hc_base = torch.randn((hc_mult,), dtype=torch.float32) * 0.1
@@ -350,7 +363,7 @@ def test_hc_head_tilelang(num_tokens, hidden_size, hc_mult):
     )
 
     assert out.shape == (num_tokens, hidden_size)
-    assert out.dtype == torch.bfloat16
+    assert out.dtype == MHC_DTYPE
     assert not torch.isnan(out).any()
 
     out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)

@@ -176,6 +176,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
   ops.def(
+      "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size) -> ()");
+  ops.impl("awq_sm70_dequantize_out", torch::kCUDA, &awq_sm70_dequantize_out);
+
+  ops.def(
       "uint4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
       "Tensor _zeros, int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("uint4_sm70_prepare", torch::kCUDA, &uint4_sm70_prepare);
@@ -184,6 +189,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fp8_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
       "int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("fp8_sm70_prepare", torch::kCUDA, &fp8_sm70_prepare);
+
+  ops.def(
+      "fp8_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size) -> ()");
+  ops.impl("fp8_sm70_dequantize_out", torch::kCUDA,
+           &fp8_sm70_dequantize_out);
 
   ops.def(
       "mxfp4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
@@ -225,6 +236,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
+      "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu, int min_prefill_m) -> ()");
+  ops.impl("fp8_gemm_sm70_prefill_dispatch_out", torch::kCUDA,
+           &fp8_gemm_sm70_prefill_dispatch_out);
 
   ops.def(
       "mxfp4_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
@@ -472,6 +491,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size) -> ()");
   ops.impl("fp8_moe_dense_stage_sm70_out", torch::kCUDA,
            &fp8_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "mxfp4_moe_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
+           &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "mxfp4_moe_single_token_prepare_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) inv_permuted_idx, "
+      "Tensor(e!) sorted_expert_ids, int w13_k, int w13_n, "
+      "int group_size, int hidden_logical_size) -> ()");
+  ops.impl("mxfp4_moe_single_token_prepare_w13_sm70_out", torch::kCUDA,
+           &mxfp4_moe_single_token_prepare_w13_sm70_out);
 
   ops.def(
       "fp8_moe_single_token_dense_stage_sm70_out("
