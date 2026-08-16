@@ -41107,3 +41107,453 @@ Interpretation:
   Long-window, token-run, malformed-tag, closure, and natural-stop guards are
   unchanged and still reject the P256 failure. Full evidence is in
   `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.
+
+## 2026-08-14 Qwen3.6 TP4 long-prefill exact-dense AWQ projections
+
+- Accepted and defaulted the gather-to-exact-dense Flash-V100 route. Its
+  attention-operator gain is 7.47%-10.81% across 8K-256K; full-model gains
+  measured 0.66% at 8K and 1.74% at 64K with identical output tokens.
+- Added exact three-way split-KV for dense `Q4096,Hq6,Hkv1,D256` attention at
+  KV >= 32K. It improves the attention kernel about 8.7% and the 64K model
+  prefill another 1.34%, with identical output tokens.
+- Added the 32 GB V100 TP4 AWQ exact-dense projection path for five validated
+  Qwen3.6 shapes. It preserves TurboMind's FP16 bias-rounding/FMA dequant
+  order and uses cuBLAS only for full M=4096 chunks; decode and tails retain
+  TurboMind AWQ.
+- Final 64K gate: `25.514792 -> 20.988843 s` prefill, latency `-17.74%`,
+  throughput `+21.56%`, identical 16 token IDs/text/hash, and unchanged TPOT.
+  Model residency is `17.36 GiB/rank`, so default enablement requires at least
+  30 GiB device memory and can be disabled with
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+- Detailed rationale, shape table, rejected paths, and artifact names are in
+  `docs/design/sm70_awq_long_prefill_exact_dense.md`.
+
+## 2026-08-14 Qwen3.6 long-prefill post-dense trace and P-layout gate
+
+- The accepted gather-to-exact-dense route remains default. Randomized
+  physical pages and the real interleaved K/V allocation are bitwise exact;
+  its 7.47%-10.81% result is an attention-operator gain, while the measured
+  full-model gain is 0.66% at 8K and 1.74% at 64K.
+- The final 64K unprofiled prefill remains 20.988843 seconds after exact FP16
+  AWQ projection preparation. The matching Nsight capture attributes 47.4%
+  of summed critical-rank kernel time to exact FP16 GEMMs, 27.6% to D256 full
+  attention, 6.7% to NCCL, and 3.5% to FlashQLA GDN.
+- Full-attention per-layer time rises from 1.701 ms at the first 4K chunk to
+  42.522 ms at 64K. The final chunk sustains about 37.6 causal TFLOP/s;
+  gather overhead is negligible in the trace.
+- Rejected the conflict-free P layout on the final TT-PV split-KV3 body.
+  Output hashes remain exact and PTXAS improves 253 to 251 registers/thread
+  with zero spill, but 32K regresses 21.0330 to 27.1365 ms and 64K regresses
+  42.6716 to 55.8776 ms. The warp-shuffle conversion stream costs more than
+  the removed shared replay. Do not retry this composition.
+- Artifacts are
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_reference_32k_64k.json`,
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/pswizzle_candidate_32k_64k.json`,
+  and the trace directory
+  `/data/minimax-h3/task-cache/1cat-fa2-sm70-long-attn-20260812/awq-prefill-dense-fullmodel/nsys/`.
+
+## 2026-08-14 Exact mixed-dtype Gemma long-prefill fusion
+
+- Accepted a default-on SM70 local fusion for Qwen3.5/Qwen3.6 Gemma residual
+  plus RMSNorm at `M>=256,H=5120`. It preserves the existing NCCL result and
+  reduction order; decode and small tails do not dispatch to it. Rollback is
+  `VLLM_SM70_GEMMA_LONG_PREFILL_FUSED=0`.
+- Production bitwise gates pass `M={256,4096}` with FP16, BF16, and FP32 norm
+  weights. The matched FP16-runtime `M=4096` chain improves from
+  0.8131-0.8141 ms to 0.2806-0.2826 ms (2.88-2.90x); the BF16 specialization
+  has the same result. The final kernel uses 48 registers/thread, 168 bytes
+  shared memory, and no local spill.
+- Matched fixed-clock 64K TP4 three-repeat prefill improves
+  `22.1030 -> 21.3302 s` (-3.50%). All output token hashes match and decode is
+  unchanged within 0.13% noise. The final register-resident production build
+  separately route-hits at 20.1917 seconds with the same 16-token hash.
+- Nsight confirms the initial fused version removed 1.661 seconds of FP32 add,
+  RMSNorm, and conversion work and replaced it with 0.669 seconds of fused
+  execution. The register-resident refinement removes the second residual
+  global read and is separately microbenchmarked.
+- A later trace's rank-1 attention slowdown and 3.117-second NCCL sum are not
+  reproducible: physical GPUs 0-3 measure 44.231/44.301/44.176/44.329 ms for
+  the same `Q4096/KV64K` kernel (0.35% maximum spread). Do not alter collective
+  dispatch from that transient capture.
+- Full method and artifacts are in
+  `docs/design/sm70_gemma_long_prefill_fusion.md`.
+
+## 2026-08-14 Exact-dense KxN storage and remaining QKV gate
+
+- Accepted contiguous `K x N` storage for the existing exact FP16 AWQ
+  long-prefill weights. Twenty real TP4 rank/shape cases are bitwise equal;
+  the five projection classes improve by 2.39%-3.01% (2.58% geometric mean).
+- Nsight Systems measures all selected projection calls at
+  `38.511 -> 36.959 s` aggregate (`-4.03%`). A fixed-clock 64K A-B-A endpoint
+  gives a conservative 0.85%-3.07% model-prefill gain, with identical token
+  hashes in all nine runs. The existing exact-dense environment gate remains
+  the rollback.
+- The remaining unquantized full-attention QKV projection is
+  `M4096,K5120,N3584`, 256 calls/rank, and about 3.3% of the latest 64K
+  prefill. cuBLAS is 1.38-1.40x faster but is rejected: every rank differs
+  from the current TurboMind FP32 accumulation result, including millions of
+  FP16 output mismatches. Raising the generic TurboMind tuning ceiling to
+  M4096 is bitwise exact but about 0.6% slower.
+- NCU on the retained `CTA128x128x16` kernel reports 255 registers/thread,
+  12.19% achieved occupancy, 61.08% cycles with no eligible warp, and only
+  10.98% DRAM throughput. The next admissible experiment must target the
+  shared-memory/MIO/scoreboard/barrier path while preserving HMMA and FP32
+  accumulation order; shape tuning and direct cuBLAS are closed.
+- Artifacts are `awq_exact_dense_kn_layout_tp4_allranks.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-nk-control-fullmodel-i65536-clock1530-repeat3.json`,
+  `awq-kn-fullmodel-i65536-clock1530-repeat3-aba.json`,
+  `awq-kn-nsys-i65536-clock1530.nsys-rep`,
+  `qkv_prefill_cublas_tp4_allranks.json`, and
+  `ncu-qkv-tm-m4096-n3584-k5120-clock1530.ncu-rep` under the retained task
+  artifact directory.
+
+## 2026-08-14 Bounded-memory AWQ exact-dense prefill
+
+- Replaced 10.60 GiB/rank of permanent FP16 projection copies with one shared
+  85 MiB `K x N` workspace. A production CUDA op reverses the TurboMind
+  K8/N32 layout and reproduces its FP16 bias plus FMA dequantization exactly
+  before cuBLAS. OOM falls back to TurboMind; the old 30 GiB device gate is no
+  longer required.
+- All 20 real Qwen3.6-27B-AWQ TP4 rank/shape cases are bitwise equal for both
+  dequantized weights and final GEMM outputs. Weighted microbench speedup over
+  TurboMind is 1.47x-1.54x; dequantization adds about 24-25 ms per full chunk.
+- Same-source model residency is `6.50 -> 6.59 GiB/rank`, available KV is
+  `20.49 -> 20.41 GiB/rank`, and 131K maximum concurrency is
+  `10.01x -> 9.97x`. The former resident implementation measured 16.77 GiB
+  model memory and only 10.34 GiB available KV.
+- Fixed-clock 64K full-model A-B-A with official sampling gives
+  `20.900 -> 24.774 -> 21.241 s` for candidate-control-candidate. Two-repeat
+  means are `24.048 -> 20.338 s` (-15.43%); all 64 output token IDs, text, and
+  hashes match, while decode TPOT is unchanged within noise.
+- Evidence is under `workspace-production/` in the retained task artifact
+  directory. The rollback remains
+  `VLLM_SM70_AWQ_PREFILL_EXACT_DENSE=0`.
+
+## 2026-08-15 Qwen3.8-27B 1.3.0 release acceptance
+
+- Accepted Qwen3.8-27B-FP8 TP4 no-MTP long-context, concurrency, MTP4,
+  FP8-KV, exact-256K-boundary, API quality, and final-wheel gates.
+- Defaulted the proven mid-range G6 XQA QK pipeline, extended no-MTP graph
+  request shapes through 16, restricted the Qwen3.6 draft-vocabulary asset so
+  Qwen3.8 uses full vocabulary, and bundled FlashQLA SM70 into the wheel.
+- Qwen3.6-35B-A3B-AWQ TP2 loads from the final wheel and passes official
+  1K/256 and 4K/1024 checks. No 35B FP8 checkpoint is available, so that speed
+  target remains explicitly unmeasured.
+- Full configuration, performance tables, quality evidence, limitations, and
+  artifact paths are in `docs/design/sm70_qwen38_130_acceptance.md`.
+
+## 2026-08-15 Qwen3.8 FP8 compile-safe long-prefill projections
+
+- Fixed a false route hit where `torch.compile` folded a Python large-M
+  branch and left every measured FP8 projection on TurboMind. The accepted
+  opaque CUDA op selects TurboMind below M3920 and exact dense above it.
+- The default is restricted to TP4 gate/up/down/output shapes. It uses one
+  shared 85 MiB FP16 workspace; QKV, decode, and tails remain unchanged.
+- Matched 32K/128K/256K throughput improves 22.36%/12.94%/7.25% with exact
+  control output hashes. Final 128K/256K prefill is 2446.5/1602.0 tok/s.
+- Q15680 split-KV3 was rejected: only 0.85%-1.80% attention gain, about
+  290 MiB/rank extra workspace, and non-bitwise output.
+- Detailed route gates, full sweep, tests, rejected paths, and artifacts are
+  in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.
+
+## 2026-08-16 Qwen3.8 output-quality audit
+
+- Audited PR 212 head `7f409a7727` on Qwen3.8-27B-FP8, TP4 V100, max length
+  32768, official sampling, and the fixed 74-token macOS code prompt. Do not
+  repeat the earlier 1K/8K smokes as long-form quality evidence.
+- Natural-stop output gates passed no-MTP/FP16 KV (24,441 tokens),
+  no-MTP/E5M2 KV (25,055), MTP4/FP16 KV (25,753), and MTP4/E5M2 KV (18,642).
+  Every output contains complete HTML/CSS/JavaScript, closed tags and code
+  fences, no replacement characters, and no semantic long-block repetition.
+- Same-seed duplicate requests were byte-identical for all four paths. Long
+  prefix-cache probes remained byte-identical after 4,704, 4,896, and 6,464
+  cached tokens in the no-MTP/FP16, MTP4/FP16, and MTP4/E5M2 lanes.
+- Qwen3.8 TP4 XQA-vs-scalar operator checks at the 4095/4096/4097 boundary,
+  6272, 8192, and 16384 stayed within `6.1035e-5` maximum absolute difference
+  for FP16 and E5M2 KV. The MTP five-row, partition-1024 checks have the same
+  bound. The full MTP services logged the automatic GDN full-forward quality
+  guard and actual route hit.
+- A no-MTP-vs-MTP FP16 greedy comparison first diverges at output index 179.
+  The no-MTP top two tokens are tied at returned precision; the MTP target
+  top-1 leads by only 0.015625 and the verifier selects that target top-1.
+  This is a low-margin M=1/M=5 floating-point-order flip, not evidence that MTP
+  accepted a non-target draft token.
+- The serving/release gates falsely counted each overlapping 20/50-character
+  window inside decorative `=====` comments. On the MTP4/E5M2 output this
+  produced `repeat20=1064` and `repeat50=224`; excluding homogeneous windows
+  yields 28/28 while the independent same-character-run gate remains active.
+- The historical 8192-token no-MTP/FP16 artifact that degenerates after about
+  token 6377 predates the new E5M2 work and has no retained request seed. Keep
+  it as an unmatched regression sample; do not attribute it to FP8 KV, XQA,
+  MTP, or sampling without a matched reproduction.
+
+## 2026-08-16 Rejected MTP chunked-prefill compile entry
+
+- PR 213 proposed a second compiled Qwen target entry that bypassed the
+  automatic full-forward GDN guard only while every scheduled request was an
+  unfinished prefill chunk. Its 64K output was healthy, but its claimed
+  `22.5%-24.3%` prefill improvement compared against an older release artifact
+  rather than a same-source control.
+- A matched Qwen3.8-27B-FP8 TP4 control used MTP4, E5M2 KV, 65,517 prompt
+  tokens, 8,192-token prefill chunks, max length 262,144, seed 20260815,
+  official sampling, GPU memory utilization 0.88, and one warmup followed by
+  prefix/Mamba cache reset. The only changed setting was
+  `VLLM_SM70_MTP_PREFILL_STANDARD_GDN`.
+- The proposed entry took 24.428544 s for prefill. The disabled control took
+  24.284061 s, so enabling the entry added 0.144483 s (`+0.595%`) rather than
+  recovering the claimed release gap. Both lanes stopped naturally, retained
+  all three long-context sentinels, passed the corruption/repetition gate, and
+  reproduced their warmup text exactly. Cross-route token identity was not
+  required.
+- The additional entry also raised observed engine initialization from
+  117.93 s to 166.12 s because it compiled a second target graph. PR 213 was
+  closed without merge: the older comparison was confounded by other source
+  changes, while the matched result showed no runtime benefit to justify the
+  startup and maintenance cost.
+- Evidence is
+  `/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/results/qwen38-27b-fp8-mtp4-candidate-tp4-e5m2-64k-o512-warm.json`
+  and
+  `/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/results/qwen38-27b-fp8-mtp4-control-off-tp4-e5m2-64k-o512-warm.json`.
+  Do not repeat the older release-vs-candidate comparison as evidence for this
+  compile entry.
+
+## 2026-08-16 XQA FP16 probability-handoff audit
+
+- Audited PR 210 on current main `4ba41b32ac`. The change keeps softmax
+  probabilities in FP32 through the scalar PV loop only for FP16 KV. The
+  FP8-E5M2 instantiations retain the existing FP16 probability handoff.
+- The quality contract does not require FP8-KV greedy output to equal FP16-KV
+  greedy output. The relevant gates here were same-build repeat stability,
+  same-quantized-cache candidate/control equality, finite output, bounded
+  scalar/XQA differences, and error against an FP64 attention oracle.
+- Five controlled FP16 shapes covered G4/G6/G8, partitions 256/512/1024,
+  partial tiles, block sizes 16/784/1616, and a five-row MTP-verifier shape.
+  Candidate/control FP64 RMS ratios were 0.835, 0.862, 0.850, 0.868, and
+  0.856. Two default-production G6/block784 shapes at 16K and 64K had ratios
+  0.863 and 0.874. Thus every tested FP16 shape improved by 12.6%-16.5%.
+- Four controlled and two default-production E5M2 shapes were bitwise
+  identical between candidate and control across all 15,360 output elements.
+  All 13 FP16/E5M2 cases were finite and bitwise repeatable across four runs.
+  Resource usage was identical for every compiled kernel instantiation.
+- Swapped-GPU concurrent A/B timing at FP16 G6/block784/65,539, 500 measured
+  calls per lane, produced candidate/control medians of 0.294912/0.296960 ms,
+  0.295936/0.295936 ms, and 0.299008/0.295936 ms. The observed range
+  (-0.7% to +1.0%) is neutral measurement noise; no decode regression was
+  established.
+- Raw builds, outputs, JSON, logs, resource tables, and the standalone audit
+  harness are retained under
+  `/data/minimax-h3/task-cache/pr210-xqa-fp32-p-audit-20260816/`. Do not rerun
+  full-model FP8-vs-FP16 greedy equality for this change: the E5M2 binary path
+  is compile-time unchanged and has already passed the stronger same-cache
+  bitwise A/B gate.
+
+## 2026-08-16 AWQ fallback and Marlin split-K quality audit
+
+- Audited PR 204 on current main `d879e2580a` with CUDA 12.8, Torch
+  2.10.0+cu128, and V100 SM70. The AWQ fallback and Marlin split-K changes
+  were treated as separate quality fixes even though they arrived in one PR.
+- The classic AWQ fallback is genuinely broken on SM70, not merely different
+  from an FP16 greedy reference. Its M=1 GEMM returned finite but uninitialized
+  values with alternating hashes and about 3.2 RMS error; its M=300 dequantize
+  path produced 19,200 NaNs in 38,400 output elements. Triton dequantize plus
+  matmul was finite, repeat-bit-exact, and had 0/`8.14e-5` RMS error at M=1/300
+  against the matching half reference. The fallback is restricted to exact
+  CUDA capability 7.0; CUDA SM60/SM75 and non-CUDA platforms retain their
+  existing route. Five platform-dispatch regression cases cover this gate.
+- The Marlin candidate/control binaries differ only in the seven dense SM70
+  launchers and shared split-K epilogue. Their SHA256 values are
+  `92c267fe...392` and `d8dcbf50...96ff`. Production Qwen AWQ
+  `M={1,16,48,96,128}, N=4352, K=5120, group=128` used the same packed weight,
+  activation, CTA geometry, metadata layout, and FP32 reference in both
+  processes. Split-1 output was bitwise identical between binaries.
+- Candidate/control split-K RMS ratios at M=1/16/48/96 were
+  0.750/0.760/0.849/0.853, reducing error by 14.7%-25.0% and bringing it back
+  to the split-1 floor. Across 50 eager repeats, the maximum output spread fell
+  from `0.0039-0.0059` to `0.00024-0.00195`. FP32 atomic order is still not
+  bitwise deterministic, but both error and instability are strictly smaller
+  than the existing FP16 atomic route.
+- Independent split-8 gates for uint4b8, uint8b128, uint8, FP8, and NVFP4 all
+  passed. Candidate RMS was 22.5%-59.9% lower than control, remained within the
+  corresponding split-1 numerical floor, and reduced maximum repeat spread
+  from about `0.0039-0.0059` to `3.05e-5-9.77e-4`. CUDA Graph capture/replay
+  passed for every valid format and for production AWQ M=1/M=48.
+- Swapped-GPU concurrent M=48 timing was candidate `0.12716/0.12726 ms` versus
+  control `0.13175/0.13144 ms`; graph replay was `0.12299/0.12296 ms` versus
+  `0.12771/0.12781 ms`. Thus the quality fix is about 3%-4% faster in this
+  matched gate, not a performance regression. Production M=1/M=48 split
+  kernels retain 128 registers/thread and zero local spill; split-1 resources
+  are unchanged. The narrow kernel uses 12 registers/thread.
+- A new SM70 regression test passes on the candidate and fails on the exact
+  control because control split-8 RMS is more than twice the split-1 floor.
+  Raw binaries, fixed inputs, outputs, JSON, resource tables, build logs, and
+  audit harnesses are retained under
+  `/data/minimax-h3/task-cache/pr204-awq-marlin-audit-20260816/`.
+- This audit also exposed an independent pre-existing MXFP4 coverage defect.
+  The SM70 dispatcher accepts only FP16 activation/output, while the generic
+  test matrix admits MXFP4 only with BF16, which the dispatcher rejects. Under
+  FP16, E8M0 scale bytes at or below 112 are currently clamped to zero by the
+  SM70 fast decoder and can produce severe reference error. This invalid path
+  was excluded from PR 204 acceptance and requires a separate fix and PR; do
+  not cite the rejected BF16 run or the invalid FP16 result as split-K evidence.
+
+## 2026-08-16 SM70 MXFP4 E8M0 subnormal quality repair
+
+- Reproduced the independent MXFP4 defect from the PR 204 audit on main
+  `064b8044bf` with CUDA 12.8, Torch 2.10.0+cu128, and V100 SM70. This is a
+  Marlin weight-scale decoder bug and is unrelated to the accepted numerical
+  difference between FP8 KV cache and FP16 KV cache.
+- An E8M0 byte represents `2^(byte - 127)`. Bytes 103-112 therefore map to
+  representable FP16 subnormals `2^-24` through `2^-15`; byte 102 is the
+  round-to-nearest-even tie below the minimum subnormal and must become zero.
+  Both dense and MoE decoders instead clamped every byte through 112 to zero.
+- Fixed-byte `M=1,N=512,K=1024,group=32` controls produced zero output for
+  bytes 103-112 while 510-511 of 512 FP16-reference elements were nonzero.
+  Relative RMS error was exactly 1.0 in both dense and MoE paths. Bytes 100,
+  102, 113, and 120 behaved as expected, isolating the decoder boundary.
+- The accepted implementation treats each E8M0 byte as an IEEE FP32 exponent
+  field and uses the SM70 FP32-to-FP16 round-to-nearest-even conversion. It
+  preserves FP16 subnormals without changing FP4 dequantization, HMMA, or FP32
+  accumulation order. Dense and MoE candidate binaries are
+  `488c8d1c...585d` and `059b1357...93d`; controls are
+  `92c267fe...392` and `f4dfacf1...fe0`.
+- Sixteen focused candidate regressions cover dense/MoE, split-K 1/8, and
+  E8M0 bytes 102/103/112/113. All pass bitwise against the matching FP16
+  reference. A wider fixed-byte sweep over 100/102/103/104/111/112/113/120
+  is also bitwise exact for dense and MoE at split-K 1 and 8. The exact control
+  fails both paths at bytes 103 and 112.
+- CUDA Graph replay is valid for the normal production-scale benchmark. In
+  swapped-GPU tests at byte 120, dense `M=1,N=4096,K=4096` eager medians improve
+  from `0.269427/0.269308` to `0.211488/0.211551 ms`; graph medians improve from
+  `0.268847/0.268723` to `0.210803/0.211058 ms` (about 21%). MoE
+  `M=1,N=512,K=4096` eager medians improve from `0.380061/0.379988` to
+  `0.276103/0.276185 ms`; graph medians improve from
+  `0.379811/0.379772` to `0.275853/0.275913 ms` (about 27%).
+- The representative dense non-split/split kernels move from 175/183 to
+  194/193 registers/thread; representative MoE variants move from 192/194 to
+  213/214. These shapes retain two resident CTAs and have no local spill. The
+  measured speedup confirms the hardware conversion removes more integer
+  decoder work than the added registers cost.
+- Rejected two explicit integer branch/shift variants. Although both repaired
+  quality, the better of them regressed dense `0.269 -> 0.554 ms` and MoE
+  `0.380 -> 0.648 ms` at the same normal-scale contract. Do not reintroduce a
+  dynamic subnormal shift into the metadata hot loop.
+- Source binaries, control/candidate outputs, build logs, resource tables,
+  pytest logs, swapped-GPU JSON, and standalone audit harnesses are retained
+  under
+  `/data/minimax-h3/task-cache/mxfp4-e8m0-subnormal-20260816/`.
+
+## 2026-08-16 FP8 E5M2 KV scale and decode-quality follow-up
+
+- The quality contract remains quantization-aware: FP8 KV and FP16 KV greedy
+  token identity is not required. The decisive checks are correct E5M2 byte
+  storage and scale semantics, finite output, repeat stability, bounded
+  independent-reader differences, and comparison with an FP64 oracle.
+- `reshape_and_cache_flash` was checked with non-unit tensor scales and
+  per-head scales. The stored E5M2 bytes were bitwise identical to the
+  PyTorch quantization reference in every case; no scale inversion, omitted
+  scale, head-indexing error, or byte-layout mismatch was found.
+- Scalar and XQA readers were checked at G6/D256, block 1616, and sequence
+  length 16385. With K/V scales 0.75/1.25, both routes were finite and
+  bitwise repeatable; their maximum difference was `3.0518e-5`, while maximum
+  FP64 errors were `1.8593e-5` (scalar) and `1.7135e-5` (XQA). With scales
+  0.015625/0.03125, the route difference was `4.7684e-7` and FP64 error was
+  about `3.44e-7`.
+- A wider pre-existing G6/block-1568/sequence-2049 test produced one scalar/XQA
+  difference of `1.2207e-4`. This is exactly one adjacent FP16 output step at
+  that magnitude: scalar was `-0.1254883`, XQA was `-0.1256104`, and the FP64
+  reference was `-0.1255173`. Relative RMS errors were `2.93e-4` and
+  `3.50e-4`; neither path showed corruption. The regression gate now retains
+  its `1e-4` absolute tolerance near zero but permits one representable FP16
+  output ULP, while retaining the independent mean-error bound.
+- Combined with the four long-output no-MTP/MTP x FP16/E5M2 lanes above, this
+  audit found no unexpected FP8 KV quality bug. Do not reopen an issue solely
+  because an FP8-KV greedy stream differs from FP16-KV; require a matched
+  violation of one of the numerical or stability gates.
+
+## 2026-08-16 PR 200 SM70 MLA prefill audit
+
+- PR 200's availability goal is valid, but its original load-time guard was
+  ineffective on the real V100 build. `is_flash_attn_varlen_func_available()`
+  returned true whenever the platform was CUDA even when importing
+  `vllm_flash_attn` had failed and the exported function was only an
+  always-raising stub. Consequently 192/128 asymmetric MLA, uncompiled head
+  dim 80, and BF16 configurations returned no rejection reasons and would
+  fail only at first prefill.
+- The audited route now detects exact SM70 explicitly, bases availability on
+  the Flash-V100 dense-LSE entry, and always applies the FP16, uniform-head,
+  and compiled-tile checks during selection. On a real V100, 256/256 FP16 is
+  accepted; 192/128 FP16, 80/80 FP16, and 256/256 BF16 are rejected at load
+  time with specific reasons.
+- The original causal dispatch also used Python object identity for the Q/K
+  cumulative-offset tensors. Independent tensors containing identical
+  offsets therefore fell through to the unavailable FA2 stub. The SM70 path
+  is now selected explicitly and validates offset values; it no longer relies
+  on tensor identity.
+- The dense-LSE driver validates dtype, packed layout, devices, head mapping,
+  complete monotonic Q/K metadata, output and LSE buffers, and unsupported
+  attention options. Empty-key rows are written as zero output with `-inf`
+  LSE so they are neutral in `merge_attn_states`; no uninitialized row is
+  allowed to reach the merge.
+- V100 context-chunk coverage used independent query lengths 3/2/4 and key
+  lengths 5/0/3 at GQA Hq4/Hkv2/D256. Output was repeat-bitwise-exact, the
+  empty-key request was exactly zero/`-inf`, relative RMS versus FP64 was
+  `1.3478e-4`, and finite LSE maximum error was `1.286e-6`. Causal packed
+  lengths 1/3/5 had output RMS `1.3075e-4` and LSE maximum error
+  `1.519e-6` versus FP64.
+- The complete SM70 policy suite passes 82/82 and the complete varlen/layout
+  GPU suite passes 20/20. The general MLA selector suite has three unrelated
+  V100 test-harness failures caused by patching `current_platform` with a
+  `MagicMock` during lazy custom-op import, followed by duplicate Torch-op
+  registration; its other 10 tests pass. Do not treat those import-pollution
+  failures as MLA numerical evidence.
+
+## 2026-08-16 Qwen3.6 35B AWQ compact-reduce determinism repair
+
+- Reproduced a real no-MTP output-quality defect on Qwen3.6-35B-A3B-AWQ,
+  TP2 V100, FP16 KV, greedy decoding, and the accepted Flash-V100/compile-graph
+  route. Identical requests could agree twice and then diverge on the third
+  request, typically after 156-226 output tokens. This is not the expected
+  numerical difference between FP8 KV and FP16 KV: FP8 KV was not used in this
+  reproduction.
+- Focused exclusions showed that the instability remained with CUDA Graph and
+  compile disabled, asynchronous scheduling disabled, custom all-reduce
+  disabled, TRITON_ATTN selected, and FlashQLA GDN decode disabled. Disabling
+  only `VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT` restored three-request
+  token identity, but reduced the diagnostic short-request decode result from
+  about 97-98 to 83.09 tok/s. Keep that switch as an isolation control, not as
+  the production repair.
+- The compact W2 path used `StoreMoeWeightedReduce`, where eight expert CTAs
+  independently performed FP16 `atomicAdd` operations into the same output
+  row. CTA arrival order is unspecified, and rounding after each FP16 atomic
+  made the result depend on scheduling. The small per-layer drift accumulated
+  until a low-margin greedy token flipped.
+- The repair retains compact W13 and W2 GEMMs, materializes the eight sorted
+  expert rows, and invokes the existing fixed route-order half2 reduction with
+  FP32 FMA accumulation. It removes only the early weighted atomic epilogue;
+  attention, GDN, routing weights, quantized weights, and FP16 KV math are
+  unchanged.
+- Operator checks at layers 1, 20, and 39 covered round-robin routing and
+  single experts 0, 17, and 255. All 24 fused-W13/SILU and final-weighted-output
+  reports were bitwise exact against the ordered reference, with no NaNs and no
+  nonzero elements. Evidence is
+  `/data/minimax-h3/task-cache/awq-deterministic-reduce-20260816/op-layers1-20-39-patterns.json`.
+- The exact control and repaired `_C` binaries have SHA256
+  `8df401ad...d3e9` and `c81a45e8...2127`. With compact, Flash-V100,
+  compile/CUDA Graph, custom all-reduce, and asynchronous scheduling all left
+  enabled, the control produced three different 256-token greedy hashes:
+  `7f235c1e...1211`, `83f78a66...f7aa`, and `9b907780...ecc9`. The repaired
+  binary produced `e385f7e8...90dd` three times and passed both full and
+  steady-state exact-token gates.
+- A matched 512-input/256-output performance request reported 255 steady decode
+  tokens. Pure decode was 97.262188 tok/s for the atomic control and 97.691431
+  tok/s for the ordered repair (`+0.441%`, neutral noise rather than a
+  regression). Prefill/TTFT were not included in that comparison. Artifacts
+  are `fullmodel-atomic-speed256.json` and `fullmodel-fixed-speed256.json`
+  under
+  `/data/minimax-h3/task-cache/awq-deterministic-reduce-20260816/`.
+- Hardened `run_sm70_quality_speed_matrix.py` to retain output token IDs and
+  require three same-process greedy requests instead of two. It also reports
+  the last-two-request steady-state result separately. The earlier two-request
+  gate could miss this scheduler-order defect and must not be cited as
+  sufficient evidence for the compact route.
