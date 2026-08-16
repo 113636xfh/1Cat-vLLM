@@ -41396,3 +41396,49 @@ Interpretation:
   SM70 fast decoder and can produce severe reference error. This invalid path
   was excluded from PR 204 acceptance and requires a separate fix and PR; do
   not cite the rejected BF16 run or the invalid FP16 result as split-K evidence.
+
+## 2026-08-16 SM70 MXFP4 E8M0 subnormal quality repair
+
+- Reproduced the independent MXFP4 defect from the PR 204 audit on main
+  `064b8044bf` with CUDA 12.8, Torch 2.10.0+cu128, and V100 SM70. This is a
+  Marlin weight-scale decoder bug and is unrelated to the accepted numerical
+  difference between FP8 KV cache and FP16 KV cache.
+- An E8M0 byte represents `2^(byte - 127)`. Bytes 103-112 therefore map to
+  representable FP16 subnormals `2^-24` through `2^-15`; byte 102 is the
+  round-to-nearest-even tie below the minimum subnormal and must become zero.
+  Both dense and MoE decoders instead clamped every byte through 112 to zero.
+- Fixed-byte `M=1,N=512,K=1024,group=32` controls produced zero output for
+  bytes 103-112 while 510-511 of 512 FP16-reference elements were nonzero.
+  Relative RMS error was exactly 1.0 in both dense and MoE paths. Bytes 100,
+  102, 113, and 120 behaved as expected, isolating the decoder boundary.
+- The accepted implementation treats each E8M0 byte as an IEEE FP32 exponent
+  field and uses the SM70 FP32-to-FP16 round-to-nearest-even conversion. It
+  preserves FP16 subnormals without changing FP4 dequantization, HMMA, or FP32
+  accumulation order. Dense and MoE candidate binaries are
+  `488c8d1c...585d` and `059b1357...93d`; controls are
+  `92c267fe...392` and `f4dfacf1...fe0`.
+- Sixteen focused candidate regressions cover dense/MoE, split-K 1/8, and
+  E8M0 bytes 102/103/112/113. All pass bitwise against the matching FP16
+  reference. A wider fixed-byte sweep over 100/102/103/104/111/112/113/120
+  is also bitwise exact for dense and MoE at split-K 1 and 8. The exact control
+  fails both paths at bytes 103 and 112.
+- CUDA Graph replay is valid for the normal production-scale benchmark. In
+  swapped-GPU tests at byte 120, dense `M=1,N=4096,K=4096` eager medians improve
+  from `0.269427/0.269308` to `0.211488/0.211551 ms`; graph medians improve from
+  `0.268847/0.268723` to `0.210803/0.211058 ms` (about 21%). MoE
+  `M=1,N=512,K=4096` eager medians improve from `0.380061/0.379988` to
+  `0.276103/0.276185 ms`; graph medians improve from
+  `0.379811/0.379772` to `0.275853/0.275913 ms` (about 27%).
+- The representative dense non-split/split kernels move from 175/183 to
+  194/193 registers/thread; representative MoE variants move from 192/194 to
+  213/214. These shapes retain two resident CTAs and have no local spill. The
+  measured speedup confirms the hardware conversion removes more integer
+  decoder work than the added registers cost.
+- Rejected two explicit integer branch/shift variants. Although both repaired
+  quality, the better of them regressed dense `0.269 -> 0.554 ms` and MoE
+  `0.380 -> 0.648 ms` at the same normal-scale contract. Do not reintroduce a
+  dynamic subnormal shift into the metadata hot loop.
+- Source binaries, control/candidate outputs, build logs, resource tables,
+  pytest logs, swapped-GPU JSON, and standalone audit harnesses are retained
+  under
+  `/data/minimax-h3/task-cache/mxfp4-e8m0-subnormal-20260816/`.
