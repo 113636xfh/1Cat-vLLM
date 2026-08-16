@@ -262,6 +262,10 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = (
                     speculative_config.num_speculative_state_tokens() + 1
                 )
+            if speculative_config.use_dspark():
+                # The anchor itself is the first prediction position, with no
+                # separate bonus query, so DSpark needs exactly N slots.
+                self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
         if hash_block_size is None:

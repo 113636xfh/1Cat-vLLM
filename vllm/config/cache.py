@@ -76,6 +76,9 @@ class CacheConfig:
     """Data type for kv cache storage. If "auto", will use model data type.
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
+    On SM70 with the 1Cat Flash-V100 backend enabled, the user-facing ``fp8``
+    shorthand resolves to fp8_e5m2 for compatibility with its optimized KV
+    path; explicit fp8_e4m3 keeps the upstream E4M3 behavior.
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
@@ -261,14 +264,16 @@ class CacheConfig:
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
-                "memory footprint and boosts the performance. "
+                "memory footprint; performance depends on backend and "
+                "hardware support. "
                 "Dynamic per-token-head scales will be computed at runtime.",
                 str(cache_dtype),
             )
         elif is_quantized_kv_cache(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
-                "memory footprint and boosts the performance. "
+                "memory footprint; performance depends on backend and "
+                "hardware support. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor",
                 str(cache_dtype),
