@@ -246,6 +246,33 @@ struct CopyWithScaleOp {
   }
 };
 
+__device__ __forceinline__ uint8_t
+fp16_bits_to_e5m2_satfinite_rn(const uint16_t bits) {
+  const uint16_t sign = (bits >> 8) & 0x80u;
+  const uint16_t magnitude = bits & 0x7fffu;
+  const uint16_t exponent = magnitude >> 10;
+  const uint16_t mantissa = magnitude & 0x03ffu;
+
+  if (exponent == 0x1fu) {
+    // Match CUDA's __NV_SATFINITE behavior: infinities clamp to max finite,
+    // while every NaN payload and sign canonicalizes to positive E5M2 NaN.
+    return mantissa == 0 ? static_cast<uint8_t>(sign | 0x7bu) : 0x7fu;
+  }
+
+  uint16_t rounded = magnitude >> 8;
+  const uint16_t remainder = magnitude & 0x00ffu;
+  rounded += remainder > 0x80u || (remainder == 0x80u && (rounded & 1u) != 0u);
+  rounded = rounded > 0x7bu ? 0x7bu : rounded;
+  return static_cast<uint8_t>(sign | rounded);
+}
+
+struct CopyFp16ToE5M2UnitScaleOp {
+  __device__ __forceinline__ void operator()(uint8_t& dst,
+                                             const uint16_t src) const {
+    dst = fp16_bits_to_e5m2_satfinite_rn(src);
+  }
+};
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
@@ -349,13 +376,36 @@ __global__ void reshape_and_cache_flash_kernel(
     float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
     float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
 
-    CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-    CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+    if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2 &&
+                  std::is_same_v<scalar_t, uint16_t> &&
+                  std::is_same_v<cache_t, uint8_t>) {
+      if (k_scale_val == 1.f) {
+        vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
+                                           threadIdx.x, blockDim.x,
+                                           CopyFp16ToE5M2UnitScaleOp{});
+      } else {
+        CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+        vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
+                                           threadIdx.x, blockDim.x, k_op);
+      }
+      if (v_scale_val == 1.f) {
+        vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                           threadIdx.x, blockDim.x,
+                                           CopyFp16ToE5M2UnitScaleOp{});
+      } else {
+        CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+        vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                           threadIdx.x, blockDim.x, v_op);
+      }
+    } else {
+      CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+      CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
-    vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
-                                       blockDim.x, k_op);
-    vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
-                                       threadIdx.x, blockDim.x, v_op);
+      vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
+                                         blockDim.x, k_op);
+      vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                         threadIdx.x, blockDim.x, v_op);
+    }
   } else {
     // HND layout OR k/v_scales are [num_heads] (i.e. per-attn-head)
     // HND layout: heads are strided, but each head_size segment is contiguous
@@ -380,16 +430,35 @@ __global__ void reshape_and_cache_flash_kernel(
                               ? 0.f
                               : v_scale[head * kv_scale_stride];
 
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+      if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2 &&
+                    std::is_same_v<scalar_t, uint16_t> &&
+                    std::is_same_v<cache_t, uint8_t>) {
+        if (k_scale_val == 1.f) {
+          vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
+                                             32, CopyFp16ToE5M2UnitScaleOp{});
+        } else {
+          CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+          vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
+                                             32, k_op);
+        }
+        if (v_scale_val == 1.f) {
+          vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
+                                             32, CopyFp16ToE5M2UnitScaleOp{});
+        } else {
+          CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+          vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
+                                             32, v_op);
+        }
+      } else {
+        CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+        CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
-      // within each head, let the 32 threads of the warp perform the vector
-      // copy
-      vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane, 32,
-                                         k_op);
-
-      vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32,
-                                         v_op);
+        // Within each head, let one warp perform the vector copy.
+        vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
+                                           32, k_op);
+        vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
+                                           32, v_op);
+      }
     }
   }
 }
@@ -804,7 +873,19 @@ void reshape_and_cache_flash(
   int kv_scale_stride = (k_scale.numel() > 1) ? 1 : 0;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min(num_heads * head_size, 512));
+  int num_threads = std::min(num_heads * head_size, 512);
+  if (head_stride == head_size && kv_scale_stride == 0) {
+    // The contiguous path assigns one thread per vector, not one thread per
+    // scalar. Avoid launching idle warps for small-GQA decode shapes such as
+    // Hkv=1, D=256, where 32 threads process all 32 FP16 vectors.
+    const int vec_size = key.element_size() == 2 ? 8 : 4;
+    const int num_vectors = (num_heads * head_size + vec_size - 1) / vec_size;
+    num_threads = std::min(((num_vectors + 31) / 32) * 32, 512);
+  } else {
+    // The strided-head path assigns one warp per KV head.
+    num_threads = std::min(std::max(num_heads, 1) * 32, 512);
+  }
+  dim3 block(num_threads);
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
