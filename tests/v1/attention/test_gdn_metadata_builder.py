@@ -1008,6 +1008,86 @@ def test_sm70_qwen_gdn_full_forward_auto_is_mtp_engine_scoped(
 
 
 @pytest.mark.parametrize(
+    ("requested", "force_full_forward", "auto_full_forward", "expected"),
+    [
+        (True, False, True, True),
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, False, False),
+    ],
+)
+def test_sm70_qwen_gdn_standard_prefill_only_bypasses_auto_guard(
+    requested,
+    force_full_forward,
+    auto_full_forward,
+    expected,
+):
+    assert (
+        qwen_gdn._sm70_qwen_gdn_standard_prefill_enabled(
+            requested=requested,
+            force_full_forward=force_full_forward,
+            auto_full_forward=auto_full_forward,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "force_full_forward", "expected_route"),
+    [
+        (True, False, "standard"),
+        (False, False, "full"),
+        (True, True, "full"),
+    ],
+)
+def test_sm70_qwen_gdn_standard_prefill_forward_route(
+    monkeypatch,
+    requested,
+    force_full_forward,
+    expected_route,
+):
+    calls: list[str] = []
+
+    class FakeAttention:
+        prefix = "layer.0.linear_attn"
+        maybe_sm70_qwen_gdn_full_forward = True
+        disable_sm70_qwen_gdn_full_forward = False
+        auto_sm70_qwen_gdn_full_forward = True
+        force_sm70_qwen_gdn_full_forward = force_full_forward
+
+        def _forward_method(self, hidden_states, output):
+            del hidden_states, output
+            calls.append("standard")
+
+    empty_cache = torch.empty(0)
+    monkeypatch.setattr(
+        qwen_gdn,
+        "_resolve_qwen_gdn_kv_cache_args",
+        lambda *args, **kwargs: (empty_cache, empty_cache),
+    )
+
+    def fake_full_forward(*args, **kwargs):
+        del args, kwargs
+        calls.append("full")
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen_gdn_full_forward",
+        fake_full_forward,
+        raising=False,
+    )
+
+    qwen_gdn.QwenGatedDeltaNetAttention.forward(
+        FakeAttention(),
+        torch.zeros(2, 4),
+        torch.empty(2, 4),
+        sm70_mtp_prefill_standard_gdn=requested,
+    )
+
+    assert calls == [expected_route]
+
+
+@pytest.mark.parametrize(
     ("method", "num_speculative_tokens", "expected"),
     [
         ("mtp", 2, False),

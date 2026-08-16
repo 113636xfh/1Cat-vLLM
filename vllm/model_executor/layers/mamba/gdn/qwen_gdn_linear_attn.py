@@ -612,6 +612,20 @@ def _sm70_qwen_gdn_full_forward_enabled(
     return auto_enabled
 
 
+def _sm70_qwen_gdn_standard_prefill_enabled(
+    *,
+    requested: bool,
+    force_full_forward: bool,
+    auto_full_forward: bool,
+) -> bool:
+    """Allow pure partial prefill to bypass the automatic MTP guard.
+
+    An explicit full-forward request remains authoritative. The bypass is only
+    meaningful when speculative decoding automatically armed the guard.
+    """
+    return requested and auto_full_forward and not force_full_forward
+
+
 def _sm70_qwen_gdn_input_core_boundary_enabled() -> bool:
     if envs.VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP:
         return False
@@ -3561,8 +3575,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        sm70_mtp_prefill_standard_gdn: bool = False,
     ):
-        if self.maybe_sm70_qwen_gdn_full_forward:
+        use_standard_prefill = _sm70_qwen_gdn_standard_prefill_enabled(
+            requested=sm70_mtp_prefill_standard_gdn,
+            force_full_forward=self.force_sm70_qwen_gdn_full_forward,
+            auto_full_forward=self.auto_sm70_qwen_gdn_full_forward,
+        )
+        if self.maybe_sm70_qwen_gdn_full_forward and not use_standard_prefill:
             layer_name = _encode_layer_name(self.prefix)
             if _sm70_qwen_gdn_full_forward_enabled(
                 layer_name,

@@ -51,6 +51,39 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    ("enabled", "has_spec", "model_supports", "partial_prefill", "expected"),
+    [
+        (True, True, True, True, True),
+        (False, True, True, True, False),
+        (True, False, True, True, False),
+        (True, True, False, True, False),
+        (True, True, True, False, False),
+    ],
+)
+def test_sm70_mtp_standard_gdn_requires_pure_partial_prefill(
+    monkeypatch,
+    enabled,
+    has_spec,
+    model_supports,
+    partial_prefill,
+    expected,
+):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_SM70_MTP_PREFILL_STANDARD_GDN",
+        enabled,
+        raising=False,
+    )
+    runner = SimpleNamespace(
+        speculative_config=object() if has_spec else None,
+        model=SimpleNamespace(supports_sm70_mtp_prefill_standard_gdn=model_supports),
+        _is_all_reqs_chunked_prefill=lambda: partial_prefill,
+    )
+
+    assert GPUModelRunner._use_sm70_mtp_prefill_standard_gdn(runner) is expected
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()
