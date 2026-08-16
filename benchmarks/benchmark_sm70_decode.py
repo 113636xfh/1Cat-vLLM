@@ -9,11 +9,78 @@ and SM70 gates so old-vs-latest no-MTP decode comparisons are reproducible.
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+FLASH_V100_ROOT = SOURCE_ROOT / "flash-attention-v100"
+for source_path in (FLASH_V100_ROOT, SOURCE_ROOT):
+    source_path_str = str(source_path)
+    if source_path_str not in sys.path:
+        sys.path.insert(0, source_path_str)
+
+
+def _module_file(module_name: str) -> str | None:
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return getattr(module, "__file__", None)
+    spec = importlib.util.find_spec(module_name)
+    return spec.origin if spec is not None else None
+
+
+def _module_realpath(module_name: str) -> str | None:
+    module_file = _module_file(module_name)
+    return str(Path(module_file).resolve()) if module_file is not None else None
+
+
+def _sm70_fa2_d256_prefill_status(torch: Any) -> dict[str, Any]:
+    """Report whether the vendored FA2 library exposes exact SM70 D256 ops."""
+    required_ops = (
+        "sm70_d256_splitd_n32_dense_fwd",
+        "sm70_d256_splitd_n32_paged_fwd",
+    )
+    optional_ops = ("sm70_d256_splitd_n32_dense_splitkv3_fwd",)
+    try:
+        importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        return {
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "extension_file": None,
+            "extension_realpath": None,
+            "required_ops": {name: False for name in required_ops},
+            "optional_ops": {name: False for name in optional_ops},
+        }
+
+    extension_file = _module_file("vllm.vllm_flash_attn._vllm_fa2_C")
+    namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    required_status = {
+        name: namespace is not None and hasattr(namespace, name)
+        for name in required_ops
+    }
+    optional_status = {
+        name: namespace is not None and hasattr(namespace, name)
+        for name in optional_ops
+    }
+    missing_ops = [name for name, present in required_status.items() if not present]
+    return {
+        "available": not missing_ops,
+        "error": None
+        if not missing_ops
+        else "missing required operators: " + ", ".join(missing_ops),
+        "extension_file": extension_file,
+        "extension_realpath": (
+            str(Path(extension_file).resolve()) if extension_file is not None else None
+        ),
+        "required_ops": required_status,
+        "optional_ops": optional_status,
+    }
 
 
 def _parse_scalar(value: str) -> Any:
@@ -388,6 +455,13 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "awq_moe_safe_default_selector_effective": (awq_moe_safe_default_selector),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "fp8_safe_default_selector_effective": fp8_safe_default_selector,
+        "VLLM_SM70_FP8_COORDINATED_TUNING": os.environ.get(
+            "VLLM_SM70_FP8_COORDINATED_TUNING"
+        ),
+        "fp8_coordinated_tuning_effective": _env_bool(
+            "VLLM_SM70_FP8_COORDINATED_TUNING",
+            True,
+        ),
         "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": os.environ.get(
             "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
         ),
@@ -585,6 +659,30 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE",
         1024,
     )
+    g6_qk_pipeline = _env_bool(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE",
+        True,
+    )
+    g6_qk_pipeline_warps = _env_int(
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS",
+        8,
+    )
+    e5m2_g6_dual_cta = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA",
+        True,
+    )
+    e5m2_g6_split_reduce = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE",
+        True,
+    )
+    e5m2_partition_page_ids = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS",
+        True,
+    )
+    e5m2_pair_load = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
+        True,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -599,7 +697,11 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
     )
     decode_fp8_xqa_min_seq_len = _env_int(
         "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
-        8192,
+        16384,
+    )
+    e5m2_p1024_begin = _env_int(
+        "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN",
+        61633,
     )
     if selector_enabled:
         expected_sm70_priority = [
@@ -617,6 +719,11 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "TURBOQUANT",
         ]
     kv_cache_dtype_str = kv_cache_dtype if isinstance(kv_cache_dtype, str) else None
+    expected_kv_cache_dtype = (
+        "fp8_e5m2"
+        if selector_enabled and kv_cache_dtype_str == "fp8"
+        else kv_cache_dtype_str
+    )
     fp8_kv_cache_requested = _is_fp8_kv_cache_dtype(kv_cache_dtype_str)
     full_flash_default_policy = (
         selector_enabled
@@ -660,6 +767,37 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"
         ),
         "mtp5_xqa_partition_size_effective": mtp5_xqa_partition_size,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE"
+        ),
+        "g6_qk_pipeline_effective": g6_qk_pipeline,
+        "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": os.environ.get(
+            "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS"
+        ),
+        "g6_qk_pipeline_warps_effective": g6_qk_pipeline_warps,
+        "g6_qk_pipeline_mid_only_policy": (
+            g6_qk_pipeline and g6_qk_pipeline_warps == 8
+        ),
+        "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA"
+        ),
+        "e5m2_g6_dual_cta_effective": e5m2_g6_dual_cta,
+        "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE"
+        ),
+        "e5m2_g6_split_reduce_effective": e5m2_g6_split_reduce,
+        "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN"
+        ),
+        "e5m2_p1024_begin_effective": e5m2_p1024_begin,
+        "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS"
+        ),
+        "e5m2_partition_page_ids_effective": e5m2_partition_page_ids,
+        "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD"
+        ),
+        "e5m2_pair_load_effective": e5m2_pair_load,
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta
@@ -689,6 +827,8 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "decode_fp8_xqa_min_seq_len_effective": decode_fp8_xqa_min_seq_len,
         "full_flash_default_policy": full_flash_default_policy,
         "kv_cache_dtype": kv_cache_dtype_str,
+        "kv_cache_dtype_requested": kv_cache_dtype_str,
+        "kv_cache_dtype_expected_after_sm70_alias": expected_kv_cache_dtype,
         "fp8_kv_cache_requested_effective": fp8_kv_cache_requested,
         "fp8_kv_cache_full_flash_policy": (
             full_flash_default_policy and fp8_kv_cache_requested
@@ -1201,6 +1341,7 @@ def _enable_diagnostics_after_load() -> None:
 def _make_prompt_token_ids(
     tokenizer: Any,
     prompt_base: str,
+    prompt_suffix: str,
     input_len: int,
 ) -> list[int]:
     if input_len <= 0:
@@ -1209,11 +1350,15 @@ def _make_prompt_token_ids(
     chunk = tokenizer.encode(prompt_base, add_special_tokens=False)
     if not chunk:
         raise ValueError("--prompt-base produced no tokens")
+    suffix = tokenizer.encode(prompt_suffix, add_special_tokens=False)
+    if len(suffix) > input_len:
+        raise ValueError("--prompt-suffix is longer than --input-len")
 
     repeated: list[int] = []
-    while len(repeated) < input_len:
+    prefix_len = input_len - len(suffix)
+    while len(repeated) < prefix_len:
         repeated.extend(chunk)
-    return repeated[:input_len]
+    return repeated[:prefix_len] + suffix
 
 
 def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -1224,6 +1369,9 @@ def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "input_len": args.input_len,
                 "output_len": args.output_len,
                 "prompt_base": args.prompt_base,
+                "prompt_suffix": args.prompt_suffix,
+                "warmup": args.warmup,
+                "repeat": args.repeat,
             }
         ]
 
@@ -1237,14 +1385,24 @@ def _load_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             raise ValueError(f"case {index} must be an object")
         input_len = int(raw_case.get("input_len", args.input_len))
         output_len = int(raw_case.get("output_len", args.output_len))
+        warmup = int(raw_case.get("warmup", args.warmup))
+        repeat = int(raw_case.get("repeat", args.repeat))
+        if warmup < 0:
+            raise ValueError(f"case {index} warmup must be non-negative")
+        if repeat <= 0:
+            raise ValueError(f"case {index} repeat must be positive")
         name = str(raw_case.get("name", f"case_{index}"))
         prompt_base = str(raw_case.get("prompt_base", args.prompt_base))
+        prompt_suffix = str(raw_case.get("prompt_suffix", args.prompt_suffix))
         cases.append(
             {
                 "name": name,
                 "input_len": input_len,
                 "output_len": output_len,
                 "prompt_base": prompt_base,
+                "prompt_suffix": prompt_suffix,
+                "warmup": warmup,
+                "repeat": repeat,
             }
         )
     return cases
@@ -1398,7 +1556,15 @@ def _diff_spec_metrics(
     )
 
 
-def _run_once(llm: Any, prompt: dict[str, list[int]], sampling_params: Any) -> dict:
+def _run_once(
+    llm: Any,
+    prompt: dict[str, list[int]],
+    sampling_params: Any,
+    *,
+    reset_prefix_cache: bool = False,
+) -> dict:
+    if reset_prefix_cache and not llm.reset_prefix_cache():
+        raise RuntimeError("Failed to reset the prefix cache before measurement.")
     request_prompt = {"prompt_token_ids": list(prompt["prompt_token_ids"])}
     spec_metrics_before = _spec_metrics_snapshot(llm)
     start = time.perf_counter()
@@ -1484,6 +1650,12 @@ def _write_results(
             "version": getattr(vllm, "__version__", None),
             "file": getattr(vllm, "__file__", None),
         },
+        "flash_attn_v100": {
+            "python_file": _module_file("flash_attn_v100"),
+            "cuda_extension_file": _module_file("flash_attn_v100_cuda"),
+            "cuda_extension_realpath": _module_realpath("flash_attn_v100_cuda"),
+            "fa2_d256_prefill": _sm70_fa2_d256_prefill_status(torch),
+        },
         "torch": {
             "version": torch.__version__,
             "cuda": torch.version.cuda,
@@ -1507,6 +1679,8 @@ def _write_results(
         "engine_kwargs": llm_kwargs,
         "sampling_params": first_case["sampling_params"],
         "cuda_profile_repeat": args.cuda_profile_repeat,
+        "reset_prefix_cache_before_case": args.reset_prefix_cache_before_case,
+        "reset_prefix_cache_between_runs": args.reset_prefix_cache_between_runs,
         "prompt": first_case["prompt"],
         "load_seconds": load_seconds,
         "warmups": first_case["warmups"],
@@ -1531,7 +1705,8 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional JSON list of cases with name/input_len/output_len/"
-            "prompt_base. Loads the model once and runs every case."
+            "prompt_base/prompt_suffix/warmup/repeat. Loads the model once and "
+            "runs every case."
         ),
     )
     parser.add_argument("--warmup", type=int, default=1)
@@ -1545,10 +1720,36 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reset-prefix-cache-before-case",
+        action="store_true",
+        help=(
+            "Reset prefix and Mamba caches once before each case. Warmups are "
+            "cold, while measured repeats may reuse that case's prefix."
+        ),
+    )
+    parser.add_argument(
+        "--reset-prefix-cache-between-runs",
+        action="store_true",
+        help=(
+            "Reset prefix and Mamba caches before every warmup and measured "
+            "request. This preserves production Mamba align mode without "
+            "turning repeated benchmark prompts into prefix-cache hits."
+        ),
+    )
+    parser.add_argument(
         "--prompt-base",
         default=(
             "This fixed benchmark prompt is used to create a deterministic "
             "tokenized input for single-request decode measurement. "
+        ),
+    )
+    parser.add_argument(
+        "--prompt-suffix",
+        default="",
+        help=(
+            "Text kept at the end of every exact-length prompt. Use this for "
+            "a stable generation instruction while --prompt-base pads the "
+            "preceding context."
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1605,6 +1806,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Wrap only measured repeats in cudaProfilerStart/Stop.",
     )
+    parser.add_argument(
+        "--require-sm70-fa2-d256-prefill",
+        action="store_true",
+        help=(
+            "Fail before model loading unless the active vendored FA2 extension "
+            "exports the exact SM70 D256 dense and paged prefill operators."
+        ),
+    )
     parser.add_argument("--engine-arg", action="append", default=[])
     return parser.parse_args()
 
@@ -1615,12 +1824,24 @@ def main() -> int:
         raise ValueError("--repeat must be positive")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
+    if args.reset_prefix_cache_before_case and args.reset_prefix_cache_between_runs:
+        raise ValueError(
+            "Choose only one prefix-cache reset mode: before-case or between-runs."
+        )
 
     import torch
     from transformers import AutoTokenizer
 
     import vllm
     from vllm import LLM, SamplingParams
+
+    if args.require_sm70_fa2_d256_prefill:
+        fa2_status = _sm70_fa2_d256_prefill_status(torch)
+        if not fa2_status["available"]:
+            raise RuntimeError(
+                "Required SM70 FA2 D256 prefill route is unavailable: "
+                f"{fa2_status['error']}"
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model),
@@ -1632,6 +1853,7 @@ def main() -> int:
         prompt_token_ids = _make_prompt_token_ids(
             tokenizer,
             raw_case["prompt_base"],
+            raw_case["prompt_suffix"],
             raw_case["input_len"],
         )
         cases.append(
@@ -1682,10 +1904,6 @@ def main() -> int:
 
     case_results = []
     for case in cases:
-        warmups = [
-            _run_once(llm, case["prompt"], case["sampling_params"])
-            for _ in range(args.warmup)
-        ]
         case_results.append(
             {
                 "name": case["name"],
@@ -1705,13 +1923,30 @@ def main() -> int:
                     "logprobs": args.logprobs if args.logprobs != 0 else None,
                     "seed": args.seed,
                 },
-                "warmups": warmups,
+                "requested_warmups": case["warmup"],
+                "requested_repeats": case["repeat"],
+                "warmups": [],
                 "repeats": [],
                 "summary": {},
             }
         )
 
     if args.cuda_profile_repeat:
+        # Warm every case before starting the profiler so the capture contains
+        # measured repeats only. Normal sweeps warm each case immediately
+        # before measuring it, allowing checkpoints to be written promptly.
+        for case, result in zip(cases, case_results):
+            if args.reset_prefix_cache_before_case and not llm.reset_prefix_cache():
+                raise RuntimeError("Failed to reset the prefix cache before case.")
+            result["warmups"] = [
+                _run_once(
+                    llm,
+                    case["prompt"],
+                    case["sampling_params"],
+                    reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                )
+                for _ in range(case["warmup"])
+            ]
         try:
             llm.start_profile()
         except Exception as exc:
@@ -1723,9 +1958,26 @@ def main() -> int:
             ) from exc
     try:
         for case, result in zip(cases, case_results):
+            if not args.cuda_profile_repeat:
+                if args.reset_prefix_cache_before_case and not llm.reset_prefix_cache():
+                    raise RuntimeError("Failed to reset the prefix cache before case.")
+                result["warmups"] = [
+                    _run_once(
+                        llm,
+                        case["prompt"],
+                        case["sampling_params"],
+                        reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                    )
+                    for _ in range(case["warmup"])
+                ]
             repeats = [
-                _run_once(llm, case["prompt"], case["sampling_params"])
-                for _ in range(args.repeat)
+                _run_once(
+                    llm,
+                    case["prompt"],
+                    case["sampling_params"],
+                    reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                )
+                for _ in range(case["repeat"])
             ]
             result["repeats"] = repeats
             result["summary"] = _summarize(repeats)

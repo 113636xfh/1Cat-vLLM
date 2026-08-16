@@ -28,17 +28,12 @@ constexpr int kMxfp4ValuesPerWord = 8;
 
 CUTLASS_DEVICE
 __half2 e8m0x2_to_half2_fast(uint16_t e8m0_x2) {
-  int v0 = e8m0_x2 & 0xFF;
-  int v1 = e8m0_x2 >> 8;
-
-  int e0 = v0 - 112;
-  e0 = e0 < 0 ? 0 : (e0 > 31 ? 31 : e0);
-
-  int e1 = v1 - 112;
-  e1 = e1 < 0 ? 0 : (e1 > 31 ? 31 : e1);
-
-  uint32_t res = ((e1 << 10) << 16) | (e0 << 10);
-  return *reinterpret_cast<__half2*>(&res);
+  // Finite nonzero E8M0 bytes are IEEE FP32 exponent fields for
+  // 2^(value - 127); byte zero also rounds to FP16 zero. Let the hardware
+  // conversion preserve subnormals and apply round-to-nearest-even.
+  uint32_t const bits0 = static_cast<uint32_t>(e8m0_x2 & 0xFF) << 23;
+  uint32_t const bits1 = static_cast<uint32_t>(e8m0_x2 >> 8) << 23;
+  return __floats2half2_rn(__uint_as_float(bits0), __uint_as_float(bits1));
 }
 
 CUTLASS_DEVICE
