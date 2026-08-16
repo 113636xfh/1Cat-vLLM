@@ -190,7 +190,8 @@ def dump_sm70_moe_runner_graph_buffers(step: int, stage: str) -> None:
         meta = _SM70_MOE_RUNNER_DUMP_META.get(key, {})
         label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
         layer_type = str(meta.get("layer_type", "moe_runner"))
-        layer_idx = int(meta.get("layer_idx", -1))
+        layer_idx_value = meta.get("layer_idx", -1)
+        layer_idx = layer_idx_value if isinstance(layer_idx_value, int) else -1
         shape = "x".join(str(dim) for dim in tuple(buffer.shape))
         path = os.path.join(
             dump_dir,

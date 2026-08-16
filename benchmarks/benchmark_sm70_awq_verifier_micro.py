@@ -710,19 +710,23 @@ def _run_gated_silu_candidate(
     gate_up = torch.empty((m, n), dtype=torch.float16, device=device)
     baseline = torch.empty((m, out_features), dtype=torch.float16, device=device)
     fused = torch.empty_like(baseline)
+    has_standard_silu = hasattr(torch.ops._C, "silu_and_mul")
 
     def run_baseline() -> None:
         ops.awq_gemm_sm70_out(
             gate_up,
             x,
-            tm_weight,
-            tm_scales,
+            tm_weight if has_standard_silu else fused_weight,
+            tm_scales if has_standard_silu else fused_scales,
             group_size,
-            k_ld,
-            q_ld,
+            k_ld if has_standard_silu else fused_k_ld,
+            q_ld if has_standard_silu else fused_q_ld,
             False,
         )
-        torch.ops._C.silu_and_mul(baseline, gate_up)
+        if has_standard_silu:
+            torch.ops._C.silu_and_mul(baseline, gate_up)
+        else:
+            torch.ops._C.silu_and_mul_interleaved(baseline, gate_up)
 
     def run_fused() -> None:
         ops.awq_gemm_sm70_out(
@@ -756,6 +760,7 @@ def _run_gated_silu_candidate(
         "group_size": group_size,
         "tp_size": tp_size,
         "tp_rank": tp_rank,
+        "baseline_layout": "standard" if has_standard_silu else "interleaved",
         "baseline_gate_up_plus_silu": baseline_timing,
         "fused_gated_silu": fused_timing,
         "delta_mean_us": delta_us,

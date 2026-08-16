@@ -145,6 +145,208 @@ def test_sm70_flash_v100_fp8_e5m2_paged_kv_read_exact():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
+def test_sm70_flash_v100_mla_context_lse_matches_fp64():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+
+    pytest.importorskip("flash_attn_v100")
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        flash_v100_dense_prefill_lse,
+    )
+
+    torch.manual_seed(200001)
+    query_lens = [3, 2, 4]
+    key_lens = [5, 0, 3]
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 256
+    softmax_scale = head_dim**-0.5
+    query = torch.randn(
+        sum(query_lens),
+        num_q_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    key = torch.randn(
+        sum(key_lens),
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    value = torch.randn_like(key)
+    cu_q = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cu_k = torch.tensor(
+        [0, *torch.tensor(key_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def run():
+        output = torch.empty_like(query)
+        lse = torch.empty(
+            (num_q_heads, query.shape[0]), dtype=torch.float32, device="cuda"
+        )
+        return flash_v100_dense_prefill_lse(
+            query,
+            key,
+            value,
+            output,
+            lse,
+            cu_q,
+            cu_k,
+            query.shape[0],
+            softmax_scale,
+        )
+
+    output, lse = run()
+    output_repeat, lse_repeat = run()
+
+    kv_head_for_q = torch.arange(num_q_heads, device="cuda") // (
+        num_q_heads // num_kv_heads
+    )
+    output_refs = []
+    lse_refs = []
+    query_offset = 0
+    key_offset = 0
+    for query_len, key_len in zip(query_lens, key_lens):
+        if key_len == 0:
+            output_refs.append(
+                torch.zeros(
+                    (query_len, num_q_heads, head_dim),
+                    dtype=torch.float64,
+                    device="cuda",
+                )
+            )
+            lse_refs.append(
+                torch.full(
+                    (num_q_heads, query_len),
+                    -torch.inf,
+                    dtype=torch.float64,
+                    device="cuda",
+                )
+            )
+        else:
+            q_seq = query[query_offset : query_offset + query_len].double()
+            k_seq = key[key_offset : key_offset + key_len, kv_head_for_q].double()
+            v_seq = value[key_offset : key_offset + key_len, kv_head_for_q].double()
+            scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq) * softmax_scale
+            probabilities = torch.softmax(scores, dim=-1)
+            output_refs.append(torch.einsum("hqk,khd->qhd", probabilities, v_seq))
+            lse_refs.append(torch.logsumexp(scores, dim=-1))
+        query_offset += query_len
+        key_offset += key_len
+
+    output_ref = torch.cat(output_refs)
+    lse_ref = torch.cat(lse_refs, dim=1)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(output, output_repeat)
+    assert torch.equal(lse, lse_repeat)
+    empty_start = query_lens[0]
+    empty_end = empty_start + query_lens[1]
+    assert torch.count_nonzero(output[empty_start:empty_end]) == 0
+    assert torch.isneginf(lse[:, empty_start:empty_end]).all()
+    output_error = output.double() - output_ref
+    relative_rms = torch.sqrt(torch.mean(output_error.square())) / torch.sqrt(
+        torch.mean(output_ref.square())
+    )
+    assert float(relative_rms) < 5e-4
+    finite_lse = torch.isfinite(lse_ref)
+    assert float((lse.double()[finite_lse] - lse_ref[finite_lse]).abs().max()) < 2e-5
+
+    bad_cu_q = cu_q.clone()
+    bad_cu_q[-1] -= 1
+    with pytest.raises(ValueError, match="cover every actual query token"):
+        flash_v100_dense_prefill_lse(
+            query,
+            key,
+            value,
+            torch.empty_like(query),
+            torch.empty_like(lse),
+            bad_cu_q,
+            cu_k,
+            query.shape[0],
+            softmax_scale,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_sm70_flash_v100_mla_causal_lse_matches_fp64():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+
+    pytest.importorskip("flash_attn_v100")
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        flash_v100_dense_prefill_lse,
+    )
+
+    torch.manual_seed(200002)
+    seq_lens = [1, 3, 5]
+    num_heads = 2
+    head_dim = 256
+    softmax_scale = head_dim**-0.5
+    shape = (sum(seq_lens), num_heads, head_dim)
+    query = torch.randn(shape, dtype=torch.float16, device="cuda")
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    cu_seq_lens = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty_like(query)
+    lse = torch.empty((num_heads, query.shape[0]), dtype=torch.float32, device="cuda")
+
+    flash_v100_dense_prefill_lse(
+        query,
+        key,
+        value,
+        output,
+        lse,
+        cu_seq_lens,
+        cu_seq_lens.clone(),
+        query.shape[0],
+        softmax_scale,
+        causal=True,
+    )
+
+    output_refs = []
+    lse_refs = []
+    offset = 0
+    for seq_len in seq_lens:
+        q_seq = query[offset : offset + seq_len].double()
+        k_seq = key[offset : offset + seq_len].double()
+        v_seq = value[offset : offset + seq_len].double()
+        scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq) * softmax_scale
+        causal_mask = torch.ones(
+            (seq_len, seq_len), dtype=torch.bool, device="cuda"
+        ).triu(1)
+        scores.masked_fill_(causal_mask, -torch.inf)
+        probabilities = torch.softmax(scores, dim=-1)
+        output_refs.append(torch.einsum("hqk,khd->qhd", probabilities, v_seq))
+        lse_refs.append(torch.logsumexp(scores, dim=-1))
+        offset += seq_len
+
+    output_ref = torch.cat(output_refs)
+    lse_ref = torch.cat(lse_refs, dim=1)
+    torch.accelerator.synchronize()
+    output_error = output.double() - output_ref
+    relative_rms = torch.sqrt(torch.mean(output_error.square())) / torch.sqrt(
+        torch.mean(output_ref.square())
+    )
+    assert float(relative_rms) < 5e-4
+    assert float((lse.double() - lse_ref).abs().max()) < 2e-5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
 def test_sm70_flash_v100_bm32_phase_multi_kv_stride_exact(monkeypatch):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
@@ -412,5 +614,13 @@ def test_sm70_flash_v100_fp8_e5m2_xqa_decode_matches_scalar(
 
     torch.accelerator.synchronize()
     delta = (actual.float() - expected.float()).abs()
-    assert float(delta.max()) <= 1e-4
+    # The two reductions may round to adjacent fp16 outputs. Preserve the
+    # original absolute gate near zero, but do not set it below one output ULP.
+    positive = torch.full_like(expected, torch.inf)
+    negative = torch.full_like(expected, -torch.inf)
+    one_ulp = torch.maximum(
+        (torch.nextafter(expected, positive) - expected).abs(),
+        (torch.nextafter(expected, negative) - expected).abs(),
+    ).float()
+    assert torch.all(delta <= torch.maximum(one_ulp, torch.full_like(delta, 1e-4)))
     assert float(delta.mean()) <= 1e-5
