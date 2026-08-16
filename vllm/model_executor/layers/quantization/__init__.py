@@ -110,13 +110,16 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     if quantization == "humming":
+        humming_config_cls: type[QuantizationConfig]
         try:
             from .humming import HummingConfig
+
+            humming_config_cls = HummingConfig
         except ModuleNotFoundError as exc:
             if exc.name != "humming":
                 raise
 
-            class HummingConfig(QuantizationConfig):
+            class MissingHummingConfig(QuantizationConfig):
                 """Placeholder used when the optional humming package is absent."""
 
                 def get_name(self) -> QuantizationMethods:
@@ -134,7 +137,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
                     return []
 
                 @classmethod
-                def from_config(cls, config: dict) -> "HummingConfig":
+                def from_config(cls, config: dict) -> "MissingHummingConfig":
                     del config
                     raise ModuleNotFoundError(
                         "The optional 'humming' package is required for "
@@ -160,7 +163,9 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
                         "quantization='humming'."
                     )
 
-        return HummingConfig
+            humming_config_cls = MissingHummingConfig
+
+        return humming_config_cls
 
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
