@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 
@@ -10,24 +11,61 @@ import torch
 from torch.utils.cpp_extension import load
 
 _EXT = None
+_EXT_LOAD_ERROR: Exception | None = None
+_PREBUILT_EXTENSION = (
+    "flash_qla.ops.gated_delta_rule.chunk.sm70.flash_qla_sm70_gdn_strided"
+)
+
+# Avoid CUDA-device auto-detection while distributed workers are initializing.
+# The fallback JIT supports both architectures implemented by this source file.
+_SM70_GENCODE_FLAGS = [
+    "-gencode=arch=compute_70,code=sm_70",
+    "-gencode=arch=compute_75,code=sm_75",
+]
 
 
 def _load_ext():
-    global _EXT
+    global _EXT, _EXT_LOAD_ERROR
     if _EXT is not None:
         return _EXT
+    if _EXT_LOAD_ERROR is not None:
+        raise RuntimeError(
+            "SM70 FlashQLA extension initialization previously failed. "
+            "The original loader or compiler error is chained below."
+        ) from _EXT_LOAD_ERROR
     if not torch.cuda.is_available():
         raise RuntimeError("SM70 FlashQLA backend requires CUDA.")
 
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0;7.5")
+    try:
+        _EXT = importlib.import_module(_PREBUILT_EXTENSION)
+        return _EXT
+    except ModuleNotFoundError as exc:
+        if exc.name != _PREBUILT_EXTENSION:
+            _EXT_LOAD_ERROR = exc
+            raise RuntimeError(
+                "Bundled SM70 FlashQLA extension has a missing dependency."
+            ) from exc
+    except Exception as exc:
+        _EXT_LOAD_ERROR = exc
+        raise RuntimeError(
+            "Bundled SM70 FlashQLA extension failed to load. Reinstall a wheel "
+            "built for the active CUDA and PyTorch versions."
+        ) from exc
+
     src = Path(__file__).with_name("csrc") / "gdn_forward.cu"
-    _EXT = load(
-        name="flash_qla_sm70_gdn_strided",
-        sources=[str(src)],
-        extra_cuda_cflags=["-O3"],
-        extra_cflags=["-O3"],
-        verbose=bool(int(os.environ.get("FLASH_QLA_SM70_VERBOSE_BUILD", "0"))),
-    )
+    try:
+        _EXT = load(
+            name="flash_qla_sm70_gdn_strided",
+            sources=[str(src)],
+            extra_cuda_cflags=["-O3", *_SM70_GENCODE_FLAGS],
+            extra_cflags=["-O3"],
+            verbose=bool(int(os.environ.get("FLASH_QLA_SM70_VERBOSE_BUILD", "0"))),
+        )
+    except Exception as exc:
+        # PyTorch's process-local extension versioner may skip a retry after a
+        # failed build and only report a missing .so. Preserve the first error.
+        _EXT_LOAD_ERROR = exc
+        raise
     return _EXT
 
 
