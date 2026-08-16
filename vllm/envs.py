@@ -435,7 +435,6 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
     VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
     VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD: bool = False
-    VLLM_SM70_MTP_PREFILL_STANDARD_GDN: bool = True
     VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE: bool = False
     VLLM_SM70_QWEN_GDN_SPEC_CORE_OP: bool = False
     VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP: bool = False
@@ -2626,13 +2625,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # boundary against the default full-forward quality guard.
     "VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD", "0"))
-    ),
-    # Keep the opaque full-forward boundary for MTP verifier/decode quality,
-    # but let unfinished chunked-prefill batches use the regular compiled GDN
-    # path. Their sampled output is discarded and they have no active spec
-    # rows, so the verifier-specific boundary only blocks prefill fusion.
-    "VLLM_SM70_MTP_PREFILL_STANDARD_GDN": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_PREFILL_STANDARD_GDN", "1"))
     ),
     # Experimental active-MTP quality/speed lane: keep the SM70 0.0.3
     # FULL_AND_PIECEWISE compile policy, but skip FULL cudagraph replay for

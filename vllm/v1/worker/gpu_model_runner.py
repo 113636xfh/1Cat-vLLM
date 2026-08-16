@@ -56,7 +56,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
-    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -8001,20 +8000,6 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
-    def _use_sm70_mtp_prefill_standard_gdn(self) -> bool:
-        enabled = bool(
-            envs.VLLM_SM70_MTP_PREFILL_STANDARD_GDN
-            and self.speculative_config is not None
-            and getattr(self.model, "supports_sm70_mtp_prefill_standard_gdn", False)
-            and self._is_all_reqs_chunked_prefill()
-        )
-        if enabled:
-            logger.info_once(
-                "SM70 MTP target is using the standard-GDN compile entry for "
-                "unfinished chunked prefill."
-            )
-        return enabled
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -8303,10 +8288,6 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
-            if getattr(self.model, "supports_sm70_mtp_prefill_standard_gdn", False):
-                model_kwargs["sm70_mtp_prefill_standard_gdn"] = (
-                    self._use_sm70_mtp_prefill_standard_gdn()
-                )
             if trace_log:
                 trace_model_preprocess_ms = (
                     time.perf_counter() - trace_model_preprocess_t0
@@ -10592,35 +10573,6 @@ class GPUModelRunner(
                     type(attn_metadata).__name__ if attn_metadata is not None else None,
                     skip_compiled_profile,
                 )
-                if (
-                    is_profile
-                    and getattr(
-                        self.model,
-                        "supports_sm70_mtp_prefill_standard_gdn",
-                        False,
-                    )
-                    and envs.VLLM_SM70_MTP_PREFILL_STANDARD_GDN
-                ):
-                    logger.info_once(
-                        "Compiling the SM70 MTP standard-GDN prefill entry "
-                        "during memory profiling."
-                    )
-                    model_kwargs["sm70_mtp_prefill_standard_gdn"] = True
-                    forward_context = get_forward_context()
-                    previous_skip_compiled = forward_context.skip_compiled
-                    forward_context.skip_compiled = False
-                    try:
-                        prefill_outputs = self.model(
-                            input_ids=input_ids,
-                            positions=positions,
-                            intermediate_tensors=intermediate_tensors,
-                            inputs_embeds=inputs_embeds,
-                            **model_kwargs,
-                        )
-                    finally:
-                        forward_context.skip_compiled = previous_skip_compiled
-                    del prefill_outputs
-                    model_kwargs.pop("sm70_mtp_prefill_standard_gdn")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,

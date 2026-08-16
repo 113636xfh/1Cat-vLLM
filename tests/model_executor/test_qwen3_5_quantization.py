@@ -3,32 +3,11 @@
 
 from unittest.mock import Mock, patch
 
-from torch import nn
-
 
 class _QuantConfig:
     def __init__(self) -> None:
         self.ignore: list[str] = []
         self.config: dict[str, object] = {}
-
-
-def test_qwen3_5_mtp_prefill_model_selection_is_explicit():
-    from vllm.model_executor.models.qwen3_5 import (
-        _select_sm70_mtp_prefill_model,
-    )
-
-    default_model = nn.Identity()
-    prefill_model = nn.ReLU()
-
-    assert (
-        _select_sm70_mtp_prefill_model(default_model, prefill_model, True)
-        is prefill_model
-    )
-    assert (
-        _select_sm70_mtp_prefill_model(default_model, prefill_model, False)
-        is default_model
-    )
-    assert _select_sm70_mtp_prefill_model(default_model, None, True) is default_model
 
 
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():

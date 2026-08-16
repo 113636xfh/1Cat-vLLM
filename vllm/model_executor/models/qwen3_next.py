@@ -749,9 +749,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             self.linear_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
-                sm70_mtp_prefill_standard_gdn=bool(
-                    kwargs.get("sm70_mtp_prefill_standard_gdn", False)
-                ),
             )
         elif self.layer_type == "full_attention":
             self.self_attn(
@@ -869,7 +866,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        sm70_mtp_prefill_standard_gdn: bool = False,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if self.is_pp_first_rank:
             if inputs_embeds is not None:
@@ -908,7 +904,6 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                sm70_mtp_prefill_standard_gdn=sm70_mtp_prefill_standard_gdn,
             )
             if trace_enabled:
                 _sm70_profile_trace(

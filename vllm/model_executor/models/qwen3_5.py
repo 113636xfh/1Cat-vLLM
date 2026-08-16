@@ -655,54 +655,6 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_params
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-    }
-)
-class _Qwen3_5MTPPrefillModel(nn.Module):
-    """Second compile entry sharing the target model's modules and caches."""
-
-    def __init__(
-        self,
-        model: Qwen3_5Model,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        del vllm_config, prefix
-        self.shared_model = model
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        return self.shared_model.forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            sm70_mtp_prefill_standard_gdn=True,
-        )
-
-
-def _select_sm70_mtp_prefill_model(
-    default_model: nn.Module,
-    prefill_model: nn.Module | None,
-    requested: bool,
-) -> nn.Module:
-    if requested and prefill_model is not None:
-        return prefill_model
-    return default_model
-
-
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
@@ -742,28 +694,6 @@ class Qwen3_5ForCausalLMBase(
         self.model = Qwen3_5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        prefill_model = None
-        if (
-            envs.VLLM_SM70_MTP_PREFILL_STANDARD_GDN
-            and not envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
-            and not envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD
-            and vllm_config.speculative_config is not None
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-        ):
-            prefill_model = _Qwen3_5MTPPrefillModel(
-                self.model,
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "mtp_prefill_model"),
-            )
-        # Keep the shared compile entry out of the module tree so state_dict and
-        # weight loading visit the target parameters exactly once.
-        object.__setattr__(self, "_sm70_mtp_prefill_model", prefill_model)
-        self.supports_sm70_mtp_prefill_standard_gdn = prefill_model is not None
-        if prefill_model is not None:
-            logger.info_once(
-                "SM70 MTP target has a separate compiled standard-GDN "
-                "entry for unfinished chunked prefill."
-            )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -801,13 +731,7 @@ class Qwen3_5ForCausalLMBase(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
-        use_standard_prefill = bool(kwargs.pop("sm70_mtp_prefill_standard_gdn", False))
-        model = _select_sm70_mtp_prefill_model(
-            self.model,
-            self._sm70_mtp_prefill_model,
-            use_standard_prefill,
-        )
-        hidden_states = model(
+        hidden_states = self.model(
             input_ids,
             positions,
             intermediate_tensors,
@@ -927,9 +851,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.language_model = Qwen3_5ForCausalLM(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
             )
-        self.supports_sm70_mtp_prefill_standard_gdn = (
-            self.language_model.supports_sm70_mtp_prefill_standard_gdn
-        )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -1002,13 +923,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        use_standard_prefill = bool(kwargs.pop("sm70_mtp_prefill_standard_gdn", False))
-        model = _select_sm70_mtp_prefill_model(
-            self.language_model.model,
-            self.language_model._sm70_mtp_prefill_model,
-            use_standard_prefill,
-        )
-        hidden_states = model(
+        hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
