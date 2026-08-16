@@ -39,6 +39,19 @@ from vllm.triton_utils import tl, triton
 
 is_hip_ = current_platform.is_rocm()
 
+
+def _decode_grouped_block_size(
+    *,
+    is_hip: bool,
+    is_mla: bool,
+    block_dmodel: int,
+    is_sm70: bool,
+) -> int:
+    if is_hip or (is_mla and block_dmodel >= 512 and is_sm70):
+        return 16
+    return 32
+
+
 logger = logging.getLogger(__name__)
 
 # Only print the following warnings when triton version < 3.2.0.
@@ -487,13 +500,12 @@ def _decode_grouped_att_m_fwd(
     # saturated grids) at 128-user shapes. num_stages is a no-op here (no
     # cp.async on sm70 - KV loads cannot be multi-buffered); leave it alone.
     # Proof + bench: patches/0103-mla-triton-decode-smem/poc/.
-    BLOCK = 32
-    if is_hip_ or (
-        is_mla
-        and BLOCK_DMODEL >= 512
-        and current_platform.get_device_capability()[0] == 7
-    ):
-        BLOCK = 16
+    BLOCK = _decode_grouped_block_size(
+        is_hip=is_hip_,
+        is_mla=is_mla,
+        block_dmodel=BLOCK_DMODEL,
+        is_sm70=current_platform.is_device_capability(70),
+    )
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[-2]
