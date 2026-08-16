@@ -152,12 +152,13 @@ inline std::string to_string(QuantDesc desc)
 
 enum class DispatchPolicy : int
 {
-    kDefault               = 0,
-    kMeasure               = 1,
-    kReuse                 = 2,
-    kAppend                = 3,
-    kPreserveDefaultSplits = 4,
+    kDefault                   = 0,
+    kMeasure                   = 1,
+    kReuse                     = 2,
+    kAppend                    = 3,
+    kPreserveDefaultSplits     = 4,
     kPreserveDefaultSplitCount = 8,
+    kMxfp4MoeGroupedM8Fast     = 16,
 };
 
 constexpr bool operator&(const DispatchPolicy& a, const DispatchPolicy& b)

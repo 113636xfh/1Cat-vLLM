@@ -22,6 +22,8 @@
 
 using marlin::sm70::Sm70CtaGeometry;
 using marlin::sm70::Sm70AtomicFp16Epilogue;
+using marlin::sm70::Sm70AtomicFp32Epilogue;
+using marlin::sm70::sm70_marlin_narrow_f32_to_f16;
 using marlin::sm70::Sm70MarlinGemmTraits;
 using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::validate_sm70_marlin_dense_cta_geometry_supported;
@@ -439,12 +441,12 @@ void sm70_marlin_u4b8_gemm_splitk_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda, int requested_split_k) {
+    cutlass::half_t* __restrict__ c, float* __restrict__ c32, int m, int n, int k, int lda, int requested_split_k) {
   using Traits = Sm70U4B8GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
                                     WarpN, WarpK, GroupSize, PackedMacroN,
                                     UseMetadataVectorWords>;
   using Mma = typename Traits::Mma;
-  using AtomicEpilogue = Sm70AtomicFp16Epilogue<Traits>;
+  using AtomicEpilogue = Sm70AtomicFp32Epilogue<Traits>;
 
   extern __shared__ char smem[];
   auto& shared_storage =
@@ -491,7 +493,7 @@ void sm70_marlin_u4b8_gemm_splitk_kernel(
 
   AtomicEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx,
                           lane_idx);
-  epilogue(iterator_D, accumulators, c, n);
+  epilogue(iterator_D, accumulators, c32, n);
 }
 
 }  // namespace
@@ -541,9 +543,11 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  // 0009: fp32 split-K scratch (zeroed for the fp32 atomicAdd), M*N floats.
+  // Only allocated on the split_k>1 path, which the auto-selector uses ONLY at
+  // low batch (M<128), so the scratch is bounded and small.
+  auto c32 = torch::zeros({size_m, size_n},
+                          a.options().dtype(at::kFloat));
 
   dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
@@ -554,8 +558,18 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+      c32.data_ptr<float>(),
       static_cast<int>(size_m), static_cast<int>(size_n),
       static_cast<int>(size_k), static_cast<int>(a.stride(0)), requested_split_k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  // 0009: single deterministic-width fp32->fp16 narrow of the scratch.
+  int const narrow_block = 256;
+  int const narrow_grid =
+      static_cast<int>((numel + narrow_block - 1) / narrow_block);
+  sm70_marlin_narrow_f32_to_f16<256><<<narrow_grid, narrow_block, 0, stream>>>(
+      c32.data_ptr<float>(),
+      reinterpret_cast<half*>(c.data_ptr<at::Half>()), numel);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return c;

@@ -5,7 +5,9 @@ from unittest.mock import Mock, patch
 
 
 class _QuantConfig:
-    pass
+    def __init__(self) -> None:
+        self.ignore: list[str] = []
+        self.config: dict[str, object] = {}
 
 
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():

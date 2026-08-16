@@ -23,6 +23,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -85,6 +86,11 @@ _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
 _flash_attn_prefill_paged_bfla = None
 _flash_attn_prefill_paged_splitkv = None
+_sm70_splitd_d256_ops = None
+_sm70_splitd_d256_ops_checked = False
+_sm70_fa2_cu_seqlens_cache: dict[
+    tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
 _fp8_e5m2_paged_kv_to_fp16 = None
 _fp8_e5m2_paged_kv_to_fp16_checked = False
 _flash_attn_turboquant_decode_paged = None
@@ -93,6 +99,8 @@ _paged_kv_utils = None
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
+_warned_prefill_gather_oom = False
+_warned_prefill_dense_splitkv3_oom = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -101,6 +109,8 @@ _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_smallq_decode_xqa = False
+_logged_prefill_fa2_d256 = False
+_logged_prefill_dense_splitkv3 = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -117,6 +127,7 @@ _logged_dflash_prefix_dump = False
 _logged_prefill_ddtree_dense = False
 _logged_prefill_ddtree_triton = False
 _logged_prefill_ddtree_triton_fallback = False
+_logged_kv_dtype_contracts: set[str] = set()
 _route_summary_registered = False
 _route_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
@@ -124,12 +135,30 @@ _draft_graph_debug_counts: dict[str, int] = {}
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
-_DEFAULT_FP8_XQA_MIN_SEQ_LEN = 8192
+_DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 _FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
 _fp8_prefill_bridge_workspaces: dict[
     tuple[int, int, int, int],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
+_fp8_prefill_bridge_tail_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+_prefill_gather_dense_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int, int],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+_prefill_dense_splitkv3_workspaces: dict[
+    tuple[int, int, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+
+
+def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
+    # Newer vLLM resolves an explicit FP16 cache to "float16". The vendored
+    # Flash-V100 extension uses "auto" for the same unquantized FP16 layout.
+    return "auto" if kv_cache_dtype == "float16" else kv_cache_dtype
 
 
 def _split_paged_kv_cache(
@@ -266,6 +295,70 @@ def _decode_partition_size_for_metadata(
     return value
 
 
+def _g6_aligned_page_partition_size_hint(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    kv_cache_dtype: str,
+) -> int | None:
+    if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+        return None
+    if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
+        return None
+    if not (
+        query.shape == (1, 6, 256)
+        and key_cache.ndim == 4
+        and key_cache.shape[1] >= _DEFAULT_DECODE_PARTITION_SIZE
+        and key_cache.shape[1] % 16 == 0
+        and key_cache.shape[2:] == (1, 256)
+        and value_cache.shape == key_cache.shape
+        and value_cache.dtype == key_cache.dtype
+    ):
+        return None
+    if (
+        kv_cache_dtype in ("auto", "bfloat16")
+        and key_cache.dtype == torch.float16
+        and key_cache.shape[1] == 784
+    ):
+        # The exact FP16 page-784 graph contains p256 and p1024 nodes and
+        # selects between them from device seq_lens. Plan the p256 workspace
+        # envelope once.
+        return 256
+    if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
+        # Plan the largest p256 workspace once. The extension selects p256 or
+        # p1024 from device seq_lens, so CUDA graph replay keeps one
+        # captured shape while short and long contexts use different kernels.
+        # Keep this layout-driven rather than using model-name allowlists.
+        return 256
+    return None
+
+
+def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
+    if kv_cache_dtype in _logged_kv_dtype_contracts:
+        return
+    _logged_kv_dtype_contracts.add(kv_cache_dtype)
+    if kv_cache_dtype == "fp8":
+        logger.warning(
+            "SM70 Flash-V100 received an unresolved `fp8` KV-cache dtype and "
+            "will interpret it as upstream E4M3. Normal EngineArgs processing "
+            "rewrites the SM70 `fp8` shorthand to `fp8_e5m2`; this warning "
+            "usually means the backend was constructed directly. KV-cache "
+            "dtype is independent of model weight quantization."
+        )
+    elif kv_cache_dtype == "fp8_e4m3":
+        logger.warning(
+            "SM70 Flash-V100 is using explicitly requested E4M3 KV cache. "
+            "The optimized V100 quantized-KV route uses E5M2. KV-cache dtype "
+            "is independent of model weight quantization."
+        )
+    elif kv_cache_dtype == "fp8_e5m2":
+        logger.info(
+            "SM70 Flash-V100 is using explicit E5M2 KV cache. This controls "
+            "KV storage only; model weight quantization is configured "
+            "separately."
+        )
+
+
 def _mtp_context_bucket_partition_size_hint() -> int | None:
     raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
     if raw is None:
@@ -345,9 +438,10 @@ def _decode_fp8_xqa_allowed(
     attn_metadata: TritonAttentionMetadata,
     query: torch.Tensor,
 ) -> bool:
-    if bool(getattr(attn_metadata, "flash_v100_cudagraph_capture", False)):
-        return True
-    if _is_cuda_graph_capturing(query):
+    graph_capture = bool(
+        getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
+    ) or _is_cuda_graph_capturing(query)
+    if graph_capture:
         hint_names = (
             "flash_v100_static_decode_seq_hint",
             "flash_v100_decode_workspace_seq_capacity_hint",
@@ -714,6 +808,306 @@ def _get_flash_ops():
     )
 
 
+def _get_sm70_splitd_d256_ops():
+    """Load the exact SM70 Split-D dense and paged prefill operators."""
+    global _sm70_splitd_d256_ops
+    global _sm70_splitd_d256_ops_checked
+    if _sm70_splitd_d256_ops_checked:
+        return _sm70_splitd_d256_ops
+
+    _sm70_splitd_d256_ops_checked = True
+    try:
+        # Importing the interface loads the vendored FA2 torch library.
+        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+        dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
+        paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
+        splitkv3 = getattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_splitd_n32_dense_splitkv3_fwd",
+            None,
+        )
+        _sm70_splitd_d256_ops = (dense, paged, splitkv3)
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        _sm70_splitd_d256_ops = None
+        logger.warning_once(
+            "SM70 D256 exact-prefill operators are unavailable (%s: %s). "
+            "Long prefill will use a slower fallback. Verify that the active "
+            "vllm package contains a loadable _vllm_fa2_C extension with the "
+            "sm70_d256_splitd_n32_dense_fwd and "
+            "sm70_d256_splitd_n32_paged_fwd operators.",
+            type(exc).__name__,
+            exc,
+        )
+    return _sm70_splitd_d256_ops
+
+
+def _uniform_cu_seqlens(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    query_len: int,
+    kv_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    cache_key = (device_index, batch_size, query_len, kv_len)
+    cached = _sm70_fa2_cu_seqlens_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cu_q = torch.arange(
+        0,
+        (batch_size + 1) * query_len,
+        query_len,
+        dtype=torch.int32,
+        device=tensor.device,
+    )
+    cu_k = torch.arange(
+        0,
+        (batch_size + 1) * kv_len,
+        kv_len,
+        dtype=torch.int32,
+        device=tensor.device,
+    )
+    _sm70_fa2_cu_seqlens_cache[cache_key] = (cu_q, cu_k)
+    return cu_q, cu_k
+
+
+def _get_prefill_dense_splitkv3_workspace(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    global _warned_prefill_dense_splitkv3_oom
+
+    if _is_cuda_graph_capturing(query):
+        return None
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index() if query.is_cuda else -1
+    stream_id = (
+        int(torch.cuda.current_stream(query.device).cuda_stream) if query.is_cuda else 0
+    )
+    cache_key = (device_index, stream_id, query.dtype)
+    expected_out_shape = (3, *query.shape)
+    expected_stats_shape = (3, *query.shape[:-1])
+    workspace = _prefill_dense_splitkv3_workspaces.get(cache_key)
+    if (
+        workspace is not None
+        and workspace[0].shape == expected_out_shape
+        and workspace[1].shape == expected_stats_shape
+    ):
+        return workspace
+
+    _prefill_dense_splitkv3_workspaces.pop(cache_key, None)
+    workspace = None
+    try:
+        partial_out = torch.empty(
+            expected_out_shape,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        partial_max = torch.empty(
+            expected_stats_shape,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        partial_sum = torch.empty_like(partial_max)
+    except torch.OutOfMemoryError:
+        if not _warned_prefill_dense_splitkv3_oom:
+            logger.warning(
+                "Insufficient memory for the long-prefill split-KV3 FP32 "
+                "workspace; falling back to the exact dense kernel."
+            )
+            _warned_prefill_dense_splitkv3_oom = True
+        return None
+    workspace = (partial_out, partial_max, partial_sum)
+    _prefill_dense_splitkv3_workspaces[cache_key] = workspace
+    return workspace
+
+
+def _should_use_prefill_dense_splitkv3(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    splitkv3_op: Callable[..., torch.Tensor] | None,
+) -> bool:
+    return (
+        envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3
+        and splitkv3_op is not None
+        and query.shape == (1, 4096, 6, 256)
+        and key.ndim == 4
+        and key.shape[0] == 1
+        and key.shape[1] == max_seqlen_k
+        and key.shape[2:] == (1, 256)
+        and max_seqlen_q == 4096
+        and max_seqlen_k >= envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV
+        and max_seqlen_k > max_seqlen_q
+        and not _is_cuda_graph_capturing(query)
+    )
+
+
+def _try_sm70_fa2_d256_prefill(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    out: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    int32_max = torch.iinfo(torch.int32).max
+    if not envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
+        return None
+    if (
+        query.device.type != "cuda"
+        or query.dtype != torch.float16
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+        or query.stride(-1) != 1
+        or key.stride(-1) != 1
+        or value.stride(-1) != 1
+        or any(stride > int32_max for stride in query.stride()[:-1])
+        or any(stride > int32_max for stride in key.stride()[:-1])
+        or (out is not None and out.stride(-1) != 1)
+        or (out is not None and not out.is_contiguous())
+        or query.shape[-1] != 256
+        or key.shape[-1] != 256
+        or value.shape[-1] != 256
+        or max_seqlen_q < 1024
+        or not causal
+        or window_size != (-1, -1)
+        or cu_seqlens_q.device != query.device
+        or cu_seqlens_q.dtype != torch.int32
+        or not cu_seqlens_q.is_contiguous()
+    ):
+        return None
+    paged_kv = block_table is not None
+    if block_table is not None:
+        if (
+            seqused_k is None
+            or cu_seqlens_k is not None
+            or key.ndim != 4
+            or value.ndim != 4
+            or key.shape[1] % 16 != 0
+            or block_table.device != query.device
+            or block_table.dtype != torch.int32
+            or block_table.stride(-1) != 1
+            or seqused_k.device != query.device
+            or seqused_k.dtype != torch.int32
+            or not seqused_k.is_contiguous()
+        ):
+            return None
+    elif (
+        cu_seqlens_k is None
+        or seqused_k is not None
+        or cu_seqlens_k.device != query.device
+        or cu_seqlens_k.dtype != torch.int32
+        or not cu_seqlens_k.is_contiguous()
+    ):
+        return None
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    device_capability = current_platform.get_device_capability(device_index)
+    if device_capability is None or (
+        device_capability.major,
+        device_capability.minor,
+    ) != (7, 0):
+        return None
+
+    splitd_ops = _get_sm70_splitd_d256_ops()
+    splitd_eligible = (
+        splitd_ops is not None
+        and query.ndim == 4
+        and query.shape[1] == max_seqlen_q
+        and max_seqlen_q % 64 == 0
+        and max_seqlen_k % 32 == 0
+    )
+    if splitd_eligible:
+        dense_op, paged_op, splitkv3_op = splitd_ops
+        splitd_result = None
+        if paged_kv:
+            splitd_eligible = (
+                query.shape[0] == 1
+                and block_table is not None
+                and block_table.shape[0] == 1
+                and key.shape[1] % 4 == 0
+                and max_seqlen_k <= block_table.shape[1] * key.shape[1]
+            )
+            if splitd_eligible:
+                splitd_out = out if out is not None else torch.empty_like(query)
+                splitd_result = paged_op(
+                    query,
+                    key,
+                    value,
+                    block_table,
+                    splitd_out,
+                    max_seqlen_k,
+                    softmax_scale,
+                    True,
+                )
+        else:
+            splitd_eligible = (
+                key.ndim == 4
+                and value.ndim == 4
+                and key.shape[0] == query.shape[0]
+                and key.shape[1] == max_seqlen_k
+            )
+            if splitd_eligible:
+                splitd_out = out if out is not None else torch.empty_like(query)
+                if _should_use_prefill_dense_splitkv3(
+                    query,
+                    key,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    splitkv3_op=splitkv3_op,
+                ):
+                    workspace = _get_prefill_dense_splitkv3_workspace(query)
+                    if workspace is not None:
+                        partial_out, partial_max, partial_sum = workspace
+                        splitd_result = splitkv3_op(
+                            query,
+                            key,
+                            value,
+                            partial_out,
+                            partial_max,
+                            partial_sum,
+                            splitd_out,
+                            softmax_scale,
+                            True,
+                        )
+                        global _logged_prefill_dense_splitkv3
+                        if not _logged_prefill_dense_splitkv3:
+                            logger.info(
+                                "FLASH_ATTN_V100 SM70 exact dense split-KV3 "
+                                "long-prefill route active (q=%d kv=%d).",
+                                max_seqlen_q,
+                                max_seqlen_k,
+                            )
+                            _logged_prefill_dense_splitkv3 = True
+                        _record_route("prefill_dense_splitd_d256_splitkv3_kernel")
+                if splitd_result is None:
+                    splitd_result = dense_op(
+                        query, key, value, splitd_out, softmax_scale, True
+                    )
+        if splitd_result is not None:
+            result = splitd_result.reshape(query.shape)
+            if out is not None:
+                return out.reshape(query.shape)
+            return result
+    return None
+
+
 def _get_fp8_e5m2_paged_kv_bridge_op():
     global _fp8_e5m2_paged_kv_to_fp16
     global _fp8_e5m2_paged_kv_to_fp16_checked
@@ -763,13 +1157,16 @@ def _get_fp8_prefill_bridge_workspace(
         key_cache.shape[2],
         key_cache.shape[3],
     )
-    key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
-    value_out = torch.empty_like(key_out)
-    block_table = torch.arange(
-        capacity,
-        dtype=torch.int32,
-        device=key_cache.device,
-    ).unsqueeze(0)
+    try:
+        key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
+        value_out = torch.empty_like(key_out)
+        block_table = torch.arange(
+            capacity,
+            dtype=torch.int32,
+            device=key_cache.device,
+        ).unsqueeze(0)
+    except torch.OutOfMemoryError:
+        return None
     _fp8_prefill_bridge_workspaces[cache_key] = (
         key_out,
         value_out,
@@ -779,6 +1176,51 @@ def _get_fp8_prefill_bridge_workspace(
         key_out[:required_blocks],
         value_out[:required_blocks],
         block_table[:, :required_blocks],
+    )
+
+
+def _get_fp8_prefill_bridge_tail_workspace(
+    query: torch.Tensor,
+    padded_query_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    device_index = (
+        query.device.index
+        if query.device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    cache_key = (
+        device_index,
+        stream_id,
+        query.dtype,
+        int(query.shape[2]),
+        int(query.shape[3]),
+    )
+    workspace = _fp8_prefill_bridge_tail_workspaces.get(cache_key)
+    if workspace is not None and workspace[0].shape[1] >= padded_query_len:
+        return (
+            workspace[0][:, :padded_query_len],
+            workspace[1][:, :padded_query_len],
+        )
+
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    previous_capacity = workspace[0].shape[1] if workspace is not None else 0
+    capacity = max(padded_query_len, previous_capacity * 2)
+    shape = (1, capacity, query.shape[2], query.shape[3])
+    try:
+        padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
+        padded_output = torch.empty_like(padded_query)
+    except torch.OutOfMemoryError:
+        return None
+    _fp8_prefill_bridge_tail_workspaces[cache_key] = (
+        padded_query,
+        padded_output,
+    )
+    return (
+        padded_query[:, :padded_query_len],
+        padded_output[:, :padded_query_len],
     )
 
 
@@ -797,6 +1239,7 @@ def flash_v100_dense_prefill(
     softmax_scale: float,
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
+    query_start_loc_device: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Flash-V100 dense raw-QKV prefill without backend metadata coupling."""
     flash_attn_func, _, _, _, _, _, _, _, _ = _get_flash_ops()
@@ -813,6 +1256,47 @@ def flash_v100_dense_prefill(
         return output
 
     seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+    min_seq_len = int(seq_lens.min().item())
+    max_seq_len = int(seq_lens.max().item())
+    if min_seq_len >= 1024 and query_start_loc_device is not None:
+        splitd_query = query
+        splitd_key = key
+        splitd_value = value
+        splitd_out = out_view
+        if (
+            query.ndim == 3
+            and min_seq_len == max_seq_len
+            and num_actual_tokens == num_seqs * max_seq_len
+        ):
+            splitd_query = query.view(num_seqs, max_seq_len, *query.shape[1:])
+            splitd_key = key.view(num_seqs, max_seq_len, *key.shape[1:])
+            splitd_value = value.view(num_seqs, max_seq_len, *value.shape[1:])
+            splitd_out = out_view.view(num_seqs, max_seq_len, *out_view.shape[1:])
+
+        fa2_out = _try_sm70_fa2_d256_prefill(
+            splitd_query,
+            splitd_key,
+            splitd_value,
+            cu_seqlens_q=query_start_loc_device,
+            cu_seqlens_k=query_start_loc_device,
+            max_seqlen_q=max_seq_len,
+            max_seqlen_k=max_seq_len,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            out=splitd_out,
+        )
+        if fa2_out is not None:
+            global _logged_prefill_fa2_d256
+            if not _logged_prefill_fa2_d256:
+                logger.info(
+                    "FLASH_ATTN_V100 SM70 exact Split-D D256 "
+                    "software-pipelined dense prefill path active."
+                )
+                _logged_prefill_fa2_d256 = True
+            _record_route("prefill_dense_splitd_d256")
+            return output
+
     run_start = 0
     while run_start < num_seqs:
         run_seq_len = int(seq_lens[run_start].item())
@@ -852,6 +1336,188 @@ def flash_v100_dense_prefill(
         run_start = run_end
 
     return output
+
+
+# MLA context-chunk prefill needs the LSE that the dense SM70 kernel already
+# computes, plus independent Q and K sequence metadata for M != N attention.
+_flash_attn_forward_lse: Callable[..., tuple[torch.Tensor, ...]] | None = None
+_flash_attn_forward_lse_checked = False
+
+
+def _get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+    """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
+    global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
+    if not _flash_attn_forward_lse_checked:
+        _flash_attn_forward_lse_checked = True
+        try:
+            from flash_attn_v100.flash_attn_interface import _flash_attn_forward
+
+            _flash_attn_forward_lse = _flash_attn_forward
+        except (ImportError, AttributeError):
+            _flash_attn_forward_lse = None
+    return _flash_attn_forward_lse
+
+
+def flash_v100_dense_prefill_lse_available() -> bool:
+    return _get_flash_dense_forward() is not None
+
+
+def flash_v100_dense_prefill_lse(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_actual_tokens: int,
+    softmax_scale: float,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flash-V100 dense varlen prefill that also emits the softmax LSE.
+
+    Inputs use packed ``[tokens, heads, dim]`` layout and ``softmax_lse`` uses
+    the FA2 ``[query_heads, total_query_tokens]`` convention. Empty key segments
+    produce zero output and ``-inf`` LSE, making them neutral when attention
+    states are merged. Causal calls require equal Q/K lengths for every sequence.
+    """
+    fwd = _get_flash_dense_forward()
+    if fwd is None:
+        raise RuntimeError("flash_attn_v100 dense LSE prefill op is unavailable")
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("dense LSE prefill expects packed [T, H, D] Q/K/V")
+    if (
+        query.dtype != torch.float16
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+    ):
+        raise TypeError("dense LSE prefill requires fp16 Q/K/V")
+    if query.device != key.device or query.device != value.device:
+        raise ValueError("dense LSE prefill Q/K/V must share a device")
+    if key.shape != value.shape:
+        raise ValueError("dense LSE prefill K/V shapes must match")
+    if query.shape[2] != key.shape[2]:
+        raise ValueError("dense LSE prefill Q/K/V head dimensions must match")
+    if key.shape[1] <= 0 or query.shape[1] % key.shape[1] != 0:
+        raise ValueError("dense LSE prefill has an invalid Q/K head mapping")
+    if output.shape != query.shape or output.dtype != query.dtype:
+        raise ValueError("dense LSE prefill output must match the query")
+    if output.device != query.device:
+        raise ValueError("dense LSE prefill output must share the query device")
+    if softmax_lse.shape != (query.shape[1], query.shape[0]):
+        raise ValueError("dense LSE prefill LSE must have shape [Hq, Tq]")
+    if softmax_lse.dtype != torch.float32 or softmax_lse.device != query.device:
+        raise ValueError("dense LSE prefill LSE must be fp32 on the query device")
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+        raise ValueError("dense LSE prefill sequence metadata must be one-dimensional")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError("Q/K sequence metadata must describe the same batch")
+    if num_actual_tokens < 0 or num_actual_tokens > query.shape[0]:
+        raise ValueError("num_actual_tokens is outside the query bounds")
+
+    # A single device-to-host transfer replaces per-sequence scalar syncs.
+    q_off = cu_seqlens_q.tolist()
+    k_off = cu_seqlens_k.tolist()
+    if not q_off or q_off[0] != 0 or k_off[0] != 0:
+        raise ValueError("Q/K sequence offsets must start at zero")
+    if any(a > b for a, b in zip(q_off, q_off[1:])) or any(
+        a > b for a, b in zip(k_off, k_off[1:])
+    ):
+        raise ValueError("Q/K sequence offsets must be nondecreasing")
+    if q_off[-1] != num_actual_tokens:
+        raise ValueError("Q sequence offsets must cover every actual query token")
+    if k_off[-1] != key.shape[0]:
+        raise ValueError("K sequence offsets must cover every packed key/value token")
+
+    query = query[:num_actual_tokens]
+    out_view = output[:num_actual_tokens]
+    lse_view = softmax_lse[:, :num_actual_tokens]
+    num_seqs = len(q_off) - 1
+    if num_seqs == 0:
+        return output, softmax_lse
+
+    window_size_left, window_size_right = window_size
+    num_q_heads, head_dim = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+
+    run_start = 0
+    while run_start < num_seqs:
+        q_len = q_off[run_start + 1] - q_off[run_start]
+        k_len = k_off[run_start + 1] - k_off[run_start]
+        # Batch the maximal run sharing BOTH lengths — the kernel takes a
+        # rectangular [B,H,M,D] x [B,H,N,D] batch.
+        run_end = run_start + 1
+        while (
+            run_end < num_seqs
+            and q_off[run_end + 1] - q_off[run_end] == q_len
+            and k_off[run_end + 1] - k_off[run_end] == k_len
+        ):
+            run_end += 1
+
+        if q_len > 0:
+            qt0, qt1 = q_off[run_start], q_off[run_end]
+            batch_size = run_end - run_start
+
+            if k_len == 0:
+                # This is the neutral element expected by merge_attn_states.
+                out_view[qt0:qt1].zero_()
+                lse_view[:, qt0:qt1].fill_(float("-inf"))
+            else:
+                if causal and q_len != k_len:
+                    raise RuntimeError(
+                        "flash_v100_dense_prefill_lse: causal=True requires "
+                        f"q_len == k_len (got {q_len} vs {k_len})"
+                    )
+                kt0, kt1 = k_off[run_start], k_off[run_end]
+
+                # [T,H,D] -> [B,M,H,D] -> [B,H,M,D].
+                q_batch = (
+                    query[qt0:qt1]
+                    .view(batch_size, q_len, num_q_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                k_batch = (
+                    key[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                v_batch = (
+                    value[kt0:kt1]
+                    .view(batch_size, k_len, num_kv_heads, head_dim)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+
+                out_batch, lse_batch, _, _ = fwd(
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    None,
+                    0.0,
+                    softmax_scale,
+                    causal,
+                    window_size_left,
+                    window_size_right,
+                    0.0,
+                    None,
+                    False,
+                )
+
+                # [B,H,M,D] -> [B,M,H,D] -> packed [B*M,H,D].
+                out_view[qt0:qt1].copy_(
+                    out_batch.permute(0, 2, 1, 3).reshape(-1, num_q_heads, head_dim)
+                )
+                # [B,H,M] -> [H,B*M], matching FA2's [num_heads, total_q].
+                lse_view[:, qt0:qt1].copy_(
+                    lse_batch.permute(1, 0, 2).reshape(num_q_heads, -1)
+                )
+
+        run_start = run_end
+
+    return output, softmax_lse
 
 
 def _get_flash_turboquant_decode_op():
@@ -1251,6 +1917,98 @@ def _contiguous_paged_kv_bhmd(
         .contiguous()
     )
     return key_bhmd, value_bhmd
+
+
+def _get_prefill_gather_dense_workspace(
+    key_cache: torch.Tensor,
+    required_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    global _warned_prefill_gather_oom
+
+    if required_blocks <= 0:
+        return None
+    device_index = key_cache.device.index
+    if device_index is None:
+        device_index = (
+            torch.accelerator.current_device_index() if key_cache.is_cuda else -1
+        )
+    stream_id = (
+        int(torch.cuda.current_stream(key_cache.device).cuda_stream)
+        if key_cache.is_cuda
+        else 0
+    )
+    cache_key = (
+        device_index,
+        stream_id,
+        key_cache.dtype,
+        int(key_cache.shape[1]),
+        int(key_cache.shape[2]),
+        int(key_cache.shape[3]),
+    )
+    workspace = _prefill_gather_dense_workspaces.get(cache_key)
+    if workspace is not None and workspace[0].shape[0] >= required_blocks:
+        return workspace[0][:required_blocks], workspace[1][:required_blocks]
+    if _is_cuda_graph_capturing(key_cache):
+        return None
+
+    previous_capacity = workspace[0].shape[0] if workspace is not None else 0
+    capacity = max(required_blocks, previous_capacity * 2)
+    shape = (capacity, *key_cache.shape[1:])
+    try:
+        key_out = torch.empty(shape, dtype=key_cache.dtype, device=key_cache.device)
+        value_out = torch.empty_like(key_out)
+    except torch.OutOfMemoryError:
+        if not _warned_prefill_gather_oom:
+            logger.warning(
+                "Insufficient memory for the long-prefill dense KV workspace; "
+                "falling back to direct paged attention."
+            )
+            _warned_prefill_gather_oom = True
+        return None
+    _prefill_gather_dense_workspaces[cache_key] = key_out, value_out
+    return key_out[:required_blocks], value_out[:required_blocks]
+
+
+def _gather_paged_kv_to_exact_dense(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather one logical paged sequence into reusable dense K/V storage."""
+    if (
+        seq_len <= 0
+        or key_cache.dtype != torch.float16
+        or value_cache.dtype != torch.float16
+        or key_cache.shape != value_cache.shape
+        or key_cache.ndim != 4
+        or block_table_row.ndim != 1
+        or block_table_row.device != key_cache.device
+        or block_table_row.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+
+    block_size = int(key_cache.shape[1])
+    required_blocks = _cdiv_int(seq_len, block_size)
+    if required_blocks > int(block_table_row.shape[0]):
+        return None
+    workspace = _get_prefill_gather_dense_workspace(key_cache, required_blocks)
+    if workspace is None:
+        return None
+
+    key_pages, value_pages = workspace
+    page_indices = block_table_row[:required_blocks]
+    torch.index_select(key_cache, 0, page_indices, out=key_pages)
+    torch.index_select(value_cache, 0, page_indices, out=value_pages)
+    num_kv_heads = int(key_cache.shape[2])
+    head_dim = int(key_cache.shape[3])
+    key_dense = key_pages.flatten(0, 1)[:seq_len].reshape(
+        1, seq_len, num_kv_heads, head_dim
+    )
+    value_dense = value_pages.flatten(0, 1)[:seq_len].reshape(
+        1, seq_len, num_kv_heads, head_dim
+    )
+    return key_dense, value_dense
 
 
 def _cdiv_int(a: int, b: int) -> int:
@@ -2506,9 +3264,22 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 common_attn_metadata,
             )
         if not ddtree_tree_verify:
+            # EAGER build path: cap the small-query decode workspace/launch grid
+            # to the runtime max_seq_len, mirroring build_for_cudagraph_capture
+            # (:2431-2445). Without a cap, _update_smallq_decode_metadata stores
+            # the full block-table capacity (== max_model_len worth of blocks) at
+            # smallq_decode_workspace_seq_capacity_hint (:2350), and the interface
+            # then launches ceil(max_model_len/partition_size) partitions where
+            # only ceil(max_seq_len/partition_size) do work (1024 vs 17 at
+            # max_model_len=262144 / S=4224 / ps=256). The cap keeps launch equal
+            # to the runtime coverage; the interface floors it at effective
+            # max_seq_len (_get_decode_plan:165-169), so it can never under-cover.
             self._update_smallq_decode_metadata(
                 attn_metadata,
                 common_attn_metadata,
+                workspace_seq_capacity_cap=(
+                    int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
+                ),
             )
         self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._update_decode_active_num_partitions(attn_metadata, stage="build")
@@ -2544,7 +3315,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             else 0.0
         )
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
+        # EAGER drafting build path: same runtime max_seq_len cap as build()
+        # above, so the drafter hot loop does not over-launch to the full
+        # max_model_len envelope. See build() for the full rationale.
+        self._update_smallq_decode_metadata(
+            attn_metadata,
+            common_attn_metadata,
+            workspace_seq_capacity_cap=(
+                int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
+            ),
+        )
         smallq_ms = (
             (time.perf_counter() - profile_stage_t0) * 1000.0
             if profile_enabled
@@ -2606,6 +3386,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
+        _log_kv_dtype_contract(self.kv_cache_dtype)
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -2671,6 +3453,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.prefill_contig_dense_allow_copy = (
             envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY
+        )
+        self.use_flash_v100_prefill_gather_dense = (
+            self.use_flash_v100_prefill_paged
+            and envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE
+        )
+        self.prefill_gather_dense_min_q = (
+            envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q
+        )
+        self.prefill_gather_dense_min_kv = (
+            envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV
         )
         self.prefill_split_kv_tokens = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS
         self.prefill_split_kv_min_q = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q
@@ -3532,7 +4324,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
+        attn_metadata: TritonAttentionMetadata | None,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -4514,6 +5306,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             softmax_scale=self.scale,
             causal=causal,
             window_size=window_size,
+            query_start_loc_device=attn_metadata.query_start_loc,
         )
 
     def _flash_v100_decode(
@@ -4577,6 +5370,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata=attn_metadata,
                 window_size=window_size,
             )
+            partition_size_hint = _g6_aligned_page_partition_size_hint(
+                query,
+                key_cache,
+                value_cache,
+                self.kv_cache_dtype,
+            )
+            if partition_size_hint is not None:
+                _record_route(
+                    f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
+                )
             self.flash_attn_decode_paged_xqa(
                 query,
                 key_cache,
@@ -4604,6 +5407,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "flash_v100_decode_active_num_partitions",
                     None,
                 ),
+                partition_size_hint=partition_size_hint,
             )
             _record_route("decode_xqa_paged")
             return output
@@ -5148,6 +5952,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             torch.zeros_like(decode_block_table),
             decode_block_table,
         ).contiguous()
+        # EAGER fallback branch (persistent smallq metadata absent). Cap the
+        # workspace/launch grid to the runtime max_seq_len instead of passing the
+        # raw block-table capacity (== max_model_len worth of blocks), which would
+        # over-launch ceil(max_model_len/ps) partitions where only
+        # ceil(max_seq_len/ps) do work. eager_max_seq_len is computed once (single
+        # device->host sync, was already paid for max_seq_len_hint) and reused; the
+        # interface floors the hint at effective max_seq_len (_get_decode_plan:
+        # 165-169), so the cap can never under-cover the runtime sequences.
+        if num_seqs > 0:
+            eager_max_seq_len = int(seq_lens.max().item())
+            eager_workspace_seq_capacity_hint = min(
+                int(block_table.shape[1]) * int(key_cache.shape[1]),
+                eager_max_seq_len,
+            )
+        else:
+            eager_max_seq_len = None
+            eager_workspace_seq_capacity_hint = None
         self._call_flash_attn_smallq_decode_paged(
             layer,
             query,
@@ -5157,12 +5978,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             decode_seq_lens,
             attn_metadata,
             out=out_view,
-            max_seq_len_hint=(int(seq_lens.max().item()) if num_seqs > 0 else None),
-            workspace_seq_capacity_hint=(
-                int(block_table.shape[1]) * int(key_cache.shape[1])
-                if num_seqs > 0
-                else None
-            ),
+            max_seq_len_hint=eager_max_seq_len,
+            workspace_seq_capacity_hint=eager_workspace_seq_capacity_hint,
             partition_size_hint=None,
         )
         return output
@@ -5198,14 +6015,24 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_len: int,
         k_scale: float,
         v_scale: float,
         causal: bool,
         window_size: tuple[int, int],
-    ) -> torch.Tensor | None:
+        out: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool] | None:
         if block_table.shape[0] != 1:
             return None
-        input_capacity = int(block_table.shape[1]) * int(key_cache.shape[1])
+        input_block_size = int(key_cache.shape[1])
+        active_input_blocks = min(
+            int(block_table.shape[1]),
+            _cdiv_int(seq_len, input_block_size),
+        )
+        if active_input_blocks <= 0:
+            return None
+        active_block_table = block_table[:, :active_input_blocks]
+        input_capacity = active_input_blocks * input_block_size
         required_blocks = _cdiv_int(
             input_capacity,
             _FP8_PREFILL_BRIDGE_PAGE_SIZE,
@@ -5220,14 +6047,80 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.fp8_e5m2_paged_kv_to_fp16(
             key_cache,
             value_cache,
-            block_table,
+            active_block_table,
             seq_lens,
             key_out,
             value_out,
             k_scale,
             v_scale,
         )
-        return self.flash_attn_prefill_paged(
+        q_len = int(query.shape[1])
+        exact_query = query
+        exact_out = out
+        tail_prefix = 0
+        if q_len % 64 != 0 and seq_len % 32 == 0:
+            padded_q_len = _cdiv_int(q_len, 64) * 64
+            if padded_q_len <= seq_len:
+                tail_workspace = _get_fp8_prefill_bridge_tail_workspace(
+                    query,
+                    padded_q_len,
+                )
+                if tail_workspace is not None:
+                    exact_query, exact_out = tail_workspace
+                    tail_prefix = padded_q_len - q_len
+                    exact_query[:, :tail_prefix].zero_()
+                    exact_query[:, tail_prefix:].copy_(query)
+        cu_q, cu_k = _uniform_cu_seqlens(
+            exact_query,
+            batch_size=1,
+            query_len=int(exact_query.shape[1]),
+            kv_len=seq_len,
+        )
+        key_dense = key_out.flatten(0, 1)[:seq_len].unsqueeze(0)
+        value_dense = value_out.flatten(0, 1)[:seq_len].unsqueeze(0)
+        exact_result = _try_sm70_fa2_d256_prefill(
+            exact_query,
+            key_dense,
+            value_dense,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=int(exact_query.shape[1]),
+            max_seqlen_k=seq_len,
+            softmax_scale=self.scale,
+            causal=causal,
+            window_size=window_size,
+            out=exact_out,
+        )
+        if exact_result is not None:
+            if tail_prefix:
+                out.copy_(exact_result[:, tail_prefix:])
+                _record_route("prefill_prefix_fp8_bridge_exact_dense_d256_tailpad")
+                return out, True
+            _record_route("prefill_prefix_fp8_bridge_exact_dense_d256")
+            return exact_result, True
+        exact_result = _try_sm70_fa2_d256_prefill(
+            exact_query,
+            key_out,
+            value_out,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=None,
+            max_seqlen_q=int(exact_query.shape[1]),
+            max_seqlen_k=seq_len,
+            softmax_scale=self.scale,
+            causal=causal,
+            window_size=window_size,
+            out=exact_out,
+            seqused_k=seq_lens,
+            block_table=output_block_table,
+        )
+        if exact_result is not None:
+            if tail_prefix:
+                out.copy_(exact_result[:, tail_prefix:])
+                _record_route("prefill_prefix_fp8_bridge_exact_d256_tailpad")
+                return out, True
+            _record_route("prefill_prefix_fp8_bridge_exact_d256")
+            return exact_result, True
+        paged_result = self.flash_attn_prefill_paged(
             query,
             key_out,
             value_out,
@@ -5240,6 +6133,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             causal=causal,
             window_size=window_size,
         )
+        return paged_result, False
 
     def _should_use_prefill_splitkv(
         self,
@@ -5316,6 +6210,56 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return False
         return seq_len >= self.prefill_contig_dense_min_kv
 
+    def _should_use_prefill_gather_dense(
+        self,
+        *,
+        q_len: int,
+        seq_len: int,
+        head_dim: int,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        causal: bool,
+        window_size: tuple[int, int],
+        num_seqs: int,
+    ) -> bool:
+        graph_capture = _is_cuda_graph_capturing(key_cache)
+        eligible = (
+            self.use_flash_v100_prefill_gather_dense
+            and num_seqs == 1
+            and q_len >= self.prefill_gather_dense_min_q
+            and seq_len >= self.prefill_gather_dense_min_kv
+            and seq_len > q_len
+            and q_len % 64 == 0
+            and seq_len % 64 == 0
+            and head_dim == 256
+            and causal
+            and window_size == (-1, -1)
+            and key_cache.dtype == torch.float16
+            and value_cache.dtype == torch.float16
+            and key_cache.shape == value_cache.shape
+            and not graph_capture
+        )
+        _sm70_profile_trace(
+            "prefill gather-dense policy: eligible=%s gate=%s q=%d min_q=%d "
+            "kv=%d min_kv=%d num_seqs=%d head_dim=%d causal=%s window=%s "
+            "key_dtype=%s value_dtype=%s same_shape=%s graph_capture=%s",
+            eligible,
+            self.use_flash_v100_prefill_gather_dense,
+            q_len,
+            self.prefill_gather_dense_min_q,
+            seq_len,
+            self.prefill_gather_dense_min_kv,
+            num_seqs,
+            head_dim,
+            causal,
+            window_size,
+            key_cache.dtype,
+            value_cache.dtype,
+            key_cache.shape == value_cache.shape,
+            graph_capture,
+        )
+        return eligible
+
     def _run_prefill_paged_call(
         self,
         *,
@@ -5367,6 +6311,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_prefix_bfla
         global _logged_prefill_prefix_contig_dense
         global _logged_prefill_prefix_splitkv
+        global _logged_prefill_fa2_d256
         global _logged_fp8_prefill_bridge
         global _logged_prefill_compare, _logged_prefill_smallq_decode
         causal = getattr(attn_metadata, "causal", True)
@@ -5454,6 +6399,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             end = int(query_start_loc[i + 1].item())
             if end <= start:
                 continue
+            out_is_destination = False
 
             if self.use_flash_v100_prefill_paged:
                 q_len = end - start
@@ -5478,15 +6424,135 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         mask_block_n=self.prefill_bfla_mask_block_n,
                         softmax_scale=self.scale,
                     )
+                fa2_paged_out = None
+                fa2_route = None
+                if (
+                    bfla_block_mask is None
+                    and envs.VLLM_FLASH_V100_FA2_D256_PREFILL
+                    and key_cache.dtype == torch.float16
+                    and value_cache.dtype == torch.float16
+                    and q_len >= 1024
+                    and head_dim == 256
+                    and causal
+                    and window_size == (-1, -1)
+                ):
+                    cu_q, cu_k = _uniform_cu_seqlens(
+                        q_seq,
+                        batch_size=1,
+                        query_len=q_len,
+                        kv_len=seq_len,
+                    )
+                    fa2_out_dest = out_view[start:end].unsqueeze(0)
+                    fa2_dense_kv = _contiguous_paged_kv_view(
+                        key_cache,
+                        value_cache,
+                        attn_metadata.block_table[i],
+                        seq_len,
+                        block_size,
+                        attn_metadata,
+                        i,
+                        False,
+                    )
+                    fa2_dense_route = "prefill_prefix_contig_splitd_d256"
+                    if (
+                        fa2_dense_kv is None
+                        and self._should_use_prefill_gather_dense(
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            head_dim=head_dim,
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            causal=causal,
+                            window_size=window_size,
+                            num_seqs=num_seqs,
+                        )
+                        and _get_sm70_splitd_d256_ops() is not None
+                    ):
+                        fa2_dense_kv = _gather_paged_kv_to_exact_dense(
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i],
+                            seq_len,
+                        )
+                        fa2_dense_route = "prefill_prefix_gather_splitd_d256"
+                    if fa2_dense_kv is not None:
+                        fa2_route = fa2_dense_route
+                        fa2_key, fa2_value = fa2_dense_kv
+                        fa2_paged_out = self._run_prefill_paged_call(
+                            route=fa2_route,
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            heads_q=query.shape[1],
+                            heads_kv=num_kv_heads,
+                            head_dim=head_dim,
+                            block_size=block_size,
+                            fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                            fa2_key=fa2_key,
+                            fa2_value=fa2_value,
+                            cu_q=cu_q,
+                            cu_k=cu_k,
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            out_dest=fa2_out_dest: _try_sm70_fa2_d256_prefill(
+                                q_seq,
+                                fa2_key,
+                                fa2_value,
+                                cu_seqlens_q=cu_q,
+                                cu_seqlens_k=cu_k,
+                                max_seqlen_q=q_len,
+                                max_seqlen_k=seq_len,
+                                softmax_scale=self.scale,
+                                causal=causal,
+                                window_size=window_size,
+                                out=out_dest,
+                            ),
+                        )
+                    else:
+                        fa2_route = "prefill_prefix_paged_splitd_d256"
+                        fa2_paged_out = self._run_prefill_paged_call(
+                            route=fa2_route,
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            heads_q=query.shape[1],
+                            heads_kv=num_kv_heads,
+                            head_dim=head_dim,
+                            block_size=block_size,
+                            fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            cu_q=cu_q,
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            out_dest=fa2_out_dest,
+                            i=i: _try_sm70_fa2_d256_prefill(
+                                q_seq,
+                                key_cache,
+                                value_cache,
+                                cu_seqlens_q=cu_q,
+                                cu_seqlens_k=None,
+                                max_seqlen_q=q_len,
+                                max_seqlen_k=seq_len,
+                                softmax_scale=self.scale,
+                                causal=causal,
+                                window_size=window_size,
+                                out=out_dest,
+                                seqused_k=attn_metadata.seq_lens[i : i + 1],
+                                block_table=attn_metadata.block_table[i : i + 1],
+                            ),
+                        )
                 contig_dense_kv = None
                 contig_dense_kv_bhmd = None
-                if bfla_block_mask is None and self._should_use_prefill_contig_dense(
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    head_dim=head_dim,
-                    key_cache=key_cache,
-                    causal=causal,
-                    window_size=window_size,
+                if (
+                    bfla_block_mask is None
+                    and fa2_paged_out is None
+                    and self._should_use_prefill_contig_dense(
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        head_dim=head_dim,
+                        key_cache=key_cache,
+                        causal=causal,
+                        window_size=window_size,
+                    )
                 ):
                     if (
                         self.prefill_contig_dense_allow_copy
@@ -5567,6 +6633,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             window_size=window_size,
                         ),
                     )
+                elif fa2_paged_out is not None:
+                    if not _logged_prefill_fa2_d256:
+                        logger.info(
+                            "FLASH_ATTN_V100 SM70 Split-D D256 software-pipelined "
+                            "prefill path active (route=%s).",
+                            fa2_route,
+                        )
+                        _logged_prefill_fa2_d256 = True
+                    _record_route(fa2_route or "prefill_prefix_splitd_d256")
+                    out_seq = fa2_paged_out
+                    out_is_destination = True
                 elif contig_dense_kv_bhmd is not None:
                     if not _logged_prefill_prefix_contig_dense:
                         logger.info(
@@ -5611,39 +6688,91 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         )
                         _logged_prefill_prefix_contig_dense = True
                     k_dense, v_dense = contig_dense_kv
-                    _record_route("prefill_prefix_contig_dense")
-                    out_seq = self._run_prefill_paged_call(
-                        route="prefill_prefix_contig_dense",
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        heads_q=query.shape[1],
-                        heads_kv=num_kv_heads,
-                        head_dim=head_dim,
-                        block_size=block_size,
-                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                        k_dense=k_dense,
-                        v_dense=v_dense: self.flash_attn_func(
+                    fa2_out = None
+                    if envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
+                        cu_q, cu_k = _uniform_cu_seqlens(
                             q_seq,
-                            k_dense,
-                            v_dense,
-                            causal=causal,
-                            softmax_scale=self.scale,
-                            window_size=window_size,
-                        ),
-                    )
+                            batch_size=1,
+                            query_len=q_len,
+                            kv_len=seq_len,
+                        )
+                        fa2_out_dest = out_view[start:end].unsqueeze(0)
+                        fa2_out = self._run_prefill_paged_call(
+                            route="prefill_prefix_contig_dense_fa2_d256",
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            heads_q=query.shape[1],
+                            heads_kv=num_kv_heads,
+                            head_dim=head_dim,
+                            block_size=block_size,
+                            fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                            k_dense=k_dense,
+                            v_dense=v_dense,
+                            cu_q=cu_q,
+                            cu_k=cu_k,
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            out_dest=fa2_out_dest: _try_sm70_fa2_d256_prefill(
+                                q_seq,
+                                k_dense,
+                                v_dense,
+                                cu_seqlens_q=cu_q,
+                                cu_seqlens_k=cu_k,
+                                max_seqlen_q=q_len,
+                                max_seqlen_k=seq_len,
+                                softmax_scale=self.scale,
+                                causal=causal,
+                                window_size=window_size,
+                                out=out_dest,
+                            ),
+                        )
+                    if fa2_out is not None:
+                        if not _logged_prefill_fa2_d256:
+                            logger.info(
+                                "FLASH_ATTN_V100 SM70 FA2 D256 "
+                                "software-pipelined dense prefill path active."
+                            )
+                            _logged_prefill_fa2_d256 = True
+                        _record_route("prefill_prefix_contig_dense_fa2_d256")
+                        out_seq = fa2_out
+                        out_is_destination = True
+                    else:
+                        _record_route("prefill_prefix_contig_dense")
+                        out_seq = self._run_prefill_paged_call(
+                            route="prefill_prefix_contig_dense",
+                            q_len=q_len,
+                            seq_len=seq_len,
+                            heads_q=query.shape[1],
+                            heads_kv=num_kv_heads,
+                            head_dim=head_dim,
+                            block_size=block_size,
+                            fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                            k_dense=k_dense,
+                            v_dense=v_dense: self.flash_attn_func(
+                                q_seq,
+                                k_dense,
+                                v_dense,
+                                causal=causal,
+                                softmax_scale=self.scale,
+                                window_size=window_size,
+                            ),
+                        )
                 elif use_fp8_bridge:
-                    out_seq = self._run_fp8_prefill_bridge(
+                    bridge_result = self._run_fp8_prefill_bridge(
                         query=q_seq,
                         key_cache=key_cache,
                         value_cache=value_cache,
                         block_table=attn_metadata.block_table[i : i + 1],
                         seq_lens=attn_metadata.seq_lens[i : i + 1],
+                        seq_len=seq_len,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
                         causal=causal,
                         window_size=window_size,
+                        out=out_view[start:end].unsqueeze(0),
                     )
-                    if out_seq is not None:
+                    if bridge_result is not None:
+                        out_seq, out_is_destination = bridge_result
                         if not _logged_fp8_prefill_bridge:
                             logger.info(
                                 "FLASH_ATTN_V100 FP8 E5M2 prefill bridge "
@@ -5978,7 +7107,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     softmax_scale=self.scale,
                     window_size=window_size,
                 )
-            out_view[start:end].copy_(out_seq.squeeze(0))
+            if not out_is_destination:
+                out_view[start:end].copy_(out_seq.squeeze(0))
 
         return output
 

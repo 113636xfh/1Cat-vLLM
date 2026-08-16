@@ -99,6 +99,58 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
 
+_SM70_FP8_PREFILL_DENSE_MIN_M = 3920
+_SM70_FP8_PREFILL_DENSE_SHAPES = {
+    "gate_up_proj": (5120, 8704),
+    "down_proj": (4352, 5120),
+    "out_proj": (1536, 5120),
+    "o_proj": (1536, 5120),
+}
+_SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
+    k * n for k, n in _SM70_FP8_PREFILL_DENSE_SHAPES.values()
+)
+_SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES = (
+    _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
+)
+# Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
+_sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+def _is_sm70_fp8_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
+    if getattr(layer, "tp_size", 1) != 4:
+        return False
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    expected = _SM70_FP8_PREFILL_DENSE_SHAPES.get(suffix)
+    if expected is None:
+        return False
+    return tuple(layer.weight.shape) == expected
+
+
+def _get_sm70_fp8_prefill_exact_dense_workspace(
+    weight: torch.Tensor,
+) -> torch.Tensor | None:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    cache_key = (device_index, torch.float16)
+    workspace = _sm70_fp8_prefill_dense_workspaces.get(cache_key)
+    if workspace is not None:
+        return workspace
+    try:
+        workspace = torch.empty(
+            (_SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS,),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+    except torch.OutOfMemoryError:
+        logger.warning_once(
+            "Insufficient memory for the bounded SM70 FP8 prefill workspace; "
+            "falling back to TurboMind FP8."
+        )
+        return None
+    _sm70_fp8_prefill_dense_workspaces[cache_key] = workspace
+    return workspace
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -481,10 +533,75 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if weight_scale_inv.dtype != torch.float32:
                 weight_scale_inv = weight_scale_inv.to(torch.float32)
+            if getattr(layer, "is_bmm", False):
+                group_count = int(getattr(layer, "bmm_batch_size", 0))
+                if group_count <= 0 or weight.shape[0] % group_count != 0:
+                    raise RuntimeError(
+                        "SM70 TurboMind grouped FP8 requires a positive group "
+                        f"count dividing weight rows, got groups={group_count}, "
+                        f"weight={tuple(weight.shape)}."
+                    )
+                rows_per_group = weight.shape[0] // group_count
+                if rows_per_group % self.weight_block_size[0] != 0:
+                    raise RuntimeError(
+                        "SM70 TurboMind grouped FP8 requires each group output "
+                        f"to align to block_n={self.weight_block_size[0]}, got "
+                        f"{rows_per_group}."
+                    )
+                scale_rows_per_group = rows_per_group // self.weight_block_size[0]
+                expected_scale_rows = scale_rows_per_group * group_count
+                if weight_scale_inv.shape[0] != expected_scale_rows:
+                    raise RuntimeError(
+                        "SM70 TurboMind grouped FP8 scale rows do not match "
+                        f"weights: expected {expected_scale_rows}, got "
+                        f"{weight_scale_inv.shape[0]}."
+                    )
+
+                prepared_weights = []
+                prepared_scales = []
+                metas = []
+                for group_idx in range(group_count):
+                    row_start = group_idx * rows_per_group
+                    scale_start = group_idx * scale_rows_per_group
+                    tm_weight, tm_scale, meta = sm70_ops.fp8_sm70_prepare(
+                        weight[row_start : row_start + rows_per_group].contiguous(),
+                        weight_scale_inv[
+                            scale_start : scale_start + scale_rows_per_group
+                        ].contiguous(),
+                        self.weight_block_size[0],
+                        False,
+                    )
+                    prepared_weights.append(tm_weight)
+                    prepared_scales.append(tm_scale)
+                    metas.append(meta)
+
+                first_meta = metas[0]
+                if any(
+                    int(meta[0].item()) != int(first_meta[0].item())
+                    or int(meta[1].item()) != int(first_meta[1].item())
+                    for meta in metas[1:]
+                ):
+                    raise RuntimeError(
+                        "SM70 TurboMind grouped FP8 produced inconsistent layouts."
+                    )
+                replace_parameter(layer, "weight", torch.stack(prepared_weights))
+                replace_parameter(
+                    layer, "weight_scale_inv", torch.stack(prepared_scales)
+                )
+                layer.input_scale = None
+                layer.sm70_fp8_turbomind = True
+                layer.sm70_fp8_bmm = True
+                layer.sm70_fp8_bmm_groups = group_count
+                layer.sm70_fp8_bmm_output_size = rows_per_group
+                layer.register_buffer("sm70_fp8_meta", first_meta, persistent=False)
+                layer.sm70_fp8_k_ld = int(first_meta[0].item())
+                layer.sm70_fp8_q_ld = int(first_meta[1].item())
+                logger.info_once(
+                    "SM70 FP8 TurboMind grouped-BMM path enabled for DeepSeek V4."
+                )
+                return
             is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
-            use_gated_silu = (
-                is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
-            )
+            use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
                 weight_scale_inv,
@@ -512,6 +629,20 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
+            if (
+                envs.VLLM_SM70_FP8_PREFILL_EXACT_DENSE
+                and hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out")
+                and _is_sm70_fp8_prefill_exact_dense_layer(layer)
+            ):
+                workspace = _get_sm70_fp8_prefill_exact_dense_workspace(tm_weight)
+                if workspace is not None:
+                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
+                        workspace.data_ptr()
+                    )
+                    logger.info_once(
+                        "SM70 FP8 exact-dense prefill path enabled with a bounded "
+                        "85 MiB workspace."
+                    )
             logger.info_once("SM70 FP8 TurboMind W8A16 dense path enabled.")
             return
 
@@ -627,6 +758,39 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "sm70_fp8_turbomind", False):
+            if getattr(layer, "sm70_fp8_bmm", False):
+                group_count = int(layer.sm70_fp8_bmm_groups)
+                output_size = int(layer.sm70_fp8_bmm_output_size)
+                if x.ndim < 2 or x.shape[-2] != group_count:
+                    raise RuntimeError(
+                        "SM70 grouped FP8 input must end in [groups, K], got "
+                        f"{tuple(x.shape)} for groups={group_count}."
+                    )
+                x_grouped = x.reshape(-1, group_count, x.shape[-1])
+                x_by_group = x_grouped.transpose(0, 1).contiguous()
+                out_by_group = torch.empty(
+                    (group_count, x_grouped.shape[0], output_size),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                for group_idx in range(group_count):
+                    sm70_ops.fp8_gemm_sm70_out(
+                        out_by_group[group_idx],
+                        x_by_group[group_idx],
+                        layer.weight[group_idx],
+                        layer.weight_scale_inv[group_idx],
+                        128,
+                        layer.sm70_fp8_k_ld,
+                        layer.sm70_fp8_q_ld,
+                        False,
+                    )
+                out = out_by_group.transpose(0, 1).reshape(
+                    *x.shape[:-2], group_count, output_size
+                )
+                if bias is not None:
+                    out.add_(bias.view(group_count, output_size))
+                return out
+
             out_shape = (*x.shape[:-1], layer.output_size_per_partition)
             x_2d = x.reshape(-1, x.shape[-1])
             if x_2d.stride(-1) != 1:
@@ -636,16 +800,33 @@ class Fp8LinearMethod(LinearMethodBase):
                 device=x.device,
                 dtype=x.dtype,
             )
-            sm70_ops.fp8_gemm_sm70_out(
-                out_2d,
-                x_2d,
-                layer.weight,
-                layer.weight_scale_inv,
-                128,
-                layer.sm70_fp8_k_ld,
-                layer.sm70_fp8_q_ld,
-                False,
+            prefill_workspace_ptr = getattr(
+                layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
             )
+            if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
+                sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+                    out_2d,
+                    prefill_workspace_ptr,
+                    x_2d,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    128,
+                    layer.sm70_fp8_k_ld,
+                    layer.sm70_fp8_q_ld,
+                    False,
+                    _SM70_FP8_PREFILL_DENSE_MIN_M,
+                )
+            else:
+                sm70_ops.fp8_gemm_sm70_out(
+                    out_2d,
+                    x_2d,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    128,
+                    layer.sm70_fp8_k_ld,
+                    layer.sm70_fp8_q_ld,
+                    False,
+                )
             if getattr(layer, "sm70_fp8_gated_silu_primary", False):
                 out_features = layer.output_size_per_partition // 2
                 out_2d = (
@@ -732,6 +913,23 @@ class Fp8LinearMethod(LinearMethodBase):
             scales = layer.sm70_fp8_gated_silu_scales
             k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
             q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
+        prefill_workspace_ptr = getattr(
+            layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
+        )
+        if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
+            sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+                out_2d,
+                prefill_workspace_ptr,
+                x_2d,
+                weight,
+                scales,
+                128,
+                k_ld,
+                q_ld,
+                True,
+                _SM70_FP8_PREFILL_DENSE_MIN_M,
+            )
+            return out_2d.reshape(*x.shape[:-1], out_features)
         sm70_ops.fp8_gemm_sm70_out(
             out_2d,
             x_2d,
@@ -1042,9 +1240,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_input_scale: torch.Tensor | None,
         w2_input_scale: torch.Tensor | None,
     ) -> None:
+        fp8_backend = self.fp8_backend
+        assert fp8_backend is not None
         # Shuffle weights to runtime format.
         w13, w2, w13_scale, w2_scale = convert_to_fp8_moe_kernel_format(
-            fp8_backend=self.fp8_backend,
+            fp8_backend=fp8_backend,
             layer=layer,
             w13=w13,
             w2=w2,
@@ -1062,7 +1262,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale)
 
         # AITER backend requires weights to be marked as shuffled.
-        if self.fp8_backend == Fp8MoeBackend.AITER:
+        if fp8_backend == Fp8MoeBackend.AITER:
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
@@ -1072,7 +1272,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.moe_kernel = make_fp8_moe_kernel(
                 moe_quant_config=self.moe_quant_config,
                 moe_config=self.moe,
-                fp8_backend=self.fp8_backend,
+                fp8_backend=fp8_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
@@ -1123,16 +1323,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13 = self._dequantize_block_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_block_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_block_moe_weight(w2, w2_scale, layer.orig_dtype)
             else:
                 w13 = self._dequantize_tensor_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_tensor_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_tensor_moe_weight(w2, w2_scale, layer.orig_dtype)
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             layer.w13_input_scale = None
@@ -1214,13 +1410,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        fp8_backend = self.fp8_backend
+        assert fp8_backend is not None
         w1_scale = getattr(layer, f"w13_{self.weight_scale_name}")
         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
         a1_scale = layer.w13_input_scale
         a2_scale = layer.w2_input_scale
 
         quant_config = make_fp8_moe_quant_config(
-            fp8_backend=self.fp8_backend,
+            fp8_backend=fp8_backend,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
