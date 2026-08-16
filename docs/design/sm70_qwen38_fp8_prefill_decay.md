@@ -134,3 +134,43 @@ shuffle/repack form.
   `experiments/p-scalar-native-build-r3/_vllm_fa2_C.abi3.so`.
 - FP8 KV/chunk 8192 result:
   `results/fp8kv-chunk8192-tp4.json`.
+
+## 2026-08-16 source-worktree FA2 route audit
+
+A later Qwen3.8 MTP-prefill investigation initially measured only 2798.6
+tok/s without MTP and 2702.6 tok/s with MTP4 at 64K. Those values are invalid
+as optimized-route baselines. The source worktree shadowed the installed vLLM
+package but did not contain `_vllm_fa2_C.abi3.so`; the optional operator
+loader swallowed the resulting import error and silently disabled the exact
+SM70 D256 prefill route.
+
+Restoring the same vendored FA2 binary used by the accepted build made the
+required dense, paged, and split-KV3 operators visible. Under the matched TP4,
+E5M2 KV, chunk-8192, prefix-cache/Mamba-align, CUDA-graph, official-sampling,
+64K-input/256-output contract, the corrected results are:
+
+| Mode | Prefill | Throughput | Relative to retained table |
+|---|---:|---:|---:|
+| no-MTP | 18.743949 s | 3496.4 tok/s | -3.7% vs. 3630.6 |
+| MTP4 | 22.308881 s | 2937.7 tok/s | -0.4% vs. 2950.5 |
+
+The no-MTP worker recorded 288 hits on
+`prefill_prefix_fp8_bridge_exact_dense_d256_tailpad`. Both modes emitted 256
+coherent tokens with stable warmup/measurement hashes. The remaining matched
+MTP prefill overhead is 3.564932 seconds (+19.0% latency, -16.0% throughput),
+which is now the optimization target. Raw results and logs are retained under
+`/data/minimax-h3/task-cache/qwen38-mtp-fp8kv-prefill-20260816/`.
+
+Synchronized interval profiling attributes 21.281 seconds to the MTP target
+forward and 0.864 seconds to the four-step drafter GPU timeline. The target
+forward is therefore the dominant prefill cost; removing drafter sampling or
+the three dependent draft loops cannot recover the full MTP penalty.
+
+A state-only prefill candidate kept the first draft forward/KV update but
+skipped prefill draft sampling and the three dependent loops. It was rejected:
+prefill changed from 22.308881 to 22.330927 seconds (+0.10%), while accepted
+length fell from 3.779 to 3.253 and decode throughput fell from 60.86 to 58.79
+tok/s. The 256-token output remained coherent, but changing the draft RNG
+sequence made this route unsuitable even apart from the lack of speedup. The
+candidate was removed; its raw result is
+`results/mtp4-e5m2-64k-o256-prefill-state-only-r1.json` under the artifact root.
