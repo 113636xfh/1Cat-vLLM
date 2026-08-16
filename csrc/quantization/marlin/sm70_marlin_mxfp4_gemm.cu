@@ -23,6 +23,8 @@
 
 using marlin::sm70::Sm70CtaGeometry;
 using marlin::sm70::Sm70AtomicFp16Epilogue;
+using marlin::sm70::Sm70AtomicFp32Epilogue;
+using marlin::sm70::sm70_marlin_narrow_f32_to_f16;
 using marlin::sm70::Sm70MarlinGemmTraits;
 using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::validate_sm70_marlin_dense_cta_geometry_supported;
@@ -45,18 +47,12 @@ constexpr int kMxfp4ValuesPerWord = 8;
 
 CUTLASS_DEVICE
 __half2 e8m0x2_to_half2_fast(uint16_t e8m0_x2) {
-  int v0 = e8m0_x2 & 0xFF;
-  int v1 = e8m0_x2 >> 8;
-
-  int e0 = v0 - 112;
-  e0 = e0 < 0 ? 0 : (e0 > 31 ? 31 : e0);
-
-  int e1 = v1 - 112;
-  e1 = e1 < 0 ? 0 : (e1 > 31 ? 31 : e1);
-
-  uint32_t res = ((e1 << 10) << 16) | (e0 << 10);
-
-  return *reinterpret_cast<__half2*>(&res);
+  // Finite nonzero E8M0 bytes are IEEE FP32 exponent fields for
+  // 2^(value - 127); byte zero also rounds to FP16 zero. Let the hardware
+  // conversion preserve subnormals and apply round-to-nearest-even.
+  uint32_t const bits0 = static_cast<uint32_t>(e8m0_x2 & 0xFF) << 23;
+  uint32_t const bits1 = static_cast<uint32_t>(e8m0_x2 >> 8) << 23;
+  return __floats2half2_rn(__uint_as_float(bits0), __uint_as_float(bits1));
 }
 
 CUTLASS_DEVICE
@@ -439,11 +435,11 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     uint8_t const* __restrict__ b_scales,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda, int requested_split_k) {
+    cutlass::half_t* __restrict__ c, float* __restrict__ c32, int m, int n, int k, int lda, int requested_split_k) {
   using Traits = Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
                                   WarpN, WarpK, GroupSize, PackedMacroN>;
   using Mma = typename Traits::Mma;
-  using AtomicEpilogue = Sm70AtomicFp16Epilogue<Traits>;
+  using AtomicEpilogue = Sm70AtomicFp32Epilogue<Traits>;
 
   extern __shared__ char smem[];
   auto& shared_storage =
@@ -490,7 +486,7 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
 
   AtomicEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx,
                           lane_idx);
-  epilogue(iterator_D, accumulators, c, n);
+  epilogue(iterator_D, accumulators, c32, n);
 }
 
 }  // namespace
@@ -536,9 +532,11 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  // 0009: fp32 split-K scratch (zeroed for the fp32 atomicAdd), M*N floats.
+  // Only allocated on the split_k>1 path, which the auto-selector uses ONLY at
+  // low batch (M<128), so the scratch is bounded and small.
+  auto c32 = torch::zeros({size_m, size_n},
+                          a.options().dtype(at::kFloat));
 
   dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
@@ -549,8 +547,18 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<uint8_t const*>(b_scales.data_ptr()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+      c32.data_ptr<float>(),
       static_cast<int>(size_m), static_cast<int>(size_n),
       static_cast<int>(size_k), static_cast<int>(a.stride(0)), requested_split_k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  // 0009: single deterministic-width fp32->fp16 narrow of the scratch.
+  int const narrow_block = 256;
+  int const narrow_grid =
+      static_cast<int>((numel + narrow_block - 1) / narrow_block);
+  sm70_marlin_narrow_f32_to_f16<256><<<narrow_grid, narrow_block, 0, stream>>>(
+      c32.data_ptr<float>(),
+      reinterpret_cast<half*>(c.data_ptr<at::Half>()), numel);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return c;

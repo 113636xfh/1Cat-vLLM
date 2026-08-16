@@ -77,6 +77,25 @@ def test_quality_metrics_still_reject_degenerate_repetition():
     assert "same_token_run" in metrics["failures"]
 
 
+def test_quality_metrics_allow_decorative_character_separators():
+    separator = "/* " + "=" * 57 + " */"
+    text = "\n".join(f"{separator}\nconst section_{idx} = {idx};" for idx in range(30))
+
+    metrics = _quality_metrics(text, list(range(64)))
+
+    assert metrics["max_same_char_run"] == 57
+    assert metrics["repeat20"] <= metrics["repeat20_limit"]
+    assert metrics["repeat50"] <= 40
+    assert metrics["passed"]
+
+
+def test_quality_metrics_still_reject_long_homogeneous_run():
+    metrics = _quality_metrics("=" * 121, list(range(64)))
+
+    assert metrics["max_same_char_run"] == 121
+    assert "same_char_run" in metrics["failures"]
+
+
 def test_release_matrix_includes_fp8_weight_fp8_kv_mtp_by_default():
     cases = _make_cases(
         backends=("turbomind",),

@@ -300,6 +300,12 @@ def _max_repeated_window(text: str, width: int) -> int:
         window = normalized[idx : idx + width]
         if len(window.strip()) < width // 2:
             continue
+        # Homogeneous runs are checked independently by
+        # _longest_same_char_run. Counting their overlapping windows makes
+        # ordinary code separators such as "=====" look quadratically
+        # repetitive.
+        if len(set(window)) == 1:
+            continue
         counts[window] = counts.get(window, 0) + 1
     return max(counts.values(), default=0)
 
@@ -493,6 +499,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                     "finish_reason": q_finish_reason,
                     "stop_reason": q_stop_reason,
                     "prompt_tokens": len(request.prompt_token_ids or []),
+                    "token_ids": token_ids,
                     "metrics": _quality_metrics(text, token_ids),
                     "preview": text[:1000],
                     "tail": text[-1000:],
@@ -511,7 +518,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         top_k=-1,
         skip_special_tokens=False,
     )
-    det_outputs = [llm.generate([det_prompt], det_sampling)[0] for _ in range(2)]
+    det_outputs = [llm.generate([det_prompt], det_sampling)[0] for _ in range(3)]
     det_records = []
     for output in det_outputs:
         text, token_ids, det_finish_reason, det_stop_reason = _output_record(output)
@@ -519,14 +526,14 @@ def _run_worker(args: argparse.Namespace) -> int:
             {
                 "finish_reason": det_finish_reason,
                 "stop_reason": det_stop_reason,
+                "token_ids": token_ids,
                 "metrics": _quality_metrics(text, token_ids),
                 "preview": text[:800],
             }
         )
-    deterministic_exact = (
-        det_records[0]["metrics"]["token_hash"]
-        == det_records[1]["metrics"]["token_hash"]
-    )
+    det_hashes = [record["metrics"]["token_hash"] for record in det_records]
+    deterministic_exact = len(set(det_hashes)) == 1
+    deterministic_steady_state_exact = det_hashes[-2] == det_hashes[-1]
 
     case_quality_passed = (
         all(record["metrics"]["passed"] for record in quality_records)
@@ -581,6 +588,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             "records": quality_records,
             "determinism": {
                 "exact_token_match": deterministic_exact,
+                "steady_state_exact_token_match": deterministic_steady_state_exact,
                 "records": det_records,
             },
             "passed": case_quality_passed,

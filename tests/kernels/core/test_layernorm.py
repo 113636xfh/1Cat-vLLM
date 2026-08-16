@@ -190,3 +190,81 @@ def test_gemma_rms_norm_mixed_input_weight_dtype(default_vllm_config) -> None:
 
     assert out.dtype == x.dtype
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [256, 4096])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_sm70_gemma_long_prefill_fused_add_rms_norm_exact(
+    num_tokens: int,
+    weight_dtype: torch.dtype,
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA device required")
+
+    torch.manual_seed(20260814)
+    x = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.float16).mul_(0.125)
+    residual = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.float32).mul_(
+        0.125
+    )
+    weight = torch.randn(5120, device="cuda", dtype=torch.float32).mul_(0.05)
+    weight = weight.to(weight_dtype)
+
+    expected_residual = x.float() + residual
+    gemma_weight = weight.float() + 1.0
+    expected_normalized_fp32 = torch.empty_like(expected_residual)
+    torch.ops._C.rms_norm(
+        expected_normalized_fp32,
+        expected_residual,
+        gemma_weight,
+        1e-6,
+    )
+    expected_normalized = expected_normalized_fp32.to(torch.float16)
+
+    normalized = torch.empty_like(x)
+    residual_out = torch.empty_like(residual)
+    torch.ops._C.sm70_gemma_long_prefill_fused_add_rms_norm(
+        normalized,
+        residual_out,
+        x,
+        residual,
+        weight,
+        1e-6,
+    )
+
+    assert torch.equal(normalized, expected_normalized)
+    assert torch.equal(residual_out, expected_residual)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 18])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_sm70_gemma_long_prefill_op_small_shape_fallback_exact(
+    num_tokens: int,
+    weight_dtype: torch.dtype,
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA device required")
+
+    torch.manual_seed(20260814)
+    x = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.float16).mul_(0.125)
+    residual = torch.randn(num_tokens, 5120, device="cuda", dtype=torch.float32).mul_(
+        0.125
+    )
+    weight = torch.randn(5120, device="cuda", dtype=torch.float32).mul_(0.05)
+    weight = weight.to(weight_dtype)
+
+    expected_normalized, expected_residual = GemmaRMSNorm._forward_static_with_residual(
+        weight, 1e-6, x, residual
+    )
+    normalized, residual_out = (
+        torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
+            x,
+            residual,
+            weight,
+            1e-6,
+        )
+    )
+
+    assert torch.equal(normalized, expected_normalized)
+    assert torch.equal(residual_out, expected_residual)

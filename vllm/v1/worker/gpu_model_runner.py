@@ -205,6 +205,7 @@ from vllm.v1.spec_decode.draft_prob_alignment import (
     clone_draft_prob_token_ids,
     get_aligned_draft_probs,
 )
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -1069,7 +1070,10 @@ class GPUModelRunner(
             spec_config is not None
             and self.device.type == "cuda"
             and (
-                (spec_config.method == "mtp" and _sm70_mtp_profile_env_enabled())
+                (
+                    spec_config.method in ("mtp", "dflash", "dspark")
+                    and _sm70_mtp_profile_env_enabled()
+                )
                 or (
                     spec_config.use_dflash_ddtree() and _dflash_ddtree_profile_enabled()
                 )
@@ -1358,6 +1362,8 @@ class GPUModelRunner(
         draft_vocab_config = resolve_mtp_draft_vocab_config(
             (self.speculative_config.method or "") if self.speculative_config else "",
             self.parallel_config.tensor_parallel_size,
+            self.model_config.architecture,
+            self.model_config.model,
         )
         self.dynamic_draft_vocab_prefill_topk = draft_vocab_config.prefill_topk
         validate_dynamic_draft_vocab_prefill_topk(
@@ -1421,6 +1427,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DSparkProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -1462,6 +1469,9 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_dspark():
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = (
@@ -7746,10 +7756,9 @@ class GPUModelRunner(
 
         if (
             attention_context_len is None
-            and self.speculative_config is not None
             and uniform_decode
-            and self.uniform_decode_query_len > 1
             and num_reqs > 0
+            and self.cudagraph_dispatcher.has_attention_context_buckets
         ):
             attention_context_len = int(
                 self.optimistic_seq_lens_cpu[:num_reqs].max().item()
@@ -7798,7 +7807,7 @@ class GPUModelRunner(
                 return
             if attention_context_len is None or attention_context_len > bucket:
                 raise RuntimeError(
-                    "Refusing to replay a bounded MTP CUDA graph outside its "
+                    "Refusing to replay a bounded CUDA graph outside its "
                     f"attention context capacity: context={attention_context_len}, "
                     f"bucket={bucket}, descriptor={batch_descriptor}"
                 )
@@ -9866,6 +9875,13 @@ class GPUModelRunner(
 
             if eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+
+        if not layer_ids:
+            dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+            if dspark_layer_ids:
+                # DSpark config uses zero-based decoder-layer IDs; the target
+                # model's capture interface numbers outputs after each layer.
+                layer_ids = [layer_id + 1 for layer_id in dspark_layer_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
