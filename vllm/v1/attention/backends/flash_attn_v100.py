@@ -127,6 +127,7 @@ _logged_dflash_prefix_dump = False
 _logged_prefill_ddtree_dense = False
 _logged_prefill_ddtree_triton = False
 _logged_prefill_ddtree_triton_fallback = False
+_logged_kv_dtype_contracts: set[str] = set()
 _route_summary_registered = False
 _route_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
@@ -134,11 +135,15 @@ _draft_graph_debug_counts: dict[str, int] = {}
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
-_DEFAULT_FP8_XQA_MIN_SEQ_LEN = 8192
+_DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 _FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
 _fp8_prefill_bridge_workspaces: dict[
     tuple[int, int, int, int],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_fp8_prefill_bridge_tail_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int],
+    tuple[torch.Tensor, torch.Tensor],
 ] = {}
 _prefill_gather_dense_workspaces: dict[
     tuple[int, int, torch.dtype, int, int, int],
@@ -290,28 +295,68 @@ def _decode_partition_size_for_metadata(
     return value
 
 
-def _g6_page784_sawtooth_partition_size_hint(
+def _g6_aligned_page_partition_size_hint(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
+    kv_cache_dtype: str,
 ) -> int | None:
     if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
         return None
     if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
         return None
-    if (
-        query.shape[0] == 1
-        and query.shape[1] == 6
-        and query.shape[2] == 256
-        and key_cache.shape[1] == 784
-        and key_cache.shape[2] == 1
-        and key_cache.shape[3] == 256
+    if not (
+        query.shape == (1, 6, 256)
+        and key_cache.ndim == 4
+        and key_cache.shape[1] >= _DEFAULT_DECODE_PARTITION_SIZE
+        and key_cache.shape[1] % 16 == 0
+        and key_cache.shape[2:] == (1, 256)
         and value_cache.shape == key_cache.shape
+        and value_cache.dtype == key_cache.dtype
     ):
-        # The CUDA graph contains p256 and p1024 nodes and selects between them
-        # from device seq_lens. Plan the larger p256 workspace envelope once.
+        return None
+    if (
+        kv_cache_dtype in ("auto", "bfloat16")
+        and key_cache.dtype == torch.float16
+        and key_cache.shape[1] == 784
+    ):
+        # The exact FP16 page-784 graph contains p256 and p1024 nodes and
+        # selects between them from device seq_lens. Plan the p256 workspace
+        # envelope once.
+        return 256
+    if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
+        # Plan the largest p256 workspace once. The extension selects p256 or
+        # p1024 from device seq_lens, so CUDA graph replay keeps one
+        # captured shape while short and long contexts use different kernels.
+        # Keep this layout-driven rather than using model-name allowlists.
         return 256
     return None
+
+
+def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
+    if kv_cache_dtype in _logged_kv_dtype_contracts:
+        return
+    _logged_kv_dtype_contracts.add(kv_cache_dtype)
+    if kv_cache_dtype == "fp8":
+        logger.warning(
+            "SM70 Flash-V100 received an unresolved `fp8` KV-cache dtype and "
+            "will interpret it as upstream E4M3. Normal EngineArgs processing "
+            "rewrites the SM70 `fp8` shorthand to `fp8_e5m2`; this warning "
+            "usually means the backend was constructed directly. KV-cache "
+            "dtype is independent of model weight quantization."
+        )
+    elif kv_cache_dtype == "fp8_e4m3":
+        logger.warning(
+            "SM70 Flash-V100 is using explicitly requested E4M3 KV cache. "
+            "The optimized V100 quantized-KV route uses E5M2. KV-cache dtype "
+            "is independent of model weight quantization."
+        )
+    elif kv_cache_dtype == "fp8_e5m2":
+        logger.info(
+            "SM70 Flash-V100 is using explicit E5M2 KV cache. This controls "
+            "KV storage only; model weight quantization is configured "
+            "separately."
+        )
 
 
 def _mtp_context_bucket_partition_size_hint() -> int | None:
@@ -393,9 +438,10 @@ def _decode_fp8_xqa_allowed(
     attn_metadata: TritonAttentionMetadata,
     query: torch.Tensor,
 ) -> bool:
-    if bool(getattr(attn_metadata, "flash_v100_cudagraph_capture", False)):
-        return True
-    if _is_cuda_graph_capturing(query):
+    graph_capture = bool(
+        getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
+    ) or _is_cuda_graph_capturing(query)
+    if graph_capture:
         hint_names = (
             "flash_v100_static_decode_seq_hint",
             "flash_v100_decode_workspace_seq_capacity_hint",
@@ -976,7 +1022,7 @@ def _try_sm70_fa2_d256_prefill(
         and query.ndim == 4
         and query.shape[1] == max_seqlen_q
         and max_seqlen_q % 64 == 0
-        and max_seqlen_k % 64 == 0
+        and max_seqlen_k % 32 == 0
     )
     if splitd_eligible:
         dense_op, paged_op, splitkv3_op = splitd_ops
@@ -1102,13 +1148,16 @@ def _get_fp8_prefill_bridge_workspace(
         key_cache.shape[2],
         key_cache.shape[3],
     )
-    key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
-    value_out = torch.empty_like(key_out)
-    block_table = torch.arange(
-        capacity,
-        dtype=torch.int32,
-        device=key_cache.device,
-    ).unsqueeze(0)
+    try:
+        key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
+        value_out = torch.empty_like(key_out)
+        block_table = torch.arange(
+            capacity,
+            dtype=torch.int32,
+            device=key_cache.device,
+        ).unsqueeze(0)
+    except torch.OutOfMemoryError:
+        return None
     _fp8_prefill_bridge_workspaces[cache_key] = (
         key_out,
         value_out,
@@ -1118,6 +1167,51 @@ def _get_fp8_prefill_bridge_workspace(
         key_out[:required_blocks],
         value_out[:required_blocks],
         block_table[:, :required_blocks],
+    )
+
+
+def _get_fp8_prefill_bridge_tail_workspace(
+    query: torch.Tensor,
+    padded_query_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    device_index = (
+        query.device.index
+        if query.device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    cache_key = (
+        device_index,
+        stream_id,
+        query.dtype,
+        int(query.shape[2]),
+        int(query.shape[3]),
+    )
+    workspace = _fp8_prefill_bridge_tail_workspaces.get(cache_key)
+    if workspace is not None and workspace[0].shape[1] >= padded_query_len:
+        return (
+            workspace[0][:, :padded_query_len],
+            workspace[1][:, :padded_query_len],
+        )
+
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    previous_capacity = workspace[0].shape[1] if workspace is not None else 0
+    capacity = max(padded_query_len, previous_capacity * 2)
+    shape = (1, capacity, query.shape[2], query.shape[3])
+    try:
+        padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
+        padded_output = torch.empty_like(padded_query)
+    except torch.OutOfMemoryError:
+        return None
+    _fp8_prefill_bridge_tail_workspaces[cache_key] = (
+        padded_query,
+        padded_output,
+    )
+    return (
+        padded_query[:, :padded_query_len],
+        padded_output[:, :padded_query_len],
     )
 
 
@@ -3102,6 +3196,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
+        _log_kv_dtype_contract(self.kv_cache_dtype)
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -5084,11 +5179,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata=attn_metadata,
                 window_size=window_size,
             )
-            partition_size_hint = _g6_page784_sawtooth_partition_size_hint(
+            partition_size_hint = _g6_aligned_page_partition_size_hint(
                 query,
                 key_cache,
                 value_cache,
+                self.kv_cache_dtype,
             )
+            if partition_size_hint is not None:
+                _record_route(
+                    f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
+                )
             self.flash_attn_decode_paged_xqa(
                 query,
                 key_cache,
@@ -5724,14 +5824,24 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         value_cache: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_len: int,
         k_scale: float,
         v_scale: float,
         causal: bool,
         window_size: tuple[int, int],
-    ) -> torch.Tensor | None:
+        out: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool] | None:
         if block_table.shape[0] != 1:
             return None
-        input_capacity = int(block_table.shape[1]) * int(key_cache.shape[1])
+        input_block_size = int(key_cache.shape[1])
+        active_input_blocks = min(
+            int(block_table.shape[1]),
+            _cdiv_int(seq_len, input_block_size),
+        )
+        if active_input_blocks <= 0:
+            return None
+        active_block_table = block_table[:, :active_input_blocks]
+        input_capacity = active_input_blocks * input_block_size
         required_blocks = _cdiv_int(
             input_capacity,
             _FP8_PREFILL_BRIDGE_PAGE_SIZE,
@@ -5746,14 +5856,80 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.fp8_e5m2_paged_kv_to_fp16(
             key_cache,
             value_cache,
-            block_table,
+            active_block_table,
             seq_lens,
             key_out,
             value_out,
             k_scale,
             v_scale,
         )
-        return self.flash_attn_prefill_paged(
+        q_len = int(query.shape[1])
+        exact_query = query
+        exact_out = out
+        tail_prefix = 0
+        if q_len % 64 != 0 and seq_len % 32 == 0:
+            padded_q_len = _cdiv_int(q_len, 64) * 64
+            if padded_q_len <= seq_len:
+                tail_workspace = _get_fp8_prefill_bridge_tail_workspace(
+                    query,
+                    padded_q_len,
+                )
+                if tail_workspace is not None:
+                    exact_query, exact_out = tail_workspace
+                    tail_prefix = padded_q_len - q_len
+                    exact_query[:, :tail_prefix].zero_()
+                    exact_query[:, tail_prefix:].copy_(query)
+        cu_q, cu_k = _uniform_cu_seqlens(
+            exact_query,
+            batch_size=1,
+            query_len=int(exact_query.shape[1]),
+            kv_len=seq_len,
+        )
+        key_dense = key_out.flatten(0, 1)[:seq_len].unsqueeze(0)
+        value_dense = value_out.flatten(0, 1)[:seq_len].unsqueeze(0)
+        exact_result = _try_sm70_fa2_d256_prefill(
+            exact_query,
+            key_dense,
+            value_dense,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=int(exact_query.shape[1]),
+            max_seqlen_k=seq_len,
+            softmax_scale=self.scale,
+            causal=causal,
+            window_size=window_size,
+            out=exact_out,
+        )
+        if exact_result is not None:
+            if tail_prefix:
+                out.copy_(exact_result[:, tail_prefix:])
+                _record_route("prefill_prefix_fp8_bridge_exact_dense_d256_tailpad")
+                return out, True
+            _record_route("prefill_prefix_fp8_bridge_exact_dense_d256")
+            return exact_result, True
+        exact_result = _try_sm70_fa2_d256_prefill(
+            exact_query,
+            key_out,
+            value_out,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=None,
+            max_seqlen_q=int(exact_query.shape[1]),
+            max_seqlen_k=seq_len,
+            softmax_scale=self.scale,
+            causal=causal,
+            window_size=window_size,
+            out=exact_out,
+            seqused_k=seq_lens,
+            block_table=output_block_table,
+        )
+        if exact_result is not None:
+            if tail_prefix:
+                out.copy_(exact_result[:, tail_prefix:])
+                _record_route("prefill_prefix_fp8_bridge_exact_d256_tailpad")
+                return out, True
+            _record_route("prefill_prefix_fp8_bridge_exact_d256")
+            return exact_result, True
+        paged_result = self.flash_attn_prefill_paged(
             query,
             key_out,
             value_out,
@@ -5766,6 +5942,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             causal=causal,
             window_size=window_size,
         )
+        return paged_result, False
 
     def _should_use_prefill_splitkv(
         self,
@@ -6390,18 +6567,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             ),
                         )
                 elif use_fp8_bridge:
-                    out_seq = self._run_fp8_prefill_bridge(
+                    bridge_result = self._run_fp8_prefill_bridge(
                         query=q_seq,
                         key_cache=key_cache,
                         value_cache=value_cache,
                         block_table=attn_metadata.block_table[i : i + 1],
                         seq_lens=attn_metadata.seq_lens[i : i + 1],
+                        seq_len=seq_len,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
                         causal=causal,
                         window_size=window_size,
+                        out=out_view[start:end].unsqueeze(0),
                     )
-                    if out_seq is not None:
+                    if bridge_result is not None:
+                        out_seq, out_is_destination = bridge_result
                         if not _logged_fp8_prefill_bridge:
                             logger.info(
                                 "FLASH_ATTN_V100 FP8 E5M2 prefill bridge "

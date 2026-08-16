@@ -9,11 +9,33 @@ and SM70 gates so old-vs-latest no-MTP decode comparisons are reproducible.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+FLASH_V100_ROOT = SOURCE_ROOT / "flash-attention-v100"
+for source_path in (FLASH_V100_ROOT, SOURCE_ROOT):
+    source_path_str = str(source_path)
+    if source_path_str not in sys.path:
+        sys.path.insert(0, source_path_str)
+
+
+def _module_file(module_name: str) -> str | None:
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return getattr(module, "__file__", None)
+    spec = importlib.util.find_spec(module_name)
+    return spec.origin if spec is not None else None
+
+
+def _module_realpath(module_name: str) -> str | None:
+    module_file = _module_file(module_name)
+    return str(Path(module_file).resolve()) if module_file is not None else None
 
 
 def _parse_scalar(value: str) -> Any:
@@ -388,6 +410,13 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "awq_moe_safe_default_selector_effective": (awq_moe_safe_default_selector),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "fp8_safe_default_selector_effective": fp8_safe_default_selector,
+        "VLLM_SM70_FP8_COORDINATED_TUNING": os.environ.get(
+            "VLLM_SM70_FP8_COORDINATED_TUNING"
+        ),
+        "fp8_coordinated_tuning_effective": _env_bool(
+            "VLLM_SM70_FP8_COORDINATED_TUNING",
+            True,
+        ),
         "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": os.environ.get(
             "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
         ),
@@ -593,6 +622,22 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS",
         8,
     )
+    e5m2_g6_dual_cta = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA",
+        True,
+    )
+    e5m2_g6_split_reduce = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE",
+        True,
+    )
+    e5m2_partition_page_ids = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS",
+        True,
+    )
+    e5m2_pair_load = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
+        True,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -607,7 +652,11 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
     )
     decode_fp8_xqa_min_seq_len = _env_int(
         "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
-        8192,
+        16384,
+    )
+    e5m2_p1024_begin = _env_int(
+        "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN",
+        61633,
     )
     if selector_enabled:
         expected_sm70_priority = [
@@ -625,6 +674,11 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "TURBOQUANT",
         ]
     kv_cache_dtype_str = kv_cache_dtype if isinstance(kv_cache_dtype, str) else None
+    expected_kv_cache_dtype = (
+        "fp8_e5m2"
+        if selector_enabled and kv_cache_dtype_str == "fp8"
+        else kv_cache_dtype_str
+    )
     fp8_kv_cache_requested = _is_fp8_kv_cache_dtype(kv_cache_dtype_str)
     full_flash_default_policy = (
         selector_enabled
@@ -679,6 +733,26 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "g6_qk_pipeline_mid_only_policy": (
             g6_qk_pipeline and g6_qk_pipeline_warps == 8
         ),
+        "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA"
+        ),
+        "e5m2_g6_dual_cta_effective": e5m2_g6_dual_cta,
+        "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE"
+        ),
+        "e5m2_g6_split_reduce_effective": e5m2_g6_split_reduce,
+        "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN"
+        ),
+        "e5m2_p1024_begin_effective": e5m2_p1024_begin,
+        "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS"
+        ),
+        "e5m2_partition_page_ids_effective": e5m2_partition_page_ids,
+        "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD"
+        ),
+        "e5m2_pair_load_effective": e5m2_pair_load,
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta
@@ -708,6 +782,8 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "decode_fp8_xqa_min_seq_len_effective": decode_fp8_xqa_min_seq_len,
         "full_flash_default_policy": full_flash_default_policy,
         "kv_cache_dtype": kv_cache_dtype_str,
+        "kv_cache_dtype_requested": kv_cache_dtype_str,
+        "kv_cache_dtype_expected_after_sm70_alias": expected_kv_cache_dtype,
         "fp8_kv_cache_requested_effective": fp8_kv_cache_requested,
         "fp8_kv_cache_full_flash_policy": (
             full_flash_default_policy and fp8_kv_cache_requested
@@ -1528,6 +1604,11 @@ def _write_results(
         "vllm": {
             "version": getattr(vllm, "__version__", None),
             "file": getattr(vllm, "__file__", None),
+        },
+        "flash_attn_v100": {
+            "python_file": _module_file("flash_attn_v100"),
+            "cuda_extension_file": _module_file("flash_attn_v100_cuda"),
+            "cuda_extension_realpath": _module_realpath("flash_attn_v100_cuda"),
         },
         "torch": {
             "version": torch.__version__,
