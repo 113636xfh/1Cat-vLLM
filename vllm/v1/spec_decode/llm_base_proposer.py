@@ -88,7 +88,7 @@ def _sm70_mtp_profile_interval() -> int:
 
 
 def _is_dflash_method(method: str | None) -> bool:
-    return method in ("dflash", "dflash_ddtree")
+    return method in ("dflash", "dflash_ddtree", "dspark")
 
 
 def _spec_debug_corruption_enabled(method: str) -> bool:
@@ -176,7 +176,9 @@ class SpecDecodeBaseProposer:
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
-        self.method = self.speculative_config.method
+        method = self.speculative_config.method
+        assert method is not None
+        self.method: str = method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
 
         self.device = device
@@ -195,8 +197,10 @@ class SpecDecodeBaseProposer:
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
         draft_hf_config = self.draft_model_config.hf_config
-        if hasattr(draft_hf_config, "compress_ratios") and hasattr(
-            draft_hf_config, "hc_mult"
+        if (
+            self.method == "mtp"
+            and hasattr(draft_hf_config, "compress_ratios")
+            and hasattr(draft_hf_config, "hc_mult")
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
@@ -233,6 +237,8 @@ class SpecDecodeBaseProposer:
         draft_vocab_config = resolve_mtp_draft_vocab_config(
             self.method,
             vllm_config.parallel_config.tensor_parallel_size,
+            vllm_config.model_config.architecture,
+            vllm_config.model_config.model,
         )
         if draft_vocab_config.gpu_lru_enabled:
             if self.max_batch_size != 1:
@@ -353,9 +359,7 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
-        self._static_draft_vocab: (
-            StaticDraftVocabRuntime | DynamicDraftVocabRuntime | None
-        ) = None
+        self._static_draft_vocab: StaticDraftVocabRuntime | None = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
@@ -453,10 +457,12 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
+        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
         else:
             raise ValueError(
                 "For parallel drafting, the draft model config must have "
-                "`pard_token`, `ptd_token_id`, or "
+                "`pard_token`, `ptd_token_id`, `dspark_noise_token_id`, or "
                 "`dflash_config.mask_token_id` specified in its config.json."
             )
 
@@ -992,7 +998,9 @@ class SpecDecodeBaseProposer:
             self._static_draft_vocab.begin_proposal()
         batch_size = common_attn_metadata.batch_size()
         common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
-        profile_events = [] if self._sm70_mtp_profile_enabled() else None
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
+            [] if self._sm70_mtp_profile_enabled() else None
+        )
         profile_cpu_ms: dict[str, float] = {}
         profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
         profile_total_start = self._sm70_mtp_profile_start(profile_events)
@@ -1006,7 +1014,7 @@ class SpecDecodeBaseProposer:
                     Eagle3DeepseekV2ForCausalLM,
                     DFlashQwen3ForCausalLM,
                 ),
-            )
+            ) or hasattr(self.model, "combine_hidden_states")
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
@@ -1649,7 +1657,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash", "dflash_ddtree")
+        return self.method not in (
+            "mtp",
+            "draft_model",
+            "dflash",
+            "dflash_ddtree",
+            "dspark",
+        )
 
     def prepare_next_token_ids_cpu(
         self,
@@ -2242,6 +2256,8 @@ class SpecDecodeBaseProposer:
         vocab_config = resolve_mtp_draft_vocab_config(
             self.method,
             self.vllm_config.parallel_config.tensor_parallel_size,
+            self.vllm_config.model_config.architecture,
+            self.vllm_config.model_config.model,
         )
         ranking_path = vocab_config.ranking_path
         shortlist_size = vocab_config.shortlist_size
@@ -2305,6 +2321,7 @@ class SpecDecodeBaseProposer:
         if target_lm_head is None or not hasattr(target_lm_head, "weight"):
             raise ValueError("MTP model does not expose a shared target LM-head.")
 
+        runtime: StaticDraftVocabRuntime
         if dynamic_tail_size:
             runtime = initialize_dynamic_draft_vocab(
                 target_lm_head,
@@ -2676,6 +2693,7 @@ def compute_probs_and_sample_next_token(
         top_k,
         top_p,
     ):
+        assert sampling_metadata.top_k_cpu is not None
         return _compute_sparse_topk_draft_probs_and_sample_next_token(
             logits,
             sampling_metadata,

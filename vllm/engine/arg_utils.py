@@ -132,6 +132,34 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
+    requested_dtype: str,
+    resolved_dtype: str,
+) -> str:
+    """Preserve the historical 1Cat V100 meaning of the ``fp8`` alias."""
+    if (
+        requested_dtype != "fp8"
+        or resolved_dtype != "fp8"
+        or not envs.VLLM_SM70_FLASH_ATTN_V100
+        or not current_platform.is_cuda()
+    ):
+        return resolved_dtype
+    try:
+        capability = current_platform.get_device_capability()
+    except Exception:
+        return resolved_dtype
+    if capability is None or (capability.major, capability.minor) != (7, 0):
+        return resolved_dtype
+    logger.warning_once(
+        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e5m2 "
+        "for compatibility with the optimized 1Cat V100 KV-cache path. "
+        "Use explicit fp8_e4m3 to request E4M3 KV storage. Model weight "
+        "quantization is configured independently."
+    )
+    return "fp8_e5m2"
+
+
 # object is used to allow for special typing forms
 T = TypeVar("T")
 TypeHint: TypeAlias = type[Any] | object
@@ -1937,6 +1965,10 @@ class EngineArgs:
         # Resolve "auto" kv_cache_dtype to actual value from model config
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
+        )
+        resolved_cache_dtype = _resolve_sm70_flash_v100_kv_cache_dtype_alias(
+            self.kv_cache_dtype,
+            resolved_cache_dtype,
         )
 
         assert self.enable_prefix_caching is not None, (

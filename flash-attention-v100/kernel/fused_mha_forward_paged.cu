@@ -1363,6 +1363,25 @@ flash_attention_forward_kernel_paged(
             const int sub_valid_k_rows = min(softmax_sub_tile,
                                              valid_k_rows - sub_start);
 
+            // ================================================================
+            // Patch 0108 (surgical) — sS/sP union race fix, D-conditional.
+            // ISSUE-0007 / issues/0090. The race (W(__half2) P-commit racing
+            // R(float4) sS reads with no cross-warp barrier) exists ONLY for
+            // D != 256, where sP = reuse_sp.p aliases sS byte-for-byte.
+            //
+            // D == 256 is race-IMMUNE: sP = p_strict, a SEPARATE buffer
+            // (SmemLayout::p_strict, line ~134; selected at line ~491). So the
+            // D==256 arm below is the ORIGINAL monolithic block VERBATIM — no
+            // barrier, no variable hoisting. This is the ONLY difference from
+            // archived/patches/0011: 0011 split the guard and hoisted vars for
+            // EVERY D, which perturbed the D=256 register/spill allocation and
+            // cost the immune path +0.47..+2.79% for zero benefit. Guarding the
+            // whole transform under `if constexpr (D != 256)` makes the D=256
+            // codegen byte-identical to baseline (proved via SASS diff) => the
+            // immune path pays EXACTLY zero. The D!=256 arm is 0011's
+            // two-phase-commit fix, verbatim (barrier ALONE, no riders).
+            // ================================================================
+            if constexpr (D == 256) {
             if (tid < valid_q_rows * THREADS_PER_ROW) {
                 const int row = tid / THREADS_PER_ROW;
                 const int thread_in_row = tid % THREADS_PER_ROW;
@@ -1521,6 +1540,224 @@ flash_attention_forward_kernel_paged(
                         sO_vec[ov] = v;
                     }
                 }
+            }
+            } else {
+            // ----------------------------------------------------------------
+            // ISSUE-0007 race-class fix (patch 0011,
+            // patches/0011-paged-race-fix-issue0007/ — PoC: poc/race_poc.cu).
+            //
+            // For D != 256, sP aliases sS byte-for-byte (union reuse_sp;
+            // sP = reuse_sp.p selected above with p_stride == S_STRIDE). The
+            // softmax phase reads sS as float4 (max pass, exp pass, scalar
+            // tail) and then commits P into the SAME union bytes as
+            // __half2/__half. Row r's half P row occupies union bytes
+            // [2*S_STRIDE*r, +2*S_STRIDE) — inside the FLOAT score row of row
+            // r/2 — so the P commit of warp w lands exactly on the score row
+            // still being read as float4 by warp w/2. The register staging
+            // (half_buffer) orders read-then-write only WITHIN one thread;
+            // cross-warp there was NO ordering until the __syncthreads() at
+            // the end of this phase, i.e. AFTER both: a W(__half2) x R(float4)
+            // data race. Evidence: compute-sanitizer racecheck 3 errors /
+            // 87,712 hazard instances on the PoC extraction of this exact
+            // access pattern, and the REAL kernel 10/10-runs bitwise
+            // non-deterministic at D=128 (q=512/kv=4096 and q=1024/kv=8192).
+            //
+            // Fix, proved racecheck-clean AND bit-equal in the PoC: two-phase
+            // P commit. Phase A = all sS reads + reductions with P staged in
+            // registers exactly as before; ONE uniform block-scope
+            // __syncthreads(); phase B = all sP stores. The former single
+            // guarded region is split in two so the barrier sits in UNIFORM
+            // control flow, and the per-thread state below is hoisted to
+            // survive across the barrier. No arithmetic is changed or
+            // reordered. D == 256 keeps its original barrier-free structure:
+            // sP = p_strict there, a separate buffer that never aliases sS
+            // (constexpr guard on the barrier below).
+            // ----------------------------------------------------------------
+            const int row = tid / THREADS_PER_ROW;
+            const int thread_in_row = tid % THREADS_PER_ROW;
+            __half* sP_row_h = sP + row * p_stride;
+            __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
+            const int vec_cols = sub_valid_k_rows >> 2;
+            const int vecs_per_thread =
+                (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+            const int tail_start = vec_cols << 2;
+            float exp_diff = 1.0f;
+            __half2 half_buffer[20];
+            int tail_col = -1;
+            __half tail_value = __float2half(0.f);
+
+            if (tid < valid_q_rows * THREADS_PER_ROW) {
+                const unsigned mask = (valid_q_rows == BLOCK_M)
+                                          ? 0xFFFFFFFFU
+                                          : __activemask();
+                const int row_leader = __ffs(mask) - 1;
+
+                float*  sS_row_f = sS + row * S_STRIDE + sub_start;
+
+                float thread_max = NEG_INF;
+                float4* sS_vec4 = reinterpret_cast<float4*>(sS_row_f);
+
+                #pragma unroll 4
+                for (int j = 0; j < vecs_per_thread; ++j) {
+                    int vc = thread_in_row + j * THREADS_PER_ROW;
+                    if (vc < vec_cols) {
+                        float4 v4 = sS_vec4[vc];
+                        thread_max = fmaxf(
+                            thread_max,
+                            fmaxf(fmaxf(v4.x, v4.y), fmaxf(v4.z, v4.w)));
+                    }
+                }
+
+                #pragma unroll
+                for (int c = tail_start + thread_in_row; c < sub_valid_k_rows;
+                     c += THREADS_PER_ROW) {
+                    thread_max = fmaxf(thread_max, sS_row_f[c]);
+                }
+
+                #pragma unroll
+                for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1) {
+                    thread_max = fmaxf(
+                        thread_max,
+                        __shfl_down_sync(mask, thread_max, o, THREADS_PER_ROW));
+                }
+
+                const float row_max =
+                    __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);
+                const float old_max = sRowMax[row];
+                const float new_max = fmaxf(old_max, row_max);
+                // 0011: exp_diff hoisted above the phase split (used by the
+                // sO rescale in phase B). Same expression, same position in
+                // the arithmetic order.
+                exp_diff = __expf(old_max - new_max);
+
+                float thread_sum = 0.0f;
+                int vc_base = thread_in_row;
+                int h2_idx = 0;
+
+                #pragma unroll 4
+                for (int j = 0; j < vecs_per_thread; ++j,
+                         vc_base += THREADS_PER_ROW) {
+                    if (vc_base < vec_cols) {
+                        float4 v4 = sS_vec4[vc_base];
+
+                        float e0 = __expf(fmaxf(v4.x - new_max, -80.0f));
+                        float e1 = __expf(fmaxf(v4.y - new_max, -80.0f));
+                        float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
+                        float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
+
+                        thread_sum += (e0 + e1) + (e2 + e3);
+
+                        const __half2 p01 =
+                            __float22half2_rn(make_float2(e0, e1));
+                        const __half2 p23 =
+                            __float22half2_rn(make_float2(e2, e3));
+                        if constexpr (D256_SW_PIPELINE_PV) {
+                            // D256 owns a separate probability buffer, so the
+                            // values can leave registers before row reduction.
+                            const int base_offset = vc_base * 2;
+                            sP_half2[base_offset] = p01;
+                            sP_half2[base_offset + 1] = p23;
+                        } else {
+                            half_buffer[h2_idx++] = p01;
+                            half_buffer[h2_idx++] = p23;
+                        }
+                    }
+                }
+
+                #pragma unroll 4
+                for (int c = tail_start + thread_in_row; c < sub_valid_k_rows;
+                     c += THREADS_PER_ROW) {
+                    float v = sS_row_f[c];
+                    float e = __expf(fmaxf(v - new_max, -80.0f));
+                    thread_sum += e;
+                    if constexpr (D256_SW_PIPELINE_PV) {
+                        sP_row_h[c] = __float2half_rn(e);
+                    } else {
+                        tail_col = c;
+                        tail_value = __float2half_rn(e);
+                    }
+                }
+
+                #pragma unroll
+                for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1) {
+                    thread_sum +=
+                        __shfl_down_sync(mask, thread_sum, o, THREADS_PER_ROW);
+                }
+
+                float row_sum =
+                    __shfl_sync(mask, thread_sum, row_leader, THREADS_PER_ROW);
+
+                if (thread_in_row == 0) {
+                    sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
+                    sRowMax[row] = new_max;
+                }
+            }  // end phase A: every sS read of this sub-tile is done; P is
+               // staged in registers (half_buffer / tail_col / tail_value).
+
+            // ISSUE-0007 fix (patch 0011): THE one uniform __syncthreads()
+            // between the sS read phase and the sP commit phase — the only
+            // behavioral change of this patch. UNIFORMITY: this point is at
+            // the body scope of the sub_start loop; its trip count
+            // (valid_k_rows, softmax_sub_tile) and every enclosing control
+            // transfer (kernel early returns on blockIdx.z/M; block_n loop
+            // break/continue on start_col/min_key_pos/bfla block mask) are
+            // block-uniform — the same uniformity the pre-existing
+            // __syncthreads() at the end of this loop body already requires.
+            // All threads of the block reach this barrier exactly once per
+            // sub_start iteration. D == 256 is immune (sP = p_strict,
+            // separate buffer) and keeps its barrier-free codegen.
+            if constexpr (D != 256) {
+                __syncthreads();
+            }
+
+            if (tid < valid_q_rows * THREADS_PER_ROW) {
+                // phase B: commit P to the union bytes. Bit-identical values
+                // (straight from the phase-A registers), same store order,
+                // same addresses as the pre-fix code.
+                if constexpr (!D256_SW_PIPELINE_PV) {
+                    int h2_idx = 0;
+                    int vc_base = thread_in_row;
+                    #pragma unroll 4
+                    for (int j = 0; j < vecs_per_thread; ++j,
+                             vc_base += THREADS_PER_ROW) {
+                        if (vc_base < vec_cols) {
+                            int base_offset = vc_base * 2;
+                            sP_half2[base_offset] = half_buffer[h2_idx++];
+                            sP_half2[base_offset + 1] = half_buffer[h2_idx++];
+                        }
+                    }
+
+                    if (tail_col >= 0) {
+                        sP_row_h[tail_col] = tail_value;
+                    }
+                }
+
+                #pragma unroll 4
+                for (int c = tail_start + thread_in_row; c < p_tile_capacity;
+                     c += THREADS_PER_ROW) {
+                    if (c >= sub_valid_k_rows) {
+                        sP_row_h[c] = __float2half(0.f);
+                    }
+                }
+
+                if (block_n > 0 || sub_start > 0) {
+                    float*  sO_row = sO + row * O_STRIDE;
+                    float4* sO_vec = reinterpret_cast<float4*>(sO_row);
+                    const int o_vec_count = D / 4;
+                    float scale = exp_diff;
+
+                    #pragma unroll 4
+                    for (int ov = thread_in_row; ov < o_vec_count;
+                         ov += THREADS_PER_ROW) {
+                        float4 v = sO_vec[ov];
+                        v.x *= scale;
+                        v.y *= scale;
+                        v.z *= scale;
+                        v.w *= scale;
+                        sO_vec[ov] = v;
+                    }
+                }
+            }
             }
             __syncthreads();
 
