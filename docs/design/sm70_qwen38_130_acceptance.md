@@ -4,7 +4,7 @@ Date: 2026-08-15
 
 ## Contract
 
-- Model: `Qwen3.8-27B-FP8`, TP4 on four V100-32GB GPUs.
+- Model: `Qwen3.8-27B-FP8`, TP4 on four V100-SXM2-16GB GPUs.
 - Runtime: Python 3.12, Torch 2.10.0+cu128, CUDA 12.8, CUDA graphs enabled.
 - Production attention: `FLASH_ATTN_V100`; no eager or Marlin performance
   evidence is accepted.

@@ -1,7 +1,8 @@
-# 1Cat-vLLM 1.2.2
+# 1Cat-vLLM 1.3.0
 
-1Cat-vLLM 1.2.2 improves V100/SM70 long-context attention, FP8 KV cache,
-and Qwen3.6 MTP4 performance. It supersedes 1.2.1.
+1Cat-vLLM 1.3.0 improves V100/SM70 long-context attention, FP8 KV cache,
+Qwen3.6 MTP4 performance, and adds validated Qwen3.8-27B FP8 support. It
+supersedes 1.2.2.
 
 ## Highlights
 
@@ -14,7 +15,7 @@ and Qwen3.6 MTP4 performance. It supersedes 1.2.1.
   exact output on the accepted prefill paths.
 - Fixed stale CUDA Graph partition metadata so decode scans the live KV length.
 
-| Matched path | Before | 1.2.2 | Change |
+| Matched path | Before | 1.3.0 | Change |
 | --- | ---: | ---: | ---: |
 | FP16 paged-prefill operator, 64K | `43.605 ms` | `31.717 ms` | `-27.26%` |
 | 27B-AWQ TP4 full-model prefill, 64K | `47.9785 s` | `33.0984 s` | `-31.01%` |
