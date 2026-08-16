@@ -328,6 +328,24 @@ def fused_add_rms_norm(
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
+def sm70_gemma_long_prefill_fused_add_rms_norm(
+    normalized_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> None:
+    torch.ops._C.sm70_gemma_long_prefill_fused_add_rms_norm(
+        normalized_out,
+        residual_out,
+        input,
+        residual,
+        weight,
+        epsilon,
+    )
+
+
 def fused_qk_norm_rope(
     qkv: torch.Tensor,
     num_heads_q: int,

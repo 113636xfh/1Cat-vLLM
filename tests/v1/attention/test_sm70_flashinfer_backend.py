@@ -95,9 +95,7 @@ def _make_fixed_prefill_impl(fixed_entry, splitkv3_entry=None):
     impl.logits_soft_cap = 0.0
     impl.sinks = None
     impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch = fixed_entry
-    impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3 = (
-        splitkv3_entry
-    )
+    impl.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3 = splitkv3_entry
     impl.last_route_proof = None
     impl._flashinfer_sm70_active_metadata = None
     return impl
@@ -247,7 +245,7 @@ def test_eligible_fixed_prefill_bypasses_parent_and_records_runtime_proof(
 ) -> None:
     decision, metadata, query, kv_cache, output = _make_fixed_prefill_case()
     calls = []
-    route_calls = []
+    route_calls: list[str] = []
 
     def fixed_entry(
         query_bhmd,
@@ -351,7 +349,7 @@ def test_promoted_splitkv3_bypasses_fixed_entry_and_records_actual_n(
 ) -> None:
     decision, metadata, query, kv_cache, output = _make_fixed_prefill_case()
     calls = []
-    route_calls = []
+    route_calls: list[str] = []
 
     def splitkv3_entry(
         query_bhmd,
@@ -541,7 +539,7 @@ def test_fixed_prefill_entry_error_is_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, metadata, query, kv_cache, output = _make_fixed_prefill_case()
-    route_calls = []
+    route_calls: list[str] = []
 
     def failed_fixed_entry(*args, **kwargs):
         raise RuntimeError("fixed entry failed")

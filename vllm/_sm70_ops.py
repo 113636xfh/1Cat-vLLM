@@ -76,6 +76,28 @@ if hasattr(torch.ops._C, "awq_sm70_prepare"):
         return [tm_weight, tm_scales, meta]
 
 
+def awq_sm70_dequantize_out(
+    out: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("awq_sm70_dequantize_out")(out, qweight, scales, group_size)
+
+
+if hasattr(torch.ops._C, "awq_sm70_dequantize_out"):
+
+    @register_fake("_C::awq_sm70_dequantize_out")
+    def _awq_sm70_dequantize_out_fake(
+        out: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        del out, qweight, scales, group_size
+        return None
+
+
 def uint4_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -146,6 +168,28 @@ if hasattr(torch.ops._C, "fp8_sm70_prepare"):
         )
         meta = torch.empty((2,), dtype=torch.int64, device=qweight.device)
         return [tm_weight, tm_scales, meta]
+
+
+def fp8_sm70_dequantize_out(
+    out: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("fp8_sm70_dequantize_out")(out, qweight, scales, group_size)
+
+
+if hasattr(torch.ops._C, "fp8_sm70_dequantize_out"):
+
+    @register_fake("_C::fp8_sm70_dequantize_out")
+    def _fp8_sm70_dequantize_out_fake(
+        out: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        del out, qweight, scales, group_size
+        return None
 
 
 def mxfp4_sm70_prepare(
@@ -377,6 +421,51 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         return None
 
 
+def fp8_gemm_sm70_prefill_dispatch_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+) -> None:
+    _op("fp8_gemm_sm70_prefill_dispatch_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        qweight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        gated_silu,
+        min_prefill_m,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out"):
+
+    @register_fake("_C::fp8_gemm_sm70_prefill_dispatch_out")
+    def _fp8_gemm_sm70_prefill_dispatch_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+        min_prefill_m: int,
+    ) -> None:
+        del dense_weight_ptr
+        return None
+
+
 def mxfp4_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -404,6 +493,103 @@ if hasattr(torch.ops._C, "mxfp4_gemm_sm70_out"):
         k_ld: int,
         q_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def mxfp4_moe_dense_stage_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("mxfp4_moe_dense_stage_sm70_out")(
+        out,
+        input,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
+
+    @register_fake("_C::mxfp4_moe_dense_stage_sm70_out")
+    def _mxfp4_moe_dense_stage_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+def mxfp4_moe_single_token_prepare_w13_sm70_out(
+    gate_up: torch.Tensor,
+    compact_input: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_ptrs_w: torch.Tensor,
+    w13_ptrs_s: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    w13_k: int,
+    w13_n: int,
+    group_size: int,
+    hidden_logical_size: int,
+) -> None:
+    _op("mxfp4_moe_single_token_prepare_w13_sm70_out")(
+        gate_up,
+        compact_input,
+        x,
+        topk_ids,
+        w13_ptrs_w,
+        w13_ptrs_s,
+        expert_offsets,
+        inv_permuted_idx,
+        sorted_expert_ids,
+        w13_k,
+        w13_n,
+        group_size,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "mxfp4_moe_single_token_prepare_w13_sm70_out"):
+
+    @register_fake("_C::mxfp4_moe_single_token_prepare_w13_sm70_out")
+    def _mxfp4_moe_single_token_prepare_w13_sm70_out_fake(
+        gate_up: torch.Tensor,
+        compact_input: torch.Tensor,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w13_ptrs_w: torch.Tensor,
+        w13_ptrs_s: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        w13_k: int,
+        w13_n: int,
+        group_size: int,
+        hidden_logical_size: int,
     ) -> None:
         return None
 

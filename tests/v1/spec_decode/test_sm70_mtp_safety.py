@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -17,6 +20,7 @@ from vllm.v1.spec_decode.utils import (
     next_power_of_2,
 )
 from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
     _async_spec_decode_participating_prev_positions,
     _count_contiguous_spec_tokens,
 )
@@ -28,6 +32,21 @@ pytestmark = pytest.mark.skipif(
     DEVICE_TYPE != "cuda",
     reason="SM70 MTP safety tests exercise Triton CUDA helper kernels.",
 )
+
+
+def test_dspark_uses_sm70_mtp_profile_timing() -> None:
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            use_dflash_ddtree=lambda: False,
+        ),
+        device=torch.device("cuda"),
+    )
+    with patch(
+        "vllm.v1.worker.gpu_model_runner._sm70_mtp_profile_env_enabled",
+        return_value=True,
+    ):
+        assert GPUModelRunner._sm70_mtp_profile_enabled(runner)
 
 
 def test_prepare_next_token_padded_counts_only_contiguous_prefix():
