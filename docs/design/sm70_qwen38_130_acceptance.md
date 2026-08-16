@@ -108,40 +108,6 @@ issue, not an idle-GPU or missing graph-shape issue.
   follows the final four-line instruction, emits no replacement characters,
   and stops naturally after 47 tokens.
 
-## MTP Chunked-Prefill Recovery
-
-The 2026-08-16 follow-up keeps the opaque GDN full-forward boundary for the
-MTP verifier and decode, but gives unfinished chunked-prefill batches a
-separate compiled standard-GDN entry. This lets MTP prefill use the later FP8
-exact-dense projection route without specializing the verifier graph on a
-Python route flag. The default can be disabled with
-`VLLM_SM70_MTP_PREFILL_STANDARD_GDN=0`.
-
-The release MTP4 FP8-KV 64K cold request took 32.269 s, or about 2031 prompt
-tok/s. On the current TP4 candidate, a 65517-token official-chat request took
-25.008 s while paying the first `postprocess_mamba_fused_kernel` JIT. After one
-warmup and a successful prefix/Mamba cache reset, measured prefill was
-24.429 s, or 2682 prompt tok/s. This is 22.5%-24.3% lower prefill latency and
-29.0%-32.1% higher throughput than the retained release MTP cold request. It
-also exceeds the retained 64K no-MTP FP8-KV result of 2063.4 tok/s by 30.0%.
-
-Runtime logs confirm the standard-GDN entry only for discarded partial
-prefill chunks, the full-forward route for verifier/decode, FP8 exact-dense
-prefill, Flash-V100 E5M2 prefill/decode, and MTP4 XQA. The measured request
-naturally stopped after 406 tokens under official sampling. Its complete text
-is coherent, contains all three long-context sentinel values, has no repeated
-or malformed spans, and exactly matches the warmup output. Acceptance length
-was 2.632 for this prompt; it is content-specific and is not compared with the
-older synthetic long-sweep acceptance result.
-
-Candidate artifacts are under
-`/data/minimax-h3/task-cache/qwen38-mtp-prefill-fastpath-20260816/`; the
-measured JSON is
-`results/qwen38-27b-fp8-mtp4-candidate-tp4-e5m2-64k-o512-warm.json` and the
-full route log is the corresponding file under `logs/`. The retained release
-control is `mtp/mtp4-dynamic-fp8kv-long-sweep.json` under the 1.3.0 acceptance
-artifact root.
-
 ## Wheel And Compatibility
 
 - Wheel: `1cat_vllm-1.3.0-cp312-cp312-linux_x86_64.whl`.
