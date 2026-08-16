@@ -104,16 +104,21 @@ def test_is_envs_cache_enabled() -> None:
 
 
 def test_precompiled_install_flags_are_orthogonal() -> None:
-    with patch.dict(
-        os.environ,
-        {
-            "VLLM_PRECOMPILED_WHEEL_LOCATION": "/tmp/vllm.whl",
-            "VLLM_USE_PRECOMPILED_RUST": "1",
-        },
-        clear=False,
-    ):
+    # The Rust frontend flag must not implicitly enable the precompiled C
+    # extensions.
+    with patch.dict(os.environ, {"VLLM_USE_PRECOMPILED_RUST": "1"}, clear=True):
         assert environment_variables["VLLM_USE_PRECOMPILED"]() is False
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+    # A wheel location still selects precompiled C extensions without
+    # implicitly enabling the Rust frontend.
+    with patch.dict(
+        os.environ,
+        {"VLLM_PRECOMPILED_WHEEL_LOCATION": "/tmp/vllm.whl"},
+        clear=True,
+    ):
+        assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
+        assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is False
 
 
 def test_flash_v100_g6_sawtooth_pipeline_envs(

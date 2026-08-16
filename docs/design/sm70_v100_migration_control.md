@@ -41256,3 +41256,34 @@ Interpretation:
   290 MiB/rank extra workspace, and non-bitwise output.
 - Detailed route gates, full sweep, tests, rejected paths, and artifacts are
   in `docs/design/sm70_fp8_long_prefill_exact_dense.md`.
+
+## 2026-08-16 Qwen3.8 output-quality audit
+
+- Audited PR 212 head `7f409a7727` on Qwen3.8-27B-FP8, TP4 V100, max length
+  32768, official sampling, and the fixed 74-token macOS code prompt. Do not
+  repeat the earlier 1K/8K smokes as long-form quality evidence.
+- Natural-stop output gates passed no-MTP/FP16 KV (24,441 tokens),
+  no-MTP/E5M2 KV (25,055), MTP4/FP16 KV (25,753), and MTP4/E5M2 KV (18,642).
+  Every output contains complete HTML/CSS/JavaScript, closed tags and code
+  fences, no replacement characters, and no semantic long-block repetition.
+- Same-seed duplicate requests were byte-identical for all four paths. Long
+  prefix-cache probes remained byte-identical after 4,704, 4,896, and 6,464
+  cached tokens in the no-MTP/FP16, MTP4/FP16, and MTP4/E5M2 lanes.
+- Qwen3.8 TP4 XQA-vs-scalar operator checks at the 4095/4096/4097 boundary,
+  6272, 8192, and 16384 stayed within `6.1035e-5` maximum absolute difference
+  for FP16 and E5M2 KV. The MTP five-row, partition-1024 checks have the same
+  bound. The full MTP services logged the automatic GDN full-forward quality
+  guard and actual route hit.
+- A no-MTP-vs-MTP FP16 greedy comparison first diverges at output index 179.
+  The no-MTP top two tokens are tied at returned precision; the MTP target
+  top-1 leads by only 0.015625 and the verifier selects that target top-1.
+  This is a low-margin M=1/M=5 floating-point-order flip, not evidence that MTP
+  accepted a non-target draft token.
+- The serving/release gates falsely counted each overlapping 20/50-character
+  window inside decorative `=====` comments. On the MTP4/E5M2 output this
+  produced `repeat20=1064` and `repeat50=224`; excluding homogeneous windows
+  yields 28/28 while the independent same-character-run gate remains active.
+- The historical 8192-token no-MTP/FP16 artifact that degenerates after about
+  token 6377 predates the new E5M2 work and has no retained request seed. Keep
+  it as an unmatched regression sample; do not attribute it to FP8 KV, XQA,
+  MTP, or sampling without a matched reproduction.

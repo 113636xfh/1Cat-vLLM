@@ -100,10 +100,30 @@ issue, not an idle-GPU or missing graph-shape issue.
   all token IDs are legal, `is_corrupted=false`, and acceptance length is 4.0.
 - Tool-call JSON and streaming tool calls parse correctly. A repeated 3136-token
   prefix records a cache hit and reduces request latency from 1.965 to 1.152 s.
-- HTML/JavaScript quality prompts pass structural checks, natural-stop checks,
-  and `node --check`. One long stochastic seed repeated after about 6377 tokens;
-  another bounded run naturally stopped at 7894 tokens. Treat this as a model
-  sampling risk, not deterministic token or HTML-tag corruption.
+- The original acceptance run contains one unmatched no-MTP/FP16-KV sample
+  that reached the 8192-token request limit and began repeating after about
+  6377 tokens. Its request seed was not retained, so that artifact is neither
+  proof of a deterministic kernel defect nor sufficient evidence to dismiss
+  the failure as sampling variance.
+- A matched audit at source `7f409a7727` used the 74-token macOS prompt,
+  seed `20260620`, `temperature=1.0`, `top_p=0.95`, `top_k=20`, and a
+  32600-token output allowance. All four production combinations stopped
+  naturally with complete HTML/CSS/JavaScript and closed code fences:
+
+  | MTP | KV cache | Output tokens | Decode tok/s | Result |
+  | --- | --- | ---: | ---: | --- |
+  | off | FP16 | 24,441 | 61.63 | pass |
+  | off | E5M2 | 25,055 | 61.71 | pass |
+  | MTP4 | FP16 | 25,753 | 75.21 | pass |
+  | MTP4 | E5M2 | 18,642 | 81.82 | pass |
+
+  Repeated same-seed requests were byte-identical in every combination.
+  Prefix-cache-hit probes were also byte-identical for no-MTP/FP16,
+  MTP4/FP16, and MTP4/E5M2. The MTP4/E5M2 sample initially tripped the local
+  repeated-window heuristic because fourteen decorative `=====` section
+  separators contributed overlapping single-character windows; 200-character
+  windows did not repeat. The gate now leaves homogeneous runs to its separate
+  same-character-run check.
 - The corrected FP8 workspace ABI passes a 6278-token natural prompt: it
   follows the final four-line instruction, emits no replacement characters,
   and stops naturally after 47 tokens.
