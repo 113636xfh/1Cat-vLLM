@@ -57,6 +57,7 @@ TP2 FP8-weight baseline by `+22.24%` to `53.693 tok/s` at 128K.
 | Qwen3.6-27B | FP8 | 2/4 | supported | supported |
 | Qwen3.6-35B-A3B | AWQ | 2/4 | supported | supported fallback |
 | Qwen3.6-35B-A3B | FP8 | 2/4 | supported | supported fallback |
+| Qwen3.8-27B | FP8 | 4 | supported | supported |
 | Qwen3.5-27B | NVFP4 | 4 | supported | no valid MTP weights |
 
 FP8 KV decode overhead at 64K is within 0.49%-1.16% of matched FP16 KV across
