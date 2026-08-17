@@ -210,6 +210,29 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
         remove_rpath(dst_ext)
 
 
+def bundle_precompiled_flash_attn_v100(build_lib: str) -> None:
+    """Embed Flash-V100 files extracted from a precompiled 1Cat wheel."""
+    extracted_pkg = ROOT_DIR / "flash_attn_v100"
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    extensions: list[Path] = []
+    for ext_name in ("flash_attn_v100_cuda", "paged_kv_utils"):
+        matches = sorted(extracted_pkg.glob(f"{ext_name}*{ext_suffix}"))
+        if not matches:
+            matches = sorted(extracted_pkg.glob(f"{ext_name}*.so"))
+        if not matches:
+            return
+        extensions.append(matches[-1])
+
+    dst_pkg = Path(build_lib) / "flash_attn_v100"
+    dst_pkg.mkdir(parents=True, exist_ok=True)
+    for py_file in FLASH_ATTN_V100_PACKAGE.glob("*.py"):
+        shutil.copy2(py_file, dst_pkg / py_file.name)
+    for extension in extensions:
+        dst_ext = dst_pkg / extension.name
+        shutil.copy2(extension, dst_ext)
+        remove_rpath(dst_ext)
+
+
 def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     """Precompile the SM70 GDN extension so runtime never requires NVCC."""
     if not _cuda_arch_contains(7, 0):
@@ -522,7 +545,8 @@ class precompiled_build_ext(build_ext):
     """Disables extension building when using precompiled binaries."""
 
     def run(self) -> None:
-        return
+        if _is_cuda():
+            bundle_precompiled_flash_attn_v100(self.build_lib)
 
     def build_extensions(self) -> None:
         print("Skipping build_ext: using precompiled extensions.")
