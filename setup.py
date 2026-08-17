@@ -888,6 +888,9 @@ class precompiled_wheel_utils:
                     r"flash_attn_v100/"
                     r"(?:flash_attn_v100_cuda|paged_kv_utils).*\.so"
                 )
+                flash_qla_sm70_ext_regex = re.compile(
+                    r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
+                )
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -906,6 +909,7 @@ class precompiled_wheel_utils:
                         or flashmla_regex.match(member.filename)
                         or deep_gemm_regex.match(member.filename)
                         or flash_attn_v100_ext_regex.match(member.filename)
+                        or flash_qla_sm70_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
