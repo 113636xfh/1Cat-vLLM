@@ -131,16 +131,18 @@ issue, not an idle-GPU or missing graph-shape issue.
 ## Wheel And Compatibility
 
 - Wheel: `1cat_vllm-1.3.0-cp312-cp312-linux_x86_64.whl`.
-- SHA256: `38d894460540b42dc480fed2a3c3fbb6600ecc1d3fe3e6e32054d4a766a03ff4`.
+- SHA256: `e4ffba3bf61e16dcba0eeeafac4036b7cead5abe047e4474ecacb7e5abb35da3`
+  (75,765,498 bytes).
 - A cloned environment imports vLLM 1.3.0 from site-packages with Torch
   2.10.0+cu128. `_moe_C.moe_permute_sort_workspace_size` is present.
 - The wheel contains `_C`, `_C_stable_libtorch`, `_moe_C`, Flash-V100,
   vLLM FA2, and `flash_qla_sm70_gdn_strided.so`.
 - A clean-cache MTP4 plus FP8-KV boundary run does not create
   `TORCH_EXTENSIONS_DIR`, proving FlashQLA does not invoke NVCC at runtime.
-- The 2026-08-17 release candidate was rebuilt from the accepted SM70 source,
-  installed into a fresh Python 3.12 environment, and served Qwen3.8-27B-FP8
-  TP4 with the `fp8` shorthand resolving to E5M2. In both no-MTP and MTP4
+- The 2026-08-17 release candidate was packaged from the accepted SM70 build
+  at source `383bbdd166`, installed into a fresh Python 3.12 environment, and
+  served Qwen3.8-27B-FP8 TP4 with the `fp8` shorthand resolving to E5M2. In
+  both no-MTP and MTP4
   lanes, repeated fixed-seed greedy responses were byte-identical and official
   sampling stopped naturally without replacement characters. MTP's first
   request may still JIT Triton helper kernels; this is a cold-latency concern,
