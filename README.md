@@ -12,6 +12,8 @@
 > 开源社区，也欢迎仍在使用 V100 的个人开发者、工作室和团队参与测试、
 > 复现、反馈和共建，让这批依然有价值的算力继续发挥作用。
 
+<img width="1173" height="1280" alt="微信图片_202608172313362" src="https://github.com/user-attachments/assets/e5ac0ed1-52c5-483c-ba69-35635fab44e2" />
+
 1Cat-vLLM is a vLLM engineering fork focused on **SM70 / Tesla V100**.
 Rather than targeting every hardware platform, it fills and optimizes the
 critical inference paths required by modern models on Volta, including
