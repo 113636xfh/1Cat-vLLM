@@ -522,6 +522,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         True,
     )
     nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
+    nvfp4_moe_grouped_prefill = _env_bool("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", True)
     mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)
     fp8_dequant_fallback = _env_bool("VLLM_SM70_FP8_DEQUANT_FALLBACK", True)
     fp8_moe_dequant_fallback = _env_bool(
@@ -579,6 +580,10 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "fp8_prefill_exact_dense_effective": fp8_prefill_exact_dense,
         "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get("VLLM_SM70_NVFP4_TURBOMIND"),
         "nvfp4_turbomind_effective": nvfp4_turbomind,
+        "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": os.environ.get(
+            "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL"
+        ),
+        "nvfp4_moe_grouped_prefill_effective": nvfp4_moe_grouped_prefill,
         "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get("VLLM_SM70_MXFP4_TURBOMIND"),
         "mxfp4_turbomind_effective": mxfp4_turbomind,
         "VLLM_SM70_FP8_DEQUANT_FALLBACK": os.environ.get(
