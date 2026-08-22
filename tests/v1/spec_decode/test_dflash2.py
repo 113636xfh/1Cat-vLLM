@@ -12,6 +12,13 @@ import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    _is_dflash2_spec_config,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    _maybe_sm70_dflash2_lm_head_top20,
+)
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
     DFLASH_SM70_WIDE_OUTPUT_SCALE,
@@ -255,6 +262,31 @@ def test_dflash1_architecture_stays_on_official_mrv2_speculator(monkeypatch):
         )
     )
     assert isinstance(init_speculator(config, torch.device("cpu")), DFlashSpeculator)
+
+
+@pytest.mark.parametrize(
+    ("method", "architecture", "expected"),
+    [
+        ("dflash", "DFlash2DraftModel", True),
+        ("dflash", "DFlashDraftModel", False),
+        ("dflash_ddtree", "DFlash2DraftModel", False),
+        ("mtp", "DFlash2DraftModel", False),
+        ("eagle3", "DFlash2DraftModel", False),
+    ],
+)
+def test_fused_gdn_verify_config_is_dflash2_mrv2_only(
+    method: str,
+    architecture: str,
+    expected: bool,
+):
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method,
+            draft_model_config=SimpleNamespace(architectures=[architecture]),
+        )
+    )
+
+    assert _is_dflash2_spec_config(config) is expected
 
 
 @pytest.mark.parametrize(
