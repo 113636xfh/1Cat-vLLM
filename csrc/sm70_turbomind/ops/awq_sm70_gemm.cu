@@ -1083,14 +1083,12 @@ bool mxfp4_moe_grouped_m8_enabled() {
 }
 
 bool mxfp4_moe_grouped_verifier_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
@@ -8219,10 +8217,9 @@ void mxfp4_moe_gemm_sm70_out_impl(
   // expert segments can contain multiple rows and have graph-dynamic empty
   // tails, so retain the single-group dispatch choice while letting the
   // standard offsets scheduler discover their bounds on device.
-  op.active_group_count =
-      compact_grouped_rows && !dynamic_expert_rows
-          ? -static_cast<int>(num_experts)
-          : 0;
+  op.active_group_count = compact_grouped_rows && !dynamic_expert_rows
+                              ? -static_cast<int>(num_experts)
+                              : 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -8293,8 +8290,8 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) == 48 && num_experts == 48 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
   const bool grouped_verifier_shape =
-      input.size(0) == num_experts && num_experts >= 12 &&
-      num_experts <= 48 && num_experts % 6 == 0 &&
+      input.size(0) == num_experts && num_experts >= 12 && num_experts <= 48 &&
+      num_experts % 6 == 0 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
   if ((vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) ||
       (vllm::awq_sm70::mxfp4_moe_grouped_verifier_enabled() &&
