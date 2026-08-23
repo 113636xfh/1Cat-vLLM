@@ -146,15 +146,63 @@ def _uses_split_gdn_input_projections(
     raw_config = getattr(quant_config, "config", None)
     if isinstance(raw_config, dict):
         add_ignored_modules(raw_config.get("ignore"))
-    if not ignored_modules:
-        return False
-    return any(
+    if any(
         module_name == "linear_attn"
         or module_name.endswith(".linear_attn")
         or ("linear_attn.in_proj_a" in module_name)
         or ("linear_attn.in_proj_b" in module_name)
         for module_name in ignored_modules
-    )
+    ):
+        return True
+
+    # ModelOpt mixed checkpoints describe quantized modules positively in
+    # ``quantized_layers`` instead of listing the unquantized b/a projections
+    # in an ignore list. A fused qkv/z/b/a Linear would then allocate the b/a
+    # rows in the qkv/z quant format and leave their scale slots uninitialized.
+    # Compare algorithms per GDN layer and split whenever b/a is absent or
+    # differs from the quantized qkv/z group.
+    quantized_layers = getattr(quant_config, "quantized_layers", None)
+    if not isinstance(quantized_layers, dict):
+        return False
+
+    per_layer: dict[str, dict[str, str]] = {}
+    projection_names = {
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+    }
+    marker = ".linear_attn."
+    for module_name, layer_info in quantized_layers.items():
+        if marker not in module_name or not isinstance(layer_info, dict):
+            continue
+        layer_prefix, projection_name = module_name.rsplit(marker, 1)
+        if projection_name not in projection_names:
+            continue
+        quant_algo = str(layer_info.get("quant_algo", "")).upper()
+        if quant_algo:
+            per_layer.setdefault(layer_prefix, {})[projection_name] = quant_algo
+
+    for projection_algos in per_layer.values():
+        qkvz_algos = {
+            projection_algos[name]
+            for name in ("in_proj_qkv", "in_proj_z")
+            if name in projection_algos
+        }
+        if not qkvz_algos:
+            continue
+        ba_algos = {
+            projection_algos[name]
+            for name in ("in_proj_b", "in_proj_a")
+            if name in projection_algos
+        }
+        has_ba_pair = all(
+            name in projection_algos for name in ("in_proj_b", "in_proj_a")
+        )
+        if not has_ba_pair or ba_algos != qkvz_algos:
+            return True
+
+    return False
 
 
 def _get_default_sm70_dense_force_suffixes(tp_size: int) -> set[str]:
