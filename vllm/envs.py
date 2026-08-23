@@ -354,6 +354,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN: int = 61633
     VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS: bool = True
     VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD: bool = True
+    VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD: bool = True
     VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE: bool = False
     VLLM_FLASH_V100_TRACE_DECODE_ACTIVE: bool = False
     VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED: bool = True
@@ -2361,6 +2362,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))
