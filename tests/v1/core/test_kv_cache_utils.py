@@ -1930,6 +1930,60 @@ def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     )
 
 
+def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
+    full_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        compress_ratio=4,
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+    grouped_specs = [
+        UniformTypeKVCacheSpecs(
+            block_size=256,
+            kv_cache_specs={f"full_{i}": full_spec for i in range(21)},
+        ),
+        UniformTypeKVCacheSpecs(
+            block_size=64,
+            kv_cache_specs={f"swa_{i}": swa_spec for i in range(46)},
+        ),
+    ]
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    assert (
+        kv_cache_utils._select_deepseek_v4_tuple_width(
+            vllm_config,  # type: ignore[arg-type]
+            grouped_specs,
+        )
+        == 21
+    )
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        vllm_config,  # type: ignore[arg-type]
+        grouped_specs,
+    )
+    assert [len(group.layer_names) for group in groups] == [21, 16, 15, 15]
+
+
 def test_get_kv_cache_spec_kind_unwraps_uniform_type_specs():
     uniform_mla_spec = UniformTypeKVCacheSpecs(
         block_size=16,
