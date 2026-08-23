@@ -184,6 +184,11 @@ def _create_gdn_builder(
         vllm_config.compilation_config.max_cudagraph_capture_size = (
             max_cudagraph_capture_size
         )
+    else:
+        # Keep the helper's default contract explicit. The repository-wide
+        # compilation default may select FULL graphs on CUDA platforms, which
+        # would pad otherwise eager metadata and make these tests route-dependent.
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -459,9 +464,7 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
         num_actual_tokens=4,
     )
     num_accepted_tokens = torch.tensor([3], dtype=torch.int32, device=DEVICE)
-    num_decode_draft_tokens_cpu = torch.tensor(
-        [2], dtype=torch.int32, device="cpu"
-    )
+    num_decode_draft_tokens_cpu = torch.tensor([2], dtype=torch.int32, device="cpu")
 
     expected = generic_builder.build(
         common_prefix_len=0,
