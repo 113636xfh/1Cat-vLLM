@@ -543,6 +543,10 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
         True,
     )
+    qwen36_mtp_moe_tuned_config = _env_bool(
+        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG",
+        True,
+    )
     awq_warmup = _env_bool("VLLM_SM70_AWQ_WARMUP", True)
     awq_moe_disable = _env_bool("VLLM_SM70_AWQ_MOE_DISABLE", False)
     awq_moe_batched = _env_bool("VLLM_SM70_AWQ_MOE_BATCHED_GEMM", True)
@@ -621,6 +625,10 @@ def _sm70_turbomind_policy(
             "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG"
         ),
         "unquantized_moe_0dot3_config_effective": (unquantized_moe_0dot3_config),
+        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG": os.environ.get(
+            "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG"
+        ),
+        "qwen36_mtp_moe_tuned_config_effective": qwen36_mtp_moe_tuned_config,
         "VLLM_SM70_AWQ_WARMUP": os.environ.get("VLLM_SM70_AWQ_WARMUP"),
         "awq_warmup_effective": awq_warmup,
         "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get("VLLM_SM70_AWQ_WARMUP_MAX_M"),
