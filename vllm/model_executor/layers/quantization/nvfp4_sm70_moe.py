@@ -627,7 +627,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer, x, router_logits, input_ids
         raise NotImplementedError("SM70 NVFP4 MoE is not a monolithic route.")
 
-    def get_fused_moe_quant_config(
+    def get_fused_moe_quant_config(  # type: ignore[override]
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
         del layer
