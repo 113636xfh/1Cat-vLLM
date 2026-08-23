@@ -90,6 +90,12 @@ bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
   return !raw || std::atoi(raw) != 0;
 }
 
+// Default-on gate for exact block-FP8 8K prefill GEMM descriptors.
+bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR");
+  return !raw || std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
   int n;
   int k;
@@ -172,6 +178,11 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
       return Sm70AwqTp2FastTarget{
           desc.n, desc.k, 8, 32, 64, 3, 4, true, "c8x32_a1x1x64_01"};
     }
+  }
+  if (Sm70Fp8BlockPrefillFastSelectorEnabled() &&
+      (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
+       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1")) {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, ""};
   }
   const bool awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
   if (awq_fast_selector_enabled) {
