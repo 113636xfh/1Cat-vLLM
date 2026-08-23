@@ -647,6 +647,35 @@ class TestCudagraphDispatcher:
         assert not dispatcher.sm70_fp8_kv_decode_context_buckets
 
 
+def test_negative_graph_variant_uses_an_isolated_pool():
+    wrapper = object.__new__(CUDAGraphWrapper)
+    wrapper.graph_pool = object()
+    wrapper.concrete_cudagraph_entries = {}
+    wrapper.semantic_variant_graph_pools = {}
+    default_desc = BatchDescriptor(
+        num_tokens=4,
+        graph_variant=CUDAGRAPH_VARIANT_DEFAULT,
+    )
+    long_context_desc = replace(
+        default_desc,
+        graph_variant=CUDAGRAPH_VARIANT_LONG_CONTEXT,
+    )
+    isolated_pool = object()
+
+    with patch.object(
+        current_platform,
+        "graph_pool_handle",
+        return_value=isolated_pool,
+    ) as graph_pool_handle:
+        assert wrapper._graph_pool_for_descriptor(default_desc) is wrapper.graph_pool
+        assert wrapper._graph_pool_for_descriptor(long_context_desc) is isolated_pool
+        assert wrapper._graph_pool_for_descriptor(long_context_desc) is isolated_pool
+
+    graph_pool_handle.assert_called_once_with()
+    wrapper.clear_graphs()
+    assert not wrapper.semantic_variant_graph_pools
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:
     def setup_method(self):

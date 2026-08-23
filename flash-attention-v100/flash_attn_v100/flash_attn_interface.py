@@ -1077,10 +1077,17 @@ def flash_attn_decode_paged_xqa(
 
     batch_context_max_seq_len = 0
     if batch_context_routing:
-        batch_context_max_seq_len = max(
-            int(max_seq_len_hint or 0),
-            int(workspace_seq_capacity_hint or 0),
-        )
+        live_max_seq_len = int(max_seq_len_hint or 0)
+        workspace_max_seq_len = int(workspace_seq_capacity_hint or 0)
+        if _cuda_graph_capture_active():
+            batch_context_max_seq_len = max(
+                live_max_seq_len,
+                workspace_max_seq_len,
+            )
+        else:
+            batch_context_max_seq_len = live_max_seq_len
+        if batch_context_max_seq_len <= 0:
+            batch_context_max_seq_len = workspace_max_seq_len
         if batch_context_max_seq_len <= 0:
             batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
 
