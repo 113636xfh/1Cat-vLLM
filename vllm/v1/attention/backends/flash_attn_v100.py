@@ -22,6 +22,7 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
@@ -68,6 +69,18 @@ def _as_flash_v100_metadata(
     # The inherited Triton builder creates the object; this backend attaches
     # the fields above before any Flash-V100 path consumes them.
     return cast(FlashAttnV100Metadata, attn_metadata)
+
+
+def _batch_context_routing_for_graph_variant(
+    routing_enabled: bool,
+    graph_variant: int | None,
+) -> bool:
+    if not routing_enabled:
+        return False
+    if graph_variant is None:
+        # Eager execution can route directly from the live batch and context.
+        return True
+    return graph_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
@@ -2526,7 +2539,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
-            self._batch_context_routing_enabled
+            _batch_context_routing_for_graph_variant(
+                self._batch_context_routing_enabled,
+                getattr(common_attn_metadata, "cudagraph_graph_variant", None),
+            )
         )
 
     def _attach_ddtree_metadata(

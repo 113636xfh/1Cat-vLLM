@@ -1724,19 +1724,35 @@ def test_flash_v100_fp8_xqa_graph_capture_uses_static_context_hint(
 
 
 @pytest.mark.parametrize(
-    ("routing_enabled", "context_capacity", "expected_route"),
+    ("routing_enabled", "graph_variant", "expected"),
     (
-        (True, 16383, "scalar"),
-        (False, 16383, "scalar"),
-        (True, 16384, "xqa"),
-        (False, 16384, "xqa"),
+        (True, None, True),
+        (True, 0, False),
+        (True, -1, True),
+        (False, None, False),
+        (False, -1, False),
     ),
 )
-def test_flash_v100_fp8_xqa_batch_context_graph_preserves_short_scalar(
+def test_flash_v100_batch_context_routing_isolated_by_graph_variant(
+    routing_enabled,
+    graph_variant,
+    expected,
+):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    assert (
+        mod._batch_context_routing_for_graph_variant(
+            routing_enabled,
+            graph_variant,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("routing_enabled", (True, False))
+def test_flash_v100_fp8_xqa_full_capacity_graph_preserves_baseline_xqa(
     monkeypatch,
     routing_enabled,
-    context_capacity,
-    expected_route,
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -1764,11 +1780,12 @@ def test_flash_v100_fp8_xqa_batch_context_graph_preserves_short_scalar(
     attn_metadata = SimpleNamespace(
         num_actual_tokens=4,
         block_table=torch.zeros((4, 256), dtype=torch.int32),
-        seq_lens=torch.full((4,), context_capacity, dtype=torch.int32),
+        seq_lens=torch.full((4,), 1, dtype=torch.int32),
         flash_v100_cudagraph_capture=True,
         flash_v100_batch_context_routing=routing_enabled,
-        flash_v100_decode_max_seq_len_hint=context_capacity,
-        flash_v100_decode_workspace_seq_capacity_hint=context_capacity,
+        flash_v100_decode_max_seq_len_hint=1,
+        flash_v100_static_decode_seq_hint=262144,
+        flash_v100_decode_workspace_seq_capacity_hint=262144,
         flash_v100_decode_active_num_partitions=torch.tensor([16], dtype=torch.int32),
     )
     layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
@@ -1787,7 +1804,7 @@ def test_flash_v100_fp8_xqa_batch_context_graph_preserves_short_scalar(
     )
 
     assert result is output
-    assert calls == [(expected_route, routing_enabled and expected_route == "xqa")]
+    assert calls == [("xqa", routing_enabled)]
     assert torch.all(output == 1)
 
 
