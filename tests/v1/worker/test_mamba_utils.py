@@ -544,6 +544,32 @@ def test_warmup_batch_memcpy_kernel():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_warmup_fused_postprocess_does_not_modify_state():
+    device = torch.device("cuda:0")
+    cfg = _TestConfig()
+    layer_names = ["layer_0"]
+    kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
+    _, _, conv_state, temporal_state, _, forward_context = _make_dual_layer_state(
+        cfg, device
+    )
+    block_table = torch.arange(
+        cfg.max_num_reqs * cfg.num_blocks,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(cfg.max_num_reqs, cfg.num_blocks)
+    gpu_ctx.initialize_from_forward_context(
+        kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
+    )
+    conv_before = conv_state.clone()
+    temporal_before = temporal_state.clone()
+
+    assert gpu_ctx.warmup_fused_postprocess()
+    assert torch.equal(conv_state, conv_before)
+    assert torch.equal(temporal_state, temporal_before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""
 
