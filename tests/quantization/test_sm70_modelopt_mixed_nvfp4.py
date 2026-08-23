@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
+    _prepare_compact_slot_groups,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
@@ -153,6 +154,23 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     )
 
     assert method.maybe_make_prepare_finalize() is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent():
+    sorted_expert_ids = torch.tensor(
+        [3, 3, 3, 17, 17, 42, 88, 88], dtype=torch.int32, device="cuda"
+    )
+    compact_offsets = torch.empty(9, dtype=torch.int32, device="cuda")
+    active_expert_ids = torch.empty(8, dtype=torch.int32, device="cuda")
+
+    _prepare_compact_slot_groups(sorted_expert_ids, compact_offsets, active_expert_ids)
+
+    assert torch.equal(compact_offsets.cpu(), torch.arange(9, dtype=torch.int32))
+    assert torch.equal(active_expert_ids.cpu(), sorted_expert_ids.cpu())
 
 
 def test_mixed_w4a16_moe_requires_turbomind_on_sm70():

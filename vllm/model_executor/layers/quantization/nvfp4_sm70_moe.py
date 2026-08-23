@@ -48,7 +48,7 @@ _COMPACT_GROUPED_MAX_TOKENS: Final = 8
 
 
 @triton.jit
-def _compact_sorted_experts_kernel(
+def _prepare_compact_slot_groups_kernel(
     sorted_expert_ids_ptr,
     compact_offsets_ptr,
     active_expert_ids_ptr,
@@ -62,33 +62,19 @@ def _compact_sorted_experts_kernel(
         mask=valid,
         other=-1,
     )
-    previous_ids = tl.load(
-        sorted_expert_ids_ptr + offsets - 1,
-        mask=valid & (offsets > 0),
-        other=-2,
-    )
-    is_boundary = valid & ((offsets == 0) | (expert_ids != previous_ids))
-    active_indices = tl.cumsum(is_boundary.to(tl.int32), axis=0) - 1
-
     tl.store(
         compact_offsets_ptr + offsets,
-        TOTAL_SLOTS,
+        offsets,
         mask=offsets <= TOTAL_SLOTS,
     )
-    tl.store(active_expert_ids_ptr + offsets, 0, mask=valid)
     tl.store(
-        compact_offsets_ptr + active_indices,
-        offsets,
-        mask=is_boundary,
-    )
-    tl.store(
-        active_expert_ids_ptr + active_indices,
+        active_expert_ids_ptr + offsets,
         expert_ids,
-        mask=is_boundary,
+        mask=valid,
     )
 
 
-def _compact_active_experts(
+def _prepare_compact_slot_groups(
     sorted_expert_ids: torch.Tensor,
     compact_offsets: torch.Tensor,
     active_expert_ids: torch.Tensor,
@@ -98,7 +84,11 @@ def _compact_active_experts(
     if not (0 < total_slots <= max_slots):
         raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
     block = triton.next_power_of_2(total_slots + 1)
-    _compact_sorted_experts_kernel[(1,)](
+    # TurboMind's compact grouped dispatch forces one row per group. Keep each
+    # routed slot independent even when adjacent slots select the same expert;
+    # coalescing duplicate expert IDs would make the forced one-row scheduler
+    # silently skip or miscompute the additional rows.
+    _prepare_compact_slot_groups_kernel[(1,)](
         sorted_expert_ids,
         compact_offsets,
         active_expert_ids,
@@ -579,7 +569,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
 
         if num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
-            _compact_active_experts(
+            _prepare_compact_slot_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],
                 buffers["active_expert_ids"],
