@@ -297,19 +297,58 @@ The final Python regression run passes all 94 tests in the sampler, NVFP4
 admission, and SM70 TurboMind adapter files. Ruff lint/format, Python byte
 compilation, the sidecar wheel-name gate, and `git diff --check` also pass.
 
-Freshly relinking the primary `_C` was tested separately. Even after matching
-the accepted CUDA cubins for QPN8, QPN4, and custom all-reduce, fresh main
-libraries measured roughly 77-80 tok/s and changed the low-margin random stream.
-Those main-library builds are rejected; do not substitute them for the
-compatible `_C` SHA above until the remaining host/link reproducibility issue
-is resolved. Keeping the sampler in its own sidecar is the accepted packaging
+Freshly relinking the primary `_C` was tested separately. The first cold run
+measured 77.314 tok/s, while the matching second run measured 80.181 tok/s at
+12.472 ms/token. Both used a current-source C++17 sampler sidecar and produced
+the exact same 256 token IDs as the accepted production C++17 run. The earlier
+roughly 77-80 tok/s spread was therefore startup-state variation, not a decode
+route or output regression.
+
+The clean source snapshot is `7bd1d783e4861af5f5396a721156c44f623f88b0`.
+Its primary `_C` SHA256 is
+`c5d7c6a9a0fa714c1e97427c3d16369404ae5af6ee80f48b165595081cc43e56`,
+and its C++17 sampler SHA256 is
+`3058051f59949d88f5982d0c5bd80121f3c75a0f5307ca901fa6aebdec4cbc74`.
+The primary and sampler `.nv_fatbin` SHA256 values are respectively
+`dbba740219f00db9a528310fa84c0defb97c03f5cf99b519af5975609eb926e6`
+and
+`9a89e8cc22d1f8e36378005c08e2b32b315d79728989d6b4b2fe44fedfa5cb2c`;
+both are byte-identical to the accepted binaries. The full primary ELF differs
+because merged main adds two unrelated ModelOpt NVFP4 MoE host entry points,
+and full sidecar hashes include host build-ID differences. Those differences
+do not enter this dense batch-one graph.
+
+The clean second-run result SHA256 is
+`4e6ed3306772efca1a9c84b3681d50a268c644b8d6327df0fab2341581236bb1`.
+Its serialized token-array SHA256 is
+`f50e0ebab44ae350c7921bf91ba709fa896dcfb253c06842323b80de5b8bde32`,
+exactly matching the accepted C++17 result. It records TP4, physical GPUs 0-3,
+custom all-reduce enabled, both FP8 and NVFP4 TurboMind enabled,
+`speculative_config=None`, and `spec_decoding_metrics=null`. Because both
+device binaries and the full sampled stream are identical, the existing
+production C++17 GSM8K result, 226/250 with zero invalid outputs, remains the
+quality gate; repeating the same 250-question run would add no new path
+coverage. Keeping the sampler in its own sidecar remains the packaging
+boundary, but a current-source primary rebuild is now accepted.
+
+CMake component installation was also checked without rebuilding unrelated
+wheel targets. It installs `vllm/_C.abi3.so` and
+`vllm/_sm70_sampler_C.cpython-312-x86_64-linux-gnu.so`, removes their build-tree
+RPATHs, and preserves both accepted fatbin hashes. The installed-file SHA256
+values are `d7ed490ef41e55f3858a45b3a92d62b2d527343fa14b04053cbe65ba16646749`
+and `8ee8466359dc4432234dc3daa92918b2226879caad563d23a85b980c2a7c755e`.
+A loader probe against the staged files registered the QPN4, QPN8, and
+`_C::sm70_sample_packed_top20_out` schemas successfully. A broad wheel rebuild
+of unrelated extensions is not required to establish this route's packaging
 boundary.
 
 Primary evidence paths are:
 
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/candidate_qpn4_fold_qpn8_m1_arpack32_official_cxx17_sidecar_chunk80_i1k_o256_a2.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/candidate_qwen38_nvfp4_clean_head_cxx17_chunk80_i1k_o256_a2.json`
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/qwen38_nvfp4_gsm8k_250_official_cxx17_sidecar.json`
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/sampler_stream_hand.json`
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/sampler_stream_cxx17.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/wheel_stage_clean_head_7bd1d783/`
 - `.artifacts/qwen38_nvfp4_speed_20260823/profiles/candidate_qwen38_nvfp4_sidecar_chunk80_nsys_nvml_i1k_o64_per_token.md`
 - `.artifacts/qwen38_nvfp4_speed_20260823/profiles/candidate_qwen38_nvfp4_sidecar_chunk80_resource_summary.md`

@@ -42267,14 +42267,33 @@ Interpretation:
   ceilings put 86.32% of service below 50% occupancy. These are not achieved
   SM/Tensor/HBM counters; Nsight Compute remains blocked by
   `ERR_NVGPUCTRPERM`.
-- Fresh primary `_C` relinks remain rejected even when the relevant CUDA cubins
-  match: observed speed is roughly 77-80 tok/s and the low-margin random stream
-  changes. Until the host/link reproducibility difference is closed, the
-  compatible main SHA above plus the production sidecar is the acceptance
-  boundary. This prevents a source rebuild from being mistaken for validated
-  deployment evidence.
-- Final focused regressions pass 94/94 sampler, NVFP4-admission, and SM70
-  TurboMind-adapter tests. Ruff lint/format, Python byte compilation, the
-  sidecar wheel filename gate, and `git diff --check` also pass.
+- Current-source rebuild closure is complete at source snapshot `7bd1d783e4`.
+  A clean primary `_C` plus clean C++17 sampler measured 77.314 tok/s in the
+  cold A1 observation and **80.181 tok/s** at **12.472 ms/token** in A2. A2
+  exactly matches the accepted C++17 256-token stream and records
+  `speculative_config=None` plus `spec_decoding_metrics=null`.
+- The clean primary and sampler SHA256 values are `c5d7c6a9...3e56` and
+  `3058051f...bc74`. Their `.nv_fatbin` SHA256 values, `dbba7402...26e6` and
+  `9a89e8cc...b2c`, are byte-identical to the accepted binaries. Full ELF
+  hashes differ only across host/link content: merged main adds two unrelated
+  ModelOpt NVFP4 MoE host entry points, while the sampler includes host
+  build-ID differences. These do not enter the accepted dense batch-one graph.
+- The clean A2 result SHA256 is `4e6ed330...bb1`; its serialized token-array
+  SHA256 is `f50e0eba...e32`, exactly matching the accepted production C++17
+  run. Device-binary and sampled-stream identity carry forward the already
+  passed **226/250 (90.4%)**, zero-invalid GSM8K gate. The separate sampler
+  module remains the packaging boundary, but current-source primary rebuilds
+  are no longer rejected merely because the full ELF hash changes.
+- Focused CMake installation puts the modules at `vllm/_C.abi3.so` and the
+  CPython-3.12 SOABI sampler filename, strips build-tree RPATHs, and preserves
+  both accepted fatbins. The installed SHA256 values are `d7ed490e...6749` and
+  `8ee84663...55e`. Loading both staged files registers QPN4, QPN8, and the
+  packed top-20 sampler schemas. This closes the relevant install boundary
+  without rebuilding 50 unrelated wheel-target objects.
+- Final focused regressions pass 94/94 target sampler, NVFP4-admission, and
+  SM70 TurboMind-adapter tests; the post-merge four-file run including the
+  adjacent ModelOpt route passes 106/106. Ruff lint/format, Python byte
+  compilation, the sidecar wheel filename gate, and `git diff --check` also
+  pass.
 - Full results, route details, quality artifacts, trace/resource tables, and
   exact evidence paths are in `docs/design/sm70_qwen38_nvfp4_decode.md`.
