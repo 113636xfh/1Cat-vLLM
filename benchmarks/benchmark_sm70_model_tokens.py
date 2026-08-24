@@ -527,6 +527,10 @@ def _sm70_turbomind_policy(
         True,
     )
     fp8_qpn8 = _env_bool("VLLM_SM70_FP8_QPN8", False)
+    fp8_prefill_visible_dense_mm = _env_bool(
+        "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
+        False,
+    )
     nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
     nvfp4_moe_grouped_prefill = _env_bool("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", True)
     mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)
@@ -593,6 +597,10 @@ def _sm70_turbomind_policy(
         "fp8_qpn8_large_m_fallback": "bounded_fp16_weight_workspace",
         "fp8_qpn8_large_m_gated_temporary": "M_x_8704_fp16",
         "VLLM_SM70_FP8_QPN8_LIBRARY": os.environ.get("VLLM_SM70_FP8_QPN8_LIBRARY"),
+        "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": os.environ.get(
+            "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM"
+        ),
+        "fp8_prefill_visible_dense_mm_effective": fp8_prefill_visible_dense_mm,
         "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get("VLLM_SM70_NVFP4_TURBOMIND"),
         "nvfp4_turbomind_effective": nvfp4_turbomind,
         "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": os.environ.get(
@@ -1627,6 +1635,14 @@ def _dump(args: argparse.Namespace) -> int:
         )
 
     prompts = _load_prompts(args)
+    if args.repeat_count < 1:
+        raise ValueError("--repeat-count must be positive")
+    if args.repeat_count > 1 and len(prompts) != 1:
+        raise ValueError("--repeat-count greater than one requires one prompt")
+    if args.repeat_count > 1 and (
+        args.cuda_profiler_capture_generate or capture_decode_after_prefix_warmup
+    ):
+        raise ValueError("CUDA-profiler capture does not support repeated requests")
     if capture_decode_after_prefix_warmup and len(prompts) != 1:
         raise ValueError(
             "--cuda-profiler-capture-decode-after-prefix-warmup requires "
@@ -1693,21 +1709,30 @@ def _dump(args: argparse.Namespace) -> int:
 
         torch.accelerator.synchronize()
         torch.cuda.cudart().cudaProfilerStart()
-    start = time.perf_counter()
+    generate_seconds_by_repeat: list[float] = []
+    outputs = []
     try:
-        if args.sequential_prompts:
-            outputs = []
-            for prompt in prompts:
-                outputs.extend(llm.generate([prompt], sampling_params))
-        else:
-            outputs = llm.generate(prompts, sampling_params)
+        for repeat_index in range(args.repeat_count):
+            if (
+                repeat_index
+                and args.reset_prefix_cache_between_repeats
+                and not llm.reset_prefix_cache()
+            ):
+                raise RuntimeError("Failed to reset the idle prefix cache")
+            generate_start = time.perf_counter()
+            if args.sequential_prompts:
+                for prompt in prompts:
+                    outputs.extend(llm.generate([prompt], sampling_params))
+            else:
+                outputs.extend(llm.generate(prompts, sampling_params))
+            generate_seconds_by_repeat.append(time.perf_counter() - generate_start)
     finally:
         if args.cuda_profiler_capture_generate or capture_decode_after_prefix_warmup:
             import torch
 
             torch.accelerator.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
-    generate_seconds = time.perf_counter() - start
+    generate_seconds = sum(generate_seconds_by_repeat)
     metrics_snapshot = _metric_snapshot(llm)
 
     import torch
@@ -1820,6 +1845,9 @@ def _dump(args: argparse.Namespace) -> int:
         "sequential_prompts": args.sequential_prompts,
         "load_seconds": load_seconds,
         "generate_seconds": generate_seconds,
+        "generate_seconds_by_repeat": generate_seconds_by_repeat,
+        "repeat_count": args.repeat_count,
+        "reset_prefix_cache_between_repeats": (args.reset_prefix_cache_between_repeats),
         "total_output_tokens": total_output_tokens,
         "records": records,
     }
@@ -2575,6 +2603,8 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--repeat-count", type=int, default=1)
+    parser.add_argument("--reset-prefix-cache-between-repeats", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
