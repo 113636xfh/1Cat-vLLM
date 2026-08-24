@@ -83,6 +83,63 @@ adaptive sequence splitting and page-aware scheduling for long-context decode.
 These sources guide the search space; only same-machine measurements can
 promote a V100-specific default.
 
+## Independent upstream audit
+
+`sglang-V100` is derived from this project's V100 work. It remains useful for
+route and result cross-checks, but it is not independent evidence for an
+optimization decision. The bounded search therefore uses primary upstream
+implementations and papers, pinned at the audited revisions:
+
+- Official FlashAttention revision
+  [`0251105a`](https://github.com/Dao-AILab/flash-attention/tree/0251105a2fb19d2957484b7f023cd8c115286ced)
+  packs `seqlen_q * qheads_per_kv_head` into the M dimension in
+  [`pack_gqa.h`](https://github.com/Dao-AILab/flash-attention/blob/0251105a2fb19d2957484b7f023cd8c115286ced/hopper/pack_gqa.h),
+  then computes dynamic Split-KV occupancy from the packed M work in
+  [`flash_prepare_scheduler.cu`](https://github.com/Dao-AILab/flash-attention/blob/0251105a2fb19d2957484b7f023cd8c115286ced/hopper/flash_prepare_scheduler.cu).
+  This is the direct algorithmic source for combining the six Q heads that
+  share the Qwen3.8 verifier KV head. Its SM80/SM90 implementation is not
+  copied; only the exact PackGQA scheduling principle is ported to Volta WMMA.
+- FlashInfer revision
+  [`c18a974a`](https://github.com/flashinfer-ai/flashinfer/commit/c18a974a88b8c7da88be0338a7478636f1dffa17)
+  explicitly keeps head-dimension-256 prefill within the 64-KiB SM70/SM75
+  shared-memory limit. Its release JIT successfully compiled on this V100,
+  but the grouped Q8/H6/D256 paged launch still ended in an unspecified launch
+  failure during CUDA Graph setup. The direct backend route is therefore
+  rejected; its packing and scheduler layout remain useful source material.
+- TensorRT-LLM revision
+  [`958d651b`](https://github.com/NVIDIA/TensorRT-LLM/tree/958d651b18800da1da0677160e0277f701c0ff84)
+  supports multi-block and multi-query-token XQA, but
+  `supportConfigHMMA` rejects `SM < 80`. ONNX Runtime XQA likewise explicitly
+  requires compute capability 8.0 or newer. Neither is a drop-in V100 kernel;
+  both independently confirm head-group packing plus context splitting as the
+  intended speculative-verification topology. TensorRT-LLM's speculative
+  multi-block scheduler further caps the packed grid at one SM wave and avoids
+  scaling short histories, independently matching the bounded 80-CTA policy
+  tested below.
+- [PersistentKV](https://arxiv.org/abs/2606.26666) maps native paged GQA work
+  by `(request, KV head, sequence split)`, explicitly reusing each K/V tile
+  across the grouped query heads. Its compact workqueue is valuable for ragged
+  concurrent batches; the frozen single-request Q8 verifier has no empty work
+  items to compact. The head-group mapping is directly applicable, while the
+  workqueue is retained as a later concurrency experiment rather than being
+  conflated with the B1 result.
+- xFormers Split-K combines split states with LSE and supports small causal
+  query counts plus experimental paged attention. Its current Triton route
+  requires SM80, so it is algorithmic cross-check material, not a new V100
+  dependency.
+- [FlashAttention-3](https://papers.neurips.cc/paper_files/paper/2024/file/7ede97c3e082c6df10a8d6103a2eebd2-Paper-Conference.pdf),
+  [LeanAttention](https://arxiv.org/abs/2405.10480), and
+  [FlashDecoding++](https://arxiv.org/abs/2311.01282) provide the exact
+  split-softmax reduction, Stream-K work distribution, and GEMM-oriented
+  decode alternatives. They motivate bounded follow-ups, not unmeasured
+  performance claims on Volta.
+
+TinyFA revision `bc755512` was also inspected and excluded: its fast path
+requires SM75-era asynchronous-copy machinery, lacks E5M2 paged KV support,
+and its paged decode mapping does not pack all six query heads into one KV
+load. This audit leaves native SM70 PackGQA as the smallest dependency-closed
+candidate.
+
 ## Split-count microbenchmark
 
 The first candidate doubles the maximum context splits from 40 to 80. With
@@ -219,6 +276,107 @@ tests, but regressed the one-pass kernel by 3.51%/2.36%/2.47%/2.63% at
 1K/32K/128K/256K in a production-page-size A/B/A run. On this Volta path, the
 independent address arithmetic is hidden better than the added shuffle
 dependency. The candidate was reverted completely.
+
+## Short-context floor and rejected split-K QK
+
+The missing 1K TP4 FULL-Graph endpoint now uses the same final binary and
+sampling/configuration contract as the 32K and 128K traces:
+
+| Phase | 1K mean per verification round |
+| --- | ---: |
+| Complete | 21.634854 ms |
+| Target | 16.348011 ms |
+| Draft | 3.760873 ms |
+| Draft to target | 0.242986 ms |
+| Target to draft | 1.282984 ms |
+
+The grouped partial and combine kernels average 0.057043 and 0.005948 ms per
+full-attention layer. Across sixteen layers they contribute about 1.007854 ms
+to the target graph. Subtracting this measured service leaves approximately
+15.340 ms of context-independent target work and 20.627 ms of complete-round
+work. Thus long-attention work explains the decay, but eliminating it entirely
+would not by itself satisfy a sub-20-ms short-context goal; the fixed target,
+draft, and return path remain a separate optimization problem.
+
+An exact split-K experiment divided the D=256 QK accumulation between two
+warps and joined the FP32 partials before the unchanged softmax. Limiting
+unrolling removed all local stack spills (128/126 registers for the one-/two-
+pass kernels), and all six grouped-verifier correctness tests passed. A/B/A
+medians nevertheless changed by -0.40% at 32K, +0.11% at 128K, and +0.28% at
+256K versus the second baseline. There is no stable long-context gain, so the
+experiment was reverted and is not part of the performance result.
+
+## Pack-GQA48 follow-up
+
+The accepted grouped baseline launches two 256-thread CTAs per context split:
+one four-head group and one two-head tail. Both CTAs load and decode the same
+single-KV-head page. Following the official FlashAttention PackGQA mapping,
+the follow-up packs all six heads and eight verifier tokens into one 48-row,
+512-thread CTA. QK and PV remain Volta WMMA, online softmax remains FP32, and
+the split outputs retain the same FP16-partial/FP32-LSE reduction contract.
+The production partial kernel uses 128 registers, no local stack, and 50,944
+bytes of opt-in dynamic shared memory.
+
+The first packed prototype retained 128 tokens per split. It improved the
+32K/128K/256K operator by approximately 20-21%, but regressed 1K by 19-21%
+because only eight large CTAs were launched. Reducing the packed split quantum
+to 64 tokens recovered the 1K parallelism, but the single-query utility shape
+then crossed its strict FP32-reference mean-error gate. The retained dispatch
+therefore keeps 128-token splits for Q1, forces one split for Q2-Q8 at total KV
+length at most 128, and uses 64-token splits otherwise. This is a numerical
+dispatch boundary, not a sampling or acceptance heuristic.
+
+The final production-page A/B/A CUDA-Graph medians are:
+
+| Context | Accepted grouped A/A2 | Pack-GQA48 | Delta versus A/A2 |
+| --- | ---: | ---: | ---: |
+| 1K | 0.057344 / 0.057344 ms | 0.046080 ms | -19.64% / -19.64% |
+| 32K | 0.257024 / 0.257024 ms | 0.205824 ms | -19.92% / -19.92% |
+| 128K | 0.939008 / 0.937984 ms | 0.745472 ms | -20.61% / -20.52% |
+| 256K | 1.838080 / 1.838080 ms | 1.448960 ms | -21.17% / -21.17% |
+
+At the ultra-short 128/256-token fixed shapes the packed route costs about
+0.002-0.003 ms more than the accepted grouped kernel; at 512 tokens it is
+already 10.9-12.5% faster. These sub-millisecond boundary points do not affect
+the frozen 1K-or-longer promotion gate, but remain covered by correctness
+tests.
+
+The expanded operator suite covers Q1/Q3/Q4/Q5/Q6/Q8, 128/256/512/1K and
+longer boundaries, random physical pages, one-/two-pass equivalence, and CUDA
+Graph replay. All twelve tests pass. The maximum absolute error is unchanged
+from the accepted grouped baseline at every audited shape; the largest
+positive mean-error delta is `1.60e-7`, below the per-shape `5e-7` guard.
+
+The TP4 FULL-Graph endpoints confirm that the operator gain lands on the full
+target critical path without a short-context regression:
+
+| Context/phase | Accepted grouped | Pack-GQA48 | Delta |
+| --- | ---: | ---: | ---: |
+| 1K complete | 21.634854 ms | 21.303621 ms | -0.331233 ms (-1.53%) |
+| 1K target | 16.348011 ms | 16.043125 ms | -0.304886 ms (-1.86%) |
+| 32K complete | 25.237987 ms | 24.390177 ms | -0.847810 ms (-3.36%) |
+| 32K target | 19.455442 ms | 18.633571 ms | -0.821871 ms (-4.22%) |
+| 128K complete | 36.482220 ms | 33.334558 ms | -3.147662 ms (-8.63%) |
+| 128K target | 30.354906 ms | 27.208276 ms | -3.146630 ms (-10.37%) |
+
+The traced packed partial averages 0.733521 ms per full-attention layer and its
+combine averages 0.010906 ms. The diagnostic request keeps the exact 128 output
+token IDs, accepted counts `[17, 17, 17, 16, 16, 15, 15]`, and mean acceptance
+length 7.647059. Seventeen verification steps produce 128 output tokens, so
+the conservative steady-round projection is about 225.9 token/s at 128K,
+versus 206.4 token/s for the accepted grouped endpoint.
+
+The 32K-to-128K complete-round slope falls from 11.244233 to 8.944381 ms
+(-20.45%), and the target slope falls from 10.899464 to 8.574705 ms (-21.33%).
+The 32K/128K geometric-mean complete round falls from 30.343662 to 28.513782
+ms (-6.03%). Diagnostic mean acceptance changes by +0.030303 at 1K, +0.047619
+at 32K, and exactly zero at 128K, all inside the frozen 0.05 boundary.
+
+WikiText PPL is exactly equal to the accepted grouped candidate across all
+16,376 prompt-logprob positions. Against target only, the maximum PPL delta is
+0.003952 and the mean absolute prompt-logprob delta is 0.007519, exactly the
+same quality envelope recorded before Pack-GQA. Mixed task-score gates remain
+required before promotion.
 
 ## Score and PPL promotion evidence
 
