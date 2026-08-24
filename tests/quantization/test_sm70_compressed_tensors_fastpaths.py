@@ -187,7 +187,6 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
     monkeypatch.setattr(
         f"{module}._sm70_channel_fp8_qpn8_config", lambda layer: (16, 2, False)
     )
-    monkeypatch.setattr(f"{module}._is_qwen38_27b_fp8_qpn8_model", lambda: True)
     monkeypatch.setattr(f"{module}._is_sm70_fp8_qpn8_runtime_contract", lambda: True)
     monkeypatch.setattr(f"{module}._missing_sm70_fp8_qpn8_ops", lambda: [])
     monkeypatch.setattr(

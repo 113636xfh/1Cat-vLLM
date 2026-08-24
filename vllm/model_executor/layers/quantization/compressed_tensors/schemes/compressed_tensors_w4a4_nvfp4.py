@@ -94,7 +94,13 @@ def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
         return False
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
     expected = _SM70_NVFP4_QPN2_SHAPES.get(suffix)
-    return expected is not None and tuple(layer.weight.shape) == expected
+    if expected is None or tuple(layer.weight.shape) != expected:
+        return False
+    expected_n, expected_packed_k = expected
+    return bool(
+        getattr(layer, "input_size_per_partition", 0) == expected_packed_k * 2
+        and getattr(layer, "output_size_per_partition", 0) == expected_n
+    )
 
 
 def _missing_qpn2_ops() -> list[str]:
@@ -301,9 +307,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 qpn2_global_scale = float(layer.weight_global_scale.item())
 
             use_gated_silu = bool(
-                envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU
-                and is_qpn4_gate
-                and not use_qpn2
+                envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU and is_qpn4_gate and not use_qpn2
             )
             sm70_tm.prepare_nvfp4_linear(
                 layer,

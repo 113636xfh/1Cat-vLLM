@@ -182,7 +182,13 @@ def _is_sm70_fp8_qpn8_layer(layer: torch.nn.Module) -> bool:
         return False
     # Checkpoint-native block-FP8 weights are [N, K]; the shared prefill
     # workspace and QPN8 replacement parameter are [K, N].
-    return tuple(reversed(layer.weight.shape)) == expected_kn
+    if tuple(reversed(layer.weight.shape)) != expected_kn:
+        return False
+    expected_k, expected_n = expected_kn
+    return bool(
+        getattr(layer, "input_size_per_partition", 0) == expected_k
+        and getattr(layer, "output_size_per_partition", 0) == expected_n
+    )
 
 
 def _is_sm70_fp8_qpn8_runtime_contract() -> bool:

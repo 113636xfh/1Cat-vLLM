@@ -1286,8 +1286,7 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  const char* dflash2_rerank =
-      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
+  const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
   const char* dflash2_shadow =
       std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
   const bool exact_dflash2_rerank =
@@ -4310,11 +4309,10 @@ __global__ void sm70_f16_gather_packed_candidate_rows_kernel(
     const int selected_row = index / k_tiles;
     const int k_tile = index - selected_row * k_tiles;
     const int64_t token = __ldg(candidate_ids + selected_row);
-    const int64_t source =
-        (token / kRowsPerPack) * hidden_size * kRowsPerPack +
-        static_cast<int64_t>(k_tile) * kPackedTileElements +
-        ((token % kRowsPerPack) / 4) * 4 * kColsPerVector +
-        (token % 4) * kColsPerVector;
+    const int64_t source = (token / kRowsPerPack) * hidden_size * kRowsPerPack +
+                           static_cast<int64_t>(k_tile) * kPackedTileElements +
+                           ((token % kRowsPerPack) / 4) * 4 * kColsPerVector +
+                           (token % 4) * kColsPerVector;
     const int64_t destination =
         static_cast<int64_t>(selected_row / kRowsPerPack) * hidden_size *
             kRowsPerPack +
@@ -4341,30 +4339,31 @@ __global__ void sm70_f16_extract_candidate_rows_kernel(
 }
 
 template <int Threads>
-__global__ void sm70_f16_rerank_keys_kernel(
-    int64_t* keys, const half* logits, const int64_t* candidate_ids,
-    int count) {
+__global__ void sm70_f16_rerank_keys_kernel(int64_t* keys, const half* logits,
+                                            const int64_t* candidate_ids,
+                                            int count) {
   for (int index = blockIdx.x * Threads + threadIdx.x; index < count;
        index += gridDim.x * Threads) {
     const uint16_t raw =
         __ldg(reinterpret_cast<const uint16_t*>(logits) + index);
-    const uint16_t ordered =
-        raw & 0x8000U ? static_cast<uint16_t>(~raw)
-                      : static_cast<uint16_t>(raw ^ 0x8000U);
+    const uint16_t ordered = raw & 0x8000U
+                                 ? static_cast<uint16_t>(~raw)
+                                 : static_cast<uint16_t>(raw ^ 0x8000U);
     // int64 top-k over this key is exactly lexicographic by FP16 value
     // descending, then original vocabulary ID ascending.  Candidate IDs are
     // unique and below 2^32, so the key is collision-free.
     const uint64_t tie =
         0xffffffffULL - static_cast<uint32_t>(__ldg(candidate_ids + index));
-    keys[index] = static_cast<int64_t>((static_cast<uint64_t>(ordered) << 32) |
-                                       tie);
+    keys[index] =
+        static_cast<int64_t>((static_cast<uint64_t>(ordered) << 32) | tie);
   }
 }
 
-__global__ void sm70_f16_rerank_topk_kernel(
-    half* values_out, int64_t* ids_out, const half* logits,
-    const int64_t* candidate_ids, int rows, int top_k,
-    int64_t vocab_start_index) {
+__global__ void sm70_f16_rerank_topk_kernel(half* values_out, int64_t* ids_out,
+                                            const half* logits,
+                                            const int64_t* candidate_ids,
+                                            int rows, int top_k,
+                                            int64_t vocab_start_index) {
   constexpr int kCandidates = 64;
   const int row = blockIdx.x;
   if (row >= rows) {
@@ -4382,14 +4381,14 @@ __global__ void sm70_f16_rerank_topk_kernel(
 #pragma unroll
   for (int offset = 0; offset < kCandidates; offset += WARP_SIZE) {
     const int position = lane + offset;
-    const uint16_t raw = __ldg(
-        reinterpret_cast<const uint16_t*>(logits) + base + position);
-    const uint16_t ordered =
-        raw & 0x8000U ? static_cast<uint16_t>(~raw)
-                      : static_cast<uint16_t>(raw ^ 0x8000U);
+    const uint16_t raw =
+        __ldg(reinterpret_cast<const uint16_t*>(logits) + base + position);
+    const uint16_t ordered = raw & 0x8000U
+                                 ? static_cast<uint16_t>(~raw)
+                                 : static_cast<uint16_t>(raw ^ 0x8000U);
     const uint64_t tie =
-        0xffffffffULL - static_cast<uint32_t>(
-                            __ldg(candidate_ids + base + position));
+        0xffffffffULL -
+        static_cast<uint32_t>(__ldg(candidate_ids + base + position));
     candidate_keys[position] = (static_cast<uint64_t>(ordered) << 32) | tie;
   }
   __syncwarp();
@@ -4419,8 +4418,7 @@ __global__ void sm70_f16_rerank_topk_kernel(
                                ? static_cast<uint16_t>(ordered ^ 0x8000U)
                                : static_cast<uint16_t>(~ordered);
       values_out[row * top_k + rank] = __ushort_as_half(raw);
-      const uint32_t local_id =
-          0xffffffffU - static_cast<uint32_t>(best_key);
+      const uint32_t local_id = 0xffffffffU - static_cast<uint32_t>(best_key);
       ids_out[row * top_k + rank] =
           vocab_start_index + static_cast<int64_t>(local_id);
       // A valid local vocabulary ID is far below UINT32_MAX, so its key is
@@ -4433,11 +4431,9 @@ __global__ void sm70_f16_rerank_topk_kernel(
 
 template <int CTA_N>
 void launch_sm70_f16_indexed_rerank_gemm(
-    torch::Tensor out, torch::Tensor in_feats,
-    torch::Tensor selected_packed, torch::Tensor expanded,
-    torch::Tensor partials, torch::Tensor barriers,
-    turbomind::gemm::MatrixLayout desc_B, int split_k,
-    cudaStream_t stream) {
+    torch::Tensor out, torch::Tensor in_feats, torch::Tensor selected_packed,
+    torch::Tensor expanded, torch::Tensor partials, torch::Tensor barriers,
+    turbomind::gemm::MatrixLayout desc_B, int split_k, cudaStream_t stream) {
   constexpr int kCandidates = 64;
   constexpr int kThreads = 256;
   const int m = static_cast<int>(in_feats.size(0));
@@ -4454,19 +4450,16 @@ void launch_sm70_f16_indexed_rerank_gemm(
   turbomind::gemm::MatrixLayout desc_U{};
   turbomind::gemm::MatrixLayout desc_V{};
   turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,
-      turbomind::gemm::kRowMajor,
-      m,
-      selected_rows,
-      static_cast<int>(expanded.stride(0)),
+      turbomind::kHalf, turbomind::gemm::kRowMajor,           m,
+      selected_rows,    static_cast<int>(expanded.stride(0)),
   };
 
   using namespace turbomind::gemm;
   using C = sm70_s884::Config_F16<kColMajor, 0>;
   using D = turbomind::cache_policy::Default;
   using S = turbomind::cache_policy::Stream;
-  using Gemm = typename C::template Type<8, CTA_N, 64, 1, 4, 1, D, S, 2,
-                                         true, 1, 1>::Kernel;
+  using Gemm = typename C::template Type<8, CTA_N, 64, 1, 4, 1, D, S, 2, true,
+                                         1, 1>::Kernel;
   using Sched = typename Gemm::Scheduler;
   GemmParam param{
       to_param(in_feats.data_ptr(), desc_A),
@@ -4557,9 +4550,9 @@ void launch_sm70_f16_indexed_rerank(
                               selected_packed.data_ptr(), desc_B, stream) == 0,
               "sm70_f16_indexed_rerank_out: candidate pack failed.");
 
-  launch_sm70_f16_indexed_rerank_gemm<CTA_N>(
-      out, in_feats, selected_packed, expanded, partials, barriers, desc_B,
-      split_k, stream);
+  launch_sm70_f16_indexed_rerank_gemm<CTA_N>(out, in_feats, selected_packed,
+                                             expanded, partials, barriers,
+                                             desc_B, split_k, stream);
 }
 
 template <int CTA_N>
@@ -4583,25 +4576,23 @@ void launch_sm70_f16_indexed_rerank_packed(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   turbomind::gemm::MatrixLayout desc_B{
-      turbomind::kHalf,
-      turbomind::gemm::kColMajor,
-      k,
-      selected_rows,
-      k * 32,
+      turbomind::kHalf, turbomind::gemm::kColMajor, k, selected_rows, k * 32,
   };
   desc_B.pack = static_cast<turbomind::gemm::Pack>(
       turbomind::gemm::HMMA_884 | turbomind::gemm::OPERAND_B | 1);
-  launch_sm70_f16_indexed_rerank_gemm<CTA_N>(
-      out, in_feats, selected_packed, expanded, partials, barriers, desc_B,
-      split_k, stream);
+  launch_sm70_f16_indexed_rerank_gemm<CTA_N>(out, in_feats, selected_packed,
+                                             expanded, partials, barriers,
+                                             desc_B, split_k, stream);
 }
 
-void sm70_f16_indexed_rerank_out(
-    torch::Tensor out, torch::Tensor in_feats, torch::Tensor weight,
-    torch::Tensor candidate_ids, torch::Tensor selected_raw,
-    torch::Tensor selected_packed, torch::Tensor expanded,
-    torch::Tensor partials, torch::Tensor barriers, int64_t cta_n,
-    int64_t split_k) {
+void sm70_f16_indexed_rerank_out(torch::Tensor out, torch::Tensor in_feats,
+                                 torch::Tensor weight,
+                                 torch::Tensor candidate_ids,
+                                 torch::Tensor selected_raw,
+                                 torch::Tensor selected_packed,
+                                 torch::Tensor expanded, torch::Tensor partials,
+                                 torch::Tensor barriers, int64_t cta_n,
+                                 int64_t split_k) {
   constexpr int64_t kMaxRows = 8;
   constexpr int64_t kCandidates = 64;
   TORCH_CHECK(out.is_cuda() && in_feats.is_cuda() && weight.is_cuda() &&
@@ -4726,13 +4717,12 @@ void sm70_f16_indexed_rerank_packed_out(
                   candidate_ids.size(1) == kCandidates,
               "sm70_f16_indexed_rerank_packed_out: expected [M, 64] output "
               "and candidate IDs.");
-  TORCH_CHECK(selected_packed.size(0) >= selected_rows &&
-                  selected_packed.size(1) == k,
-              "sm70_f16_indexed_rerank_packed_out: packed workspace must be "
-              "[>=M*64, K].");
+  TORCH_CHECK(
+      selected_packed.size(0) >= selected_rows && selected_packed.size(1) == k,
+      "sm70_f16_indexed_rerank_packed_out: packed workspace must be "
+      "[>=M*64, K].");
   TORCH_CHECK(expanded.size(0) >= m && expanded.size(1) >= selected_rows &&
-                  partials.size(0) >= m &&
-                  partials.size(1) >= selected_rows &&
+                  partials.size(0) >= m && partials.size(1) >= selected_rows &&
                   barriers.numel() >= 64,
               "sm70_f16_indexed_rerank_packed_out: split-K workspaces are "
               "too small.");
@@ -4744,15 +4734,14 @@ void sm70_f16_indexed_rerank_packed_out(
               "sm70_f16_indexed_rerank_packed_out: tensors must be "
               "contiguous.");
   const int device = in_feats.get_device();
-  TORCH_CHECK(out.get_device() == device &&
-                  packed_weight.get_device() == device &&
-                  candidate_ids.get_device() == device &&
-                  selected_packed.get_device() == device &&
-                  expanded.get_device() == device &&
-                  partials.get_device() == device &&
-                  barriers.get_device() == device,
-              "sm70_f16_indexed_rerank_packed_out: tensors must share one "
-              "device.");
+  TORCH_CHECK(
+      out.get_device() == device && packed_weight.get_device() == device &&
+          candidate_ids.get_device() == device &&
+          selected_packed.get_device() == device &&
+          expanded.get_device() == device && partials.get_device() == device &&
+          barriers.get_device() == device,
+      "sm70_f16_indexed_rerank_packed_out: tensors must share one "
+      "device.");
   TORCH_CHECK(cta_n == 128 || cta_n == 256,
               "sm70_f16_indexed_rerank_packed_out: cta_n must be 128 or "
               "256.");
@@ -4792,9 +4781,9 @@ void sm70_f16_rerank_keys_out(torch::Tensor keys, torch::Tensor logits,
                   candidate_ids.is_contiguous(),
               "sm70_f16_rerank_keys_out: tensors must be contiguous.");
   const int device = logits.get_device();
-  TORCH_CHECK(keys.get_device() == device &&
-                  candidate_ids.get_device() == device,
-              "sm70_f16_rerank_keys_out: tensors must share one device.");
+  TORCH_CHECK(
+      keys.get_device() == device && candidate_ids.get_device() == device,
+      "sm70_f16_rerank_keys_out: tensors must share one device.");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(logits));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int count = static_cast<int>(keys.numel());
@@ -4806,9 +4795,8 @@ void sm70_f16_rerank_keys_out(torch::Tensor keys, torch::Tensor logits,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void sm70_f16_rerank_topk_out(torch::Tensor values_out,
-                              torch::Tensor ids_out, torch::Tensor logits,
-                              torch::Tensor candidate_ids,
+void sm70_f16_rerank_topk_out(torch::Tensor values_out, torch::Tensor ids_out,
+                              torch::Tensor logits, torch::Tensor candidate_ids,
                               int64_t vocab_start_index) {
   constexpr int64_t kCandidates = 64;
   constexpr int kThreads = 32;
@@ -5626,23 +5614,24 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
   vllm::awq_sm70::sm70_f16_gemm_out(out, _in_feats, _kernel, k_ld, gated_silu);
 }
 
-void sm70_f16_indexed_rerank_out(
-    torch::Tensor out, torch::Tensor _in_feats, torch::Tensor _kernel,
-    torch::Tensor candidate_ids, torch::Tensor selected_raw,
-    torch::Tensor selected_packed, torch::Tensor expanded,
-    torch::Tensor partials, torch::Tensor barriers, int64_t cta_n,
-    int64_t split_k) {
+void sm70_f16_indexed_rerank_out(torch::Tensor out, torch::Tensor _in_feats,
+                                 torch::Tensor _kernel,
+                                 torch::Tensor candidate_ids,
+                                 torch::Tensor selected_raw,
+                                 torch::Tensor selected_packed,
+                                 torch::Tensor expanded, torch::Tensor partials,
+                                 torch::Tensor barriers, int64_t cta_n,
+                                 int64_t split_k) {
   vllm::awq_sm70::sm70_f16_indexed_rerank_out(
       out, _in_feats, _kernel, candidate_ids, selected_raw, selected_packed,
       expanded, partials, barriers, cta_n, split_k);
 }
 
 void sm70_f16_indexed_rerank_packed_out(
-    torch::Tensor out, torch::Tensor _in_feats,
-    torch::Tensor _packed_kernel, torch::Tensor candidate_ids,
-    torch::Tensor selected_packed, torch::Tensor expanded,
-    torch::Tensor partials, torch::Tensor barriers, int64_t cta_n,
-    int64_t split_k) {
+    torch::Tensor out, torch::Tensor _in_feats, torch::Tensor _packed_kernel,
+    torch::Tensor candidate_ids, torch::Tensor selected_packed,
+    torch::Tensor expanded, torch::Tensor partials, torch::Tensor barriers,
+    int64_t cta_n, int64_t split_k) {
   vllm::awq_sm70::sm70_f16_indexed_rerank_packed_out(
       out, _in_feats, _packed_kernel, candidate_ids, selected_packed, expanded,
       partials, barriers, cta_n, split_k);
@@ -5653,12 +5642,11 @@ void sm70_f16_rerank_keys_out(torch::Tensor keys, torch::Tensor logits,
   vllm::awq_sm70::sm70_f16_rerank_keys_out(keys, logits, candidate_ids);
 }
 
-void sm70_f16_rerank_topk_out(torch::Tensor values_out,
-                              torch::Tensor ids_out, torch::Tensor logits,
-                              torch::Tensor candidate_ids,
+void sm70_f16_rerank_topk_out(torch::Tensor values_out, torch::Tensor ids_out,
+                              torch::Tensor logits, torch::Tensor candidate_ids,
                               int64_t vocab_start_index) {
-  vllm::awq_sm70::sm70_f16_rerank_topk_out(
-      values_out, ids_out, logits, candidate_ids, vocab_start_index);
+  vllm::awq_sm70::sm70_f16_rerank_topk_out(values_out, ids_out, logits,
+                                           candidate_ids, vocab_start_index);
 }
 
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,

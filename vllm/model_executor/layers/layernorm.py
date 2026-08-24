@@ -34,19 +34,15 @@ def _sm70_dflash2_gemma_fused_add_rms_kernel(
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < hidden_size
-    values = tl.load(
-        x + row * hidden_size + cols, mask=mask, other=0.0
-    ).to(tl.float32)
-    values += tl.load(
-        residual + row * hidden_size + cols, mask=mask, other=0.0
-    ).to(tl.float32)
+    values = tl.load(x + row * hidden_size + cols, mask=mask, other=0.0).to(tl.float32)
+    values += tl.load(residual + row * hidden_size + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
     tl.store(residual_out + row * hidden_size + cols, values, mask=mask)
 
     variance = tl.sum(tl.where(mask, values * values, 0.0), axis=0)
     inverse_rms = tl.rsqrt(variance / hidden_size + epsilon)
-    gemma_weight = (
-        tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
-    )
+    gemma_weight = tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
     tl.store(
         normalized_out + row * hidden_size + cols,
         values * inverse_rms * gemma_weight,
@@ -90,14 +86,20 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     return bool(
         envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and current_platform.is_device_capability(70)
         and residual is not None
         and x.is_cuda
         and x.dtype == torch.float16
         and residual.dtype == torch.float32
         and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.ndim == 2
+        and x.shape[0] > 0
         and x.shape[1] == 5120
         and residual.shape == x.shape
+        and residual.device == x.device
+        and weight.device == x.device
+        and weight.ndim == 1
+        and weight.numel() == 5120
         and x.is_contiguous()
         and residual.is_contiguous()
         and weight.is_contiguous()

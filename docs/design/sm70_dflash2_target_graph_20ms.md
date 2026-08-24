@@ -409,13 +409,11 @@ but the 176.56 token/s endpoint is not yet used as the paired throughput claim.
 
 ### DFlash2 target QPN8 backport
 
-The accepted Qwen3.8-27B-FP8 QPN8 operator and production route were
-cherry-picked from `db978179de` and `e0547f1b4a`. The DFlash2 integration adds
-one narrower runtime allowance: QPN8 may prepare the target backbone when the
-speculative method is exactly MRV2 `dflash` and the draft checkpoint
-architecture is `DFlash2DraftModel`. DFlash1, `dflash_ddtree`, Eagle, MTP, and
-all other speculative configurations retain TurboMind. The existing Qwen3.8
-model, TP4, projection-shape, and `max_num_seqs<=8` guards are unchanged.
+The accepted FP8 QPN8 operator and production route were cherry-picked from
+`db978179de` and `e0547f1b4a`. The audited integration admits only explicit
+QPN8 opt-in, SM70/TP4, block-FP8 layout, exact projection shapes, and bounded
+concurrency. It does not inspect a model, architecture, or checkpoint identity;
+unsupported tensor or runtime contracts retain TurboMind.
 
 The target LM head is not a QPN8 shape and remains on the dense FP16 path. The
 only admitted target projections are fused gate/up, down, and GDN/full-attention
@@ -447,8 +445,9 @@ and collapses the five full-attention metadata refreshes into one pointer-table
 kernel.  The paired single-request node traces measure 24.424136 ms for the
 control and **23.678170 ms** for the candidate.  Draft-to-target falls from
 1.857847 to 1.213916 ms.  All token IDs, token hash, acceptance length, and
-per-position acceptance counts are exact.  This grouped metadata route is
-default-on for the narrow MRV2 DFlash2/SM70 full-graph contract.
+per-position acceptance counts are exact. This grouped metadata route proved
+the measured workload, but remains default-off in the audited source so the
+kernel contract can be rolled out independently of a model identity.
 
 The retained target graph has 1,254 nodes and about 16.055 ms of rank-critical
 GPU service.  Its largest buckets are 4.235 ms gated-pair QPN8, 3.186 ms QPN8
@@ -640,14 +639,11 @@ gate; a new complete single-request DFlash2 trace must measure the movement,
 and any remaining 1-2 ms gap must be removed from that trace's actual
 critical-rank buckets.
 
-A production QPN2 implementation is now linked behind
-`VLLM_SM70_NVFP4_QPN2=1`.  Its automatic admission is restricted to the exact
-Qwen3.8-27B configuration, TP4, MRV2 `DFlash2DraftModel`,
-`max_num_seqs<=8`, and the checkpoint-native gate/up and down shapes.  M<=8
-uses QPN2; larger dynamic M dispatches inside the opaque C++ operator to the
-existing TurboMind layout.  DFlash1, DDTree, Eagle, MTP, other models, TP
-sizes, and higher concurrency are isolated.  The switch remains default-off
-until the full endpoint and quality gates pass.
+A production QPN2 implementation is linked behind
+`VLLM_SM70_NVFP4_QPN2=1`. Admission uses TP4 and the checkpoint-native gate/up
+or down tensor layout; it does not inspect model or speculator identity. M<=8
+uses QPN2, while larger dynamic M dispatches inside the opaque C++ operator to
+the existing TurboMind layout. The switch remains default-off.
 
 The exact production source compiles for SM70, its four routing tests pass,
 and a full `_C` candidate contains QPN8, graph-only push, and all four QPN2
@@ -1219,29 +1215,15 @@ official datasets. They are useful reference points, not a direct comparison
 to this 32-row-per-suite V100/mixed-checkpoint/max-2K gate. See
 <https://huggingface.co/incoai/Qwen3.8-27B-DFlash2>.
 
-### Default promotion and isolation
+### Audit disposition and isolation
 
 The score, PPL, paired acceptance, microbenchmark, short-trace, and long-context
-gates promote the validated bundle only when the engine is SM70 Flash-V100,
-TP4, MRV2 `method=dflash`, draft architecture `DFlash2DraftModel`, target FP16
-compute shape H=5120/Hq=24/Hkv=4/D=256, and `max_num_seqs <= 8`. Configuration
-now installs the validated defaults before workers start: grouped verification,
-shared/fused GDN metadata, fused Gemma RMS, sparse target rejection, sharded
-context projection, QPN8+original-FP16 candidate-order rerank, NVFP4 QPN2, and
-the `[8,5120]` TP4 push reduction. Every explicit environment value wins over
-the automatic profile.
+results remain evidence for the measured workload. They do not install a model
+profile. Every new leaf is default-off and independently selected by explicit
+environment opt-in plus hardware, algorithm configuration, dtype, tensor
+layout, cache/graph mode, sampling, and bounded-concurrency contracts.
 
-A clean 8-token TP4 smoke explicitly unsets all ten profile variables before
-constructing the engine. Startup auto-installs the expected `1/0` values, then
-route logs prove QPN2, QPN8 candidate-order rerank, TP4 push, fused GDN
-metadata, sparse rejection, and `dflash2_grouped_verify`; target and draft both
-finish FULL Graph capture. The observed 194.758 steady tok/s is route evidence
-only because the output is intentionally too short for a speed baseline. The
-result is `quality/dflash2-auto-profile-smoke-v86.json`, SHA256
-`02dfa056...e29cd`.
-
-This is config-level admission, not a generic kernel default. DFlash1,
-`dflash_ddtree`, Eagle, MTP, non-SM70, non-TP4, other hidden/head shapes, and
-higher configured concurrency do not receive the bundle. Each leaf retains its
-own shape/sampling fallback, so unsupported requests execute the previous
-dense/general path rather than changing routing semantics.
+The earlier clean 8-token TP4 auto-profile smoke remains historical route
+evidence only; automatic profile injection was removed during merge audit.
+Unsupported requests execute the previous dense/general path rather than
+changing routing semantics.

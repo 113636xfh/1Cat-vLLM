@@ -1494,7 +1494,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
     attn_metadata = SimpleNamespace(
         num_actual_tokens=8,
         causal=True,
-        is_dflash2_target=True,
+        is_dflash_selector_target=True,
         max_model_len=32768,
         query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
         seq_lens=original_seq_lens,

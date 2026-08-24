@@ -311,15 +311,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
       "Tensor[]");
-  ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA,
-           &nvfp4_qpn2_prepare_sm70);
+  ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
 
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains) -> ()");
-  ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA,
-           &nvfp4_qpn2_gemm_sm70_out);
+  ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
 
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
@@ -409,15 +407,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "sm70_f16_rerank_keys_out(Tensor(a!) keys, Tensor logits, "
       "Tensor candidate_ids) -> ()");
-  ops.impl("sm70_f16_rerank_keys_out", torch::kCUDA,
-           &sm70_f16_rerank_keys_out);
+  ops.impl("sm70_f16_rerank_keys_out", torch::kCUDA, &sm70_f16_rerank_keys_out);
 
   ops.def(
       "sm70_f16_rerank_topk_out(Tensor(a!) values_out, "
       "Tensor(b!) ids_out, Tensor logits, Tensor candidate_ids, "
       "int vocab_start_index) -> ()");
-  ops.impl("sm70_f16_rerank_topk_out", torch::kCUDA,
-           &sm70_f16_rerank_topk_out);
+  ops.impl("sm70_f16_rerank_topk_out", torch::kCUDA, &sm70_f16_rerank_topk_out);
 
   ops.def(
       "sm70_f16_lm_head_top1_out(Tensor(a!) values_out, "

@@ -98,7 +98,7 @@ def test_flashinfer_nvfp4_backends_reject_sm70():
     assert "sm_100" in cudnn_reason
 
 
-def _make_qwen38_nvfp4_gate_up_layer() -> torch.nn.Module:
+def _make_sm70_tp4_nvfp4_gate_up_layer() -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.0.mlp.gate_up_proj"
@@ -108,7 +108,7 @@ def _make_qwen38_nvfp4_gate_up_layer() -> torch.nn.Module:
     return layer
 
 
-def _make_qwen38_nvfp4_down_layer() -> torch.nn.Module:
+def _make_sm70_tp4_nvfp4_down_layer() -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.0.mlp.down_proj"
@@ -117,36 +117,34 @@ def _make_qwen38_nvfp4_down_layer() -> torch.nn.Module:
     return layer
 
 
-def test_qwen38_tp4_nvfp4_gate_up_match_is_shape_exact(monkeypatch):
-    monkeypatch.setattr(nvfp4_scheme, "_is_qwen38_27b_nvfp4_model", lambda: True)
-    layer = _make_qwen38_nvfp4_gate_up_layer()
+def test_sm70_tp4_nvfp4_gate_up_match_is_shape_exact():
+    layer = _make_sm70_tp4_nvfp4_gate_up_layer()
 
-    assert nvfp4_scheme._is_qwen38_tp4_nvfp4_gate_up(layer)
+    assert nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
 
     layer.tp_size = 2
-    assert not nvfp4_scheme._is_qwen38_tp4_nvfp4_gate_up(layer)
+    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
     layer.tp_size = 4
     layer.output_size_per_partition = 8703
-    assert not nvfp4_scheme._is_qwen38_tp4_nvfp4_gate_up(layer)
+    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
     layer.output_size_per_partition = 8704
     layer.prefix = "model.language_model.layers.0.mlp.down_proj"
-    assert not nvfp4_scheme._is_qwen38_tp4_nvfp4_gate_up(layer)
+    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_gate_up(layer)
 
 
-def test_qwen38_tp4_nvfp4_down_match_is_shape_exact(monkeypatch):
-    monkeypatch.setattr(nvfp4_scheme, "_is_qwen38_27b_nvfp4_model", lambda: True)
-    layer = _make_qwen38_nvfp4_down_layer()
+def test_sm70_tp4_nvfp4_down_match_is_shape_exact():
+    layer = _make_sm70_tp4_nvfp4_down_layer()
 
-    assert nvfp4_scheme._is_qwen38_tp4_nvfp4_down(layer)
+    assert nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
 
     layer.input_size_per_partition = 4351
-    assert not nvfp4_scheme._is_qwen38_tp4_nvfp4_down(layer)
+    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
     layer.input_size_per_partition = 4352
     layer.output_size_per_partition = 5119
-    assert not nvfp4_scheme._is_qwen38_tp4_nvfp4_down(layer)
+    assert not nvfp4_scheme._is_sm70_tp4_nvfp4_down(layer)
 
 
-def test_qwen38_nvfp4_qpn4_runtime_contract_is_single_sequence_no_mtp(
+def test_sm70_nvfp4_qpn4_runtime_contract_is_single_sequence_no_mtp(
     monkeypatch,
 ):
     config = SimpleNamespace(
@@ -159,13 +157,13 @@ def test_qwen38_nvfp4_qpn4_runtime_contract_is_single_sequence_no_mtp(
         lambda: config,
     )
 
-    assert nvfp4_scheme._is_qwen38_nvfp4_qpn4_runtime_contract()
+    assert nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
 
     config.scheduler_config.max_num_seqs = 2
-    assert not nvfp4_scheme._is_qwen38_nvfp4_qpn4_runtime_contract()
+    assert not nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
     config.scheduler_config.max_num_seqs = 1
     config.speculative_config = object()
-    assert not nvfp4_scheme._is_qwen38_nvfp4_qpn4_runtime_contract()
+    assert not nvfp4_scheme._is_sm70_nvfp4_qpn4_runtime_contract()
 
 
 def test_nvfp4_scheme_delegates_fused_silu_only_for_prepared_layer(monkeypatch):

@@ -32,6 +32,8 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     layer = SimpleNamespace(
         tp_size=4,
         prefix="model.language_model.layers.0.mlp.gate_up_proj",
+        input_size_per_partition=5120,
+        output_size_per_partition=8704,
         weight=SimpleNamespace(shape=(8704, 2560)),
     )
     assert nvfp4_scheme._is_qpn2_layer(layer)
@@ -42,28 +44,12 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     layer.prefix = "model.language_model.layers.0.self_attn.qkv_proj"
     assert not nvfp4_scheme._is_qpn2_layer(layer)
     layer.prefix = "model.language_model.layers.0.mlp.down_proj"
+    layer.input_size_per_partition = 4352
+    layer.output_size_per_partition = 5120
     layer.weight = SimpleNamespace(shape=(5120, 2176))
     assert nvfp4_scheme._is_qpn2_layer(layer)
-
-
-def test_nvfp4_qpn2_runtime_rejects_non_dflash2_and_high_concurrency(monkeypatch):
-    draft = SimpleNamespace(architectures=["DFlash2DraftModel"])
-    speculative = SimpleNamespace(use_dflash=lambda: True, draft_model_config=draft)
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        speculative_config=speculative,
-    )
-    monkeypatch.setattr(nvfp4_scheme, "get_current_vllm_config", lambda: config)
-
-    assert nvfp4_scheme._is_mrv2_dflash2_runtime()
-    config.scheduler_config.max_num_seqs = 9
-    assert not nvfp4_scheme._is_mrv2_dflash2_runtime()
-    config.scheduler_config.max_num_seqs = 8
-    draft.architectures = ["DFlashDraftModel"]
-    assert not nvfp4_scheme._is_mrv2_dflash2_runtime()
-    draft.architectures = ["DFlash2DraftModel"]
-    speculative.use_dflash = lambda: False
-    assert not nvfp4_scheme._is_mrv2_dflash2_runtime()
+    layer.input_size_per_partition = 4096
+    assert not nvfp4_scheme._is_qpn2_layer(layer)
 
 
 def _make_small_layer() -> torch.nn.Module:
@@ -100,8 +86,6 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         "should_prepare_turbomind",
         lambda tensor, enabled: enabled,
     )
-    monkeypatch.setattr(nvfp4_scheme, "_is_qwen38_27b_model", lambda: True)
-    monkeypatch.setattr(nvfp4_scheme, "_is_mrv2_dflash2_runtime", lambda: True)
     monkeypatch.setattr(nvfp4_scheme, "_is_qpn2_layer", lambda layer: True)
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_ops", lambda: [])
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, False), (8, 2))
@@ -115,7 +99,8 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         ),
     )
 
-    def fake_prepare(prepared_layer):
+    def fake_prepare(prepared_layer, *, interleave_gated_silu=False):
+        assert not interleave_gated_silu
         state = sm70_tm.SM70TurboMindLinearState(
             weight=torch.empty((1,), dtype=torch.int32),
             scales=torch.empty((1,), dtype=torch.float16),

@@ -188,7 +188,6 @@ if TYPE_CHECKING:
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
-    VLLM_SM70_DFLASH2_FUSED_SELECTOR: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
     VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
@@ -1831,11 +1830,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_LM_HEAD_TOP1_TC": lambda: bool(
         int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))
     ),
-    # Dense FP16 selector candidate. Default-off until both its M=7
-    # microbenchmark and paired end-to-end V100 gates show a stable win.
-    "VLLM_SM70_DFLASH2_FUSED_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SELECTOR", "0"))
-    ),
     # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
     # support, then directly re-evaluates the original FP16 rows and restores
     # dense-vocabulary top-k tie order. Keep default-off until real-hidden,
@@ -1902,8 +1896,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))
     ),
-    # Collapse the five already-fused Qwen3.8 target small-query metadata
-    # launches into one heterogeneous-width pointer-table kernel. The paired
+    # Collapse five compatible target small-query metadata launches into one
+    # heterogeneous-width pointer-table kernel. The paired
     # TP4 node trace is token/acceptance exact and reduces synchronized D2T.
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))
@@ -1926,8 +1920,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
     ),
-    # Compute Qwen3.8 DFlash2's 25600->5120 target-hidden projection as four
-    # output shards, then all-gather only the 80-KiB block-eight result. This
+    # Compute the compatible 25600->5120 target-hidden projection as four output
+    # shards, then all-gather only the 80-KiB block-eight result. This
     # remains opt-in until the acceptance/quality gate follows the positive
     # production-weight TP4 microbenchmark.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(

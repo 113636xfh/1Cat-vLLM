@@ -443,6 +443,8 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
         tp_size=4,
         weight_block_size=[128, 128],
         prefix="model.language_model.layers.1.mlp.gate_up_proj",
+        input_size_per_partition=5120,
+        output_size_per_partition=8704,
         weight=SimpleNamespace(shape=(8704, 5120)),
     )
 
@@ -452,11 +454,16 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert not _is_sm70_fp8_qpn8_layer(layer)
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.linear_attn.in_proj_qkvz"
+    layer.output_size_per_partition = 4096
     layer.weight = SimpleNamespace(shape=(4096, 5120))
     assert _is_sm70_fp8_qpn8_layer(layer)
     layer.prefix = "model.language_model.layers.3.self_attn.qkv_proj"
+    layer.output_size_per_partition = 3584
     layer.weight = SimpleNamespace(shape=(3584, 5120))
     assert _is_sm70_fp8_qpn8_layer(layer)
+    layer.output_size_per_partition = 4096
+    assert not _is_sm70_fp8_qpn8_layer(layer)
+    layer.output_size_per_partition = 3584
     layer.weight_block_size = [64, 128]
     assert not _is_sm70_fp8_qpn8_layer(layer)
 

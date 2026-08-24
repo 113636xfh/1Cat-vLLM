@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 logger = init_logger(__name__)
 
@@ -302,6 +303,17 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
         raise ValueError("grouped small-query block tables cannot be empty")
     max_block_cols = max(block_col_counts)
     device = block_tables[0].device
+    if (
+        seq_lens.device != device
+        or query_start_loc.device != device
+        or seq_lens.dtype != torch.int32
+        or query_start_loc.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or not query_start_loc.is_contiguous()
+        or seq_lens.numel() < num_reqs
+        or query_start_loc.numel() < num_reqs + 1
+    ):
+        raise ValueError("grouped small-query input metadata contract mismatch")
     key: tuple[object, ...] = (
         device.type,
         device.index,
@@ -314,6 +326,45 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
         tuple(table.stride(0) for table in out_block_tables),
     )
     if descriptor is None or descriptor.key != key:
+        for group, (
+            block_table,
+            out_block_table,
+            out_seq_len,
+            out_query_start,
+        ) in enumerate(
+            zip(
+                block_tables,
+                out_block_tables,
+                out_seq_lens,
+                out_query_start_locs,
+                strict=True,
+            )
+        ):
+            block_cols = block_col_counts[group]
+            if (
+                block_table.device != device
+                or out_block_table.device != device
+                or out_seq_len.device != device
+                or out_query_start.device != device
+                or block_table.dtype != torch.int32
+                or out_block_table.dtype != torch.int32
+                or out_seq_len.dtype != torch.int32
+                or out_query_start.dtype != torch.int32
+                or block_table.ndim != 2
+                or out_block_table.ndim != 2
+                or block_table.shape[0] < num_reqs
+                or out_block_table.shape[0] < num_query_tokens
+                or out_block_table.shape[1] < block_cols
+                or block_table.stride(1) != 1
+                or out_block_table.stride(1) != 1
+                or not out_seq_len.is_contiguous()
+                or not out_query_start.is_contiguous()
+                or out_seq_len.numel() < num_query_tokens
+                or out_query_start.numel() < num_reqs + 1
+            ):
+                raise ValueError(
+                    f"grouped small-query metadata contract mismatch for group {group}"
+                )
         descriptor = DFlash2SmallQGroupDescriptor(
             key=key,
             block_table_ptrs=torch.tensor(
@@ -397,7 +448,7 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     smallq_decode_max_seq_len_hint: int | None
     smallq_decode_workspace_seq_capacity_hint: int | None
     smallq_decode_partition_size_hint: int | None
-    is_dflash2_target: bool
+    is_dflash_selector_target: bool
 
 
 def _as_flash_v100_metadata(
@@ -2878,29 +2929,24 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_draft_model = self._is_speculative_draft_model and (
             getattr(spec_config, "method", None) == "dflash"
         )
-        draft_model_config = (
-            getattr(spec_config, "draft_model_config", None)
-            if spec_config is not None
-            else None
-        )
-        draft_architectures = getattr(draft_model_config, "architectures", None) or []
         use_dflash = bool(
             spec_config is not None
             and callable(getattr(spec_config, "use_dflash", None))
             and spec_config.use_dflash()
         )
-        self._is_dflash2_target_model = bool(
+        selector_engine = uses_dflash_selector_engine(self.vllm_config)
+        self._is_dflash_selector_target = bool(
             use_dflash
             and not self._is_speculative_draft_model
             and getattr(spec_config, "num_speculative_tokens", None) == 7
-            and "DFlash2DraftModel" in draft_architectures
+            and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
             and self.device.type == "cuda"
             and current_platform.is_device_capability(70)
             and use_dflash
-            and "DFlash2DraftModel" in draft_architectures
+            and selector_engine
         )
         if self._use_sm70_dflash2_fused_smallq_metadata:
             logger.info_once(
@@ -2942,7 +2988,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             else common_attn_metadata.seq_lens_cpu
         )
         flash_metadata.causal = common_attn_metadata.causal
-        flash_metadata.is_dflash2_target = self._is_dflash2_target_model
+        flash_metadata.is_dflash_selector_target = self._is_dflash_selector_target
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
@@ -4193,13 +4239,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.use_dflash2_grouped_verify = (
             self.flash_attn_grouped_verify_paged is not None
-            and os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1") == "1"
+            and envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY
+            and current_platform.is_device_capability(70)
         )
-        self.dflash2_grouped_verify_min_model_len = int(
-            os.getenv(
-                "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN",
-                "32768",
-            )
+        self.dflash2_grouped_verify_min_model_len = (
+            envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
         )
         if self.dflash2_grouped_verify_min_model_len < 1:
             raise ValueError(
@@ -4844,14 +4888,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         *,
         num_query_tokens: int,
     ) -> bool:
-        """Gate the shape-specialized verifier without affecting Eagle/MTP."""
+        """Gate the verifier on its hardware and tensor-layout contract."""
         global _logged_prefill_smallq_grouped_verify_gate
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         allowed = bool(
             self.use_dflash2_grouped_verify
             and self.flash_attn_grouped_verify_paged is not None
-            and getattr(attn_metadata, "is_dflash2_target", False)
+            and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
@@ -4859,22 +4903,31 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and num_query_tokens == 8
             and tuple(query.shape) == (8, 6, 256)
             and query.dtype == torch.float16
+            and query.is_contiguous()
             and key_cache.ndim == 4
             and value_cache.ndim == 4
+            and key_cache.device == query.device
+            and value_cache.device == query.device
             and key_cache.shape[1] in (1648, 3296)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
+            and key_cache.stride(-1) == 1
+            and value_cache.stride(-1) == 1
             and self.kv_cache_dtype == "fp8_e5m2"
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == 1
+            and block_table.device == query.device
             and block_table.dtype == torch.int32
+            and block_table.is_contiguous()
             and seq_lens is not None
             and seq_lens.ndim == 1
             and seq_lens.shape[0] == 1
+            and seq_lens.device == query.device
             and seq_lens.dtype == torch.int32
+            and seq_lens.is_contiguous()
         )
         if (
             self.use_dflash2_grouped_verify
@@ -4888,7 +4941,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
                 "seq_lens=%s/%s.",
                 self.flash_attn_grouped_verify_paged is not None,
-                getattr(attn_metadata, "is_dflash2_target", False),
+                getattr(attn_metadata, "is_dflash_selector_target", False),
                 getattr(attn_metadata, "max_model_len", None),
                 self.dflash2_grouped_verify_min_model_len,
                 getattr(attn_metadata, "causal", True),
@@ -6642,7 +6695,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             int(query.shape[0]),
             int(output.shape[0]),
         )
-        if self._dflash2_grouped_verify_allowed(
+        if self.use_dflash2_grouped_verify and self._dflash2_grouped_verify_allowed(
             query,
             key_cache,
             value_cache,

@@ -419,9 +419,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
                     ba_size,
                 )
             else:
-                z = _sm70_compile_graph_slice_dim(
-                    mixed_qkvz, -1, qkv_size, z_size
-                )
+                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
                 b = ba[..., :ba_size]
                 a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
         else:

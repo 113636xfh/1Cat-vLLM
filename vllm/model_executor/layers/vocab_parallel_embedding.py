@@ -52,9 +52,7 @@ def _sm70_env_bool(name: str, default: bool) -> bool:
 
 
 def _sm70_lm_head_top1_default() -> bool:
-    return not _sm70_env_bool(
-        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False
-    )
+    return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
 
 
 def _sm70_dflash2_qpn8_rerank_enabled() -> bool:
@@ -408,8 +406,7 @@ def _maybe_sm70_lm_head_top1(
         or hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
     ):
         logger.warning_once(
-            "SM70 LM head top1 requested, but no top1 op is available; "
-            "falling back."
+            "SM70 LM head top1 requested, but no top1 op is available; falling back."
         )
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
@@ -437,9 +434,7 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_tc_out"
-    ):
+    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -460,9 +455,7 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_out"
-    ):
+    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(
@@ -1095,6 +1088,14 @@ class VocabParallelEmbedding(PluggableLayer):
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         return _maybe_sm70_lm_head_top1(self, hidden_states, bias)
+
+    def maybe_get_sm70_dflash2_top20(
+        self,
+        hidden_states: torch.Tensor,
+        selector_k: int,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return _maybe_sm70_dflash2_lm_head_top20(self, hidden_states, selector_k, bias)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

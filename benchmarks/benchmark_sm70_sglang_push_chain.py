@@ -44,7 +44,7 @@ def main() -> None:
     if world_size != 4:
         raise ValueError(f"this verifier microbenchmark requires TP4, got {world_size}")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group(backend="gloo")
 
@@ -105,23 +105,23 @@ def main() -> None:
     with communicator.capture(), torch.cuda.graph(graph):
         for index in range(args.count):
             communicator.custom_all_reduce(work[index])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     work.copy_(source)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     exact = bool(torch.equal(work, reference))
     difference = (work.float() - reference.float()).abs()
     mismatch_count = int((work != reference).sum().item())
 
     for _ in range(args.warmup):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = torch.Event(enable_timing=True)
+    end = torch.Event(enable_timing=True)
     start.record()
     for _ in range(args.iters):
         graph.replay()
