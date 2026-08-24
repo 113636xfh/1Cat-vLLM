@@ -510,14 +510,15 @@ def test_fp8_prefill_visible_dense_mm_is_long_prefill_only(monkeypatch):
     scales = torch.empty((1, 6), dtype=torch.float16)
     calls = []
 
+    def fake_dequantize(out, qweight, factors, group_size):
+        calls.append((qweight, factors, group_size))
+        out.fill_(1)
+
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "1")
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_sm70_dequantize_out",
-        lambda out, qweight, factors, group_size: (
-            calls.append((qweight, factors, group_size)),
-            out.fill_(1),
-        ),
+        fake_dequantize,
     )
     envs.disable_envs_cache()
     _sm70_fp8_prefill_dense_workspaces[(0, torch.float16)] = workspace
