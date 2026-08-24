@@ -913,6 +913,7 @@ class SpeculativeConfig:
                                 "dspark_confidence_temperatures entries must be "
                                 f"finite and positive; got {temperatures}."
                             )
+                    self._verify_dspark_final_stage_ownership()
 
                 if self.use_dflash_ddtree() and self.ddtree_budget is None:
                     self.ddtree_budget = self.num_speculative_tokens
@@ -946,6 +947,31 @@ class SpeculativeConfig:
                     )
                 )
         return self
+
+    def _verify_dspark_final_stage_ownership(self) -> None:
+        """Validate the layer contract for a final-stage-local drafter."""
+        from vllm.distributed.utils import get_pp_indices
+
+        pp_size = self.target_parallel_config.pipeline_parallel_size
+        num_layers = self.target_model_config.get_total_num_hidden_layers()
+        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        layer_ids = tuple(
+            getattr(
+                self.draft_model_config.hf_config,
+                "dspark_target_layer_ids",
+                (),
+            )
+        )
+        outside_last_stage = [
+            layer_id for layer_id in layer_ids if not last_start <= layer_id < last_end
+        ]
+        if not layer_ids or outside_last_stage:
+            raise ValueError(
+                "DSpark's final-stage-local drafter requires every "
+                "dspark_target_layer_id to belong to the final target pipeline "
+                f"stage [{last_start}, {last_end}); got {layer_ids}. Adjust "
+                "VLLM_PP_LAYER_PARTITION or the DSpark layer contract."
+            )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():

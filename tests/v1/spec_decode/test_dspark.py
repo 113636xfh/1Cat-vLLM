@@ -19,13 +19,13 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.spec_decode.dspark import DSparkProposer
 
 
-@pytest.mark.parametrize(("pp_size", "tp_size"), [(2, 4), (4, 2)])
-def test_dspark_draft_is_local_to_last_pipeline_stage(
+def _make_dspark_speculative_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
     pp_size: int,
     tp_size: int,
-) -> None:
+) -> tuple[ParallelConfig, SpeculativeConfig]:
     monkeypatch.setattr(current_platform, "device_count", lambda: 8)
     DeepseekV4Config(
         architectures=["DeepseekV4ForCausalLM"],
@@ -51,18 +51,48 @@ def test_dspark_draft_is_local_to_last_pipeline_stage(
         pipeline_parallel_size=pp_size,
         tensor_parallel_size=tp_size,
     )
-
     speculative_config = SpeculativeConfig(
         target_model_config=target_model_config,
         target_parallel_config=target_parallel_config,
         method="dspark",
         num_speculative_tokens=7,
     )
+    return target_parallel_config, speculative_config
+
+
+@pytest.mark.parametrize(("pp_size", "tp_size"), [(2, 4), (4, 2)])
+def test_dspark_draft_is_local_to_last_pipeline_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pp_size: int,
+    tp_size: int,
+) -> None:
+    target_parallel_config, speculative_config = _make_dspark_speculative_config(
+        tmp_path,
+        monkeypatch,
+        pp_size=pp_size,
+        tp_size=tp_size,
+    )
 
     assert target_parallel_config.pipeline_parallel_size == pp_size
     assert speculative_config.draft_parallel_config.pipeline_parallel_size == 1
     assert speculative_config.draft_parallel_config.tensor_parallel_size == tp_size
     assert speculative_config.draft_model_config.architectures == ["DSparkDraftModel"]
+
+
+def test_dspark_rejects_target_layers_outside_final_pipeline_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "42,1")
+
+    with pytest.raises(ValueError, match="final target pipeline stage"):
+        _make_dspark_speculative_config(
+            tmp_path,
+            monkeypatch,
+            pp_size=2,
+            tp_size=4,
+        )
 
 
 def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
