@@ -14,9 +14,6 @@ from vllm.model_executor.layers.fla.ops import (
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     fused_gdn_gating,
 )
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    fused_gdn_gating,
-)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -361,7 +358,7 @@ def test_dflash2_packed_verify_matches_split_fp16_contract(
     torch.set_default_device(DEVICE)
     set_random_seed(11)
     dtype = torch.float16
-    # Qwen3.8 target shape per rank at TP4.
+    # Production GDN verifier shape used by the recorded TP4 parity evidence.
     num_k_heads, num_v_heads = 4, 12
     head_k_dim = head_v_dim = 128
     tokens_per_req = num_speculative_tokens + 1

@@ -2387,22 +2387,25 @@ def prepare_dflash2_gdn_group_metadata(
         descriptor.prepared_key = prepared_key
         descriptor.prepared_metadata = prepared
 
+    assert prepared is not None
     if envs.VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW:
         spec_mask = common_gdn_metadata.spec_sequence_masks
         expected_accepted = num_accepted_tokens[spec_mask]
         for group_id, builder in builders_by_group:
             actual = prepared[id(builder)]
+            actual_state = actual.spec_state_indices_tensor
+            assert actual_state is not None
             expected_state = block_tables[group_id][spec_mask, :width]
             torch.testing.assert_close(
-                actual.spec_state_indices_tensor[:num_spec_decodes],
+                actual_state[:num_spec_decodes],
                 expected_state,
                 rtol=0,
                 atol=0,
             )
             torch.testing.assert_close(
-                actual.spec_state_indices_tensor[num_spec_decodes:],
+                actual_state[num_spec_decodes:],
                 torch.full_like(
-                    actual.spec_state_indices_tensor[num_spec_decodes:],
+                    actual_state[num_spec_decodes:],
                     PAD_SLOT_ID,
                 ),
                 rtol=0,

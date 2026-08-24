@@ -74,6 +74,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -591,12 +592,7 @@ def _sm70_qwen_gdn_spec_method(vllm_config: object) -> str | None:
 
 
 def _is_dflash2_spec_config(vllm_config: object) -> bool:
-    spec_config = getattr(vllm_config, "speculative_config", None)
-    if spec_config is None or getattr(spec_config, "method", None) != "dflash":
-        return False
-    draft_model_config = getattr(spec_config, "draft_model_config", None)
-    architectures = getattr(draft_model_config, "architectures", None) or []
-    return "DFlash2DraftModel" in architectures
+    return uses_dflash_selector_engine(vllm_config)
 
 
 def _sm70_qwen_gdn_full_forward_enabled(
@@ -4864,8 +4860,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and mixed_qkv.dtype == torch.float16
             and a.dtype == torch.float16
             and b.dtype == torch.float16
-            # Qwen3.8's official target contract keeps the recurrent state in
-            # FP32; an explicit FP16 cache override is also supported.
+            # The supported verifier contract keeps recurrent state in FP32;
+            # an explicit FP16 cache override is also supported.
             and ssm_state.dtype in (torch.float16, torch.float32)
             and mixed_qkv.is_contiguous()
             and a.is_contiguous()

@@ -612,7 +612,7 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     )
     assert first_result is not None
     prepared, descriptor = first_result
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     for group_id, builder in enumerate(builders):
         state = prepared[id(builder)].spec_state_indices_tensor
@@ -657,7 +657,7 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     replayed, replay_descriptor = second_result
     assert replay_descriptor is descriptor
     assert replayed is prepared
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     for group_id, builder in enumerate(builders):
         state = replayed[id(builder)].spec_state_indices_tensor
         assert state is not None
@@ -691,7 +691,7 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     single_prepared, single_descriptor = single_result
     assert single_descriptor is descriptor
     assert single_prepared is not replayed
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     single = single_prepared[id(builders[0])]
     assert single.spec_state_indices_tensor is not None
     assert single.spec_state_indices_tensor.shape == (8, 8)

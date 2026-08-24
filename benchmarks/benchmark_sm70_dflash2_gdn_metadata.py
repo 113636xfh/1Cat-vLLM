@@ -68,7 +68,7 @@ def _profile_cuda_launches(step: Any) -> int:
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         step()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     return sum(
         1
         for event in prof.events()
@@ -79,10 +79,10 @@ def _profile_cuda_launches(step: Any) -> int:
 def _measure(step: Any, repeats: int) -> dict[str, dict[str, float]]:
     wall_samples: list[float] = []
     gpu_samples: list[float] = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    start = torch.Event(enable_timing=True)
+    end = torch.Event(enable_timing=True)
     for _ in range(repeats):
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         wall_start = time.perf_counter_ns()
         start.record()
         step()
@@ -256,7 +256,7 @@ def _run_case(
             raise AssertionError("invalid speculative query span")
 
     legacy_step()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     expected_states = [
         builder.spec_state_indices_tensor.clone() for builder in builders
     ]
@@ -273,7 +273,7 @@ def _run_case(
     common_buffers.num_accepted_tokens.fill_(-1)
     common_buffers.spec_state_slot_selectors.fill_(-1)
     fused_step()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for actual_builder, expected_state in zip(builders, expected_states):
         torch.testing.assert_close(
             actual_builder.spec_state_indices_tensor,
@@ -295,7 +295,7 @@ def _run_case(
     for _ in range(warmup):
         legacy_step()
         fused_step()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     legacy_launches = _profile_cuda_launches(legacy_step)
     fused_launches = _profile_cuda_launches(fused_step)

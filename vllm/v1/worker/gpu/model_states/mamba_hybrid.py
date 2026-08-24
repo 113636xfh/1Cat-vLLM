@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.mamba_align import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -105,20 +106,9 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        speculative_config = vllm_config.speculative_config
-        draft_model_config = (
-            speculative_config.draft_model_config
-            if speculative_config is not None
-            else None
-        )
-        draft_architectures: list[str] = []
-        if draft_model_config is not None:
-            draft_architectures = draft_model_config.architectures or []
         self._use_dflash2_common_gdn_metadata = bool(
             envs.VLLM_SM70_DFLASH2_VERIFY_FASTPATH
-            and speculative_config is not None
-            and speculative_config.use_dflash()
-            and "DFlash2DraftModel" in draft_architectures
+            and uses_dflash_selector_engine(vllm_config)
         )
         if self._use_dflash2_common_gdn_metadata:
             logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
