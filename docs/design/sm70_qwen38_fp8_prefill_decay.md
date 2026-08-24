@@ -259,14 +259,33 @@ matches 12 eligible long chunks times 16 full-attention layers times two
 requests. KV capacity remains 2,424,439 tokens per rank and no OOM fallback
 occurs.
 
-Quality does not yet justify a default-on promotion. Every lane is internally
-stable between warmup and measurement, and the candidate is token-for-token
-identical to control B for both 256-token outputs. However, identical unsplit
-control A selects a different stable sampled stream despite the same official
-seed. The candidate therefore shows no unique output divergence, but this
-cross-process sampling instability cannot prove equivalence for a non-bitwise
-route. Keep Q8000 split-KV3 explicit and default-off until a deterministic
-greedy/natural-text or dataset-quality gate passes.
+Quality does not yet justify a default-on promotion. Every official-sampling
+lane is internally stable between warmup and measurement, and the candidate
+is token-for-token identical to control B for both 256-token outputs. However,
+identical unsplit control A selects a different stable sampled stream despite
+the same official seed. The candidate therefore shows no unique output
+divergence, but this cross-process sampling instability cannot prove
+equivalence for a non-bitwise route.
+
+A follow-up deterministic greedy gate used three exact-128K natural-text
+requests: two identical Chinese prompts and one Python task. Both control and
+candidate reproduce the duplicate prompt exactly within their own process,
+and all outputs are coherent; both Python outputs stop normally and return the
+same correct `add(a, b)` implementation. The two routes are not token-for-token
+equal, though. The Chinese outputs first differ at token 7 and align for
+126/128 tokens; the Python outputs first differ at token 20, with all 67
+control tokens aligned inside the 70-token candidate stream. Candidate prefill
+times are `47.1360/47.2292/47.3380 s` versus control
+`47.6704/47.8330/47.9274 s`. This unbracketed quality run is directionally
+consistent with the formal A/B/A but is not a replacement performance claim.
+All four candidate ranks report exactly 576 split-KV3 hits, matching three
+requests times 12 eligible chunks times 16 full-attention layers; controls
+report zero.
+
+The semantic smoke passes stability and basic task correctness, but strict
+greedy identity fails. Keep Q8000 split-KV3 explicit and default-off until a
+fixed-text logprob/perplexity or dataset-level quality gate establishes that
+the classified Type-B reduction-order drift does not reduce model quality.
 
 ## Artifacts
 
@@ -280,6 +299,9 @@ greedy/natural-text or dataset-quality gate passes.
   `results/splitkv3-q8000-kv{40000,64000,96000,128000}-v6.json`.
 - Q8000 endpoint A/B/A:
   `results/tp4-128k-splitkv3-q8000-{control-a,candidate,control-b}.json`.
+- Q8000 deterministic quality gate:
+  `results/tp4-128k-splitkv3-q8000-quality-{control,candidate}.json` and the
+  matching files under `logs/`.
 - Shape diagnostic and the zero-hit Q8192 negative run:
   `logs/tp4-splitkv3-shape-diag.log` and
   `results/tp4-128k-splitkv3-{control-a,candidate,control-b}.json`.
