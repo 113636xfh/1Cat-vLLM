@@ -3461,10 +3461,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(out.stride(1) == 1,
               "fp8_gemm_sm70: output must be row-major contiguous.");
   if (exact_8k_prefill_prescaled) {
-    TORCH_CHECK(m == 8000 && k == 5120 && (n == 4096 || n == 3584) &&
-                    !gated_silu,
-                "fp8_gemm_sm70: pre-scaled block-FP8 prefill requires "
-                "M=8000, K=5120, N=4096/3584, and no fused epilogue.");
+    TORCH_CHECK(
+        m == 8000 && k == 5120 && (n == 4096 || n == 3584) && !gated_silu,
+        "fp8_gemm_sm70: pre-scaled block-FP8 prefill requires "
+        "M=8000, K=5120, N=4096/3584, and no fused epilogue.");
   }
   if (gated_silu) {
     TORCH_CHECK((n % 2) == 0,
@@ -3547,8 +3547,8 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
       device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       static_cast<int>(group_size), stream);
   if (exact_8k_prefill_prescaled) {
-    op.dispatch = op.dispatch |
-                  turbomind::gemm::DispatchPolicy::kSm70Fp8PrefillPrescaled;
+    op.dispatch =
+        op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Fp8PrefillPrescaled;
   }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
@@ -3568,11 +3568,9 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
-  const char* raw =
-      std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  return (raw == nullptr || std::atoi(raw) != 0) &&
-         in_feats.size(0) == 8000 && in_feats.size(1) == 5120 &&
-         dense_weight.size(1) == 8704;
+  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
+  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) == 8000 &&
+         in_feats.size(1) == 5120 && dense_weight.size(1) == 8704;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
@@ -3591,19 +3589,17 @@ void fp8_gemm_sm70_prefill_dispatch_out(
       reinterpret_cast<void*>(dense_weight_ptr),
       {in_feats.size(1), tm_weight.size(1)}, in_feats.options());
   fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, group_size);
-  if (gated_silu && sm70_fp8_prefill_cutlass_gated_silu_enabled(
-                        in_feats, dense_weight)) {
-    auto gate_up = at::empty(
-        {in_feats.size(0), dense_weight.size(1)}, in_feats.options());
-    if (sm70_fp8_prefill_cutlass_out(gate_up, in_feats, dense_weight,
-                                       false)) {
+  if (gated_silu &&
+      sm70_fp8_prefill_cutlass_gated_silu_enabled(in_feats, dense_weight)) {
+    auto gate_up =
+        at::empty({in_feats.size(0), dense_weight.size(1)}, in_feats.options());
+    if (sm70_fp8_prefill_cutlass_out(gate_up, in_feats, dense_weight, false)) {
       sm70_silu_and_mul_interleaved_fp16_out(out, gate_up);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
   }
-  if (sm70_fp8_prefill_cutlass_out(out, in_feats, dense_weight,
-                                     gated_silu)) {
+  if (sm70_fp8_prefill_cutlass_out(out, in_feats, dense_weight, gated_silu)) {
     return;
   }
   if (gated_silu) {
@@ -4947,13 +4943,14 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                                     group_size, k_ld, q_ld, gated_silu);
 }
 
-void fp8_gemm_sm70_prefill_prescaled_out(
-    torch::Tensor out, torch::Tensor _in_feats, torch::Tensor _kernel,
-    torch::Tensor _prescaled_factors, int64_t group_size, int64_t k_ld,
-    int64_t q_ld) {
-  vllm::awq_sm70::fp8_gemm_sm70_out(
-      out, _in_feats, _kernel, _prescaled_factors, group_size, k_ld, q_ld,
-      false, true);
+void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
+                                         torch::Tensor _in_feats,
+                                         torch::Tensor _kernel,
+                                         torch::Tensor _prescaled_factors,
+                                         int64_t group_size, int64_t k_ld,
+                                         int64_t q_ld) {
+  vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _prescaled_factors,
+                                    group_size, k_ld, q_ld, false, true);
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(

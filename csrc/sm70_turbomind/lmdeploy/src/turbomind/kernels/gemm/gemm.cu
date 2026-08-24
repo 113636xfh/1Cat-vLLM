@@ -248,8 +248,8 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(
   return std::nullopt;
 }
 
-std::optional<Sm70AwqTp2FastTarget>
-GetSm70Fp8BlockPrefillPrescaledTarget(const GemmDesc& desc) {
+std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
+    const GemmDesc& desc) {
   const std::string desc_str = to_string(desc);
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {

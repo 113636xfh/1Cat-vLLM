@@ -13,27 +13,25 @@ using D = cache_policy::Default;
 
 namespace {
 
-template<class Gemm>
-class Qwen38PrescaledFullTileKernelImpl final: public KernelImpl<Gemm> {
-public:
-    Qwen38PrescaledFullTileKernelImpl()
-    {
-        this->info_.name += "_sm70_fp8_pscale_full";
-    }
+template <class Gemm>
+class Qwen38PrescaledFullTileKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  Qwen38PrescaledFullTileKernelImpl() {
+    this->info_.name += "_sm70_fp8_pscale_full";
+  }
 
-    bool is_feasible(const GemmDesc& desc) const noexcept override
-    {
-        return desc.m == 8000 && (desc.n == 4096 || desc.n == 3584) && desc.k == 5120 && desc.num == 1
-               && KernelImpl<Gemm>::is_feasible(desc);
-    }
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    return desc.m == 8000 && (desc.n == 4096 || desc.n == 3584) &&
+           desc.k == 5120 && desc.num == 1 &&
+           KernelImpl<Gemm>::is_feasible(desc);
+  }
 };
 
 }  // namespace
 
-void Registry::sm70_884_8()
-{
-    if constexpr (1) {
-        // clang-format off
+void Registry::sm70_884_8() {
+  if constexpr (1) {
+    // clang-format off
         using C = Config_E4M3<kColMajor, 0>;
         Add<C::Type<128, 256,  16, 2, 4, 1, D, D, 2, true, 1, 128, 128, 128>>();
         Add<C::Type<128, 128,  16, 2, 2, 1, D, D, 2, true, 1, 128,  64, 128>>();
@@ -52,8 +50,8 @@ void Registry::sm70_884_8()
         using CP = Config_E4M3_Prescaled<kColMajor, 0>;
         using Q38PrescaledFull = CP::Type<64, 256, 16, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
         Add(std::make_unique<Qwen38PrescaledFullTileKernelImpl<typename Q38PrescaledFull::Kernel>>());
-        // clang-format on
-    }
+    // clang-format on
+  }
 }
 
 }  // namespace turbomind::gemm

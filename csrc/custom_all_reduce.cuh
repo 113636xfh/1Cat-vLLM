@@ -633,16 +633,14 @@ __global__ void __launch_bounds__(Threads, 1)
     sm70_peer_reduce_scatter_gemma_rms_norm_all_gather(
         RankData* _input_dp, RankData* _output_dp, RankSignals sg,
         Signal* self_sg, const ResidualT* __restrict__ residual,
-        const WeightT* __restrict__ weight,
-        float* __restrict__ residual_out, int rank, int num_tokens,
-        float epsilon) {
+        const WeightT* __restrict__ weight, float* __restrict__ residual_out,
+        int rank, int num_tokens, float epsilon) {
   static_assert(ngpus == 4);
   using H4 = array_t<half, 4>;
   constexpr int kVarianceVectorWidth = 4;
   constexpr int kVectorsPerRow =
       kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
-  constexpr int kVectorsPerThread =
-      (kVectorsPerRow + Threads - 1) / Threads;
+  constexpr int kVectorsPerThread = (kVectorsPerRow + Threads - 1) / Threads;
 
   __shared__ float inverse_rms;
   // Preserve the accepted local GemmaNorm reduction topology. The valid-item
@@ -1488,8 +1486,8 @@ class CustomAllreduce {
           "SM70 long-prefill fused norm requires fully connected TP" +
           std::to_string(ngpus) + " on SM70.");
     }
-    if (hidden_size != kSm70GemmaRmsNormHiddenSize ||
-        num_tokens <= 0 || num_tokens % ngpus != 0) {
+    if (hidden_size != kSm70GemmaRmsNormHiddenSize || num_tokens <= 0 ||
+        num_tokens % ngpus != 0) {
       throw std::runtime_error(
           "SM70 long-prefill fused norm requires a TP-divisible [M, 5120] "
           "input.");
@@ -1507,12 +1505,12 @@ class CustomAllreduce {
     const int threads = sm70_tp4_long_fused_norm_threads();
     const int blocks =
         std::min(tokens_per_rank, sm70_tp4_long_fused_norm_blocks());
-#define VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(THREADS)                     \
-  sm70_peer_reduce_scatter_gemma_rms_norm_all_gather<                     \
-      THREADS, ngpus, ResidualT, WeightT>                                  \
-      <<<blocks, THREADS, 0, stream>>>(                                    \
-          input_ptrs, output_ptrs, sg_, self_sg_, residual, weight,        \
-          residual_out, rank_, num_tokens, epsilon)
+#define VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(THREADS)                          \
+  sm70_peer_reduce_scatter_gemma_rms_norm_all_gather<THREADS, ngpus,           \
+                                                     ResidualT, WeightT>       \
+      <<<blocks, THREADS, 0, stream>>>(input_ptrs, output_ptrs, sg_, self_sg_, \
+                                       residual, weight, residual_out, rank_,  \
+                                       num_tokens, epsilon)
     switch (threads) {
       case 256:
         VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(256);

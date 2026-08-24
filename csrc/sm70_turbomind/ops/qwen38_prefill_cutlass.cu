@@ -29,8 +29,7 @@ using Sm70Fp8PrefillCutlassKernel =
         cutlass::half_t, cutlass::layout::RowMajor, float,
         cutlass::arch::OpClassTensorOp, cutlass::arch::Sm70,
         cutlass::gemm::GemmShape<128, 256, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32>,
-        cutlass::gemm::GemmShape<8, 8, 4>,
+        cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<8, 8, 4>,
         cutlass::epilogue::thread::LinearCombination<cutlass::half_t, 8, float,
                                                      float>,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 2,
@@ -59,10 +58,8 @@ void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
 
 }  // namespace
 
-bool sm70_fp8_prefill_cutlass_out(torch::Tensor out,
-                                    torch::Tensor in_feats,
-                                    torch::Tensor dense_weight,
-                                    bool gated_silu) {
+bool sm70_fp8_prefill_cutlass_out(torch::Tensor out, torch::Tensor in_feats,
+                                  torch::Tensor dense_weight, bool gated_silu) {
   const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
   if ((raw != nullptr && std::atoi(raw) == 0) || gated_silu ||
       in_feats.dim() != 2 || dense_weight.dim() != 2) {
@@ -74,9 +71,8 @@ bool sm70_fp8_prefill_cutlass_out(torch::Tensor out,
   const bool exact_gate_up = k == 5120 && n == 8704;
   const bool exact_down = k == 4352 && n == 5120;
   const bool exact_attention_output = k == 1536 && n == 5120;
-  if (in_feats.size(0) != 8000 ||
-      (!exact_qkv && !exact_gate_up && !exact_down &&
-       !exact_attention_output)) {
+  if (in_feats.size(0) != 8000 || (!exact_qkv && !exact_gate_up &&
+                                   !exact_down && !exact_attention_output)) {
     return false;
   }
 
@@ -86,9 +82,10 @@ bool sm70_fp8_prefill_cutlass_out(torch::Tensor out,
                   in_feats.scalar_type() == at::ScalarType::Half &&
                   dense_weight.scalar_type() == at::ScalarType::Half,
               "SM70 block-FP8 prefill CUTLASS GEMM expects float16 tensors.");
-  TORCH_CHECK(out.is_contiguous() && in_feats.is_contiguous() &&
-                  dense_weight.is_contiguous(),
-              "SM70 block-FP8 prefill CUTLASS GEMM expects contiguous tensors.");
+  TORCH_CHECK(
+      out.is_contiguous() && in_feats.is_contiguous() &&
+          dense_weight.is_contiguous(),
+      "SM70 block-FP8 prefill CUTLASS GEMM expects contiguous tensors.");
   TORCH_CHECK(out.dim() == 2 && dense_weight.size(0) == k &&
                   out.size(0) == in_feats.size(0) && out.size(1) == n,
               "SM70 block-FP8 prefill CUTLASS GEMM shape mismatch.");
@@ -97,8 +94,8 @@ bool sm70_fp8_prefill_cutlass_out(torch::Tensor out,
   const int m = static_cast<int>(in_feats.size(0));
   const int problem_n = static_cast<int>(n);
   const int problem_k = static_cast<int>(k);
-  auto* dense_ptr = reinterpret_cast<cutlass::half_t*>(
-      dense_weight.data_ptr<at::Half>());
+  auto* dense_ptr =
+      reinterpret_cast<cutlass::half_t*>(dense_weight.data_ptr<at::Half>());
   auto* input_ptr =
       reinterpret_cast<cutlass::half_t*>(in_feats.data_ptr<at::Half>());
   auto* output_ptr =

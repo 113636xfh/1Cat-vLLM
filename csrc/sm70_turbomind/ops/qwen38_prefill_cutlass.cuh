@@ -7,9 +7,7 @@
 
 namespace vllm::awq_sm70 {
 
-bool sm70_fp8_prefill_cutlass_out(torch::Tensor out,
-                                    torch::Tensor in_feats,
-                                    torch::Tensor dense_weight,
-                                    bool gated_silu);
+bool sm70_fp8_prefill_cutlass_out(torch::Tensor out, torch::Tensor in_feats,
+                                  torch::Tensor dense_weight, bool gated_silu);
 
 }  // namespace vllm::awq_sm70

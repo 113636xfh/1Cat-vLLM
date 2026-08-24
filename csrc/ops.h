@@ -202,12 +202,11 @@ void nvfp4_qpn4_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                   bool use_scale_code, bool gated_silu);
 
 void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
-                                      torch::Tensor _in_feats,
-                                      torch::Tensor _kernel,
-                                      torch::Tensor _prescaled_factors,
-                                      int64_t group_size,
-                                      int64_t k_ld,
-                                      int64_t q_ld);
+                                         torch::Tensor _in_feats,
+                                         torch::Tensor _kernel,
+                                         torch::Tensor _prescaled_factors,
+                                         int64_t group_size, int64_t k_ld,
+                                         int64_t q_ld);
 
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
