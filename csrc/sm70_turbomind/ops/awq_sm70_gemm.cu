@@ -7862,7 +7862,12 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       logged_nvfp4_dense_stage,
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
-  constexpr int kNvfp4MaxCompactGroups = 8 * 8;
+  constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
+  // Cover the Qwen3.6 C2 verifier bound. Duplicate expert selections
+  // remain separate one-row groups, so this is a routed-slot bound rather
+  // than an active-expert bound. Keep the dense-grouped cutoff independent:
+  // a disabled compact route above 64 rows must not fall back per expert.
+  constexpr int kNvfp4MaxCompactGroups = 10 * 8;
   const bool compact_decode_shape =
       input.size(0) == num_experts && num_experts <= kNvfp4MaxCompactGroups;
   if (compact_decode_shape) {
@@ -7872,7 +7877,7 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
     return;
   }
   const bool exact_qwen36_prefill_shape =
-      input.size(0) > kNvfp4MaxCompactGroups && num_experts == 256 &&
+      input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 256 &&
       ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
        (n == 2048 && (k == 512 || k == 256 || k == 128)));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&

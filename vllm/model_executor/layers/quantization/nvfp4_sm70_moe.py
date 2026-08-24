@@ -44,7 +44,7 @@ _QWEN36_NUM_EXPERTS: Final = 256
 _QWEN36_TOP_K: Final = 8
 _QWEN36_SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
-_COMPACT_GROUPED_MAX_TOKENS: Final = 8
+_COMPACT_GROUPED_MAX_TOKENS: Final = 10
 
 
 @triton.jit
@@ -322,6 +322,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_w2_n_dim = hidden
         layer.sm70_nvfp4_group_size = NVFP4_GROUP_SIZE
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
+        layer.sm70_nvfp4_compact_grouped_max_tokens = _COMPACT_GROUPED_MAX_TOKENS
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight

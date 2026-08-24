@@ -42381,11 +42381,13 @@ Interpretation:
   measured `535.635/524.376/539.113 tok/s`; the candidate endpoint mean is
   `+2.48%`, summed pure decode is `+2.85%`, and P50 TPOT improves about `4.0%`
   with stable MTP acceptance.
-- Two low-width target-MoE candidates are rejected. Directly reusing sorted
-  expert IDs instead of the compact metadata copy regressed the C1 sandwich;
-  splitting B9/B10 into correctness-bounded 64-slot compact chunks was
-  numerically healthy but `41.5%/10.3%` slower. Direct compact execution above
-  64 slots remains correctness-invalid and must not be retried.
+- Two earlier low-width target-MoE candidates are rejected. Directly reusing
+  sorted expert IDs instead of the compact metadata copy regressed the C1
+  sandwich; splitting B9/B10 into 64-slot compact chunks was numerically
+  healthy but `41.5%/10.3%` slower. The old conclusion that every direct
+  compact execution above 64 slots was invalid was too broad: that experiment
+  coalesced repeated expert IDs even though TurboMind's forced-one-row
+  scheduler requires each routed slot to remain an independent group.
 - A C1 Nsight graph-node trace identified the bundled unquantized MTP drafter
   MoE as a separate `2.825 ms` per-cycle hotspot. An initial oracle incorrectly
   used the checkpoint-global I512 shape. The first candidate startup log proved
@@ -42433,4 +42435,42 @@ Interpretation:
   source change is therefore restricted to combined top-k plus top-p on SM70
   with Qwen3.6's exact vocabulary; setting
   `VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS=0` restores Triton's default launch.
-- The final six-point GPU0-3 curve and GSM8K/ShareGPT quality remain required.
+- Corrected slot-independent compact metadata is finite and route-correct on a
+  real TP4 layer through B20. B9 is bitwise equal to the dense route. B10 has
+  cosine at least `0.99999988`, relative L2 at most `1.0115e-4`, and maximum
+  absolute error `2.38e-7`; its isolated graph stage is `1.091x` faster. The
+  production candidate stops at B10/80 routed slots and prewarms the exact
+  B1-B10 metadata signatures before CUDA Graph capture.
+- A physical-GPU4-7 C2 candidate/control/candidate sandwich accepts B10.
+  Output was `154.608/147.135/160.890 tok/s`; candidate-mean output improves
+  `7.21%`. Pure decode was `91.962/89.762/94.566 tok/s`, a `3.90%` candidate
+  mean gain. Candidate mean acceptance length was lower than control
+  (`2.909` versus `2.963`), so acceptance does not explain the win. Extending
+  compact routing through B20 is rejected by a matching C4 sandwich: candidate
+  mean output/pure decode regressed `1.90%/2.48%`, with P50 TPOT about `1.18%`
+  worse. B11+ therefore keeps the 256-expert dense-grouped route.
+- The final B10 48-request curve on one exclusive physical-GPU4-7 claim is:
+
+  | concurrency | output tok/s | efficiency vs C1 | pure decode tok/s | serial prefill tok/s | P50 TPOT ms | mean acceptance |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 97.693 | 100.00% | 114.247 | 564.795 | 8.522 | 2.890 |
+  | 2 | 150.736 | 77.15% | 90.851 | 423.341 | 10.207 | 2.946 |
+  | 4 | 246.399 | 63.05% | 71.322 | 596.885 | 13.559 | 2.884 |
+  | 8 | 350.834 | 44.89% | 52.398 | 629.601 | 20.006 | 2.969 |
+  | 12 | 444.117 | 37.88% | 46.313 | 631.019 | 22.274 | 2.909 |
+  | 16 | 530.810 | 33.96% | 44.734 | 720.400 | 23.478 | 2.900 |
+
+- Relative to the preceding final-source single-run curve, output/pure-decode
+  movement was C1 `-2.73/-3.08%`, C2 `+3.13/+2.41%`, C4
+  `-0.73/-0.18%`, C8 `-2.93/-2.99%`, C12 `+4.21/+3.93%`, and C16
+  `-4.47/-6.38%`. This alternating high-width movement is not attributable to
+  the bounded B10 route; B11+ still uses the same dense-grouped main shape and
+  only drain-tail widths can reach B9/B10. Treat B10 as a low-concurrency win,
+  not as high-concurrency recovery.
+- The next target-side candidate must compact GPU-resident active expert IDs
+  for B20/B40/B60/B80 and use a device-count guard with an exact full-group
+  fallback. It may reduce padded grouped scheduling without a host readback or
+  a probabilistic correctness assumption. A persistent tile scheduler remains
+  the larger follow-up if guarded active-group bucketing cannot beat its extra
+  CUDA Graph launch. The B10 GSM8K-128 quality gate remains pending while the
+  physical TP4 GPUs are occupied by an unrelated task.
