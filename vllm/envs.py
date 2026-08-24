@@ -156,8 +156,12 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
+    VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
+    VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -178,6 +182,9 @@ if TYPE_CHECKING:
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
+    VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
+    VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
+    VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -185,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
+    VLLM_SM70_TP4_SMALL_AR_PACK32: bool = False
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_MOE_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_F16_DENSE_MAX_M: int = 64
@@ -199,6 +207,9 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
+    VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
+    VLLM_SM70_NVFP4_QPN4: bool = True
+    VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -1610,6 +1621,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
+    # Memory-neutral QPN8 layout for model-, shape-, and runtime-gated
+    # Qwen3.8 TP4 no-MTP dense projections. Pure-FP8 checkpoints must opt in;
+    # a mixed NVFP4 checkpoint may select its separately validated default in
+    # the compressed-tensors scheme. Explicit 0 disables both routes.
+    "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Optional source-built QPN8-only extension. Production builds leave this
+    # unset because the same operators are linked into vllm._C.
+    "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
+    "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -1672,6 +1692,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))
+    ),
+    "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))
@@ -1789,6 +1812,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_SM70_TP4_M5_AR_THREADS" in os.environ
         else None
     ),
+    "VLLM_SM70_TP4_SMALL_AR_PACK32": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_SMALL_AR_PACK32", "0"))
+    ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
     "VLLM_SM70_TOP1_CUSTOM_AR": lambda: bool(
@@ -1846,6 +1872,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the compact active-expert route; larger graph shapes use full groups.
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))
+    ),
+    "VLLM_SM70_NVFP4_DENSE_GATED_SILU": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))
+    ),
+    # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
+    # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
+    # shared FP16 workspace. Set to 0 to retain the TurboMind NVFP4 route.
+    "VLLM_SM70_NVFP4_QPN4": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4", "1"))),
+    "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE", "0"))
+    ),
+    # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
+    # The base flag enables exact compact sampling after full-logits gather.
+    # The separate TP-local flag opts into rank-local top-20 reduction.
+    "VLLM_SM70_COMPACT_TOPK20_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_SM70_COMPACT_TOPK20_SAMPLER", "0"))
+    ),
+    "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": lambda: int(
+        os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")
+    ),
+    "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))

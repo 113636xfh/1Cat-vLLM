@@ -1096,6 +1096,11 @@ bool nvfp4_moe_grouped_prefill_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
 bool fp8_moe_single_token_per_expert_dispatch_enabled() {
   const char* raw =
       std::getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH");
@@ -1313,6 +1318,11 @@ turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
 
 turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
+  if (nvfp4_qwen38_tp4_m1_fast_selector_enabled() && m == 1 &&
+      group_size == 16 &&
+      ((n == 8704 && k == 5120) || (n == 5120 && k == 4352))) {
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
       nvfp4_tune_small_shapes_enabled(), false, nvfp4_dense_tune_max_m());
@@ -2401,8 +2411,7 @@ __global__ void fp8_sm70_dequantize_kernel(
   }
 
   const int words_per_n_tile = k / kFp8QuantValuesPerWord;
-  const int n_in_tile =
-      static_cast<int>(word_index % kFp8OutputColumnsPerTile);
+  const int n_in_tile = static_cast<int>(word_index % kFp8OutputColumnsPerTile);
   const int64_t tile_word = word_index / kFp8OutputColumnsPerTile;
   const int k_word = static_cast<int>(tile_word % words_per_n_tile);
   const int n_tile = static_cast<int>(tile_word / words_per_n_tile);
@@ -2411,10 +2420,12 @@ __global__ void fp8_sm70_dequantize_kernel(
   const int group = k_base / group_size;
 
   const uint2 quant = reinterpret_cast<const uint2*>(packed_weight)[word_index];
-  const auto& quant_lo = reinterpret_cast<
-      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.x);
-  const auto& quant_hi = reinterpret_cast<
-      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.y);
+  const auto& quant_lo =
+      reinterpret_cast<const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(
+          quant.x);
+  const auto& quant_hi =
+      reinterpret_cast<const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(
+          quant.y);
   const auto half_lo = turbomind::cvt_f16x4_e4m3(quant_lo);
   const auto half_hi = turbomind::cvt_f16x4_e4m3(quant_hi);
   const __half scale = packed_scales[static_cast<int64_t>(group) * n + col];
@@ -2439,10 +2450,8 @@ __global__ void fp8_sm70_dequantize_kernel(
       __hmul(half_hi[3], scale);
 }
 
-void fp8_sm70_dequantize_out(torch::Tensor output,
-                             torch::Tensor packed_weight,
-                             torch::Tensor packed_scales,
-                             int64_t group_size) {
+void fp8_sm70_dequantize_out(torch::Tensor output, torch::Tensor packed_weight,
+                             torch::Tensor packed_scales, int64_t group_size) {
   TORCH_CHECK(
       output.is_cuda() && packed_weight.is_cuda() && packed_scales.is_cuda(),
       "SM70 FP8 prefill dequant expects CUDA tensors.");
@@ -2462,8 +2471,7 @@ void fp8_sm70_dequantize_out(torch::Tensor output,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const int64_t k = output.size(0);
   const int64_t n = output.size(1);
-  TORCH_CHECK(k % group_size == 0 &&
-                  k % kFp8QuantValuesPerWord == 0 &&
+  TORCH_CHECK(k % group_size == 0 && k % kFp8QuantValuesPerWord == 0 &&
                   n % kFp8OutputColumnsPerTile == 0,
               "SM70 FP8 prefill dequant shape alignment mismatch.");
   TORCH_CHECK(packed_weight.numel() == k * n,
@@ -2476,15 +2484,14 @@ void fp8_sm70_dequantize_out(torch::Tensor output,
               "SM70 FP8 prefill tensors must share a device.");
 
   const int64_t words = packed_weight.numel() / kFp8QuantValuesPerWord;
-  const int blocks = static_cast<int>(
-      (words + kFp8PrefillDequantThreads - 1) / kFp8PrefillDequantThreads);
+  const int blocks = static_cast<int>((words + kFp8PrefillDequantThreads - 1) /
+                                      kFp8PrefillDequantThreads);
   fp8_sm70_dequantize_kernel<<<blocks, kFp8PrefillDequantThreads, 0,
                                at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
       packed_weight.data_ptr<uint8_t>(),
       reinterpret_cast<const __half*>(packed_scales.data_ptr<at::Half>()),
-      static_cast<int>(k), static_cast<int>(n),
-      static_cast<int>(group_size));
+      static_cast<int>(k), static_cast<int>(n), static_cast<int>(group_size));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2819,10 +2826,13 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
   const int64_t k = qweight.size(1);
   TORCH_CHECK(k % 8 == 0 && n % 8 == 0,
               "fp8_sm70_prepare: K and N must be multiples of 8.");
-  TORCH_CHECK(scales.size(0) == (n + group_size - 1) / group_size,
-              "fp8_sm70_prepare: output scale block mismatch.");
-  TORCH_CHECK(scales.size(1) == (k + group_size - 1) / group_size,
-              "fp8_sm70_prepare: input scale block mismatch.");
+  const bool channelwise_scales = scales.size(0) == n && scales.size(1) == 1;
+  const bool blockwise_scales =
+      scales.size(0) == (n + group_size - 1) / group_size &&
+      scales.size(1) == (k + group_size - 1) / group_size;
+  TORCH_CHECK(channelwise_scales || blockwise_scales,
+              "fp8_sm70_prepare: expected [N, 1] channel scales or "
+              "[ceil(N/128), ceil(K/128)] block scales.");
 
   const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
@@ -2886,12 +2896,21 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
   const bool is_B_s = !is_A_s;
   const int64_t num_groups = (k + group_size - 1) / group_size;
 
-  auto group_scales = scales.transpose(0, 1)
-                          .contiguous()
-                          .to(torch::kFloat16)
-                          .repeat_interleave(group_size, 1)
-                          .slice(1, 0, n)
-                          .contiguous();
+  torch::Tensor group_scales;
+  if (channelwise_scales) {
+    group_scales = scales.transpose(0, 1)
+                       .contiguous()
+                       .to(torch::kFloat16)
+                       .repeat({num_groups, 1})
+                       .contiguous();
+  } else {
+    group_scales = scales.transpose(0, 1)
+                       .contiguous()
+                       .to(torch::kFloat16)
+                       .repeat_interleave(group_size, 1)
+                       .slice(1, 0, n)
+                       .contiguous();
+  }
   if (interleave_gated_silu) {
     group_scales = interleave_gated_silu_cols(group_scales);
   }

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,6 +10,40 @@ import torch
 from vllm.platforms import current_platform
 
 current_platform.import_kernels()
+
+
+def _maybe_load_fp8_qpn8_library() -> None:
+    """Load an explicitly selected source-built QPN8 extension.
+
+    Production builds register these operators in ``vllm._C``. This opt-in
+    path lets source experiments add only the QPN8 operators to an otherwise
+    compatible installed build, including in spawned TP workers.
+    """
+    if os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1":
+        return
+    library_path = os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY")
+    if library_path:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_fp8_qpn8_library()
+
+
+def _maybe_load_sm70_sampler_library() -> None:
+    """Load the sampler fragment only when the main ``vllm._C`` lacks it."""
+    if hasattr(torch.ops._C, "sm70_sample_chunked_top20_philox_token_out"):
+        return
+
+    library_path = os.getenv("VLLM_SM70_SAMPLER_LIBRARY")
+    if library_path is None:
+        bundled = sorted(Path(__file__).resolve().parent.glob("_sm70_sampler_C*.so"))
+        if bundled:
+            library_path = str(bundled[-1])
+    if library_path is not None:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_sm70_sampler_library()
 
 if TYPE_CHECKING:
 
@@ -416,6 +452,356 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         group_size: int,
         k_ld: int,
         q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_prepare_sm70(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack checkpoint-native block/channel FP8 weights into QPN8 layout."""
+    return _op("fp8_qpn8_prepare_sm70")(qweight, scales)
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
+
+    @register_fake("_C::fp8_qpn8_prepare_sm70")
+    def _fp8_qpn8_prepare_sm70_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        n = qweight.size(0)
+        k = qweight.size(1)
+        codes = torch.empty((k, n), dtype=torch.uint8, device=qweight.device)
+        scale_shape = (1, n) if scales.shape == (n, 1) else (k // 128, n // 32)
+        group_scales = torch.empty(
+            scale_shape, dtype=torch.float16, device=scales.device
+        )
+        return [codes, group_scales]
+
+
+def fp8_qpn8_dequantize_sm70_out(
+    out: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+) -> None:
+    """Materialize one QPN8 weight into a caller-owned FP16 workspace."""
+    _op("fp8_qpn8_dequantize_sm70_out")(out, codes, group_scales)
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dequantize_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dequantize_sm70_out")
+    def _fp8_qpn8_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_prefill_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    gated_silu: bool,
+) -> None:
+    """Dequantize QPN8 into bounded workspace and run a large-M FP16 GEMM."""
+    _op("fp8_qpn8_prefill_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_prefill_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_prefill_sm70_out")
+    def _fp8_qpn8_prefill_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_dispatch_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    """Runtime-dispatch dynamic M without specializing a Python branch."""
+    _op("fp8_qpn8_dispatch_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dispatch_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dispatch_sm70_out")
+    def _fp8_qpn8_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        prefetch_codes: bool,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the SM70 QPN8 FP8 GEMM into ``out``.
+
+    The model- and shape-gated automatic route and operator benchmark share
+    this entry point. ``codes`` and ``group_scales`` use the QPN8 layout.
+    """
+    _op("fp8_qpn8_gemm_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gemm_sm70_out")
+    def _fp8_qpn8_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_gated_pair_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the single-kernel paired-tile QPN8 gated SiLU experiment."""
+    _op("fp8_qpn8_gated_pair_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gated_pair_sm70_out")
+    def _fp8_qpn8_gated_pair_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn4_prepare_sm70(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack unpacked FP4 weights and FP16 group scales into QPN4 layout."""
+    return _op("nvfp4_qpn4_prepare_sm70")(qweight, scales)
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn4_prepare_sm70"):
+
+    @register_fake("_C::nvfp4_qpn4_prepare_sm70")
+    def _nvfp4_qpn4_prepare_sm70_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        k, n = qweight.shape
+        codes = torch.empty((k, n // 2), dtype=torch.uint8, device=qweight.device)
+        packed_scales = torch.empty_like(scales)
+        return [codes, packed_scales]
+
+
+def nvfp4_qpn4_prepare_scale_code_sm70(
+    qweight: torch.Tensor,
+    scale_codes: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack unpacked FP4 weights and checkpoint E4M3 group-scale codes."""
+    return _op("nvfp4_qpn4_prepare_scale_code_sm70")(qweight, scale_codes)
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn4_prepare_scale_code_sm70"):
+
+    @register_fake("_C::nvfp4_qpn4_prepare_scale_code_sm70")
+    def _nvfp4_qpn4_prepare_scale_code_sm70_fake(
+        qweight: torch.Tensor,
+        scale_codes: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        k, n = qweight.shape
+        codes = torch.empty((k, n // 2), dtype=torch.uint8, device=qweight.device)
+        packed_scale_codes = torch.empty(
+            (k // 16, n),
+            dtype=torch.uint8,
+            device=scale_codes.device,
+        )
+        return [codes, packed_scale_codes]
+
+
+def nvfp4_qpn4_dequantize_sm70_out(
+    out: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    use_scale_code: bool,
+) -> None:
+    _op("nvfp4_qpn4_dequantize_sm70_out")(
+        out, codes, scales, global_scale, use_scale_code
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn4_dequantize_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn4_dequantize_sm70_out")
+    def _nvfp4_qpn4_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        use_scale_code: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn4_prefill_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    use_scale_code: bool,
+    gated_silu: bool,
+) -> None:
+    _op("nvfp4_qpn4_prefill_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        scales,
+        global_scale,
+        use_scale_code,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn4_prefill_sm70_out")
+    def _nvfp4_qpn4_prefill_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        use_scale_code: bool,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn4_dispatch_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    use_scale_code: bool,
+    gated_silu: bool,
+) -> None:
+    """Dispatch exact M=1 decode or bounded-workspace large-M prefill."""
+    _op("nvfp4_qpn4_dispatch_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        scales,
+        global_scale,
+        use_scale_code,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn4_dispatch_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn4_dispatch_sm70_out")
+    def _nvfp4_qpn4_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        use_scale_code: bool,
         gated_silu: bool,
     ) -> None:
         return None
@@ -979,6 +1365,114 @@ if hasattr(torch.ops._C, "sm70_sample_packed_top20_out"):
         gathered_pairs: torch.Tensor,
         exponential: torch.Tensor,
         top_p: float,
+    ) -> None:
+        return None
+
+
+def sm70_sample_sorted_top20_philox_out(
+    sampled_token_out: torch.Tensor,
+    sparse_ids_out: torch.Tensor,
+    sparse_probs_out: torch.Tensor,
+    top_values: torch.Tensor,
+    top_indices: torch.Tensor,
+    generator: torch.Generator | None,
+    vocab_size: int,
+    top_p: float,
+) -> None:
+    _op("sm70_sample_sorted_top20_philox_out")(
+        sampled_token_out,
+        sparse_ids_out,
+        sparse_probs_out,
+        top_values,
+        top_indices,
+        generator,
+        vocab_size,
+        top_p,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_sample_sorted_top20_philox_out"):
+
+    @register_fake("_C::sm70_sample_sorted_top20_philox_out")
+    def _sm70_sample_sorted_top20_philox_out_fake(
+        sampled_token_out: torch.Tensor,
+        sparse_ids_out: torch.Tensor,
+        sparse_probs_out: torch.Tensor,
+        top_values: torch.Tensor,
+        top_indices: torch.Tensor,
+        generator: torch.Generator | None,
+        vocab_size: int,
+        top_p: float,
+    ) -> None:
+        return None
+
+
+def sm70_sample_sorted_top20_philox_token_out(
+    sampled_token_out: torch.Tensor,
+    top_values: torch.Tensor,
+    top_indices: torch.Tensor,
+    generator: torch.Generator | None,
+    vocab_size: int,
+    top_p: float,
+) -> None:
+    _op("sm70_sample_sorted_top20_philox_token_out")(
+        sampled_token_out,
+        top_values,
+        top_indices,
+        generator,
+        vocab_size,
+        top_p,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_sample_sorted_top20_philox_token_out"):
+
+    @register_fake("_C::sm70_sample_sorted_top20_philox_token_out")
+    def _sm70_sample_sorted_top20_philox_token_out_fake(
+        sampled_token_out: torch.Tensor,
+        top_values: torch.Tensor,
+        top_indices: torch.Tensor,
+        generator: torch.Generator | None,
+        vocab_size: int,
+        top_p: float,
+    ) -> None:
+        return None
+
+
+def sm70_sample_chunked_top20_philox_token_out(
+    sampled_token_out: torch.Tensor,
+    global_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    global_positions: torch.Tensor,
+    generator: torch.Generator | None,
+    vocab_size: int,
+    top_p: float,
+    chunk_size: int,
+) -> None:
+    _op("sm70_sample_chunked_top20_philox_token_out")(
+        sampled_token_out,
+        global_values,
+        local_indices,
+        global_positions,
+        generator,
+        vocab_size,
+        top_p,
+        chunk_size,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_sample_chunked_top20_philox_token_out"):
+
+    @register_fake("_C::sm70_sample_chunked_top20_philox_token_out")
+    def _sm70_sample_chunked_top20_philox_token_out_fake(
+        sampled_token_out: torch.Tensor,
+        global_values: torch.Tensor,
+        local_indices: torch.Tensor,
+        global_positions: torch.Tensor,
+        generator: torch.Generator | None,
+        vocab_size: int,
+        top_p: float,
+        chunk_size: int,
     ) -> None:
         return None
 

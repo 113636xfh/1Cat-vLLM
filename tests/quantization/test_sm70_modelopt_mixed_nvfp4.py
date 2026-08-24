@@ -169,7 +169,10 @@ def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent():
 
     _prepare_compact_slot_groups(sorted_expert_ids, compact_offsets, active_expert_ids)
 
-    assert torch.equal(compact_offsets.cpu(), torch.arange(9, dtype=torch.int32))
+    assert torch.equal(
+        compact_offsets.cpu(),
+        torch.arange(9, dtype=torch.int32, device="cpu"),
+    )
     assert torch.equal(active_expert_ids.cpu(), sorted_expert_ids.cpu())
 
 

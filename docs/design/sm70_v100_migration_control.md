@@ -42156,3 +42156,147 @@ Interpretation:
   deterministic greedy/natural-text or dataset-quality gate passes. Evidence
   is under
   `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824/`.
+
+## 2026-08-23 Qwen3.8-27B-FP8 TP4 no-MTP QPN8 decode acceptance
+
+- Integration base is `7aede2cf01`; the owned source worktree and Draft PR are
+  `codex/v100-qwen38-fp8-qpn8-operator-race-20260822-114943` and PR 258.
+- Added a memory-neutral SM70 QPN8 weight layout and direct decode operators for
+  the accepted TP-local gate/up `(K,N)=(5120,8704)`, down `(4352,5120)`, and
+  output `(1536,5120)` projections. GDN input and full-attention QKV remain on
+  TurboMind. The old layout is replaced at load time rather than retained.
+- Opt-in admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
+  TP4, no MTP, and configured `max_num_seqs <= 8`. Native QPN8 handles M=1-8.
+  Wider-concurrency and MTP configurations retain TurboMind until their own
+  performance and quality gates pass; this is not a batch-one-only dispatch.
+- The opaque C++ M dispatch prevents an AOTInductor M=1 trace from being reused
+  for prefill. M>8 remains functionally correct through one bounded 85 MiB FP16
+  weight workspace, but fused gate/up additionally creates an `M x 8704` FP16
+  temporary and is not accepted as a high-concurrency performance route.
+- Complete-source no-MTP E5M2 TP4 A/B at input 1024 and output cap 256 measured
+  TurboMind at `16.961295 ms/token`, `58.958 tok/s`, and QPN8 at
+  `16.347973 ms/token`, `61.170 tok/s` (`+3.752%`). The candidate stopped
+  normally at token 233; the control finished all 256 tokens. An earlier
+  matched operator-integration run measured `15.808000 ms/token`,
+  `63.259 tok/s` (`+7.448%`) and remains headroom evidence, not the conservative
+  complete-source observation. Because these arms contain 255 versus 232
+  steady intervals, respectively, this is not a pure-FP8 default-promotion
+  result; an equal-interval same-source rerun remains required.
+- Nsight Systems attributes about `0.944 ms/token` of the trace improvement to
+  dense service (`10.335 -> 9.391 ms`), while launch count and GPU idle time are
+  unchanged. The QPN8 dense service spends 6.172 ms in the 75-90% DRAM band and
+  7.059 ms in the 25-50% SM band; no dense kernel sustains at least 90% DRAM or
+  50% SM. Useful dense arithmetic rises from 1.177 to 1.295 TFLOP/s per GPU.
+- The quality gate passed without a measured regression: WikiText PPL/byte PPL
+  and bits/byte improved slightly, GSM8K flexible accuracy was equal and strict
+  accuracy improved by one item, all measured MMLU subjects were equal or
+  better, and all measured C-Eval subjects were equal. Sampled token identity
+  is therefore not used as the sole acceptance criterion.
+- Full evidence and artifact paths are recorded in
+  `docs/design/sm70_qwen38_qpn8_decode.md`. Next work is a measured single-launch
+  M=9/11/16 row-tile route, followed by larger concurrency crossovers; do not
+  compose an eight-row launch with a separate tail or promote the current
+  large-M temporary as an accepted throughput implementation.
+
+## 2026-08-23 Qwen3.8-27B-NVFP4 TP4 decode recovery
+
+- Recovered the mixed NVFP4/channel-FP8 checkpoint without crediting Marlin:
+  accepted FP8 projection shapes use QPN8, remaining FP8 projections and the
+  LM head use TurboMind W8A16, and NVFP4 uses TurboMind W4A16.
+- Added channelwise FP8 TurboMind packing, exact NVFP4 N32 selectors, E4M3
+  Flash-V100 XQA, QPN8 split-12 for the K1536 x N5120 output projection, and
+  an exact B1/G6/D256 E4M3 p64 attention partition.
+- Frozen TP4 I1024/O256, E4M3 KV, official random sampling, no-MTP, and full
+  CUDA graph decode first measured 71.732 tok/s at 13.941 ms/token with the
+  native sampler. After merging current `onecat/main` at `675a12dedc` and
+  rebuilding Flash-V100, the frozen request reconfirmed **71.342 tok/s** at
+  **14.017 ms/token**. The clean p128 control is 69.904 tok/s at
+  14.305 ms/token.
+- The p64 operator sweep saves 9.55-16.98 us per attention launch from sequence
+  lengths 1025-2049. All p64/p128 cases stay within one FP16 output ULP of the
+  scalar reference; the focused GPU suite passes 6/6.
+- Compact and fused top-k20 sampler experiments were removed because their
+  sampled trajectories were not deterministic against the native route. They
+  are not part of either accepted p64 result.
+- Post-merge checks pass: 12/12 focused CPU policy/dispatch cases, 6/6 E4M3
+  XQA GPU numerical cases, Ruff lint/format, and `git diff --check`. The final
+  `_C` and Flash-V100 SHA256 values are `e0ea14d0...7624` and
+  `b418fed8...dce7`.
+- The latest merged p64 Nsight Systems trace captures 63 decode replays on all
+  four ranks. Steady replay/GPU-union time is 14.621/14.055 ms, GPU activity
+  union is 96.136%, and the route launches 1140.8 kernels/rank/token. NVML
+  samples show 99.47% GPU busy-window duty but only 48.26% memory-active duty;
+  69.40% of service has a grid-limited occupancy ceiling below 25%. Current NCU
+  counters remain unavailable because the driver rejects non-root counter
+  access with `ERR_NVGPUCTRPERM`; do not present NVML duty or effective payload
+  rates as achieved SM or HBM throughput.
+- Full contract, route map, staged results, profile table, numerical evidence,
+  rejected paths, rollback controls, and artifacts are in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-24 Qwen3.8-27B-NVFP4 TP4 no-MTP 80 tok/s acceptance
+
+- The frozen input-1024/output-256 TP4 contract now passes the requested
+  no-MTP speed gate. The production CMake C++17 sampler-sidecar run measures
+  **80.624 tok/s** at **12.403 ms/token**. Three behavior-equivalent hand
+  sidecar repeats measure 80.177, 80.164, and 80.026 tok/s, including a repeat
+  on physical GPUs 4-7. Pure decode excludes TTFT and prefill.
+- The deployment retains the proven-faster exact-shape QPN8 projections. GDN
+  input, full-attention QKV, and the LM head continue through TurboMind W8A16;
+  non-admitted NVFP4 cases retain TurboMind fallback. The accepted batch-one
+  NVFP4 shapes use native QPN4, E4M3 attention uses Flash-V100 XQA p64, and TP4
+  communication uses the pack32 one-stage all-reduce. MTP is disabled.
+- The quality gate passes at the frozen baseline: the production sidecar scores
+  **226/250 (90.4%)** on the first 250 GSM8K questions with five-shot greedy
+  prompting and has zero invalid outputs. The baseline is also 226/250; the
+  hand-sidecar result is 227/250. Per-question prompts, texts, token IDs,
+  extracted answers, labels, correctness, and hashes are retained in the JSON.
+- The production sidecar and hand-built validation library select identical
+  tokens for 100 independent seeds and 256 sequential Philox draws and finish
+  with the same generator state. This exact implementation supersedes the
+  earlier rejected compact/fused sampler experiments, which did not preserve
+  native Philox behavior.
+- The accepted compatible main `_C`, production sampler sidecar, and
+  Flash-V100 SHA256 values are `a0a0cd9...d36d`, `cdbfdd87...9ae`, and
+  `b418fed8...dce7`. The sampler is intentionally a separate CMake/wheel module
+  so registering it does not relink the frozen main library.
+- The latest 63-replay/rank Nsight Systems trace shows a 13.430 ms mean replay
+  interval, 12.887 ms GPU activity union (95.958%), 0.543 ms idle, and 1061.9
+  launches/rank/token. QPN8 split-16, QPN4 gate/up, TP all-reduce, QPN4 down,
+  QPN8 output, XQA, QPN8 gate/up, and TurboMind FP8 service contribute 2.213,
+  2.165, 1.587, 1.441, 0.915, 0.618, 0.496, and 0.410 ms/token respectively.
+- NVML reports 100% busy-window duty, 53.25% memory-active duty, about 28.97
+  GiB allocated per GPU, and 56.36% of the 300 W limit. Grid-limited occupancy
+  ceilings put 86.32% of service below 50% occupancy. These are not achieved
+  SM/Tensor/HBM counters; Nsight Compute remains blocked by
+  `ERR_NVGPUCTRPERM`.
+- Current-source rebuild closure is complete at source snapshot `7bd1d783e4`.
+  A clean primary `_C` plus clean C++17 sampler measured 77.314 tok/s in the
+  cold A1 observation and **80.181 tok/s** at **12.472 ms/token** in A2. A2
+  exactly matches the accepted C++17 256-token stream and records
+  `speculative_config=None` plus `spec_decoding_metrics=null`.
+- The clean primary and sampler SHA256 values are `c5d7c6a9...3e56` and
+  `3058051f...bc74`. Their `.nv_fatbin` SHA256 values, `dbba7402...26e6` and
+  `9a89e8cc...b2c`, are byte-identical to the accepted binaries. Full ELF
+  hashes differ only across host/link content: merged main adds two unrelated
+  ModelOpt NVFP4 MoE host entry points, while the sampler includes host
+  build-ID differences. These do not enter the accepted dense batch-one graph.
+- The clean A2 result SHA256 is `4e6ed330...bb1`; its serialized token-array
+  SHA256 is `f50e0eba...e32`, exactly matching the accepted production C++17
+  run. Device-binary and sampled-stream identity carry forward the already
+  passed **226/250 (90.4%)**, zero-invalid GSM8K gate. The separate sampler
+  module remains the packaging boundary, but current-source primary rebuilds
+  are no longer rejected merely because the full ELF hash changes.
+- Focused CMake installation puts the modules at `vllm/_C.abi3.so` and the
+  CPython-3.12 SOABI sampler filename, strips build-tree RPATHs, and preserves
+  both accepted fatbins. The installed SHA256 values are `d7ed490e...6749` and
+  `8ee84663...55e`. Loading both staged files registers QPN4, QPN8, and the
+  packed top-20 sampler schemas. This closes the relevant install boundary
+  without rebuilding 50 unrelated wheel-target objects.
+- Final focused regressions pass 94/94 target sampler, NVFP4-admission, and
+  SM70 TurboMind-adapter tests; the post-merge four-file run including the
+  adjacent ModelOpt route passes 106/106. Ruff lint/format, Python byte
+  compilation, the sidecar wheel filename gate, and `git diff --check` also
+  pass.
+- Full results, route details, quality artifacts, trace/resource tables, and
+  exact evidence paths are in `docs/design/sm70_qwen38_nvfp4_decode.md`.
