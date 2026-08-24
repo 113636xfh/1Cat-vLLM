@@ -56,6 +56,22 @@ class ModelServingDefaults:
     # tokens. A request-supplied value always wins.
     repetition_detection_defaults: dict[str, int] | None = None
 
+    # Optional multi-image request profile (e.g. multi-page document
+    # parsing uses a different anti-repetition window). ``None`` falls back
+    # to the single-image values above. Bounds apply to both profiles.
+    sampling_defaults_multi_image: dict[str, Any] | None = None
+    extra_args_defaults_multi_image: dict[str, Any] | None = None
+
+    def sampling_defaults_for(self, num_image_items: int) -> dict[str, Any]:
+        if num_image_items > 1 and self.sampling_defaults_multi_image is not None:
+            return self.sampling_defaults_multi_image
+        return self.sampling_defaults
+
+    def extra_args_defaults_for(self, num_image_items: int) -> dict[str, Any]:
+        if num_image_items > 1 and self.extra_args_defaults_multi_image is not None:
+            return self.extra_args_defaults_multi_image
+        return self.extra_args_defaults
+
 
 _REGISTRY: dict[str, ModelServingDefaults] = {}
 
@@ -129,13 +145,17 @@ def apply_repetition_detection_default(defaults, sampling_params) -> None:
 def merge_extra_args(
     defaults: ModelServingDefaults,
     request_xargs: Mapping[str, Any] | None,
+    *,
+    num_image_items: int = 1,
 ) -> dict[str, Any]:
     """Overlay request ``vllm_xargs`` on the model's recipe defaults.
 
     Request keys win; integer keys with registered bounds are validated and
     a ValueError (surfaced as HTTP 400) is raised for out-of-range values.
+    The defaults profile is selected by the request's image count (multi-page
+    recipes may use e.g. a different anti-repetition window).
     """
-    merged: dict[str, Any] = dict(defaults.extra_args_defaults)
+    merged: dict[str, Any] = dict(defaults.extra_args_defaults_for(num_image_items))
     for key, value in (request_xargs or {}).items():
         bounds = defaults.extra_args_bounds.get(key)
         if bounds is not None:
@@ -192,5 +212,8 @@ register_model_serving_defaults(
         required_logits_processors=(
             "vllm.model_executor.models.deepseek_ocr.NGramPerReqLogitsProcessor",
         ),
+        # The DeepSeek-OCR README documents a single recipe with no
+        # multi-page variant — the single-image profile applies to any
+        # image count (multi profiles stay None).
     ),
 )

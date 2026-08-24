@@ -138,3 +138,71 @@ def test_dsocr_registration_includes_repetition_detection():
         "min_pattern_size": 2,
         "min_count": 8,
     }
+
+# ---------------------------------------------------------------------------
+# Multi-image request profile (multi-page document parsing recipes).
+# ---------------------------------------------------------------------------
+
+
+def _defaults_with_multi():
+    return ModelServingDefaults(
+        sampling_defaults={"temperature": 0.0},
+        extra_args_defaults={"ngram_size": 35, "window_size": 128},
+        extra_args_bounds={"ngram_size": (1, 128), "window_size": (1, 4096)},
+        extra_args_defaults_multi_image={"ngram_size": 35, "window_size": 1024},
+    )
+
+
+@pytest.mark.parametrize("n", [0, 1])
+def test_multi_profile_single_image_uses_single_defaults(n):
+    merged = merge_extra_args(_defaults_with_multi(), None, num_image_items=n)
+    assert merged["window_size"] == 128
+
+
+def test_multi_profile_selected_for_multi_image_requests():
+    merged = merge_extra_args(_defaults_with_multi(), None, num_image_items=3)
+    assert merged["window_size"] == 1024
+    assert merged["ngram_size"] == 35
+
+
+def test_multi_profile_request_override_still_bounded():
+    merged = merge_extra_args(
+        _defaults_with_multi(), {"window_size": 2048}, num_image_items=2
+    )
+    assert merged["window_size"] == 2048
+    with pytest.raises(ValueError):
+        merge_extra_args(
+            _defaults_with_multi(), {"window_size": 100000}, num_image_items=2
+        )
+
+
+def test_multi_profile_absent_falls_back_to_single():
+    d = ModelServingDefaults(extra_args_defaults={"window_size": 90})
+    assert merge_extra_args(d, None, num_image_items=5)["window_size"] == 90
+    assert d.sampling_defaults_for(5) == d.sampling_defaults
+
+
+def test_count_request_image_items_from_messages():
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        _count_request_image_items,
+    )
+
+    class Req:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:x"}},
+                    {"type": "text", "text": "a"},
+                    {"type": "image_url", "image_url": {"url": "data:y"}},
+                ],
+            },
+            {"role": "user", "content": "plain string content"},
+        ]
+
+    assert _count_request_image_items(Req()) == 2
+
+    class Empty:
+        messages = None
+
+    assert _count_request_image_items(Empty()) == 0

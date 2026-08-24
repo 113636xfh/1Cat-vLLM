@@ -299,6 +299,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
+        num_image_items = _count_request_image_items(request)
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
@@ -333,7 +334,9 @@ class OpenAIServingChat(OpenAIServing):
                 if self.model_serving_defaults is not None:
                     try:
                         merged = merge_extra_args(
-                            self.model_serving_defaults, sampling_params.extra_args
+                            self.model_serving_defaults,
+                            sampling_params.extra_args,
+                            num_image_items=num_image_items,
                         )
                     except ValueError as e:
                         return self.create_error_response(str(e))
@@ -341,6 +344,19 @@ class OpenAIServingChat(OpenAIServing):
                     apply_repetition_detection_default(
                         self.model_serving_defaults, sampling_params
                     )
+
+                    # Multi-image sampling profile: apply only the fields the
+                    # request did not set itself (single-image defaults were
+                    # already folded into default_sampling_params at init).
+                    if num_image_items > 1:
+                        multi = (
+                            self.model_serving_defaults.sampling_defaults_multi_image
+                        )
+                        for key, value in (multi or {}).items():
+                            if getattr(request, key, None) is None and hasattr(
+                                sampling_params, key
+                            ):
+                                setattr(sampling_params, key, value)
 
             self._log_inputs(
                 sub_request_id,
@@ -1627,3 +1643,35 @@ class OpenAIServingChat(OpenAIServing):
                 )
             ]
         )
+
+
+def _count_request_image_items(request: ChatCompletionRequest) -> int:
+    """Number of image items in the request messages.
+
+    Selects the serving-defaults profile (single vs multi page); counting is
+    done on the raw messages so it is independent of prompt preprocessing.
+    """
+    count = 0
+    messages = getattr(request, "messages", None) or []
+    for message in messages:
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if part_type in (
+                "image_url",
+                "input_image",
+                "image_embeds",
+                "image_pil",
+            ):
+                count += 1
+    return count
