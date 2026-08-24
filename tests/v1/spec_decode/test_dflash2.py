@@ -4,17 +4,25 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
+import vllm.model_executor.layers.logits_processor as logits_processor_module
 import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    _sm70_dflash2_dense_order_topk,
+    _sm70_dflash2_rerank_output_buffers,
 )
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
@@ -25,15 +33,23 @@ from vllm.model_executor.models.dflash_sm70 import (
 )
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
+    DFlashQwen3Model,
     _dflash_layer_causal,
 )
-from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.model_executor.models.qwen3_dflash2 import (
+    DFlash2Qwen3Model,
+    _grouped_conv,
+    _score_edges,
+)
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    _supports_sparse_sampling_contract,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     DFlash2Speculator,
     _requires_sm70_tail,
@@ -43,10 +59,21 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
+        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY",
+        "VLLM_SM70_DFLASH2_QPN8_RERANK",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
         "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
         "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_NORM",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT",
+        "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA",
+        "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA",
+        "VLLM_SM70_DFLASH2_FUSED_QKV_PACK",
+        "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS",
+        "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION",
+        "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+        "VLLM_SM70_TP4_PUSH_ALLREDUCE",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -55,6 +82,96 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
         assert not any(getattr(envs, name) for name in names)
     finally:
         envs.disable_envs_cache()
+
+
+def _bare_dflash2_model() -> DFlash2Qwen3Model:
+    model = DFlash2Qwen3Model.__new__(DFlash2Qwen3Model)
+    torch.nn.Module.__init__(model)
+    model.quant_config = None
+    return model
+
+
+def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(monkeypatch):
+    model = _bare_dflash2_model()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        model_config=SimpleNamespace(dtype=torch.float16),
+    )
+    created = {}
+
+    def fake_column_parallel(**kwargs):
+        created.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        dflash2_model.envs,
+        "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+        True,
+    )
+    monkeypatch.setattr(dflash2_model.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        dflash2_model.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    monkeypatch.setattr(dflash2_model, "ColumnParallelLinear", fake_column_parallel)
+
+    projection = model._make_context_projection(
+        vllm_config=config,
+        input_size=25600,
+        output_size=5120,
+        prefix="model.fc",
+    )
+
+    assert created["gather_output"] is True
+    assert created["input_size"] == 25600
+    assert created["output_size"] == 5120
+    assert projection._sm70_f16_force_enable is True
+
+
+@pytest.mark.parametrize(
+    ("enabled", "tp_size", "input_size", "output_size"),
+    [
+        (False, 4, 25600, 5120),
+        (True, 2, 25600, 5120),
+        (True, 4, 5120, 5120),
+        (True, 4, 25600, 4096),
+    ],
+)
+def test_sharded_context_projection_falls_back_outside_exact_contract(
+    monkeypatch, enabled, tp_size, input_size, output_size
+):
+    model = _bare_dflash2_model()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        model_config=SimpleNamespace(dtype=torch.float16),
+    )
+    sentinel = object()
+    monkeypatch.setattr(
+        dflash2_model.envs,
+        "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+        enabled,
+    )
+    monkeypatch.setattr(dflash2_model.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        dflash2_model.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    monkeypatch.setattr(
+        DFlashQwen3Model,
+        "_make_context_projection",
+        lambda *_args, **_kwargs: sentinel,
+    )
+
+    projection = model._make_context_projection(
+        vllm_config=config,
+        input_size=input_size,
+        output_size=output_size,
+        prefix="model.fc",
+    )
+
+    assert projection is sentinel
 
 
 @pytest.mark.parametrize("block_size", [4, 6, 8])
@@ -138,12 +255,27 @@ def test_selector_leaves_greedy_without_proposal_logits(monkeypatch):
     assert speculator.draft_logits is None
 
 
-def test_selector_initializes_probabilistic_cache_to_negative_infinity(monkeypatch):
+def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch):
     allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     assert speculator.draft_logits is allocated
     assert torch.isneginf(speculator.draft_logits).all()
+    assert speculator.get_sparse_draft_logits() is None
+
+
+def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
+    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    _stub_base(monkeypatch, allocated)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    speculator = DFlash2Speculator(None, torch.device("cpu"))
+    sparse_logits = speculator.get_sparse_draft_logits()
+    assert sparse_logits is not None
+    candidate_ids, candidate_scores = sparse_logits
+    assert candidate_ids.shape == (2, 7, 16)
+    assert candidate_scores.shape == (2, 7, 16)
+    assert candidate_scores.dtype is torch.float32
 
 
 def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
@@ -153,6 +285,81 @@ def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
     assert speculator.selector_top_k == 16
     assert dtype is torch.float32
     assert fill == float("-inf")
+
+
+def _sparse_sampling_contract_fixture():
+    idx = np.array([0], dtype=np.int32)
+    sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(np=np.array([1.0], dtype=np.float32)),
+        top_k=SimpleNamespace(np=np.array([20], dtype=np.int32)),
+        top_p=SimpleNamespace(np=np.array([0.95], dtype=np.float32)),
+        min_p=SimpleNamespace(np=np.array([0.0], dtype=np.float32)),
+        max_num_logprobs=Mock(return_value=-1),
+    )
+    sampler = SimpleNamespace(
+        sampling_states=sampling_states,
+        penalties_state=SimpleNamespace(use_penalty=np.array([False])),
+        logit_bias_state=SimpleNamespace(use_logit_bias=np.array([False])),
+        bad_words_state=SimpleNamespace(
+            num_bad_words=SimpleNamespace(np=np.array([0], dtype=np.int32))
+        ),
+        logprob_token_ids_state=SimpleNamespace(max_num_token_ids=Mock(return_value=0)),
+        compute_nans=False,
+    )
+    rejection_sampler = SimpleNamespace(
+        rejection_sample_method="standard",
+        sampler=sampler,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        is_prefilling_np=np.array([False]),
+        idx_mapping_np=idx,
+    )
+    return rejection_sampler, input_batch
+
+
+def test_sparse_target_rejection_accepts_official_sampling_contract():
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture()
+    assert _supports_sparse_sampling_contract(rejection_sampler, input_batch)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", 0.0),
+        ("top_k", 16),
+        ("top_p", 0.0),
+        ("min_p", 0.05),
+        ("penalty", True),
+        ("logit_bias", True),
+        ("bad_words", 1),
+        ("logprobs", 1),
+        ("custom_logprobs", 1),
+        ("compute_nans", True),
+    ],
+)
+def test_sparse_target_rejection_falls_back_for_unsupported_sampling(
+    field: str,
+    value: float | int | bool,
+):
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture()
+    sampler = rejection_sampler.sampler
+    if field in {"temperature", "top_k", "top_p", "min_p"}:
+        getattr(sampler.sampling_states, field).np[0] = value
+    elif field == "penalty":
+        sampler.penalties_state.use_penalty[0] = value
+    elif field == "logit_bias":
+        sampler.logit_bias_state.use_logit_bias[0] = value
+    elif field == "bad_words":
+        sampler.bad_words_state.num_bad_words.np[0] = value
+    elif field == "logprobs":
+        sampler.sampling_states.max_num_logprobs.return_value = value
+    elif field == "custom_logprobs":
+        sampler.logprob_token_ids_state.max_num_token_ids.return_value = value
+    else:
+        sampler.compute_nans = value
+
+    assert not _supports_sparse_sampling_contract(rejection_sampler, input_batch)
 
 
 def test_probabilistic_selector_caches_temperature_applied_scores():
@@ -253,6 +460,46 @@ def test_probabilistic_cache_respects_column_stride():
     assert torch.isnan(cache[0, 0]).all()
     torch.testing.assert_close(cache[0, 1], logits[0])
     assert torch.isnan(storage[:, :, vocab_size:]).all()
+
+
+def test_probabilistic_cache_keeps_ids_and_scores_in_request_slot_order(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the DFlash2 cache kernel")
+
+    device = torch.device("cuda")
+    dense_cache = torch.zeros((2, 7, 31), dtype=torch.float32, device=device)
+    _stub_base(monkeypatch, dense_cache)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    speculator = DFlash2Speculator(None, device)
+    speculator.sample_idx_mapping = torch.tensor(
+        [1] * 7 + [0] * 7,
+        dtype=torch.int32,
+        device=device,
+    )
+    candidate_ids = torch.stack(
+        (
+            torch.arange(16, dtype=torch.int64, device=device).repeat(7, 1),
+            torch.arange(15, 31, dtype=torch.int64, device=device).repeat(7, 1),
+        )
+    )
+    selector_scores = torch.arange(
+        2 * 7 * 16,
+        dtype=torch.float32,
+        device=device,
+    ).view(2, 7, 16)
+    speculator._selector_scores.copy_(selector_scores)
+
+    speculator._cache_draft_logits(candidate_ids, num_sample=14)
+    sparse_logits = speculator.get_sparse_draft_logits()
+    assert sparse_logits is not None
+    cached_ids, cached_scores = sparse_logits
+
+    assert torch.equal(cached_ids[1], candidate_ids[0])
+    assert torch.equal(cached_ids[0], candidate_ids[1])
+    assert torch.equal(cached_scores[1], selector_scores[0])
+    assert torch.equal(cached_scores[0], selector_scores[1])
+    assert torch.equal(dense_cache[1].gather(1, candidate_ids[0]), selector_scores[0])
+    assert torch.equal(dense_cache[0].gather(1, candidate_ids[1]), selector_scores[1])
 
 
 def test_dflash2_selector_contract_dispatches_to_mrv2(monkeypatch):
@@ -410,6 +657,219 @@ def test_flashinfer_topk_is_capability_gated_on_sm70(monkeypatch):
     monkeypatch.setattr(dflash2_model, "has_flashinfer", lambda: True)
     assert dflash2_model._flashinfer_topk() is None
     dflash2_model._flashinfer_topk.cache_clear()
+
+
+def test_target_topk_uses_reranked_local_candidates_without_dense_logits(monkeypatch):
+    dense_apply = Mock(side_effect=AssertionError("dense logits must not run"))
+    values = torch.linspace(5.0, -5.0, 20, dtype=torch.float16).reshape(1, 20)
+    ids = torch.arange(100, 120, dtype=torch.int64).reshape(1, 20)
+    lm_head = SimpleNamespace(
+        quant_method=SimpleNamespace(apply=dense_apply),
+        weight=torch.empty((62080, 1), dtype=torch.float16),
+        maybe_get_sm70_dflash2_top20=lambda hidden, top_k, bias: (values, ids),
+    )
+    processor = LogitsProcessor(vocab_size=248320, scale=0.5, soft_cap=3.0)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
+    actual_ids, actual_values = processor.get_topk_tokens_and_logits(
+        lm_head,
+        torch.empty((1, 1), dtype=torch.float16),
+        20,
+    )
+
+    expected_values = (torch.tanh(values / 3.0) * 3.0 * 0.5).float()
+    assert torch.equal(actual_ids, ids)
+    torch.testing.assert_close(actual_values, expected_values)
+    dense_apply.assert_not_called()
+
+
+def test_lm_head_candidate_interface_falls_back_when_rerank_is_disabled(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_RERANK", False)
+    layer = SimpleNamespace()
+
+    assert (
+        VocabParallelEmbedding.maybe_get_sm70_dflash2_top20(
+            layer,
+            torch.empty((1, 8)),
+            20,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("selector_k", [16, 20])
+@pytest.mark.parametrize("num_rows", [1, 7, 8])
+def test_qpn8_rerank_output_buffers_are_contiguous(selector_k, num_rows):
+    layer = SimpleNamespace()
+    for top_k in (16, 20):
+        setattr(
+            layer,
+            f"_sm70_dflash2_rerank_values_{top_k}",
+            torch.empty((8, top_k), dtype=torch.float16),
+        )
+        setattr(
+            layer,
+            f"_sm70_dflash2_rerank_positions_{top_k}",
+            torch.empty((8, top_k), dtype=torch.int64),
+        )
+        setattr(
+            layer,
+            f"_sm70_dflash2_rerank_ids_{top_k}",
+            torch.empty((8, top_k), dtype=torch.int64),
+        )
+
+    buffers = _sm70_dflash2_rerank_output_buffers(layer, num_rows, selector_k)
+
+    assert all(buffer.shape == (num_rows, selector_k) for buffer in buffers)
+    assert all(buffer.is_contiguous() for buffer in buffers)
+
+
+def test_qpn8_rerank_restores_dense_vocab_tie_order():
+    vocab_start = 96
+    candidate_ids = torch.tensor(
+        [[9, 1, 7, 3, 12, 4], [18, 2, 15, 5, 11, 8]], dtype=torch.int64
+    )
+    candidate_logits = torch.tensor(
+        [[5, 5, 5, 5, 4, 3], [7, 7, 7, 7, 6, 5]], dtype=torch.float16
+    )
+    sparse_logits = torch.empty((2, 24), dtype=torch.float16)
+    actual_values = torch.empty((2, 4), dtype=torch.float16)
+    actual_ids = torch.empty((2, 4), dtype=torch.int64)
+
+    _sm70_dflash2_dense_order_topk(
+        sparse_logits,
+        candidate_ids,
+        candidate_logits,
+        actual_values,
+        actual_ids,
+        4,
+        vocab_start,
+    )
+
+    reference = torch.full_like(sparse_logits, -float("inf"))
+    reference.scatter_(1, candidate_ids, candidate_logits)
+    expected_values, expected_ids = torch.topk(reference, 4, dim=-1, sorted=True)
+    assert torch.equal(actual_values, expected_values)
+    assert torch.equal(actual_ids, expected_ids + vocab_start)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("selector_k", [16, 20])
+@pytest.mark.parametrize("num_rows", [1, 7, 8])
+def test_sm70_f16_rerank_topk_matches_composite_key_contract(
+    selector_k: int, num_rows: int
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the exact rerank top-k kernel is SM70-only")
+    required_ops = (
+        "sm70_f16_rerank_keys_out",
+        "sm70_f16_rerank_topk_out",
+    )
+    if any(not hasattr(torch.ops._C, name) for name in required_ops):
+        pytest.skip("the exact rerank top-k operators are not built")
+
+    from vllm import _sm70_ops
+
+    generator = torch.Generator().manual_seed(20260824)
+    local_vocab = 62080
+    candidate_ids = torch.stack(
+        [torch.randperm(local_vocab, generator=generator)[:64] for _ in range(num_rows)]
+    ).to(device="cuda", dtype=torch.int64)
+    torch.manual_seed(20260824)
+    candidate_logits = torch.randn(
+        (num_rows, 64), dtype=torch.float16, device="cuda"
+    ).clamp_(-3, 3)
+    # Force more equal maxima than either requested top-k so ID-ascending tie
+    # precedence is part of every comparison, not just an incidental edge.
+    candidate_logits[:, :24] = 4
+    if num_rows > 1:
+        candidate_logits[1, 24:28] = torch.tensor(
+            [-float("inf"), -0.0, 0.0, float("inf")],
+            dtype=torch.float16,
+            device="cuda",
+        )
+
+    actual_values = torch.empty(
+        (num_rows, selector_k), dtype=torch.float16, device="cuda"
+    )
+    actual_ids = torch.empty((num_rows, selector_k), dtype=torch.int64, device="cuda")
+    vocab_start = 186240
+    _sm70_ops.sm70_f16_rerank_topk_out(
+        actual_values,
+        actual_ids,
+        candidate_logits,
+        candidate_ids,
+        vocab_start,
+    )
+
+    keys = torch.empty_like(candidate_ids)
+    _sm70_ops.sm70_f16_rerank_keys_out(keys, candidate_logits, candidate_ids)
+    _, positions = torch.topk(keys, selector_k, dim=-1, sorted=True)
+    expected_values = candidate_logits.gather(1, positions)
+    expected_ids = candidate_ids.gather(1, positions).add_(vocab_start)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        actual_values.view(torch.int16), expected_values.view(torch.int16)
+    )
+    assert torch.equal(actual_ids, expected_ids)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_rows", [1, 7, 8])
+def test_sm70_dflash2_exact_rerank_matches_gathered_bmm(num_rows):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the exact rerank kernel is SM70-only")
+    if not hasattr(torch.ops._C, "sm70_f16_indexed_rerank_out"):
+        pytest.skip("the exact TurboMind rerank op is not built")
+
+    from vllm import _sm70_ops
+
+    torch.manual_seed(20260824)
+    device = torch.device("cuda")
+    candidates, vocab, hidden_size = 64, 256, 5120
+    hidden = torch.randn((num_rows, hidden_size), dtype=torch.float16, device=device)
+    weight = torch.randn((vocab, hidden_size), dtype=torch.float16, device=device)
+    candidate_ids = torch.randint(
+        0, vocab, (num_rows, candidates), dtype=torch.int64, device=device
+    )
+    actual = torch.empty((num_rows, candidates), dtype=torch.float16, device=device)
+    selected_raw = torch.empty(
+        (num_rows * candidates, hidden_size), dtype=torch.float16, device=device
+    )
+    selected_packed = torch.empty_like(selected_raw)
+    expanded = torch.empty(
+        (num_rows, num_rows * candidates), dtype=torch.float16, device=device
+    )
+    partials = torch.empty(
+        (num_rows, num_rows * candidates), dtype=torch.float32, device=device
+    )
+    barriers = torch.zeros(64, dtype=torch.int32, device=device)
+
+    _sm70_ops.sm70_f16_indexed_rerank_out(
+        actual,
+        hidden,
+        weight,
+        candidate_ids,
+        selected_raw,
+        selected_packed,
+        expanded,
+        partials,
+        barriers,
+        128,
+        10,
+    )
+    gathered = weight.index_select(0, candidate_ids.reshape(-1))
+    expected = torch.bmm(
+        gathered.view(num_rows, candidates, hidden_size),
+        hidden.unsqueeze(-1),
+    ).squeeze(-1)
+
+    torch.testing.assert_close(actual, expected, atol=0.125, rtol=0.002)
 
 
 @pytest.mark.parametrize(

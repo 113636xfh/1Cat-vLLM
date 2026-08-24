@@ -16,6 +16,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import cast
 
@@ -25,6 +26,7 @@ import vllm.envs as envs
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -32,8 +34,393 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _sm70_prepare_smallq_decode_metadata_kernel(
+    out_block_table_ptr,
+    out_seq_lens_ptr,
+    out_query_start_loc_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    block_table_stride,
+    out_block_table_stride,
+    num_reqs,
+    num_query_tokens,
+    real_num_query_tokens,
+    block_cols,
+    REQ_BLOCK: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+
+    # Find the request that owns this flattened query token. Equal trailing
+    # boundaries are CUDA-graph padding; clamping maps them to the final padded
+    # request, matching repeat_query_lens[-1] += padding_tokens.
+    req_offsets = tl.arange(0, REQ_BLOCK)
+    req_mask = req_offsets < num_reqs
+    query_ends = tl.load(
+        query_start_loc_ptr + req_offsets + 1,
+        mask=req_mask,
+        other=0x7FFFFFFF,
+    )
+    req_idx = tl.sum((token_idx >= query_ends).to(tl.int32), axis=0)
+    req_idx = tl.minimum(req_idx, num_reqs - 1)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    effective_seq_len = tl.maximum(seq_len, query_len)
+    decode_seq_len = effective_seq_len - query_len + token_idx - query_start + 1
+    is_padding = token_idx >= real_num_query_tokens
+    tl.store(
+        out_seq_lens_ptr + token_idx,
+        tl.where(is_padding, 0, decode_seq_len),
+    )
+
+    cols = tl.arange(0, BLOCK_COLS)
+    col_mask = cols < block_cols
+    block_ids = tl.load(
+        block_table_ptr + req_idx * block_table_stride + cols,
+        mask=col_mask,
+        other=0,
+    )
+    block_ids = tl.maximum(block_ids, 0)
+    block_ids = tl.where(is_padding, 0, block_ids)
+    tl.store(
+        out_block_table_ptr + token_idx * out_block_table_stride + cols,
+        block_ids,
+        mask=col_mask,
+    )
+
+    # The same launch also refreshes the graph-stable query boundaries.
+    if token_idx == 0:
+        boundary_offsets = tl.arange(0, REQ_BLOCK)
+        boundary_mask = boundary_offsets < num_reqs + 1
+        boundaries = tl.load(
+            query_start_loc_ptr + boundary_offsets,
+            mask=boundary_mask,
+            other=0,
+        )
+        tl.store(
+            out_query_start_loc_ptr + boundary_offsets,
+            boundaries,
+            mask=boundary_mask,
+        )
+
+
+def _sm70_prepare_smallq_decode_metadata(
+    out_block_table: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    out_query_start_loc: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    num_reqs: int,
+    num_query_tokens: int,
+    real_num_query_tokens: int,
+) -> None:
+    """Materialize persistent Flash-V100 verifier metadata in one launch."""
+    if num_reqs <= 0 or num_query_tokens <= 0:
+        raise ValueError("small-query metadata requires positive request/token counts")
+    block_cols = int(block_table.shape[1])
+    if block_cols <= 0:
+        raise ValueError("small-query block table must have at least one column")
+    if out_block_table.shape[0] < num_query_tokens:
+        raise ValueError("small-query output block table is too small")
+    if out_seq_lens.numel() < num_query_tokens:
+        raise ValueError("small-query output sequence buffer is too small")
+    if out_query_start_loc.numel() < num_reqs + 1:
+        raise ValueError("small-query output boundary buffer is too small")
+
+    _sm70_prepare_smallq_decode_metadata_kernel[(num_query_tokens,)](
+        out_block_table,
+        out_seq_lens,
+        out_query_start_loc,
+        block_table,
+        seq_lens,
+        query_start_loc,
+        block_table.stride(0),
+        out_block_table.stride(0),
+        num_reqs,
+        num_query_tokens,
+        real_num_query_tokens,
+        block_cols,
+        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        BLOCK_COLS=triton.next_power_of_2(block_cols),
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _load_sm70_smallq_i32_ptr(ptrs, group_id):
+    ptr = tl.load(ptrs + group_id)
+    return tl.cast(ptr, tl.pointer_type(tl.int32))
+
+
+@triton.jit
+def _sm70_prepare_grouped_smallq_decode_metadata_kernel(
+    out_block_table_ptrs,
+    out_seq_lens_ptrs,
+    out_query_start_loc_ptrs,
+    block_table_ptrs,
+    block_table_strides,
+    out_block_table_strides,
+    block_col_counts,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    num_reqs,
+    real_num_query_tokens,
+    REQ_BLOCK: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Materialize every target full-attention group's verifier metadata."""
+    group_id = tl.program_id(0)
+    token_idx = tl.program_id(1)
+    out_block_table = _load_sm70_smallq_i32_ptr(out_block_table_ptrs, group_id)
+    out_seq_lens = _load_sm70_smallq_i32_ptr(out_seq_lens_ptrs, group_id)
+    out_query_start_loc = _load_sm70_smallq_i32_ptr(out_query_start_loc_ptrs, group_id)
+    block_table = _load_sm70_smallq_i32_ptr(block_table_ptrs, group_id)
+    block_table_stride = tl.load(block_table_strides + group_id)
+    out_block_table_stride = tl.load(out_block_table_strides + group_id)
+    block_cols = tl.load(block_col_counts + group_id)
+
+    req_offsets = tl.arange(0, REQ_BLOCK)
+    req_mask = req_offsets < num_reqs
+    query_ends = tl.load(
+        query_start_loc_ptr + req_offsets + 1,
+        mask=req_mask,
+        other=0x7FFFFFFF,
+    )
+    req_idx = tl.sum((token_idx >= query_ends).to(tl.int32), axis=0)
+    req_idx = tl.minimum(req_idx, num_reqs - 1)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    effective_seq_len = tl.maximum(seq_len, query_len)
+    decode_seq_len = effective_seq_len - query_len + token_idx - query_start + 1
+    is_padding = token_idx >= real_num_query_tokens
+    tl.store(
+        out_seq_lens + token_idx,
+        tl.where(is_padding, 0, decode_seq_len),
+    )
+
+    cols = tl.arange(0, BLOCK_COLS)
+    col_mask = cols < block_cols
+    block_ids = tl.load(
+        block_table + req_idx * block_table_stride + cols,
+        mask=col_mask,
+        other=0,
+    )
+    block_ids = tl.maximum(block_ids, 0)
+    block_ids = tl.where(is_padding, 0, block_ids)
+    tl.store(
+        out_block_table + token_idx * out_block_table_stride + cols,
+        block_ids,
+        mask=col_mask,
+    )
+
+    if token_idx == 0:
+        boundary_offsets = tl.arange(0, REQ_BLOCK)
+        boundary_mask = boundary_offsets < num_reqs + 1
+        boundaries = tl.load(
+            query_start_loc_ptr + boundary_offsets,
+            mask=boundary_mask,
+            other=0,
+        )
+        tl.store(
+            out_query_start_loc + boundary_offsets,
+            boundaries,
+            mask=boundary_mask,
+        )
+
+
+@dataclass
+class DFlash2SmallQGroupDescriptor:
+    """Persistent pointer tables for grouped Flash-V100 verifier metadata."""
+
+    key: tuple[object, ...]
+    block_table_ptrs: torch.Tensor
+    out_block_table_ptrs: torch.Tensor
+    out_seq_lens_ptrs: torch.Tensor
+    out_query_start_loc_ptrs: torch.Tensor
+    block_table_strides: torch.Tensor
+    out_block_table_strides: torch.Tensor
+    block_col_counts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DFlash2SmallQPreparedMetadata:
+    """Graph-stable buffers already refreshed by the grouped launch."""
+
+    builder_id: int
+    num_reqs: int
+    num_query_tokens: int
+    max_seq_len_hint: int
+    workspace_seq_capacity_hint: int
+    partition_size_hint: int | None = None
+
+
+def _sm70_prepare_grouped_smallq_decode_metadata(
+    out_block_tables: list[torch.Tensor],
+    out_seq_lens: list[torch.Tensor],
+    out_query_start_locs: list[torch.Tensor],
+    block_tables: list[torch.Tensor],
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    num_reqs: int,
+    num_query_tokens: int,
+    real_num_query_tokens: int,
+    descriptor: DFlash2SmallQGroupDescriptor | None = None,
+) -> DFlash2SmallQGroupDescriptor:
+    """Refresh N full-attention cache groups in one Triton launch."""
+    num_groups = len(block_tables)
+    if num_groups <= 0:
+        raise ValueError("grouped small-query metadata requires at least one group")
+    if not (
+        len(out_block_tables)
+        == len(out_seq_lens)
+        == len(out_query_start_locs)
+        == num_groups
+    ):
+        raise ValueError("grouped small-query metadata lists must have equal lengths")
+    if num_reqs <= 0 or num_query_tokens <= 0:
+        raise ValueError("grouped small-query metadata requires positive sizes")
+    if not 0 <= real_num_query_tokens <= num_query_tokens:
+        raise ValueError("real query token count exceeds grouped launch size")
+
+    block_col_counts = [int(table.shape[1]) for table in block_tables]
+    if any(cols <= 0 for cols in block_col_counts):
+        raise ValueError("grouped small-query block tables cannot be empty")
+    max_block_cols = max(block_col_counts)
+    device = block_tables[0].device
+    if (
+        seq_lens.device != device
+        or query_start_loc.device != device
+        or seq_lens.dtype != torch.int32
+        or query_start_loc.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or not query_start_loc.is_contiguous()
+        or seq_lens.numel() < num_reqs
+        or query_start_loc.numel() < num_reqs + 1
+    ):
+        raise ValueError("grouped small-query input metadata contract mismatch")
+    key: tuple[object, ...] = (
+        device.type,
+        device.index,
+        tuple(block_col_counts),
+        tuple(table.data_ptr() for table in block_tables),
+        tuple(table.data_ptr() for table in out_block_tables),
+        tuple(tensor.data_ptr() for tensor in out_seq_lens),
+        tuple(tensor.data_ptr() for tensor in out_query_start_locs),
+        tuple(table.stride(0) for table in block_tables),
+        tuple(table.stride(0) for table in out_block_tables),
+    )
+    if descriptor is None or descriptor.key != key:
+        for group, (
+            block_table,
+            out_block_table,
+            out_seq_len,
+            out_query_start,
+        ) in enumerate(
+            zip(
+                block_tables,
+                out_block_tables,
+                out_seq_lens,
+                out_query_start_locs,
+                strict=True,
+            )
+        ):
+            block_cols = block_col_counts[group]
+            if (
+                block_table.device != device
+                or out_block_table.device != device
+                or out_seq_len.device != device
+                or out_query_start.device != device
+                or block_table.dtype != torch.int32
+                or out_block_table.dtype != torch.int32
+                or out_seq_len.dtype != torch.int32
+                or out_query_start.dtype != torch.int32
+                or block_table.ndim != 2
+                or out_block_table.ndim != 2
+                or block_table.shape[0] < num_reqs
+                or out_block_table.shape[0] < num_query_tokens
+                or out_block_table.shape[1] < block_cols
+                or block_table.stride(1) != 1
+                or out_block_table.stride(1) != 1
+                or not out_seq_len.is_contiguous()
+                or not out_query_start.is_contiguous()
+                or out_seq_len.numel() < num_query_tokens
+                or out_query_start.numel() < num_reqs + 1
+            ):
+                raise ValueError(
+                    f"grouped small-query metadata contract mismatch for group {group}"
+                )
+        descriptor = DFlash2SmallQGroupDescriptor(
+            key=key,
+            block_table_ptrs=torch.tensor(
+                [table.data_ptr() for table in block_tables],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            out_block_table_ptrs=torch.tensor(
+                [table.data_ptr() for table in out_block_tables],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            out_seq_lens_ptrs=torch.tensor(
+                [tensor.data_ptr() for tensor in out_seq_lens],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            out_query_start_loc_ptrs=torch.tensor(
+                [tensor.data_ptr() for tensor in out_query_start_locs],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            block_table_strides=torch.tensor(
+                [table.stride(0) for table in block_tables],
+                dtype=torch.int64,
+                device=device,
+            ),
+            out_block_table_strides=torch.tensor(
+                [table.stride(0) for table in out_block_tables],
+                dtype=torch.int64,
+                device=device,
+            ),
+            block_col_counts=torch.tensor(
+                block_col_counts,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+
+    _sm70_prepare_grouped_smallq_decode_metadata_kernel[(num_groups, num_query_tokens)](
+        descriptor.out_block_table_ptrs,
+        descriptor.out_seq_lens_ptrs,
+        descriptor.out_query_start_loc_ptrs,
+        descriptor.block_table_ptrs,
+        descriptor.block_table_strides,
+        descriptor.out_block_table_strides,
+        descriptor.block_col_counts,
+        seq_lens,
+        query_start_loc,
+        num_reqs,
+        real_num_query_tokens,
+        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        BLOCK_COLS=triton.next_power_of_2(max_block_cols),
+        num_warps=1,
+    )
+    return descriptor
 
 
 class FlashAttnV100Metadata(TritonAttentionMetadata):
@@ -61,6 +448,7 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     smallq_decode_max_seq_len_hint: int | None
     smallq_decode_workspace_seq_capacity_hint: int | None
     smallq_decode_partition_size_hint: int | None
+    is_dflash_selector_target: bool
 
 
 def _as_flash_v100_metadata(
@@ -96,6 +484,8 @@ _flash_attn_bhmd_func = None
 _flash_attn_decode_paged = None
 _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
+_flash_attn_grouped_verify_paged = None
+_flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
 _flash_attn_prefill_paged_bfla = None
@@ -123,6 +513,8 @@ _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_smallq_decode_xqa = False
+_logged_prefill_smallq_grouped_verify = False
+_logged_prefill_smallq_grouped_verify_gate = False
 _logged_prefill_fa2_d256 = False
 _logged_prefill_dense_splitkv3 = False
 _logged_prefill_triton_safe = False
@@ -831,6 +1223,23 @@ def _get_flash_ops():
         _flash_attn_prefill_paged_bfla,
         _flash_attn_prefill_paged_splitkv,
     )
+
+
+def _get_flash_grouped_verify_op():
+    """Load the optional exact SM70 DFlash2 grouped verifier."""
+    global _flash_attn_grouped_verify_paged
+    global _flash_attn_grouped_verify_checked
+    if _flash_attn_grouped_verify_checked:
+        return _flash_attn_grouped_verify_paged
+
+    _flash_attn_grouped_verify_checked = True
+    try:
+        from flash_attn_v100 import flash_attn_grouped_verify_paged
+
+        _flash_attn_grouped_verify_paged = flash_attn_grouped_verify_paged
+    except ImportError:
+        _flash_attn_grouped_verify_paged = None
+    return _flash_attn_grouped_verify_paged
 
 
 def _get_sm70_splitd_d256_ops():
@@ -2520,6 +2929,29 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_draft_model = self._is_speculative_draft_model and (
             getattr(spec_config, "method", None) == "dflash"
         )
+        use_dflash = bool(
+            spec_config is not None
+            and callable(getattr(spec_config, "use_dflash", None))
+            and spec_config.use_dflash()
+        )
+        selector_engine = uses_dflash_selector_engine(self.vllm_config)
+        self._is_dflash_selector_target = bool(
+            use_dflash
+            and not self._is_speculative_draft_model
+            and getattr(spec_config, "num_speculative_tokens", None) == 7
+            and selector_engine
+        )
+        self._use_sm70_dflash2_fused_smallq_metadata = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and use_dflash
+            and selector_engine
+        )
+        if self._use_sm70_dflash2_fused_smallq_metadata:
+            logger.info_once(
+                "SM70 DFlash2 fused Flash-V100 small-query metadata active."
+            )
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
         self._draft_query_start_loc: torch.Tensor | None = None
@@ -2556,6 +2988,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             else common_attn_metadata.seq_lens_cpu
         )
         flash_metadata.causal = common_attn_metadata.causal
+        flash_metadata.is_dflash_selector_target = self._is_dflash_selector_target
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
@@ -2953,6 +3386,45 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.smallq_decode_workspace_seq_capacity_hint = None
         flash_metadata.smallq_decode_partition_size_hint = None
 
+    def _attach_prepared_dflash2_smallq_metadata(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+        prepared: DFlash2SmallQPreparedMetadata,
+    ) -> None:
+        """Attach buffers refreshed by the cross-cache-group launch."""
+        if prepared.builder_id != id(self):
+            raise ValueError("grouped small-query metadata belongs to another builder")
+        if (
+            self._smallq_decode_block_table is None
+            or self._smallq_decode_seq_lens is None
+            or self._smallq_query_start_loc is None
+            or self._smallq_buffer_shape is None
+        ):
+            raise RuntimeError("grouped small-query metadata has no persistent buffers")
+        token_capacity, req_capacity, _ = self._smallq_buffer_shape
+        if (
+            prepared.num_query_tokens > token_capacity
+            or prepared.num_reqs > req_capacity
+        ):
+            raise RuntimeError("grouped small-query metadata exceeds captured capacity")
+
+        self._clear_smallq_decode_metadata(attn_metadata)
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
+            : prepared.num_query_tokens
+        ]
+        flash_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
+            : prepared.num_query_tokens
+        ]
+        flash_metadata.smallq_query_start_loc = self._smallq_query_start_loc[
+            : prepared.num_reqs + 1
+        ]
+        flash_metadata.smallq_decode_max_seq_len_hint = prepared.max_seq_len_hint
+        flash_metadata.smallq_decode_workspace_seq_capacity_hint = (
+            prepared.workspace_seq_capacity_hint
+        )
+        flash_metadata.smallq_decode_partition_size_hint = prepared.partition_size_hint
+
     def _update_smallq_decode_metadata(
         self,
         attn_metadata: TritonAttentionMetadata,
@@ -3050,92 +3522,110 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
         query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1]
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        real_query_lens = query_lens
         real_num_query_tokens = int(query_start_loc_cpu[-1].item())
         if real_num_query_tokens > num_query_tokens:
             return
-
-        repeat_query_lens = query_lens
         padding_tokens = num_query_tokens - real_num_query_tokens
-        if padding_tokens > 0:
-            repeat_query_lens = query_lens.clone()
-            repeat_query_lens[-1] += padding_tokens
-
         seq_lens = attn_metadata.seq_lens[:num_reqs]
-        effective_seq_lens = torch.maximum(
-            seq_lens,
-            real_query_lens.to(dtype=seq_lens.dtype),
-        )
-        block_table = block_table.clamp_min(0)
         prep_ms = (
             (time.perf_counter() - profile_stage_t0) * 1000.0
             if profile_enabled
             else 0.0
         )
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        decode_block_table = torch.repeat_interleave(
-            block_table,
-            repeat_query_lens,
-            dim=0,
-            output_size=num_query_tokens,
-        ).contiguous()
-        seq_lens_rep = torch.repeat_interleave(
-            effective_seq_lens,
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        query_lens_rep = torch.repeat_interleave(
-            real_query_lens.to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        start_locs_rep = torch.repeat_interleave(
-            query_start_loc[:-1].to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        token_indices = self._smallq_token_indices[:num_query_tokens].to(
-            dtype=seq_lens.dtype
-        )
-        offsets = token_indices - start_locs_rep + 1
-        decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
-        if padding_tokens > 0:
-            padding_mask = token_indices >= real_num_query_tokens
-            decode_seq_lens = torch.where(
-                padding_mask,
-                torch.zeros_like(decode_seq_lens),
-                decode_seq_lens,
-            ).contiguous()
-            decode_block_table = torch.where(
-                padding_mask[:, None],
-                torch.zeros_like(decode_block_table),
-                decode_block_table,
-            ).contiguous()
-        expand_ms = (
-            (time.perf_counter() - profile_stage_t0) * 1000.0
-            if profile_enabled
-            else 0.0
-        )
+        if self._use_sm70_dflash2_fused_smallq_metadata:
+            _sm70_prepare_smallq_decode_metadata(
+                self._smallq_decode_block_table,
+                self._smallq_decode_seq_lens,
+                self._smallq_query_start_loc,
+                block_table,
+                seq_lens,
+                query_start_loc,
+                num_reqs=num_reqs,
+                num_query_tokens=num_query_tokens,
+                real_num_query_tokens=real_num_query_tokens,
+            )
+            expand_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
+            copy_ms = 0.0
+        else:
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            real_query_lens = query_lens
+            repeat_query_lens = query_lens
+            if padding_tokens > 0:
+                repeat_query_lens = query_lens.clone()
+                repeat_query_lens[-1] += padding_tokens
 
-        profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        self._smallq_decode_block_table[:num_query_tokens].copy_(
-            decode_block_table,
-            non_blocking=True,
-        )
-        self._smallq_decode_seq_lens[:num_query_tokens].copy_(
-            decode_seq_lens,
-            non_blocking=True,
-        )
-        self._smallq_query_start_loc[: num_reqs + 1].copy_(
-            query_start_loc,
-            non_blocking=True,
-        )
-        copy_ms = (
-            (time.perf_counter() - profile_stage_t0) * 1000.0
-            if profile_enabled
-            else 0.0
-        )
+            effective_seq_lens = torch.maximum(
+                seq_lens,
+                real_query_lens.to(dtype=seq_lens.dtype),
+            )
+            clamped_block_table = block_table.clamp_min(0)
+            decode_block_table = torch.repeat_interleave(
+                clamped_block_table,
+                repeat_query_lens,
+                dim=0,
+                output_size=num_query_tokens,
+            ).contiguous()
+            seq_lens_rep = torch.repeat_interleave(
+                effective_seq_lens,
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            query_lens_rep = torch.repeat_interleave(
+                real_query_lens.to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            start_locs_rep = torch.repeat_interleave(
+                query_start_loc[:-1].to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            token_indices = self._smallq_token_indices[:num_query_tokens].to(
+                dtype=seq_lens.dtype
+            )
+            offsets = token_indices - start_locs_rep + 1
+            decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
+            if padding_tokens > 0:
+                padding_mask = token_indices >= real_num_query_tokens
+                decode_seq_lens = torch.where(
+                    padding_mask,
+                    torch.zeros_like(decode_seq_lens),
+                    decode_seq_lens,
+                ).contiguous()
+                decode_block_table = torch.where(
+                    padding_mask[:, None],
+                    torch.zeros_like(decode_block_table),
+                    decode_block_table,
+                ).contiguous()
+            expand_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
+
+            profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
+            self._smallq_decode_block_table[:num_query_tokens].copy_(
+                decode_block_table,
+                non_blocking=True,
+            )
+            self._smallq_decode_seq_lens[:num_query_tokens].copy_(
+                decode_seq_lens,
+                non_blocking=True,
+            )
+            self._smallq_query_start_loc[: num_reqs + 1].copy_(
+                query_start_loc,
+                non_blocking=True,
+            )
+            copy_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
         flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
@@ -3178,7 +3668,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 "total_ms=%.3f clear_ms=%.3f guard_ms=%.3f ensure_ms=%.3f "
                 "prep_ms=%.3f expand_ms=%.3f copy_ms=%.3f hint_ms=%.3f "
                 "num_reqs=%d num_query_tokens=%d real_query_tokens=%d "
-                "padding_tokens=%d block_cols=%d",
+                "padding_tokens=%d block_cols=%d fused=%s",
                 (time.perf_counter() - profile_t0) * 1000.0,
                 clear_ms,
                 guard_ms,
@@ -3192,6 +3682,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 real_num_query_tokens,
                 padding_tokens,
                 int(block_table.shape[1]),
+                self._use_sm70_dflash2_fused_smallq_metadata,
             )
         if _draft_graph_debug_enabled():
             _graph_metadata_debug_log(
@@ -3296,6 +3787,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         fast_build: bool = False,
         ddtree_parent_ids: torch.Tensor | None = None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
+        prepared_dflash2_smallq_metadata: (DFlash2SmallQPreparedMetadata | None) = None,
     ):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
@@ -3336,13 +3828,20 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             # max_model_len=262144 / S=4224 / ps=256). The cap keeps launch equal
             # to the runtime coverage; the interface floors it at effective
             # max_seq_len (_get_decode_plan:165-169), so it can never under-cover.
-            self._update_smallq_decode_metadata(
-                attn_metadata,
-                common_attn_metadata,
-                workspace_seq_capacity_cap=(
-                    int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
-                ),
-            )
+            if prepared_dflash2_smallq_metadata is not None:
+                self._attach_prepared_dflash2_smallq_metadata(
+                    attn_metadata,
+                    prepared_dflash2_smallq_metadata,
+                )
+            else:
+                self._update_smallq_decode_metadata(
+                    attn_metadata,
+                    common_attn_metadata,
+                    workspace_seq_capacity_cap=(
+                        int(getattr(common_attn_metadata, "max_seq_len", 0) or 0)
+                        or None
+                    ),
+                )
         self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._update_decode_active_num_partitions(attn_metadata, stage="build")
         self._debug_draft_metadata("build", attn_metadata, common_attn_metadata)
@@ -3443,6 +3942,170 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         return attn_metadata
 
 
+def prepare_dflash2_smallq_group_metadata(
+    *,
+    builders_by_group: list[tuple[int, FlashAttnV100MetadataBuilder]],
+    block_tables: tuple[torch.Tensor, ...],
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_reqs: int,
+    num_query_tokens: int,
+    max_seq_len_hint: int,
+    workspace_seq_capacity_cap: int | None,
+    descriptor: DFlash2SmallQGroupDescriptor | None,
+) -> (
+    tuple[
+        dict[int, DFlash2SmallQPreparedMetadata],
+        DFlash2SmallQGroupDescriptor,
+    ]
+    | None
+):
+    """Refresh all pure-DFlash2 target full-attention metadata in one launch."""
+
+    def fallback(reason: str) -> None:
+        logger.info_once(
+            "DFlash2 grouped small-query metadata fell back to per-group launches: %s",
+            reason,
+        )
+
+    if (
+        not envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+        or not envs.VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA
+        or not builders_by_group
+        or num_reqs <= 0
+        or num_query_tokens <= 1
+        or max_seq_len_hint <= 0
+    ):
+        fallback("route-or-shape guard")
+        return None
+    if (
+        seq_lens.device.type != "cuda"
+        or seq_lens.dtype != torch.int32
+        or query_start_loc.device != seq_lens.device
+        or query_start_loc.dtype != torch.int32
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.dtype != torch.int32
+        or seq_lens.numel() < num_reqs
+        or query_start_loc.numel() < num_reqs + 1
+        or query_start_loc_cpu.numel() < num_reqs + 1
+    ):
+        fallback("common tensor contract")
+        return None
+
+    real_num_query_tokens = int(query_start_loc_cpu[num_reqs].item())
+    if not 0 < real_num_query_tokens <= num_query_tokens:
+        fallback("real query-token count")
+        return None
+
+    input_tables: list[torch.Tensor] = []
+    output_tables: list[torch.Tensor] = []
+    output_seq_lens: list[torch.Tensor] = []
+    output_query_start_locs: list[torch.Tensor] = []
+    builder_ids: list[int] = []
+    workspace_hints: list[int] = []
+    seen_builders: set[int] = set()
+    for group_id, builder in builders_by_group:
+        builder_id = id(builder)
+        if builder_id in seen_builders:
+            continue
+        seen_builders.add(builder_id)
+        if (
+            not builder._use_sm70_dflash2_fused_smallq_metadata
+            or group_id < 0
+            or group_id >= len(block_tables)
+            or builder._smallq_decode_block_table is None
+            or builder._smallq_decode_seq_lens is None
+            or builder._smallq_query_start_loc is None
+            or builder._smallq_buffer_shape is None
+        ):
+            fallback("builder route or persistent buffers")
+            return None
+
+        input_table = block_tables[group_id]
+        output_table = builder._smallq_decode_block_table
+        output_seq = builder._smallq_decode_seq_lens
+        output_query = builder._smallq_query_start_loc
+        token_capacity, req_capacity, builder_block_cols = builder._smallq_buffer_shape
+        input_block_cols = int(input_table.shape[1])
+        if (
+            input_table.device != seq_lens.device
+            or input_table.dtype != torch.int32
+            or input_table.ndim != 2
+            or input_table.shape[0] < num_reqs
+            or not input_table.is_contiguous()
+            or input_block_cols <= 0
+            or builder_block_cols != input_block_cols
+            or token_capacity < num_query_tokens
+            or req_capacity < num_reqs
+            or output_table.dtype != torch.int32
+            or output_seq.dtype != torch.int32
+            or output_query.dtype != torch.int32
+            or not output_table.is_contiguous()
+            or not output_seq.is_contiguous()
+            or not output_query.is_contiguous()
+        ):
+            fallback(
+                "cache-group tensor contract "
+                f"(group={group_id}, input_shape={tuple(input_table.shape)}, "
+                f"input_dtype={input_table.dtype}, input_device={input_table.device}, "
+                f"input_stride={input_table.stride()}, "
+                f"input_contiguous={input_table.is_contiguous()}, "
+                f"buffer_shape={builder._smallq_buffer_shape}, "
+                f"output_dtype={output_table.dtype}, "
+                f"output_stride={output_table.stride()}, "
+                f"output_contiguous={output_table.is_contiguous()}, "
+                f"seq_dtype={output_seq.dtype}, "
+                f"seq_contiguous={output_seq.is_contiguous()}, "
+                f"query_dtype={output_query.dtype}, "
+                f"query_contiguous={output_query.is_contiguous()}, "
+                f"num_reqs={num_reqs}, num_query_tokens={num_query_tokens}, "
+                f"input_block_cols={input_block_cols}, "
+                f"builder_block_cols={builder_block_cols})"
+            )
+            return None
+
+        raw_seq_capacity = input_block_cols * int(builder.block_size)
+        if workspace_seq_capacity_cap is not None:
+            raw_seq_capacity = min(
+                raw_seq_capacity,
+                max(max_seq_len_hint, int(workspace_seq_capacity_cap)),
+            )
+        input_tables.append(input_table)
+        output_tables.append(output_table)
+        output_seq_lens.append(output_seq)
+        output_query_start_locs.append(output_query)
+        builder_ids.append(builder_id)
+        workspace_hints.append(raw_seq_capacity)
+
+    if not input_tables:
+        fallback("no distinct full-attention builders")
+        return None
+    descriptor = _sm70_prepare_grouped_smallq_decode_metadata(
+        output_tables,
+        output_seq_lens,
+        output_query_start_locs,
+        input_tables,
+        seq_lens[:num_reqs],
+        query_start_loc[: num_reqs + 1],
+        num_reqs=num_reqs,
+        num_query_tokens=num_query_tokens,
+        real_num_query_tokens=real_num_query_tokens,
+        descriptor=descriptor,
+    )
+    prepared = {
+        builder_id: DFlash2SmallQPreparedMetadata(
+            builder_id=builder_id,
+            num_reqs=num_reqs,
+            num_query_tokens=num_query_tokens,
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_hint,
+        )
+        for builder_id, workspace_hint in zip(builder_ids, workspace_hints)
+    }
+    return prepared, descriptor
+
+
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
@@ -3461,6 +4124,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_bfla,
             self.flash_attn_prefill_paged_splitkv,
         ) = _get_flash_ops()
+        self.flash_attn_grouped_verify_paged = _get_flash_grouped_verify_op()
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -3573,6 +4237,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_decode_xqa
             and os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
         )
+        self.use_dflash2_grouped_verify = (
+            self.flash_attn_grouped_verify_paged is not None
+            and envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY
+            and current_platform.is_device_capability(70)
+        )
+        self.dflash2_grouped_verify_min_model_len = (
+            envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
+        )
+        if self.dflash2_grouped_verify_min_model_len < 1:
+            raise ValueError(
+                "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
+            )
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -4202,6 +4878,122 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             seq_lens,
             **kwargs,
         )
+
+    def _dflash2_grouped_verify_allowed(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        num_query_tokens: int,
+    ) -> bool:
+        """Gate the verifier on its hardware and tensor-layout contract."""
+        global _logged_prefill_smallq_grouped_verify_gate
+        block_table = getattr(attn_metadata, "block_table", None)
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        allowed = bool(
+            self.use_dflash2_grouped_verify
+            and self.flash_attn_grouped_verify_paged is not None
+            and getattr(attn_metadata, "is_dflash_selector_target", False)
+            and getattr(attn_metadata, "max_model_len", 0)
+            >= self.dflash2_grouped_verify_min_model_len
+            and getattr(attn_metadata, "causal", True)
+            and self._flash_v100_window_size(causal=True) == (-1, -1)
+            and num_query_tokens == 8
+            and tuple(query.shape) == (8, 6, 256)
+            and query.dtype == torch.float16
+            and query.is_contiguous()
+            and key_cache.ndim == 4
+            and value_cache.ndim == 4
+            and key_cache.device == query.device
+            and value_cache.device == query.device
+            and key_cache.shape[1] in (1648, 3296)
+            and tuple(key_cache.shape[2:]) == (1, 256)
+            and tuple(value_cache.shape) == tuple(key_cache.shape)
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            and key_cache.stride(-1) == 1
+            and value_cache.stride(-1) == 1
+            and self.kv_cache_dtype == "fp8_e5m2"
+            and block_table is not None
+            and block_table.ndim == 2
+            and block_table.shape[0] == 1
+            and block_table.device == query.device
+            and block_table.dtype == torch.int32
+            and block_table.is_contiguous()
+            and seq_lens is not None
+            and seq_lens.ndim == 1
+            and seq_lens.shape[0] == 1
+            and seq_lens.device == query.device
+            and seq_lens.dtype == torch.int32
+            and seq_lens.is_contiguous()
+        )
+        if (
+            self.use_dflash2_grouped_verify
+            and not allowed
+            and not _logged_prefill_smallq_grouped_verify_gate
+        ):
+            logger.info(
+                "FLASH_ATTN_V100 DFlash2 grouped verifier gate rejected: "
+                "op=%s marker=%s max_model_len=%s min_model_len=%s "
+                "causal=%s window=%s actual=%d q=%s/%s "
+                "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
+                "seq_lens=%s/%s.",
+                self.flash_attn_grouped_verify_paged is not None,
+                getattr(attn_metadata, "is_dflash_selector_target", False),
+                getattr(attn_metadata, "max_model_len", None),
+                self.dflash2_grouped_verify_min_model_len,
+                getattr(attn_metadata, "causal", True),
+                self._flash_v100_window_size(causal=True),
+                num_query_tokens,
+                tuple(query.shape),
+                query.dtype,
+                tuple(key_cache.shape),
+                key_cache.dtype,
+                tuple(value_cache.shape),
+                value_cache.dtype,
+                self.kv_cache_dtype,
+                None if block_table is None else tuple(block_table.shape),
+                None if block_table is None else block_table.dtype,
+                None if seq_lens is None else tuple(seq_lens.shape),
+                None if seq_lens is None else seq_lens.dtype,
+            )
+            _logged_prefill_smallq_grouped_verify_gate = True
+        return allowed
+
+    def _call_dflash2_grouped_verify(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        global _logged_prefill_smallq_grouped_verify
+        if not _logged_prefill_smallq_grouped_verify:
+            logger.info(
+                "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
+                "(q8/H6/Hkv1/D256, FP8 E5M2 KV, one-pass)."
+            )
+            _logged_prefill_smallq_grouped_verify = True
+        self.flash_attn_grouped_verify_paged(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table[:1],
+            attn_metadata.seq_lens[:1],
+            softmax_scale=self.scale,
+            out=out,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+            one_pass=True,
+        )
+        _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dflash2_grouped_verify")
+        _record_route("prefill_smallq_dflash2_grouped_verify")
 
     def _smallq_decode_xqa_allowed(
         self,
@@ -5903,6 +6695,25 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             int(query.shape[0]),
             int(output.shape[0]),
         )
+        if self.use_dflash2_grouped_verify and self._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=num_query_tokens,
+        ):
+            query = query[:num_query_tokens]
+            out_view = output[:num_query_tokens]
+            self._call_dflash2_grouped_verify(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out=out_view,
+            )
+            return output
+
         persistent_decode_block_table = getattr(
             attn_metadata,
             "smallq_decode_block_table",

@@ -190,6 +190,18 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
       return target;
     }
   }
+  const char* selector_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
+  const char* selector_shadow =
+      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
+  const bool exact_selector_rerank =
+      (selector_rerank && std::atoi(selector_rerank) != 0) ||
+      (selector_shadow && std::atoi(selector_shadow) != 0);
+  if (exact_selector_rerank && desc.arch == 700 && desc.type_a == kHalf &&
+      desc.type_b == kHalf && desc.type_c == kHalf && desc.m >= 1 &&
+      desc.m <= 8 && desc.n == 62080 && desc.k == 5120 && desc.num == 1) {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8,    256,         64,
+                                10,     1,      true, "s884_1x4x1"};
+  }
   if (!awq_fast_selector_enabled) {
     return std::nullopt;
   }

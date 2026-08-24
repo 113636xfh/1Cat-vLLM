@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
+    VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
@@ -187,10 +188,23 @@ if TYPE_CHECKING:
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
+    VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
+    VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
+    VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
+    VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
+    VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
+    VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
+    VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
+    VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -365,6 +379,8 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_BHMD_OUT: bool = True
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
+    VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = False
+    VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH: bool = True
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE: bool = False
@@ -1663,6 +1679,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))
     ),
+    # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
+    # stays on the existing TurboMind path.
+    "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -1811,9 +1830,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_LM_HEAD_TOP1_TC": lambda: bool(
         int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))
     ),
+    # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
+    # support, then directly re-evaluates the original FP16 rows and restores
+    # dense-vocabulary top-k tie order. Keep default-off until real-hidden,
+    # quality, and complete Graph/Nsight gates all pass.
+    "VLLM_SM70_DFLASH2_QPN8_RERANK": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))
+    ),
+    # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
+    # local top-k, and return the dense result so the baseline trajectory is
+    # unchanged.  This intentionally synchronizes for diagnostics.
+    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0"))
+    ),
+    # Preserve the production full-vocabulary torch.topk tie contract by
+    # default.  The candidate-order experiment avoids a host-blocking SM70
+    # multi-block top-k, but may be enabled only for paired quality tests.
+    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))
+    ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
-    # this default-off while each stage is checked against the unchanged MRV2
-    # path with identical weights, prompts, and sampling configuration.
+    # this default-off while each stage is checked against the unchanged path.
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))
     ),
@@ -1828,11 +1865,73 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))
     ),
+    # Debug-only device-value assertion. The metadata producers and FULL graph
+    # replay share the current CUDA stream, so production ordering does not
+    # require a host-blocking Tensor.item(). The no-sync route preserves the
+    # accepted token/acceptance trajectory; opt in only when auditing metadata.
+    "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT", "0"))
+    ),
     # Selector-based DFlash packed GDN verification kernel. This is deliberately
     # independent from the shared-metadata umbrella gate so each optimization
     # can be paired against the unchanged verifier in isolation.
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
+    ),
+    # Route compatible target GDN output gates through the existing one-pass
+    # CUDA RMSNormGated implementation. This remains an explicit opt-in.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))
+    ),
+    # Fuse compatible nonzero-offset GDN z/b/a materialization into one
+    # copy kernel. This must stay separate from the plain-view path because
+    # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
+    ),
+    # Build Flash-V100 small-query verifier rows directly in their persistent
+    # graph buffers. This replaces four repeat_interleave scans per KV group.
+    # The matched TP4 trace is token/acceptance exact and cuts the synchronized
+    # DFlash2 draft-to-target interval from 5.720 ms to 1.911 ms on V100.
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))
+    ),
+    # Collapse five compatible target small-query metadata launches into one
+    # heterogeneous-width pointer-table kernel. The paired
+    # TP4 node trace is token/acceptance exact and reduces synchronized D2T.
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))
+    ),
+    # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
+    # packed contiguous layout with one bitwise Triton launch. This replaces
+    # three reshape copies plus one cat in the exact block-eight verifier.
+    "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_QKV_PACK", "0"))
+    ),
+    # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
+    # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
+    ),
+    # Avoid materializing/gathering full-vocabulary target logits when the
+    # DFlash2 proposal and target sampling distributions both have compact
+    # top-k support. Default-off until paired output/acceptance and end-to-end
+    # V100 gates pass; unsupported sampling features fall back to dense logits.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
+    ),
+    # Compute the compatible 25600->5120 target-hidden projection as four output
+    # shards, then all-gather only the 80-KiB block-eight result. This
+    # remains opt-in until the acceptance/quality gate follows the positive
+    # production-weight TP4 microbenchmark.
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    # Opt-in SGLang-style push collective for the exact FP16 [8, 5120]
+    # verifier shape on fully-connected SM70 TP4. The communicator allocates
+    # dedicated two-epoch push storage only when this gate is enabled.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "0"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
@@ -2445,6 +2544,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
+    ),
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "0"))
+    ),
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
     ),
     "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")

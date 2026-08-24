@@ -836,6 +836,152 @@ if hasattr(torch.ops._C, "nvfp4_qpn4_dispatch_sm70_out"):
         return None
 
 
+def nvfp4_qpn2_prepare_sm70(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack checkpoint-native NVFP4 tensors into the QPN2 layout."""
+    return _op("nvfp4_qpn2_prepare_sm70")(weight_packed, weight_scale)
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_sm70"):
+
+    @register_fake("_C::nvfp4_qpn2_prepare_sm70")
+    def _nvfp4_qpn2_prepare_sm70_fake(
+        weight_packed: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        codes = torch.empty_like(weight_packed)
+        scales = torch.empty(
+            weight_scale.shape, dtype=torch.uint8, device=weight_scale.device
+        )
+        return [codes, scales]
+
+
+def nvfp4_qpn2_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    accumulator_chains: int,
+) -> None:
+    _op("nvfp4_qpn2_gemm_sm70_out")(
+        out,
+        input,
+        codes,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_gemm_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_gemm_sm70_out")
+    def _nvfp4_qpn2_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        split_k: int,
+        accumulator_chains: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn2_gated_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    accumulator_chains: int,
+) -> None:
+    _op("nvfp4_qpn2_gated_sm70_out")(
+        out,
+        input,
+        codes,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_gated_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_gated_sm70_out")
+    def _nvfp4_qpn2_gated_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        split_k: int,
+        accumulator_chains: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn2_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    accumulator_chains: int,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    tm_group_size: int,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    gated_silu: bool,
+) -> None:
+    """Select QPN2 for M<=8 and TurboMind for larger dynamic M."""
+    _op("nvfp4_qpn2_dispatch_sm70_out")(
+        out,
+        input,
+        codes,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+        tm_weight,
+        tm_scales,
+        tm_group_size,
+        tm_k_ld,
+        tm_q_ld,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_dispatch_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_dispatch_sm70_out")
+    def _nvfp4_qpn2_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        split_k: int,
+        accumulator_chains: int,
+        tm_weight: torch.Tensor,
+        tm_scales: torch.Tensor,
+        tm_group_size: int,
+        tm_k_ld: int,
+        tm_q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
 def fp8_gemm_sm70_prefill_dispatch_out(
     out: torch.Tensor,
     dense_weight_ptr: int,
@@ -1222,6 +1368,145 @@ if hasattr(torch.ops._C, "sm70_f16_gemm_out"):
         weight: torch.Tensor,
         k_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def sm70_f16_indexed_rerank_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    selected_raw: torch.Tensor,
+    selected_packed: torch.Tensor,
+    expanded: torch.Tensor,
+    partials: torch.Tensor,
+    barriers: torch.Tensor,
+    cta_n: int,
+    split_k: int,
+) -> None:
+    _op("sm70_f16_indexed_rerank_out")(
+        out,
+        input,
+        weight,
+        candidate_ids,
+        selected_raw,
+        selected_packed,
+        expanded,
+        partials,
+        barriers,
+        cta_n,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_indexed_rerank_out"):
+
+    @register_fake("_C::sm70_f16_indexed_rerank_out")
+    def _sm70_f16_indexed_rerank_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        selected_raw: torch.Tensor,
+        selected_packed: torch.Tensor,
+        expanded: torch.Tensor,
+        partials: torch.Tensor,
+        barriers: torch.Tensor,
+        cta_n: int,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def sm70_f16_indexed_rerank_packed_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    packed_weight: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    selected_packed: torch.Tensor,
+    expanded: torch.Tensor,
+    partials: torch.Tensor,
+    barriers: torch.Tensor,
+    cta_n: int,
+    split_k: int,
+) -> None:
+    _op("sm70_f16_indexed_rerank_packed_out")(
+        out,
+        input,
+        packed_weight,
+        candidate_ids,
+        selected_packed,
+        expanded,
+        partials,
+        barriers,
+        cta_n,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_indexed_rerank_packed_out"):
+
+    @register_fake("_C::sm70_f16_indexed_rerank_packed_out")
+    def _sm70_f16_indexed_rerank_packed_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        packed_weight: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        selected_packed: torch.Tensor,
+        expanded: torch.Tensor,
+        partials: torch.Tensor,
+        barriers: torch.Tensor,
+        cta_n: int,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def sm70_f16_rerank_keys_out(
+    keys: torch.Tensor,
+    logits: torch.Tensor,
+    candidate_ids: torch.Tensor,
+) -> None:
+    _op("sm70_f16_rerank_keys_out")(keys, logits, candidate_ids)
+
+
+if hasattr(torch.ops._C, "sm70_f16_rerank_keys_out"):
+
+    @register_fake("_C::sm70_f16_rerank_keys_out")
+    def _sm70_f16_rerank_keys_out_fake(
+        keys: torch.Tensor,
+        logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def sm70_f16_rerank_topk_out(
+    values_out: torch.Tensor,
+    ids_out: torch.Tensor,
+    logits: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    vocab_start_index: int,
+) -> None:
+    _op("sm70_f16_rerank_topk_out")(
+        values_out,
+        ids_out,
+        logits,
+        candidate_ids,
+        vocab_start_index,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_rerank_topk_out"):
+
+    @register_fake("_C::sm70_f16_rerank_topk_out")
+    def _sm70_f16_rerank_topk_out_fake(
+        values_out: torch.Tensor,
+        ids_out: torch.Tensor,
+        logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        vocab_start_index: int,
     ) -> None:
         return None
 

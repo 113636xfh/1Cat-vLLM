@@ -1375,7 +1375,6 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
-
         sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         sm70_flash_no_compile_graph = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE

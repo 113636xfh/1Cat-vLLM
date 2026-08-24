@@ -18,6 +18,12 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backends.flash_attn_v100 import (
+    DFlash2SmallQGroupDescriptor,
+    DFlash2SmallQPreparedMetadata,
+    FlashAttnV100MetadataBuilder,
+    prepare_dflash2_smallq_group_metadata,
+)
 from vllm.v1.attention.backends.gdn_attn import (
     DFlash2GDNGroupDescriptor,
     GDNAttentionMetadata,
@@ -56,6 +62,9 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
     common_gdn_metadata: CommonGDNSpecMetadata | None = None
     prepared_dflash2_gdn_metadata: dict[int, GDNAttentionMetadata] | None = None
+    prepared_dflash2_smallq_metadata: (
+        dict[int, DFlash2SmallQPreparedMetadata] | None
+    ) = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -69,6 +78,16 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         attn_metadata_builder: Any,
         num_reqs: int,
     ) -> dict[str, Any]:
+        if isinstance(attn_metadata_builder, FlashAttnV100MetadataBuilder):
+            return {
+                "prepared_dflash2_smallq_metadata": (
+                    None
+                    if self.prepared_dflash2_smallq_metadata is None
+                    else self.prepared_dflash2_smallq_metadata.get(
+                        id(attn_metadata_builder)
+                    )
+                )
+            }
         if not isinstance(
             attn_metadata_builder,
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
@@ -124,6 +143,20 @@ class MambaHybridModelState(DefaultModelState):
         ) = None
         self._dflash2_gdn_group_descriptor: DFlash2GDNGroupDescriptor | None = None
         self._dflash2_fused_gdn_metadata_logged = False
+        self._use_dflash2_grouped_smallq_metadata = bool(
+            self._use_dflash2_common_gdn_metadata
+            and envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+            and envs.VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA
+            and device.type == "cuda"
+            and current_platform.is_device_capability(70)
+        )
+        self._dflash2_smallq_builders: (
+            list[tuple[int, FlashAttnV100MetadataBuilder]] | None
+        ) = None
+        self._dflash2_smallq_group_descriptor: DFlash2SmallQGroupDescriptor | None = (
+            None
+        )
+        self._dflash2_grouped_smallq_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.full(
@@ -256,6 +289,20 @@ class MambaHybridModelState(DefaultModelState):
             self._dflash2_gdn_builders = builders
         return self._dflash2_gdn_builders
 
+    def _get_dflash2_smallq_builders(
+        self,
+        attn_groups: list[list[AttentionGroup]],
+    ) -> list[tuple[int, FlashAttnV100MetadataBuilder]]:
+        if self._dflash2_smallq_builders is None:
+            builders: list[tuple[int, FlashAttnV100MetadataBuilder]] = []
+            for kv_cache_group_id, groups in enumerate(attn_groups):
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    if isinstance(builder, FlashAttnV100MetadataBuilder):
+                        builders.append((kv_cache_group_id, builder))
+            self._dflash2_smallq_builders = builders
+        return self._dflash2_smallq_builders
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -286,6 +333,7 @@ class MambaHybridModelState(DefaultModelState):
         num_decode_draft_tokens_cpu = None
         common_gdn_metadata = None
         prepared_dflash2_gdn_metadata = None
+        prepared_dflash2_smallq_metadata = None
         if not for_capture:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
@@ -345,12 +393,45 @@ class MambaHybridModelState(DefaultModelState):
                         )
                         self._dflash2_fused_gdn_metadata_logged = True
 
+            if (
+                self._use_dflash2_grouped_smallq_metadata
+                and cudagraph_mode == CUDAGraphMode.FULL
+                and common_gdn_metadata is not None
+            ):
+                seq_lens_cpu = input_batch.seq_lens_cpu_upper_bound[:num_reqs]
+                max_seq_len_hint = int(seq_lens_cpu.max().item())
+                prepared_smallq_result = prepare_dflash2_smallq_group_metadata(
+                    builders_by_group=self._get_dflash2_smallq_builders(attn_groups),
+                    block_tables=block_tables,
+                    seq_lens=input_batch.seq_lens,
+                    query_start_loc=input_batch.query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    num_reqs=num_reqs,
+                    num_query_tokens=num_tokens,
+                    max_seq_len_hint=max_seq_len_hint,
+                    workspace_seq_capacity_cap=self.max_model_len,
+                    descriptor=self._dflash2_smallq_group_descriptor,
+                )
+                if prepared_smallq_result is not None:
+                    (
+                        prepared_dflash2_smallq_metadata,
+                        self._dflash2_smallq_group_descriptor,
+                    ) = prepared_smallq_result
+                    if not self._dflash2_grouped_smallq_metadata_logged:
+                        logger.info(
+                            "DFlash2 grouped small-query metadata active for %d "
+                            "full-attention cache groups.",
+                            len(prepared_dflash2_smallq_metadata),
+                        )
+                        self._dflash2_grouped_smallq_metadata_logged = True
+
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             common_gdn_metadata=common_gdn_metadata,
             prepared_dflash2_gdn_metadata=prepared_dflash2_gdn_metadata,
+            prepared_dflash2_smallq_metadata=prepared_dflash2_smallq_metadata,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -364,19 +445,24 @@ class MambaHybridModelState(DefaultModelState):
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
         )
         if common_gdn_metadata is not None:
-            # The legacy per-group builder fenced here through a GPU ``.item()``
-            # assertion. Keep one batch-level fence after every group's state
-            # contract and graph-buffer copy instead of removing the ordering
-            # edge or paying it once per GDN cache group.
-            assert (
-                common_gdn_metadata.spec_query_start_loc[-1].item()
-                == common_gdn_metadata.num_spec_decode_tokens
+            assert common_gdn_metadata.spec_query_start_loc.numel() == (
+                common_gdn_metadata.num_spec_decodes + 1
             )
+            # Metadata kernels/copies and FULL CUDA Graph replay are enqueued on
+            # the same current stream, which already supplies the required
+            # device ordering. Retain the old value check as an opt-in debug
+            # fence while the no-sync route is quality- and trace-gated.
+            if envs.VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT:
+                assert (
+                    common_gdn_metadata.spec_query_start_loc[-1].item()
+                    == common_gdn_metadata.num_spec_decode_tokens
+                )
         return attn_metadata
 
     def postprocess_state(

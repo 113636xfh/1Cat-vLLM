@@ -104,6 +104,80 @@ _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
+@triton.jit
+def _sm70_pack_qwen_gdn_qkv_kernel(
+    mixed_qkv,
+    packed,
+    input_row_stride: tl.int64,
+    num_rows: tl.constexpr,
+    q_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """Bitwise row-slice copy into [all Q][all K][all V] storage."""
+    row = tl.program_id(0)
+    input_row = mixed_qkv + row * input_row_stride
+
+    q_cols = tl.arange(0, BLOCK_Q)
+    q_mask = q_cols < q_dim
+    q = tl.load(input_row + q_cols, mask=q_mask)
+    tl.store(packed + row * q_dim + q_cols, q, mask=q_mask)
+
+    k_cols = tl.arange(0, BLOCK_K)
+    k_mask = k_cols < k_dim
+    k = tl.load(input_row + q_dim + k_cols, mask=k_mask)
+    q_numel = num_rows * q_dim
+    tl.store(packed + q_numel + row * k_dim + k_cols, k, mask=k_mask)
+
+    v_cols = tl.arange(0, BLOCK_V)
+    v_mask = v_cols < v_dim
+    v = tl.load(input_row + q_dim + k_dim + v_cols, mask=v_mask)
+    qk_numel = q_numel + num_rows * k_dim
+    tl.store(packed + qk_numel + row * v_dim + v_cols, v, mask=v_mask)
+
+
+def _sm70_pack_qwen_gdn_qkv(
+    mixed_qkv: torch.Tensor,
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+) -> torch.Tensor:
+    """Materialize the recurrent Q/K/V layout with one copy launch."""
+    if mixed_qkv.ndim != 2:
+        raise ValueError("mixed_qkv must be rank two")
+    if mixed_qkv.stride(1) != 1:
+        raise ValueError("mixed_qkv must be contiguous by row")
+    if min(q_dim, k_dim, v_dim) <= 0:
+        raise ValueError("Q/K/V widths must be positive")
+    if mixed_qkv.shape[1] < q_dim + k_dim + v_dim:
+        raise ValueError("mixed_qkv is narrower than the Q/K/V widths")
+
+    num_rows = mixed_qkv.shape[0]
+    packed = torch.empty(
+        num_rows * (q_dim + k_dim + v_dim),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    _sm70_pack_qwen_gdn_qkv_kernel[(num_rows,)](
+        mixed_qkv,
+        packed,
+        mixed_qkv.stride(0),
+        num_rows=num_rows,
+        q_dim=q_dim,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        BLOCK_Q=triton.next_power_of_2(q_dim),
+        BLOCK_K=triton.next_power_of_2(k_dim),
+        BLOCK_V=triton.next_power_of_2(v_dim),
+        num_warps=8,
+        num_stages=1,
+    )
+    return packed
+
+
 def _ddtree_parent_ids_require_branch(
     parent_ids: torch.Tensor | None,
     num_tree_tokens_cpu: torch.Tensor | None,
@@ -2211,6 +2285,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_fused_gdn_norm = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+        )
+        self.enable_sm70_dflash2_fused_gdn_split = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+        )
+        self.enable_sm70_dflash2_fused_qkv_pack = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+        )
         self.compare_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
         )
@@ -2302,6 +2391,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.enable_sm70_dflash2_fused_gdn_verify:
             logger.info_once(
                 "SM70 DFlash2 packed GDN target-verification route enabled.",
+                scope="local",
+            )
+        if self.enable_sm70_dflash2_fused_gdn_norm:
+            logger.info_once(
+                "SM70 DFlash2 one-pass GDN output RMSNorm route enabled.",
+                scope="local",
+            )
+        if self.enable_sm70_dflash2_fused_gdn_split:
+            logger.info_once(
+                "SM70 DFlash2 fused GDN z/b/a materialization route enabled.",
+                scope="local",
+            )
+        if self.enable_sm70_dflash2_fused_qkv_pack:
+            logger.info_once(
+                "SM70 DFlash2 fused post-convolution Q/K/V packing enabled.",
                 scope="local",
             )
         if envs.is_set("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING"):
@@ -2663,11 +2767,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         k_dim = self.key_dim // self.tp_size
         v_dim = self.value_dim // self.tp_size
 
-        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
-
-        fused = torch.cat(
-            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
-        )
+        if (
+            self.enable_sm70_dflash2_fused_qkv_pack
+            and seq_len == 8
+            and mixed_qkv.is_cuda
+            and mixed_qkv.dtype == torch.float16
+            and mixed_qkv.stride(1) == 1
+        ):
+            fused = _sm70_pack_qwen_gdn_qkv(mixed_qkv, q_dim, k_dim, v_dim)
+        else:
+            query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+            fused = torch.cat(
+                [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
+            )
 
         q_size = seq_len * q_dim
         k_size = seq_len * k_dim
@@ -3632,7 +3744,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         z = _sm70_dump_gdn_projection_tensor("proj_z", layer_name, z)
         profile_start = _sm70_gdn_prefill_profile_start()
-        core_attn_out = self.norm(core_attn_out, z)
+        if self.enable_sm70_dflash2_fused_gdn_norm:
+            # RMSNormGated is decomposed into a nine-kernel native chain when
+            # it is reached from the opaque Qwen GDN op under the default
+            # inductor custom-op policy. Its canonical CUDA implementation is
+            # a one-pass Triton kernel with the same FP32 accumulation and
+            # FP16 output contract, so call it directly on this isolated path.
+            core_attn_out = self.norm.forward_cuda(core_attn_out, z)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_norm",

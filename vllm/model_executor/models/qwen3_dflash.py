@@ -402,6 +402,24 @@ class DFlashQwen3Model(nn.Module):
         },
     )
 
+    def _make_context_projection(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> nn.Module:
+        return ReplicatedLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            params_dtype=vllm_config.model_config.dtype,
+            quant_config=self.quant_config,
+            prefix=prefix,
+            return_bias=False,
+        )
+
     def __init__(
         self,
         *,
@@ -456,16 +474,11 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
-                input_size=_get_dflash_fc_input_size(
-                    vllm_config,
-                ),
+            self.fc = self._make_context_projection(
+                vllm_config=vllm_config,
+                input_size=_get_dflash_fc_input_size(vllm_config),
                 output_size=self.config.hidden_size,
-                bias=False,
-                params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
-                return_bias=False,
             )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
