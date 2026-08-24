@@ -1539,7 +1539,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
 //
 // Independent-row decode scans the same paged KV prefix once for every
 // verifier token.  This kernel instead assigns two GQA subgroups to each of
-// forty context splits.  Every CTA handles up to four query heads for all
+// eighty context splits.  Every CTA handles up to four query heads for all
 // eight verifier tokens, so K/V is shared across tokens before the exact
 // split-softmax states are merged.
 //
@@ -1555,7 +1555,10 @@ constexpr int kGroupedVerifyHeadDim = 256;
 constexpr int kGroupedVerifyHeadsPerCta = 4;
 constexpr int kGroupedVerifyRows = 32;
 constexpr int kGroupedVerifyBlockN = 32;
-constexpr int kGroupedVerifySplits = 40;
+// Two head groups times eighty context splits expose two resident CTAs on
+// each of V100's eighty SMs. Short sequences still reduce active_splits using
+// kGroupedVerifyMinTokensPerSplit inside the captured graph.
+constexpr int kGroupedVerifySplits = 80;
 constexpr int kGroupedVerifyMinTokensPerSplit = 128;
 constexpr int kGroupedVerifyThreads = 256;
 constexpr int kGroupedVerifyWarps = kGroupedVerifyThreads / kWarpSize;
@@ -3176,14 +3179,19 @@ at::Tensor flash_attention_grouped_verify_paged(
               "grouped verify KV head dimension must be contiguous");
   TORCH_CHECK(partial_out.is_contiguous() && partial_lse.is_contiguous(),
               "grouped verify workspaces must be contiguous");
-  TORCH_CHECK(partial_out.sizes() ==
-                  at::IntArrayRef({kGroupedVerifySplits, kGroupedVerifyMaxQ,
-                                   kGroupedVerifyHeads, kGroupedVerifyHeadDim}),
-              "partial_out must have shape [40, 8, 6, 256]");
-  TORCH_CHECK(partial_lse.sizes() ==
-                  at::IntArrayRef({kGroupedVerifySplits, kGroupedVerifyMaxQ,
-                                   kGroupedVerifyHeads}),
-              "partial_lse must have shape [40, 8, 6]");
+  TORCH_CHECK(
+      partial_out.sizes() ==
+          at::IntArrayRef({kGroupedVerifySplits,
+                           kGroupedVerifyMaxQ,
+                           kGroupedVerifyHeads,
+                           kGroupedVerifyHeadDim}),
+      "partial_out must have shape [80, 8, 6, 256]");
+  TORCH_CHECK(
+      partial_lse.sizes() ==
+          at::IntArrayRef({kGroupedVerifySplits,
+                           kGroupedVerifyMaxQ,
+           kGroupedVerifyHeads}),
+      "partial_lse must have shape [80, 8, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
 
