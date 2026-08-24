@@ -42015,17 +42015,20 @@ Interpretation:
   shapes, TP8, EP, and all-to-all fail closed rather than taking a generic
   fallback.
 - The native Qwen3.6-35B-A3B MoE contract is H2048, expert I512, 256 experts,
-  top-k 8, replicated experts, and TP1/2/4. B1-B8 decode uses compact active
-  expert groups. B9-B18 CUDA Graph/MTP decode and larger prefill use persistent
+  top-k 8, replicated experts, and TP1/2/4. B1-B10 decode uses compact routed
+  slot groups. B11-B18 CUDA Graph/MTP decode and larger prefill use persistent
   buffers with the full 256-expert grouped TurboMind operation. The grouped
   prefill policy is default-on and may be disabled only for diagnosis with
   `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=0`.
 - A real layer-0 TP4 checkpoint oracle matched the previous per-expert route:
   M4096 W13/W2 were bitwise identical and improved 20.39x/9.48x. Full-grouped
   B9 and B18 had cosine 1.0, maximum absolute error at most 1.221e-4, and
-  21.59x-35.21x isolated-stage speedups. Expanding the compact path to 144
-  groups produced a roughly 0.495 W13 relative-L2 error and catastrophic W2
-  output, so the compact limit remains 64 groups; do not repeat that candidate.
+  21.59x-35.21x isolated-stage speedups. A rejected 144-group experiment
+  coalesced repeated expert IDs even though the forced-one-row scheduler
+  requires routed slots to remain independent; its roughly 0.495 W13
+  relative-L2 error and catastrophic W2 output do not establish a general
+  64-group correctness limit. The corrected slot-independent B9/B10 evidence
+  is recorded in the concurrency section below.
 - Matching TP4, FP8-E5M2 KV-cache, Flash-V100/FlashQLA, full CUDA Graph,
   input-4096/output-1024, max-length-8192 runs measured AWQ at 0.3813 s prefill
   and 113.71 token/s steady decode. Default-grouped NVFP4 measured 0.4216 s and
@@ -42057,6 +42060,12 @@ Interpretation:
   `[2, 12, 37, 87, 89, 102, 119]`. Record 37 is a cap-induced truncation and is
   correct at 1024 output tokens, so effective MTP4 accuracy is 122/128. A
   standard-GDN diagnostic scored only 108/128 and is rejected.
+- The bounded B10 source at `5422173e99` passes the same pinned GSM8K-128
+  MTP4 gate at 122/128 (95.3125%), with zero invalid answers, zero repetitive
+  records, and wrong indices `[2, 12, 87, 89, 102, 119]`. It generated 19,434
+  output tokens in 135.967 s. This is dataset-level evidence that the B10
+  extension does not regress the accepted MTP4 quality band; no-MTP token
+  equality is not used as its oracle.
 - A final default-grouped, no-MTP natural-text gate used two identical Chinese
   prompts and one Python prompt. All three requests reached EOS with `stop`;
   the duplicate outputs were token-for-token identical, and the code response
@@ -42069,6 +42078,8 @@ Interpretation:
   `results/tp4_mtp4_fp8kv_gsm8k_chat_nothink_5shot_128_coldstart_rebased_final_graph.json`;
   the all-JIT-warm ShareGPT artifact is
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
+  The bounded-B10 dataset artifact is
+  `bench_results/qwen36_nvfp4_concurrency_scaling_20260824/results/candidate_final_mtp4_gsm8k_chat_nothink_5shot_128.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
 
@@ -42472,5 +42483,6 @@ Interpretation:
   fallback. It may reduce padded grouped scheduling without a host readback or
   a probabilistic correctness assumption. A persistent tile scheduler remains
   the larger follow-up if guarded active-group bucketing cannot beat its extra
-  CUDA Graph launch. The B10 GSM8K-128 quality gate remains pending while the
-  physical TP4 GPUs are occupied by an unrelated task.
+  CUDA Graph launch. B10 has passed the pinned GSM8K-128 MTP4 gate at 122/128,
+  with zero invalid or repetitive records; the next quality gate belongs to
+  any high-concurrency scheduler candidate that survives full-model A/B/A.
