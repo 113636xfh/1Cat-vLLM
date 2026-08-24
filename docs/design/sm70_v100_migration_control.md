@@ -41770,7 +41770,23 @@ Interpretation:
   because it grows shared memory without a measurable speed advantage. Nsight
   Compute counter collection is unavailable to this user
   (`ERR_NVGPUCTRPERM`); no driver security setting was changed.
-- Full TP4 Qwen3.8 128K E5M2-KV, chunk-8192, official-sampling A/B/A is the
-  remaining promotion gate. Do not cite the operator result as an endpoint
-  throughput claim until that gate records route hits, output quality, prefill,
-  TTFT, and pure decode separately.
+- The first full-model attempt failed before any request during FULL-graph XQA
+  metadata warmup. The source passed the new 19th
+  `batch_context_max_seq_len` argument, while the stale system Flash-V100
+  binary exposed the old 18-argument ABI. Rebuilding the unchanged current
+  Flash-V100 source produced SHA `ac07dc9d...5580a8`; its 19-argument docstring
+  and a CUDA-graph E5M2 XQA scalar/padded bitwise gate pass. This harness repair
+  was used identically for both control arms and the candidate.
+- Matched TP4 Qwen3.8 128K E5M2-KV, chunk-8192, official-sampling A/B/A passes.
+  Baseline A/candidate/baseline B prefill times are
+  `47.8992/47.6687/47.9475 s`. The bracketed control is `47.9233 s` or
+  `2735.0 tok/s`; the candidate is `47.6687 s` or `2749.6 tok/s`, giving
+  `-0.531%` latency and `+0.534%` throughput. TTFT changes
+  `47.9498 -> 47.6937 s` (`-0.534%`). Pure decode is neutral at
+  `5.1557 -> 5.1547 s` and `49.460 -> 49.470 tok/s`.
+- All arms return 256 tokens with identical hash `2db7ef09...503325a`.
+  All four ranks report the same route counts: exact-dense D256 32,
+  prefix-paged 544, E5M2 bridge 544, scalar decode 176, and XQA decode 256.
+  The endpoint promotion gate is satisfied; the result is deliberately cited
+  as a small dependency-chain gain, not as completion of the broader 128K
+  utilization target.

@@ -194,11 +194,35 @@ Closed intermediate variants must not be repeated:
 Nsight Compute recognized the exact mangled kernel but the host driver denied
 performance-counter access with `ERR_NVGPUCTRPERM`. No privilege or machine
 security setting was changed. CUDA-event timing and static SASS are therefore
-the timing and structural authorities for this experiment. End-to-end TP4
-128K acceptance remains a separate gate.
+the timing and structural authorities for this experiment.
+
+The matched end-to-end TP4 128K A/B/A gate also passes. It fixes Qwen3.8-27B
+FP8 weights, 131,072 input tokens, 256 sampled output tokens, E5M2 KV, chunk
+8192, no MTP, prefix caching, Mamba align, Flash-V100, CUDA graphs, and
+`temperature=1.0/top_p=0.95/top_k=20/seed=20260824`. The control is the mean
+of the two bracketing baseline runs.
+
+| Metric | Bracketed control | Lifetime alias | Change |
+|---|---:|---:|---:|
+| prefill | 47.9233 s | 47.6687 s | -0.531% |
+| prefill throughput | 2735.0 tok/s | 2749.6 tok/s | +0.534% |
+| TTFT | 47.9498 s | 47.6937 s | -0.534% |
+| pure decode | 5.1557 s | 5.1547 s | neutral (+0.020% speed) |
+
+All three runs produce the same 256-token output hash
+`2db7ef09...503325a`. Every rank reports the same route counts, including 32
+exact dense D256 calls, 544 prefix-paged calls, and 544 E5M2 bridge calls.
+This promotes the small dependency-chain win, but it also establishes that
+barrier removal alone is not a double-digit long-context solution.
 
 ## Artifacts
 
+- K-stage task root:
+  `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824`.
+- Final clean FA2 binary:
+  `build/formal-v6-final-cmake/_vllm_fa2_C.abi3.so` under that task root.
+- Endpoint A/B/A JSON:
+  `results/tp4-128k-{baseline-a-v6,candidate-v6,baseline-b-v6}.json`.
 - Root: task-local `qwen38-fp8-prefill-decay-20260815` artifact directory.
 - Nsight Systems:
   `profiles/qwen38-fp8-tp4-i128k-chunk15680-r2.nsys-rep`.
