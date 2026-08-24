@@ -61,6 +61,11 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
     parse_chat_output,
 )
+from vllm.entrypoints.openai.serving_defaults import (
+    get_model_serving_defaults,
+    merge_extra_args,
+    validate_required_logits_processors,
+)
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
@@ -151,6 +156,20 @@ class OpenAIServingChat(OpenAIServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        # Per-model serving recipe (e.g. document-OCR models): fill sampling
+        # defaults the hub generation_config does not provide, and fail loudly
+        # at startup when a recipe-required logits processor is not loaded.
+        self.model_serving_defaults = get_model_serving_defaults(
+            getattr(self.model_config, "architectures", None)
+        )
+        if self.model_serving_defaults is not None:
+            for key, value in self.model_serving_defaults.sampling_defaults.items():
+                self.default_sampling_params.setdefault(key, value)
+            validate_required_logits_processors(
+                self.model_serving_defaults,
+                self.model_config.logits_processors,
+                self.model_config.model,
+            )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -310,6 +329,14 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if self.model_serving_defaults is not None:
+                    try:
+                        merged = merge_extra_args(
+                            self.model_serving_defaults, sampling_params.extra_args
+                        )
+                    except ValueError as e:
+                        return self.create_error_response(str(e))
+                    sampling_params.extra_args = merged or None
 
             self._log_inputs(
                 sub_request_id,
