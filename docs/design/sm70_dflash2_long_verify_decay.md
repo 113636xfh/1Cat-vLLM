@@ -112,7 +112,7 @@ random physical-page cases against the FP32 reference, and CUDA Graph replay
 while mutating runtime sequence length. These are operator correctness gates;
 acceptance length, PPL, and task scores remain required before promotion.
 
-## Full-model 128K confirmation
+## Full-model 32K and 128K confirmation
 
 A TP4 FULL-Graph Nsight run used the same 128K prompt, 128 generated tokens,
 probabilistic sampling seed, model/KV dtypes, and route gates as retained
@@ -139,6 +139,71 @@ The fixed diagnostic request retained identical accepted-token counts
 output token IDs. This is trajectory evidence, not a substitute for the
 required score/PPL gates.
 
+The matching 32K TP4 FULL-Graph trace independently confirms the shorter
+context point:
+
+| Phase | Split 40 | Split 80 | Delta |
+| --- | ---: | ---: | ---: |
+| Complete verification round | 26.361447 ms | 25.238442 ms | -1.123005 ms (-4.26%) |
+| Target | 20.451644 ms | 19.468326 ms | -0.983318 ms (-4.81%) |
+| Draft | 4.365014 ms | 4.257568 ms | -0.107446 ms |
+| Draft to target | 0.260419 ms | 0.235765 ms | -0.024654 ms |
+| Target to draft | 1.284369 ms | 1.276783 ms | -0.007586 ms |
+
+The split-80 partial kernel averages 0.248999 ms at 32K, versus 0.313606 ms
+for split 40. The measured target reduction is within 0.05 ms of the operator
+projection. Across the paired full-model endpoints, the 32K-to-128K complete
+round growth falls from 14.416625 ms to 11.445270 ms (-20.61%), while target
+growth falls from 14.195222 ms to 11.089005 ms (-21.88%). The remaining slope
+is still serious: target accounts for 96.89% of the optimized complete-round
+growth, so subsequent work remains scoped to grouped paged attention.
+
+## Physical-page and tile-balanced follow-up
+
+Two address-equivalent scheduling changes pass the same six operator tests:
+
+- Specialize the actual FP8 kernel-page sizes (1,648 and 3,296) at compile
+  time, replacing runtime integer division with constant arithmetic. The
+  Qwen3.8 hybrid cache reports a 1,648-token logical attention block, while the
+  grouped verifier receives the 3,296-element physical FP8 view; the final
+  trace proves the `<page=3296>` specialization is selected.
+- Divide the sequence by complete 32-token WMMA tiles, distributing the
+  remainder across splits. This removes per-split padded tail tiles without
+  changing visibility, loaded KV bytes, softmax, or WMMA arithmetic.
+
+Repeated CUDA-Graph A/B/A runs show no 32K regression and a further
+approximately 1.7% operator reduction at 128K versus plain split 80. The final
+TP4 FULL-Graph endpoints are:
+
+| Phase | Split 80 at 32K | Final at 32K | Split 80 at 128K | Final at 128K |
+| --- | ---: | ---: | ---: | ---: |
+| Complete verification round | 25.238442 ms | 25.237987 ms | 36.683712 ms | 36.482220 ms |
+| Target | 19.468326 ms | 19.455442 ms | 30.557332 ms | 30.354906 ms |
+| Draft | 4.257568 ms | 4.269400 ms | 4.627743 ms | 4.606652 ms |
+
+At 128K, the partial kernel falls from 0.944041 ms to 0.926568 ms per
+full-attention layer; sixteen layers predict -0.280 ms and the measured target
+delta is -0.202 ms. At 32K, the partial kernel is 0.245912 ms and complete wall
+is unchanged within 0.001 ms. The final 32K-to-128K complete-round slope is
+11.244233 ms, 22.01% below split 40 and 1.76% below plain split 80. The final
+target slope is 10.899464 ms, 23.22% below split 40. Target attention still
+accounts for 96.93% of the residual complete-round slope.
+
+A logical-work roofline proxy narrows the remaining operator bottleneck. The
+two padded 32-row GQA groups perform about 2.15/8.59 GFLOP per layer at
+32K/128K; the measured partial times correspond to only 8.73/9.27 logical
+TFLOP/s. Their requested E5M2 K/V payload corresponds to about 136/145 GB/s
+before accounting for duplicate-group L2 reuse. Both rates stay nearly flat as
+context grows and are far below V100 peak figures. This is not an NCU hardware
+counter claim, but it rules out treating the residual as unavoidable saturated
+HBM traffic and prioritizes flat-QK/PV utilization, softmax synchronization,
+and GQA packing over further page-address arithmetic.
+
+The final 128K diagnostic request preserves the split-80 accepted-token counts
+and 7.647059 mean acceptance length. At 32K, the single-request diagnostic
+changes from 6.142857 to 6.095238 (-0.047619), inside the 0.05 diagnostic gate;
+dataset-level acceptance and model-quality gates remain authoritative.
+
 An attempted compact mapping for the two-head GQA tail passed the six operator
 correctness tests but was 6.3-7.0% slower than split 80 across the micro sweep.
 The run also observed a late external-worker ownership race, so its absolute
@@ -146,6 +211,48 @@ timings are not promotion evidence; the uniformly negative direction was
 sufficient to revert the experiment completely. Nsight Compute hardware
 counters are unavailable to the current user (`ERR_NVGPUCTRPERM`), so no NCU
 counter claim is made.
+
+A second exact-address experiment replaced sixteen redundant page divisions,
+modulos, and block-table loads per D=256 row with one half-warp calculation and
+broadcast. It preserved register count and passed all six operator correctness
+tests, but regressed the one-pass kernel by 3.51%/2.36%/2.47%/2.63% at
+1K/32K/128K/256K in a production-page-size A/B/A run. On this Volta path, the
+independent address arithmetic is hidden better than the added shuffle
+dependency. The candidate was reverted completely.
+
+## Score and PPL promotion evidence
+
+The final split-80/page-specialized/tile-balanced binary was evaluated with
+probabilistic proposals, target sampling at temperature 1.0/top-p 0.95/top-k
+20, fixed seed, a 2,048-token cap, and natural EOS. The mixed dataset supplies
+32 GSM8K, 32 HumanEval, and 32 MATH500 cases. Its embedded MBPP prompts have an
+incompatible function-name contract and are excluded; the independent
+`mbpp-tests-32` dataset supplies the valid MBPP result.
+The tested extension SHA256 is
+`4a925265cfed934ebd7772be2a1eccaa64163d5324f87d31ba8ee99d10c3a044`.
+
+| Suite | Target only | Prior grouped | Final candidate |
+| --- | ---: | ---: | ---: |
+| GSM8K | 29/32 | 30/32 | 30/32 |
+| HumanEval | 28/32 | 28/32 | 27/32 |
+| MATH500 | 26/32 | 25/32 | 26/32 |
+| MBPP, independent tests | 25/32 | 25/32 | 26/32 |
+| Valid total | 108/128 | 108/128 | 109/128 |
+
+The suite-level movement is one HumanEval case down and a net two MATH/MBPP
+cases up; the valid aggregate is therefore one case above both controls, not a
+quality-regression claim. WikiText prompt-logprob/PPL output is exactly equal
+to the prior grouped candidate across all eight samples (zero maximum and mean
+difference). Against target only, the maximum PPL difference is 0.003952 and
+the mean absolute prompt-logprob difference is 0.007519.
+
+Acceptance also remains inside the frozen 0.05 gate. On the 128-request mixed
+run, request-mean completion tokens per verification step change from 4.238430
+to 4.218840 (-0.019589), and pooled acceptance length changes from 3.749104 to
+3.714972 (-0.034132). On independent MBPP they change from 3.527945 to
+3.509266 (-0.018679), while pooled acceptance changes from 3.421634 to
+3.431016 (+0.009382). The final runs produce 101,312 and 28,070 output tokens,
+respectively; 103/128 and 24/32 requests terminate naturally before the cap.
 
 ## Measurement order
 
@@ -174,7 +281,12 @@ counter claim is made.
 ## Current status
 
 The 32K/128K trace attribution is closed: target grouped attention is the
-long-context verification bottleneck. The split-40/80 operator A/B is complete
-and the 128K full-model trace confirms the predicted critical-path improvement.
-The 32K/1K boundary checks and score/PPL gates remain pending before split 80
-can be promoted as the default.
+long-context verification bottleneck. The split-40/80 operator A/B and both
+32K and 128K full-model traces confirm the predicted critical-path
+improvement. Split 80 reduces, but does not eliminate, the long-context slope.
+The physical-page specialization and tile-balanced partitioning also pass
+operator and full-model performance gates, reducing the final slope by 22.01%
+relative to split 40. PPL, score, and dataset-level acceptance gates pass. The
+1K full-model boundary check remains pending before promotion. Two bounded
+follow-ups (tail compaction and page-address broadcast) are recorded as
+rejected paths and must not be resurrected without new evidence.

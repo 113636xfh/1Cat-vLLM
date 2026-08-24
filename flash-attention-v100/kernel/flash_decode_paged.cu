@@ -636,8 +636,10 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   const int row = copy_idx / panel_d_stride_uint4;
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
-  static_assert(BLOCK_SIZE == 0 || BLOCK_SIZE == 16 || BLOCK_SIZE == 784,
-                "Unsupported paged-KV block-size specialization");
+  static_assert(
+      BLOCK_SIZE == 0 || BLOCK_SIZE == 16 || BLOCK_SIZE == 784 ||
+          BLOCK_SIZE == 1648 || BLOCK_SIZE == 3296,
+      "Unsupported paged-KV block-size specialization");
   static_assert(!CONTIGUOUS_HKV1_LAYOUT || BLOCK_SIZE == 16,
                 "The contiguous Hkv=1 layout requires 16-token pages");
   int logical_block;
@@ -648,6 +650,12 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   } else if constexpr (BLOCK_SIZE == 784) {
     logical_block = token_offset / 784;
     block_offset = token_offset - logical_block * 784;
+  } else if constexpr (BLOCK_SIZE == 1648) {
+    logical_block = token_offset / 1648;
+    block_offset = token_offset - logical_block * 1648;
+  } else if constexpr (BLOCK_SIZE == 3296) {
+    logical_block = token_offset / 3296;
+    block_offset = token_offset - logical_block * 3296;
   } else {
     logical_block = token_offset / block_size;
     block_offset = token_offset % block_size;
@@ -714,6 +722,12 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       } else if constexpr (BLOCK_SIZE == 784) {
         logical_block = token_offset / 784;
         block_offset = token_offset - logical_block * 784;
+      } else if constexpr (BLOCK_SIZE == 1648) {
+        logical_block = token_offset / 1648;
+        block_offset = token_offset - logical_block * 1648;
+      } else if constexpr (BLOCK_SIZE == 3296) {
+        logical_block = token_offset / 3296;
+        block_offset = token_offset - logical_block * 3296;
       } else {
         logical_block = token_offset / block_size;
         block_offset = token_offset % block_size;
@@ -1644,18 +1658,27 @@ __device__ __forceinline__ void grouped_verify_scale_output_fragment(
   fragment.x[7] *= second_scale;
 }
 
-template <bool TWO_PASS>
-__global__
-__launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_e5m2_partial_kernel(
-    const __half* __restrict__ q, const void* __restrict__ k_cache,
-    const void* __restrict__ v_cache, const int* __restrict__ block_table,
-    const int* __restrict__ seq_lens, __half* __restrict__ partial_out,
-    float* __restrict__ partial_lse, const int query_len,
-    const int max_num_blocks, const int page_block_size,
-    const int64_t k_block_stride, const int64_t k_token_stride,
-    const int64_t k_head_stride, const int64_t v_block_stride,
-    const int64_t v_token_stride, const int64_t v_head_stride,
-    const float qk_scale, const float v_scale) {
+template <bool TWO_PASS, int PAGE_BLOCK_SIZE = 0>
+__global__ __launch_bounds__(kGroupedVerifyThreads, 2)
+void flash_attention_grouped_verify_e5m2_partial_kernel(
+    const __half* __restrict__ q,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    __half* __restrict__ partial_out,
+    float* __restrict__ partial_lse,
+    const int query_len,
+    const int max_num_blocks,
+    const int page_block_size,
+    const int64_t k_block_stride,
+    const int64_t k_token_stride,
+    const int64_t k_head_stride,
+    const int64_t v_block_stride,
+    const int64_t v_token_stride,
+    const int64_t v_head_stride,
+    const float qk_scale,
+    const float v_scale) {
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
   (void)max_num_blocks;
@@ -1675,9 +1698,16 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
   if (split_id >= active_splits) {
     return;
   }
-  const int split_len = (total_kv + active_splits - 1) / active_splits;
-  const int split_start = split_id * split_len;
-  const int split_end = min(total_kv, split_start + split_len);
+  const int total_tiles =
+      (total_kv + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
+  const int base_tiles = total_tiles / active_splits;
+  const int extra_tiles = total_tiles - base_tiles * active_splits;
+  const int split_tile_start =
+      split_id * base_tiles + min(split_id, extra_tiles);
+  const int split_tiles = base_tiles + (split_id < extra_tiles ? 1 : 0);
+  const int split_start = split_tile_start * kGroupedVerifyBlockN;
+  const int split_end =
+      min(total_kv, split_start + split_tiles * kGroupedVerifyBlockN);
   const int prefix_kv_len = max(0, total_kv - query_len);
   const int head_start = head_group * kGroupedVerifyHeadsPerCta;
   const int tid = threadIdx.x;
@@ -1733,7 +1763,7 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
          tile_start += kGroupedVerifyBlockN) {
       const int valid_k_rows =
           min(kGroupedVerifyBlockN, split_end - tile_start);
-      load_xqa_tc_kv_panel<0, false, kGroupedVerifyThreads,
+      load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, false, kGroupedVerifyThreads,
                            flash_v100::KV_CACHE_DTYPE_FP8_E5M2, true>(
           shared_kv, k_cache, block_table, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_start, 0, page_block_size, 0, k_block_stride,
@@ -1786,8 +1816,9 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
   // Volta WMMA P @ V arithmetic.
   for (int tile_start = split_start; tile_start < split_end;
        tile_start += kGroupedVerifyBlockN) {
-    const int valid_k_rows = min(kGroupedVerifyBlockN, split_end - tile_start);
-    load_xqa_tc_kv_panel<0, false, kGroupedVerifyThreads,
+    const int valid_k_rows =
+        min(kGroupedVerifyBlockN, split_end - tile_start);
+    load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, false, kGroupedVerifyThreads,
                          flash_v100::KV_CACHE_DTYPE_FP8_E5M2, true>(
         shared_kv, k_cache, block_table, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_start, 0, page_block_size, 0, k_block_stride,
@@ -1867,7 +1898,7 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
       }
     }
 
-    load_xqa_tc_kv_panel<0, false, kGroupedVerifyThreads,
+    load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, false, kGroupedVerifyThreads,
                          flash_v100::KV_CACHE_DTYPE_FP8_E5M2, true>(
         shared_kv, v_cache, block_table, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_start, 0, page_block_size, 0, v_block_stride,
@@ -3215,34 +3246,38 @@ at::Tensor flash_attention_grouped_verify_paged(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const dim3 partial_grid(2, kGroupedVerifySplits, 1);
+#define LAUNCH_GROUPED_VERIFY_PARTIAL(TWO_PASS, PAGE_SIZE)                     \
+  flash_attention_grouped_verify_e5m2_partial_kernel<TWO_PASS, PAGE_SIZE>     \
+      <<<partial_grid, kGroupedVerifyThreads, 0, stream>>>(                    \
+          reinterpret_cast<const __half*>(q.data_ptr()),                      \
+          k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr<int>(), \
+          seq_lens.data_ptr<int>(),                                            \
+          reinterpret_cast<__half*>(partial_out.data_ptr()),                  \
+          partial_lse.data_ptr<float>(), static_cast<int>(q.size(0)),          \
+          static_cast<int>(block_table.size(1)),                              \
+          static_cast<int>(k_cache.size(1)), k_cache.stride(0),                \
+          k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),             \
+          v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,       \
+          v_scale)
+
   if (one_pass) {
-    flash_attention_grouped_verify_e5m2_partial_kernel<false>
-        <<<partial_grid, kGroupedVerifyThreads, 0, stream>>>(
-            reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(),
-            v_cache.data_ptr(), block_table.data_ptr<int>(),
-            seq_lens.data_ptr<int>(),
-            reinterpret_cast<__half*>(partial_out.data_ptr()),
-            partial_lse.data_ptr<float>(), static_cast<int>(q.size(0)),
-            static_cast<int>(block_table.size(1)),
-            static_cast<int>(k_cache.size(1)), k_cache.stride(0),
-            k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
-            v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,
-            v_scale);
+    if (k_cache.size(1) == 1648) {
+      LAUNCH_GROUPED_VERIFY_PARTIAL(false, 1648);
+    } else if (k_cache.size(1) == 3296) {
+      LAUNCH_GROUPED_VERIFY_PARTIAL(false, 3296);
+    } else {
+      LAUNCH_GROUPED_VERIFY_PARTIAL(false, 0);
+    }
+  } else if (k_cache.size(1) == 1648) {
+    LAUNCH_GROUPED_VERIFY_PARTIAL(true, 1648);
+  } else if (k_cache.size(1) == 3296) {
+    LAUNCH_GROUPED_VERIFY_PARTIAL(true, 3296);
   } else {
-    flash_attention_grouped_verify_e5m2_partial_kernel<true>
-        <<<partial_grid, kGroupedVerifyThreads, 0, stream>>>(
-            reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(),
-            v_cache.data_ptr(), block_table.data_ptr<int>(),
-            seq_lens.data_ptr<int>(),
-            reinterpret_cast<__half*>(partial_out.data_ptr()),
-            partial_lse.data_ptr<float>(), static_cast<int>(q.size(0)),
-            static_cast<int>(block_table.size(1)),
-            static_cast<int>(k_cache.size(1)), k_cache.stride(0),
-            k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
-            v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,
-            v_scale);
+    LAUNCH_GROUPED_VERIFY_PARTIAL(true, 0);
   }
-  const dim3 combine_grid(static_cast<unsigned>(q.size(0)), kGroupedVerifyHeads,
+#undef LAUNCH_GROUPED_VERIFY_PARTIAL
+  const dim3 combine_grid(static_cast<unsigned>(q.size(0)),
+                          kGroupedVerifyHeads,
                           1);
   flash_attention_grouped_verify_e5m2_combine_kernel<<<
       combine_grid, kGroupedVerifyThreads, 0, stream>>>(
