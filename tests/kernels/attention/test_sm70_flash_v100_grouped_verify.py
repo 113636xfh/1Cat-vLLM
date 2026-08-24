@@ -8,7 +8,6 @@ import math
 import pytest
 import torch
 
-
 _EXPANDED_BASELINE_MEAN_ERROR = {
     (16, 8, 120): 5.159488409844926e-6,
     (16, 8, 121): 8.621820597909391e-6,

@@ -3,9 +3,16 @@
 ## Scope
 
 This task measures, attributes, and reduces the context-length growth of one
-MRV2 DFlash2 verification round on V100. It is stacked on private DFlash2
-verifier head `e8daa778f55cf16df311f8ce8dd032e2281f1680`. It does not replace or
-retune DFlash1, `dflash_ddtree`, Eagle, or MTP.
+MRV2 DFlash2 verification round on V100. The historical study started on
+private DFlash2 verifier head `e8daa778f55cf16df311f8ce8dd032e2281f1680`;
+the public change set contains only the five retained verifier commits rebased
+onto current `main`. It does not replace or retune DFlash1, `dflash_ddtree`,
+Eagle, or MTP.
+
+DFlash2 names the measured workload, not a runtime activation identity. The
+kernel entry admits only the explicit SM70, E5M2 paged-KV, Q1-Q8, Hq6/Hkv1,
+D256, page-layout, causal-mask, and workspace contracts. It does not inspect a
+model name, checkpoint, `model_type`, or architecture identity.
 
 Quality promotion remains score based. Greedy token identity is diagnostic;
 the production gates are probabilistic task scores, PPL, acceptance length,
@@ -343,8 +350,8 @@ tests.
 
 The expanded operator suite covers Q1/Q3/Q4/Q5/Q6/Q8, 128/256/512/1K and
 longer boundaries, random physical pages, one-/two-pass equivalence, and CUDA
-Graph replay. All twelve tests pass. The maximum absolute error is unchanged
-from the accepted grouped baseline at every audited shape; the largest
+Graph replay. All thirteen collected cases pass. The maximum absolute error is
+unchanged from the accepted grouped baseline at every audited shape; the largest
 positive mean-error delta is `1.60e-7`, below the per-shape `5e-7` guard.
 
 The TP4 FULL-Graph endpoints confirm that the operator gain lands on the full
@@ -439,12 +446,20 @@ respectively; 103/128 and 24/32 requests terminate naturally before the cap.
 ## Current status
 
 The 32K/128K trace attribution is closed: target grouped attention is the
-long-context verification bottleneck. The split-40/80 operator A/B and both
-32K and 128K full-model traces confirm the predicted critical-path
-improvement. Split 80 reduces, but does not eliminate, the long-context slope.
-The physical-page specialization and tile-balanced partitioning also pass
-operator and full-model performance gates, reducing the final slope by 22.01%
-relative to split 40. PPL, score, and dataset-level acceptance gates pass. The
-1K full-model boundary check remains pending before promotion. Two bounded
-follow-ups (tail compaction and page-address broadcast) are recorded as
-rejected paths and must not be resurrected without new evidence.
+long-context verification bottleneck. Pack-GQA48 is the retained candidate;
+its 1K/32K/128K full-graph endpoints, 1K-256K operator sweep, task scores, PPL,
+and dataset-level acceptance gates are recorded above. The route remains
+explicitly opt-in through `VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY`, so this
+change does not silently alter other attention or speculation paths. Two
+bounded follow-ups (tail compaction and page-address broadcast) are rejected
+and must not be resurrected without new evidence.
+
+The final source audit rebased all five patches without semantic change onto
+`main@acc0f6fb92`, after the generic prefix-anchored and E4M3 batch-XQA merges.
+The complete changed-file static suite passes and the combined SM70 extension
+builds and links. Removing a redundant translation-unit-wide dynamic-shared
+alignment attribute preserves the packed verifier layout while restoring all
+121 pre-existing XQA kernel SASS instruction streams exactly; none are changed
+or missing. All thirteen grouped-verifier cases pass on a V100 against this
+current-main build. No new full-model or 256K production-configuration claim
+is made by the current-main source audit.
