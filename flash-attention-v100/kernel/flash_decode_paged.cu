@@ -256,6 +256,25 @@ bool xqa_g6_p1024_sawtooth_enabled() {
   return value == nullptr || value[0] != '0';
 }
 
+bool xqa_e4m3_g6_p64_p256_auto_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO");
+  return value != nullptr && value[0] == '1';
+}
+
+bool xqa_e4m3_g6_p64_p256_auto_trace_enabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
+}
+
+int xqa_e4m3_g6_p256_begin() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN");
+  return value == nullptr ? 12288 : std::max(1, std::atoi(value));
+}
+
 bool decode_partition_size_overridden() {
   return std::getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") != nullptr;
 }
@@ -1183,13 +1202,16 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
                                                route_seq_len_final)) {
     return;
   }
-  const int start_token_idx = partition_idx * PARTITION_SIZE;
+  const int partition_size = PARTITION_SIZE == 0
+                                 ? (seq_len < route_seq_len_begin ? 64 : 256)
+                                 : PARTITION_SIZE;
+  const int start_token_idx = partition_idx * partition_size;
   if (seq_len <= 0 || start_token_idx >= seq_len) {
     return;
   }
   const int runtime_num_partitions = active_num_partitions[0];
   const int seq_num_partitions =
-      (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+      (seq_len + partition_size - 1) / partition_size;
   const int effective_num_partitions =
       min(max_num_partitions, max(runtime_num_partitions, seq_num_partitions));
   if (partition_idx >= effective_num_partitions) {
@@ -1204,7 +1226,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane_id = tid % kWarpSize;
-  const int part_tokens = min(PARTITION_SIZE, seq_len - start_token_idx);
+  const int part_tokens = min(partition_size, seq_len - start_token_idx);
   const int num_k_tiles = (part_tokens + kXQATCBlockN - 1) / kXQATCBlockN;
   const int* block_table_seq = block_table + batch_idx * max_num_blocks;
 
@@ -2158,7 +2180,7 @@ __global__ void flash_attention_decode_reduce_kernel(
     const int64_t tmp_out_stride0, const int64_t tmp_out_stride1,
     const int64_t tmp_out_stride2, const int64_t stats_stride0,
     const int64_t stats_stride1, const int64_t out_stride0,
-    const int64_t out_stride1) {
+    const int64_t out_stride1, const int route_partition_size_begin) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
 
@@ -2167,8 +2189,11 @@ __global__ void flash_attention_decode_reduce_kernel(
   }
 
   const int seq_len = seq_lens[batch_idx];
+  const int partition_size =
+      PARTITION_SIZE == 0 ? (seq_len < route_partition_size_begin ? 64 : 256)
+                          : PARTITION_SIZE;
   const int num_partitions =
-      min(max_num_partitions, (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
+      min(max_num_partitions, (seq_len + partition_size - 1) / partition_size);
   (void)active_num_partitions;
 
   if (seq_len <= 0 || num_partitions <= 0) {
@@ -2960,7 +2985,7 @@ void launch_flash_attention_decode_paged(
           reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
           max_num_partitions, num_heads_q, tmp_out.stride(0), tmp_out.stride(1),
           tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
-          out.stride(0), out.stride(1));
+          out.stride(0), out.stride(1), 0);
 }
 
 template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
@@ -3118,7 +3143,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
             launch_num_partitions, num_heads_q, tmp_out.stride(0),
             tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
-            max_logits.stride(1), out.stride(0), out.stride(1));
+            max_logits.stride(1), out.stride(0), out.stride(1), 0);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -3223,7 +3248,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_staged(
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
             launch_num_partitions, num_heads_q, tmp_out.stride(0),
             tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
-            max_logits.stride(1), out.stride(0), out.stride(1));
+            max_logits.stride(1), out.stride(0), out.stride(1), 0);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
