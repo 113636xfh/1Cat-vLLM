@@ -41737,3 +41737,88 @@ Interpretation:
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
+
+## 2026-08-24 Qwen3.8 exact-D256 long-prefill K ping-pong
+
+- The Qwen3.8-27B-FP8 TP4 128K trace remains attention-led: exact-dense and
+  direct-paged D256 attention account for 35.55% and 6.22% of profiled wall.
+  The exact long shape sustains only 38.67% tensor-pipe active with 62.14% of
+  cycles lacking an eligible warp; DRAM is only 9.06%. This is an SM70
+  shared-memory/dependency problem, not HBM saturation.
+- Added a third vendored-FA2 patch that alternates the four D64 K panels across
+  two non-overlapping shared stages. The second stage borrows the later V/P
+  allocation because K and V/P lifetimes do not overlap. Its 2240-half stride
+  is above the padded 2188-half K `cosize`, aligned for 128-bit stores, and on
+  a common 128-byte bank phase. This removes three static full-CTA barriers
+  while preserving every HMMA/load/store count and the exact N32 arithmetic
+  order.
+- Shared memory remains 45,568 bytes. Dense and split-KV3 remain at 254/253
+  registers per thread with zero stack or spill. A clean CUDA 12.8 SM70 build
+  has byte-identical SASS to the measured candidate. The first clean-clone
+  build failed only because the CUTLASS submodule was absent (`cute/tensor.hpp`
+  not found); initializing pinned CUTLASS `62750a2b...` repaired the build.
+- Exact dense A/B/A improves 0.74%-1.11% at Q8192/KV32K-128K and 0.54% at the
+  historical Q15680/KV125440 shape; a separate clean-build 128K run improves
+  0.39%. The first Q8192/KV8192 chunk is neutral. Dense, randomized-paged, and
+  split-KV3 output gates are all bitwise equal to their matching controls.
+  Two order-reversed 128K comparisons pool to `142.4068 ms` control,
+  `141.8076 ms` fully-disjoint v5, and `141.7669 ms` lifetime alias. The final
+  form is `-0.45%` versus control and preserves the smaller shared envelope.
+- Rejected 2048-half spacing because K stages overlap, 2188 because `STS.128`
+  becomes misaligned, and 2192/2304 because they are slower than the final
+  same-bank-phase layout. The exact fully-disjoint 2240 form is superseded
+  because it grows shared memory without a measurable speed advantage. Nsight
+  Compute counter collection is unavailable to this user
+  (`ERR_NVGPUCTRPERM`); no driver security setting was changed.
+- The first full-model attempt failed before any request during FULL-graph XQA
+  metadata warmup. The source passed the new 19th
+  `batch_context_max_seq_len` argument, while the stale system Flash-V100
+  binary exposed the old 18-argument ABI. Rebuilding the unchanged current
+  Flash-V100 source produced SHA `ac07dc9d...5580a8`; its 19-argument docstring
+  and a CUDA-graph E5M2 XQA scalar/padded bitwise gate pass. This harness repair
+  was used identically for both control arms and the candidate.
+- Matched TP4 Qwen3.8 128K E5M2-KV, chunk-8192, official-sampling A/B/A passes.
+  Baseline A/candidate/baseline B prefill times are
+  `47.8992/47.6687/47.9475 s`. The bracketed control is `47.9233 s` or
+  `2735.0 tok/s`; the candidate is `47.6687 s` or `2749.6 tok/s`, giving
+  `-0.531%` latency and `+0.534%` throughput. TTFT changes
+  `47.9498 -> 47.6937 s` (`-0.534%`). Pure decode is neutral at
+  `5.1557 -> 5.1547 s` and `49.460 -> 49.470 tok/s`.
+- All arms return 256 tokens with identical hash `2db7ef09...503325a`.
+  All four ranks report the same route counts: exact-dense D256 32,
+  prefix-paged 544, E5M2 bridge 544, scalar decode 176, and XQA decode 256.
+  The endpoint promotion gate is satisfied; the result is deliberately cited
+  as a small dependency-chain gain, not as completion of the broader 128K
+  utilization target.
+
+## 2026-08-24 Qwen3.8 Q8000 split-KV3 long-prefill experiment
+
+- A runtime-shape diagnostic closed the initial Q8192 assumption. With
+  chunk-8192 plus Mamba align, long prefix calls are actually Q8000; the first
+  Q8192-gated endpoint run had zero split-KV3 hits and is not performance
+  evidence. One control was additionally invalidated when another TP4 job
+  started between its 47.90-second warmup and 64.45-second measurement.
+- Added an exact-shape, default-off
+  `VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL` policy. Existing
+  production Q4096 admission is unchanged; Q8192 and nearby shapes remain
+  rejected. The policy suite passes 89/89 and Ruff lint/format checks pass.
+- Bracketed Q8000 operator sweeps at KV 40K/64K/96K/128K improve throughput by
+  3.94%/2.85%/3.45%/3.36%. At KV128K the kernel moves from 138.9150 to
+  134.3961 ms and 43.87 to 45.35 causal TFLOP/s. Workspace is 141.72 MiB per
+  rank. The FP16 outputs are repeat-stable but non-bitwise versus unsplit;
+  maximum absolute error is at most `3.052e-5` and mean error at most
+  `1.38e-6`.
+- Matched TP4 128K A/B/A measures control A/candidate/control B at
+  `47.5940/47.1074/47.6612 s`. The bracketed control is `47.6276 s` or
+  `2752.0 tok/s`; candidate is `47.1074 s` or `2782.4 tok/s`, for `-1.092%`
+  latency and `+1.104%` throughput. TTFT improves 1.078%; decode is neutral.
+  All ranks report exactly 384 Q8000 split-KV3 hits and unchanged surrounding
+  prefill/decode route counts. KV capacity remains 2,424,439 tokens per rank.
+- Each lane's warmup and measured 256-token stream is internally exact. The
+  candidate and control B are also token-for-token identical, but identical
+  unsplit control A selects a different stable sampled stream under the same
+  official seed. This cross-process sampling instability prevents default-on
+  promotion of a non-bitwise route. Keep the Q8000 gate experimental until a
+  deterministic greedy/natural-text or dataset-quality gate passes. Evidence
+  is under
+  `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824/`.

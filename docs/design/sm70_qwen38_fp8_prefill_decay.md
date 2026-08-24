@@ -123,8 +123,166 @@ The extra address-generation/scalar-publication issue cost exceeds the saved
 P-load replay. Do not retry this layout spelling or the earlier
 shuffle/repack form.
 
+## 2026-08-24 Exact-D256 K-Stage Ping-Pong
+
+The accepted exact-N32 arithmetic order is unchanged. The candidate alternates
+K D64 panels between two non-overlapping shared-memory stages. The second K
+stage borrows bytes from the later V/P allocation: K is dead before V is
+loaded and P is materialized, so those lifetimes do not overlap. A next-K
+fragment is published to the stage that the current QK phase is not reading,
+so the pre-overwrite full-CTA barrier is no longer required. The visibility
+barrier before the next QK phase remains.
+
+The K layout's logical size is 2048 half elements, but its padded physical
+`cosize` is 2188. The final stage stride is therefore 2240 half elements: it
+is larger than the physical span, 16-byte aligned for `STS.128`, and keeps
+both stages on the same 128-byte shared-bank phase. The final lifetime-aliased
+layout leaves dynamic shared memory at 45,568 bytes. Dense/split-KV3 kernels
+remain at 254/253 registers per thread with zero stack or spill.
+
+SASS for the exact dense nonpaged specialization changes as follows:
+
+- static `BAR.SYNC.DEFER_BLOCKING` count: 15 to 12;
+- HMMA step counts: 128 each, unchanged;
+- `LDG`, `LDS`, `STS`, `SHFL`, and `MUFU` counts: unchanged;
+- `FADD` and `IADD3` static counts: 15 to 12 and 71 to 68;
+- full SASS from the clean repository-patch build is byte-identical to the
+  measured lifetime-alias artifact.
+
+The initial fully-disjoint v5 stage layout was screened across the length
+curve. Same-build, separate-process A/B/A CUDA-event measurements use FP16,
+`Hq=6`, `Hkv=1`, D256, causal attention, five warmups, five queued calls per
+sample, and seven samples. The control column is the mean of the two bracketing
+control medians except for the first 8K chunk, where the first process was a
+visible clock-ramp outlier and the hot second control is reported.
+
+| Q | KV | Control | Ping-pong | Latency change | Exact |
+|---:|---:|---:|---:|---:|---:|
+| 8192 | 8192 | 4.8259 ms | 4.8302 ms | +0.09% | bitwise |
+| 8192 | 32768 | 32.5750 ms | 32.2132 ms | -1.11% | bitwise |
+| 8192 | 65536 | 68.2283 ms | 67.7216 ms | -0.74% | bitwise |
+| 8192 | 131072 | 142.3325 ms | 140.9176 ms | -0.99% | bitwise |
+| 15680 | 125440 | 251.6402 ms | 250.2695 ms | -0.54% | bitwise |
+
+A second 128K run from the clean v5 build measured
+`142.1020 -> 141.5512 ms` (`-0.39%`) and was again bitwise exact. The final
+lifetime-alias layout was then compared with v5 in both execution orders,
+each bracketed by fresh controls. Across the two orders, pooled control, v5,
+and lifetime-alias medians are `142.4068`, `141.8076`, and `141.7669 ms`:
+`-0.42%` for v5 and `-0.45%` for the final layout. The `0.03%` difference
+between candidates is noise-sized; the final layout is selected because it
+does not enlarge shared memory or alter the original V/P addresses.
+
+Direct paged and split-KV3 gates at `Q4096/KV32768` are bitwise equal over
+6,291,456 elements each; the dense gate covers 12,582,912 elements. The gain
+is small but length-directed: the hot first chunk is neutral while long-prefix
+calls consistently improve.
+
+Closed intermediate variants must not be repeated:
+
+- 2048-half stage spacing overlaps the 2188-half K physical span and changes
+  almost every output element;
+- 2188-half spacing removes overlap but misaligns the second stage for
+  `STS.128` and raises a CUDA misaligned-address fault;
+- 2192-half spacing is exact but loses address/bank-phase efficiency;
+- 2304-half spacing is exact but is slower than the minimal same-phase 2240
+  spacing;
+- allocating the two 2240-half stages as fully disjoint storage is exact and
+  performance-equivalent, but unnecessarily grows shared memory to 46,336
+  bytes; the lifetime-alias form retains the original 45,568-byte envelope.
+
+Nsight Compute recognized the exact mangled kernel but the host driver denied
+performance-counter access with `ERR_NVGPUCTRPERM`. No privilege or machine
+security setting was changed. CUDA-event timing and static SASS are therefore
+the timing and structural authorities for this experiment.
+
+The matched end-to-end TP4 128K A/B/A gate also passes. It fixes Qwen3.8-27B
+FP8 weights, 131,072 input tokens, 256 sampled output tokens, E5M2 KV, chunk
+8192, no MTP, prefix caching, Mamba align, Flash-V100, CUDA graphs, and
+`temperature=1.0/top_p=0.95/top_k=20/seed=20260824`. The control is the mean
+of the two bracketing baseline runs.
+
+| Metric | Bracketed control | Lifetime alias | Change |
+|---|---:|---:|---:|
+| prefill | 47.9233 s | 47.6687 s | -0.531% |
+| prefill throughput | 2735.0 tok/s | 2749.6 tok/s | +0.534% |
+| TTFT | 47.9498 s | 47.6937 s | -0.534% |
+| pure decode | 5.1557 s | 5.1547 s | neutral (+0.020% speed) |
+
+All three runs produce the same 256-token output hash
+`2db7ef09...503325a`. Every rank reports the same route counts, including 32
+exact dense D256 calls, 544 prefix-paged calls, and 544 E5M2 bridge calls.
+This promotes the small dependency-chain win, but it also establishes that
+barrier removal alone is not a double-digit long-context solution.
+
+## 2026-08-24 Q8000 Split-KV3 Tail-Wave Experiment
+
+The matched runtime does not present `Q=8192` to long prefix-attention calls.
+Although `max_num_batched_tokens` is 8192, Mamba/attention page alignment makes
+the repeated full chunks `Q=8000`; a 40K diagnostic observed
+`Q=(1,8000,6,256)` and `KV=(1,40000,1,256)`. The first Q8192 experiment was
+therefore a useful operator screen but had zero end-to-end route hits. Its
+first control measurement was also invalidated by a second TP4 job starting on
+GPUs 4-7 between warmup and measurement (`47.90 -> 64.45 s`). The uncontended
+candidate/control-B pair used the same unsplit route and differed by only
+0.15%, confirming that run did not measure split-KV3.
+
+The corrected candidate admits exactly `Q=(1,8000,6,256)` behind the
+default-off
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL` gate. It leaves
+the existing production Q4096 policy unchanged and does not admit Q8192 or
+other nearby shapes. Three independent KV partitions turn 750 Q tiles into
+2250 CTAs at Q8000, avoiding the short last wave of the 72-SM V100. Bracketed
+CUDA-event operator results from the final K-stage binary are:
+
+| Q | KV | Unsplit | Split-KV3 | Throughput change | Causal TFLOP/s |
+|---:|---:|---:|---:|---:|---:|
+| 8000 | 40000 | 40.1736 ms | 38.6519 ms | +3.94% | 44.05 -> 45.78 |
+| 8000 | 64000 | 66.5214 ms | 64.6753 ms | +2.85% | 44.33 -> 45.60 |
+| 8000 | 96000 | 102.8820 ms | 99.4545 ms | +3.45% | 43.95 -> 45.47 |
+| 8000 | 128000 | 138.9150 ms | 134.3961 ms | +3.36% | 43.87 -> 45.35 |
+
+The three FP32 partial-output buffers plus max/sum state require 141.72 MiB
+per rank. Outputs are repeat-stable but not bitwise equal to unsplit because
+the partition merge changes reduction order. Across the four shapes, maximum
+absolute difference is `1.526e-5` to `3.052e-5`; mean absolute difference is
+`7.51e-7` to `1.38e-6`.
+
+The corrected full-model A/B/A uses the same TP4 128K official-sampling
+contract as the accepted K-stage endpoint. Control A/candidate/control B
+prefill times are `47.5940/47.1074/47.6612 s`. The bracketed control is
+`47.6276 s` or `2752.0 tok/s`; split-KV3 is `47.1074 s` or `2782.4 tok/s`,
+giving `-1.092%` latency and `+1.104%` throughput. TTFT improves 1.078%.
+Decode remains neutral: `5.1533 -> 5.1617 s` and
+`49.483 -> 49.402 tok/s`. Every rank reports 384 split-KV3 kernel hits, which
+matches 12 eligible long chunks times 16 full-attention layers times two
+requests. KV capacity remains 2,424,439 tokens per rank and no OOM fallback
+occurs.
+
+Quality does not yet justify a default-on promotion. Every lane is internally
+stable between warmup and measurement, and the candidate is token-for-token
+identical to control B for both 256-token outputs. However, identical unsplit
+control A selects a different stable sampled stream despite the same official
+seed. The candidate therefore shows no unique output divergence, but this
+cross-process sampling instability cannot prove equivalence for a non-bitwise
+route. Keep Q8000 split-KV3 explicit and default-off until a deterministic
+greedy/natural-text or dataset-quality gate passes.
+
 ## Artifacts
 
+- K-stage task root:
+  `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824`.
+- Final clean FA2 binary:
+  `build/formal-v6-final-cmake/_vllm_fa2_C.abi3.so` under that task root.
+- Endpoint A/B/A JSON:
+  `results/tp4-128k-{baseline-a-v6,candidate-v6,baseline-b-v6}.json`.
+- Q8000 operator sweep:
+  `results/splitkv3-q8000-kv{40000,64000,96000,128000}-v6.json`.
+- Q8000 endpoint A/B/A:
+  `results/tp4-128k-splitkv3-q8000-{control-a,candidate,control-b}.json`.
+- Shape diagnostic and the zero-hit Q8192 negative run:
+  `logs/tp4-splitkv3-shape-diag.log` and
+  `results/tp4-128k-splitkv3-{control-a,candidate,control-b}.json`.
 - Root: task-local `qwen38-fp8-prefill-decay-20260815` artifact directory.
 - Nsight Systems:
   `profiles/qwen38-fp8-tp4-i128k-chunk15680-r2.nsys-rep`.
