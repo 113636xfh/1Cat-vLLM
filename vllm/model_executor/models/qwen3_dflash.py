@@ -861,6 +861,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
+        # AWQ target paths can surface fp32 auxiliary states even when the
+        # draft projection is initialized in fp16. Match the FC weight dtype
+        # before dispatching the linear kernel.
+        fc_weight = getattr(self.model.fc, "weight", None)
+        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
+            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

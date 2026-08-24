@@ -99,6 +99,25 @@ def test_ddtree_topk_adapter_uses_official_logits_processor() -> None:
     assert actual[1] is expected_logprobs
 
 
+def test_dflash_aux_projection_matches_fc_weight_dtype() -> None:
+    class FC:
+        input_size = 4
+        weight = torch.empty((4, 4), dtype=torch.float16)
+
+        def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            assert hidden_states.dtype == self.weight.dtype
+            return hidden_states
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(use_aux_hidden_state=True, fc=FC()),
+    )
+    hidden_states = torch.ones((2, 4), dtype=torch.float32)
+
+    output = DFlashQwen3ForCausalLM.combine_hidden_states(model, hidden_states)
+
+    assert output.dtype == torch.float16
+
+
 def test_draft_kv_dtype_is_public_and_defaults_to_inherit() -> None:
     assert SpeculativeConfig.kv_cache_dtype is None
 
