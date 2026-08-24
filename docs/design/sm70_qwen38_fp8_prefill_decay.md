@@ -123,6 +123,66 @@ The extra address-generation/scalar-publication issue cost exceeds the saved
 P-load replay. Do not retry this layout spelling or the earlier
 shuffle/repack form.
 
+## 2026-08-24 Exact-D256 K-Stage Ping-Pong
+
+The accepted exact-N32 arithmetic order is unchanged. The candidate uses the
+two existing K/V shared-memory regions as alternating K D64 stages. A next-K
+fragment is published to the stage that the current QK phase is not reading,
+so the pre-overwrite full-CTA barrier is no longer required. The visibility
+barrier before the next QK phase remains.
+
+The K layout's logical size is 2048 half elements, but its padded physical
+`cosize` is 2188. The final stage stride is therefore 2240 half elements: it
+is larger than the physical span, 16-byte aligned for `STS.128`, and keeps
+both stages on the same 128-byte shared-bank phase. Dynamic shared memory
+grows from 45,568 to 46,336 bytes. Dense/split-KV3 kernels remain at 254/253
+registers per thread with zero stack or spill.
+
+SASS for the exact dense nonpaged specialization changes as follows:
+
+- static `BAR.SYNC.DEFER_BLOCKING` count: 15 to 12;
+- HMMA step counts: 128 each, unchanged;
+- `LDG`, `LDS`, `STS`, `SHFL`, and `MUFU` counts: unchanged;
+- full SASS from the clean repository-patch build is byte-identical to the
+  measured v5 artifact.
+
+Same-build, separate-process A/B/A CUDA-event measurements use FP16,
+`Hq=6`, `Hkv=1`, D256, causal attention, five warmups, five queued calls per
+sample, and seven samples. The control column is the mean of the two bracketing
+control medians except for the first 8K chunk, where the first process was a
+visible clock-ramp outlier and the hot second control is reported.
+
+| Q | KV | Control | Ping-pong | Latency change | Exact |
+|---:|---:|---:|---:|---:|---:|
+| 8192 | 8192 | 4.8259 ms | 4.8302 ms | +0.09% | bitwise |
+| 8192 | 32768 | 32.5750 ms | 32.2132 ms | -1.11% | bitwise |
+| 8192 | 65536 | 68.2283 ms | 67.7216 ms | -0.74% | bitwise |
+| 8192 | 131072 | 142.3325 ms | 140.9176 ms | -0.99% | bitwise |
+| 15680 | 125440 | 251.6402 ms | 250.2695 ms | -0.54% | bitwise |
+
+A second 128K run from the clean formal build measured
+`142.1020 -> 141.5512 ms` (`-0.39%`) and was again bitwise exact. Direct paged
+and split-KV3 gates at `Q4096/KV32768` are also bitwise equal over 6,291,456
+elements each; the dense gate covers 12,582,912 elements. The gain is small
+but length-directed: the hot first chunk is neutral while long-prefix calls
+consistently improve.
+
+Closed intermediate variants must not be repeated:
+
+- 2048-half stage spacing overlaps the 2188-half K physical span and changes
+  almost every output element;
+- 2188-half spacing removes overlap but misaligns the second stage for
+  `STS.128` and raises a CUDA misaligned-address fault;
+- 2192-half spacing is exact but loses address/bank-phase efficiency;
+- 2304-half spacing is exact but is slower than the minimal same-phase 2240
+  spacing.
+
+Nsight Compute recognized the exact mangled kernel but the host driver denied
+performance-counter access with `ERR_NVGPUCTRPERM`. No privilege or machine
+security setting was changed. CUDA-event timing and static SASS are therefore
+the timing and structural authorities for this experiment. End-to-end TP4
+128K acceptance remains a separate gate.
+
 ## Artifacts
 
 - Root: task-local `qwen38-fp8-prefill-decay-20260815` artifact directory.

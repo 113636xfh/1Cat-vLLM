@@ -41737,3 +41737,31 @@ Interpretation:
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
+
+## 2026-08-24 Qwen3.8 exact-D256 long-prefill K ping-pong
+
+- The Qwen3.8-27B-FP8 TP4 128K trace remains attention-led: exact-dense and
+  direct-paged D256 attention account for 35.55% and 6.22% of profiled wall.
+  The exact long shape sustains only 38.67% tensor-pipe active with 62.14% of
+  cycles lacking an eligible warp; DRAM is only 9.06%. This is an SM70
+  shared-memory/dependency problem, not HBM saturation.
+- Added a third vendored-FA2 patch that alternates the four D64 K panels across
+  two disjoint shared stages. The stage stride is 2240 half elements, above the
+  padded 2188-half K `cosize`, aligned for 128-bit stores, and on a common
+  128-byte bank phase. This removes three static full-CTA barriers while
+  preserving every HMMA/load/store count and the exact N32 arithmetic order.
+- Shared memory changes `45,568 -> 46,336` bytes. Dense and split-KV3 remain
+  at 254/253 registers per thread with zero stack or spill. A clean CUDA 12.8
+  SM70 build has byte-identical SASS to the measured candidate.
+- Exact dense A/B/A improves 0.74%-1.11% at Q8192/KV32K-128K and 0.54% at the
+  historical Q15680/KV125440 shape; a separate clean-build 128K run improves
+  0.39%. The first Q8192/KV8192 chunk is neutral. Dense, randomized-paged, and
+  split-KV3 output gates are all bitwise equal to their matching controls.
+- Rejected 2048-half spacing because K stages overlap, 2188 because `STS.128`
+  becomes misaligned, and 2192/2304 because they are slower than the final
+  same-bank-phase layout. Nsight Compute counter collection is unavailable to
+  this user (`ERR_NVGPUCTRPERM`); no driver security setting was changed.
+- Full TP4 Qwen3.8 128K E5M2-KV, chunk-8192, official-sampling A/B/A is the
+  remaining promotion gate. Do not cite the operator result as an endpoint
+  throughput claim until that gate records route hits, output quality, prefill,
+  TTFT, and pure decode separately.
