@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -222,7 +223,7 @@ __device__ __forceinline__ void load_pipeline_swizzled_matrix_a_fragment(
 }
 
 template <int Q_STRIDE, int S_STRIDE, int K_TILES, bool IS_CAUSAL,
-          bool SWIZZLED_Q = false>
+          bool SWIZZLED_Q = false, bool ANCHORED_SWA = false>
 __device__ __forceinline__ void pipeline_qk_slice(
     const __half* __restrict__ sQ, float* __restrict__ score,
     const __half* __restrict__ k_cache, const int* __restrict__ page_idx,
@@ -231,7 +232,8 @@ __device__ __forceinline__ void pipeline_qk_slice(
     int start_col, int valid_k_rows, int start_row, int valid_q_rows,
     int causal_q_offset, int tile_n, int k_begin, bool load_partial,
     bool finalize, float softmax_scale, int window_size_left,
-    int window_size_right, float neg_inf) {
+    int window_size_right, float neg_inf, int anchor_len = 0,
+    int anchored_window = 0) {
   if (tile_n >= valid_k_rows) {
     return;
   }
@@ -294,9 +296,15 @@ __device__ __forceinline__ void pipeline_qk_slice(
         is_window_valid =
             is_window_valid && global_n <= global_q_pos + window_size_right;
       }
-      acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
-                          ? acc_frag.x[i] * softmax_scale
-                          : neg_inf;
+      bool is_anchor_valid = true;
+      if constexpr (ANCHORED_SWA) {
+        is_anchor_valid = (global_n < anchor_len) ||
+                          (global_q_pos - global_n < anchored_window);
+      }
+      acc_frag.x[i] =
+          (is_valid && is_causal_valid && is_window_valid && is_anchor_valid)
+              ? acc_frag.x[i] * softmax_scale
+              : neg_inf;
     }
   }
 
@@ -343,7 +351,8 @@ __device__ __forceinline__ void pipeline_pv_tile(
 template <int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
           bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
           bool IS_CAUSAL, int KV_DTYPE, bool D256_OUTPUT_STRIDE_268 = false,
-          bool D256_SW_PIPELINE_QK = false, bool D256_SW_PIPELINE_PV = false>
+          bool D256_SW_PIPELINE_QK = false, bool D256_SW_PIPELINE_PV = false,
+          bool ANCHORED_SWA = false>
 __global__ void __launch_bounds__(
     KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                  D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
@@ -365,7 +374,11 @@ __global__ void __launch_bounds__(
         const float k_scale, const float v_scale, const int window_size_left,
         const int window_size_right, float* __restrict__ split_tmp_out,
         float* __restrict__ split_tmp_row_max,
-        float* __restrict__ split_tmp_row_sum, const int split_kv_tiles) {
+        float* __restrict__ split_tmp_row_sum, const int split_kv_tiles,
+        const int* __restrict__ anchor_lens, const int anchored_window) {
+  static_assert(!ANCHORED_SWA ||
+                    (IS_CAUSAL && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16),
+                "ANCHORED_SWA requires causal attention and an fp16 KV cache");
   using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                               D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
                               D256_SW_PIPELINE_PV>;
@@ -408,6 +421,11 @@ __global__ void __launch_bounds__(
   int num_n_tiles = (actual_N + BLOCK_N - 1) / BLOCK_N;
   const int valid_q_rows = min(BLOCK_M, M - start_row);
   const int causal_q_offset = max(actual_N - M, 0);
+
+  int anchor_len = 0;
+  if constexpr (ANCHORED_SWA) {
+    anchor_len = anchor_lens[batch_id];
+  }
 
   int max_key_pos = actual_N - 1;
   if constexpr (IS_CAUSAL) {
@@ -524,12 +542,13 @@ __global__ void __launch_bounds__(
 
       if (warp_id < BLOCK_N / WMMA_N) {
         const int valid_k_rows = min(BLOCK_N, actual_N);
-        pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL, true>(
+        pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL, true,
+                          ANCHORED_SWA>(
             sQ, sS, k_cache_h, sPageIdx, sPageOffset, k_block_stride,
             k_token_stride, k_head_stride, kv_head_id, 0, valid_k_rows,
             start_row, valid_q_rows, causal_q_offset, warp_id * WMMA_N, 0,
             false, true, softmax_scale, window_size_left, window_size_right,
-            NEG_INF);
+            NEG_INF, anchor_len, anchored_window);
       }
       __syncthreads();
 
@@ -666,13 +685,14 @@ __global__ void __launch_bounds__(
 
           if (sub_start == 0) {
             if (warp_id < BLOCK_N / WMMA_N) {
-              pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL,
-                                true>(
+              pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL, true,
+                                ANCHORED_SWA>(
                   sQ, score_next, k_cache_h, page_idx_next, page_offset_next,
                   k_block_stride, k_token_stride, k_head_stride, kv_head_id,
                   next_start_col, next_valid_k_rows, start_row, valid_q_rows,
                   causal_q_offset, warp_id * WMMA_N, 0, false, true,
-                  softmax_scale, window_size_left, window_size_right, NEG_INF);
+                  softmax_scale, window_size_left, window_size_right, NEG_INF,
+                  anchor_len, anchored_window);
             } else {
               const int pv_warp = warp_id - BLOCK_N / WMMA_N;
               pipeline_pv_tile<P_STRIDE, O_STRIDE, true>(
@@ -866,6 +886,11 @@ __global__ void __launch_bounds__(
           if (window_size_right >= 0) {
             is_valid = is_valid && global_n <= global_q_pos + window_size_right;
           }
+          if constexpr (ANCHORED_SWA) {
+            is_valid =
+                is_valid && ((global_n < anchor_len) ||
+                             (global_q_pos - global_n < anchored_window));
+          }
 
           float acc = 0.0f;
           if (is_valid) {
@@ -887,12 +912,12 @@ __global__ void __launch_bounds__(
         constexpr int QK_TILES = BLOCK_N / WMMA_N;
         if (warp_id < QK_TILES) {
           pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL,
-                            D256_SW_PIPELINE_PV>(
+                            D256_SW_PIPELINE_PV, ANCHORED_SWA>(
               sQ, sS, K_cache_h, sPageIdx, sPageOffset, k_block_stride,
               k_token_stride, k_head_stride, kv_head_id, start_col,
               valid_k_rows, start_row, valid_q_rows, causal_q_offset,
               warp_id * WMMA_N, 0, false, true, softmax_scale, window_size_left,
-              window_size_right, NEG_INF);
+              window_size_right, NEG_INF, anchor_len, anchored_window);
         }
       } else {
         const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
@@ -986,7 +1011,14 @@ __global__ void __launch_bounds__(
                                 global_n <= global_q_pos + window_size_right;
             }
 
-            acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
+            bool is_anchor_valid = true;
+            if constexpr (ANCHORED_SWA) {
+              is_anchor_valid = (global_n < anchor_len) ||
+                                (global_q_pos - global_n < anchored_window);
+            }
+
+            acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid &&
+                             is_anchor_valid)
                                 ? acc_frag.x[i] * softmax_scale
                                 : NEG_INF;
           }
@@ -1132,7 +1164,14 @@ __global__ void __launch_bounds__(
                 is_window_valid && global_n <= global_q_pos + window_size_right;
           }
 
-          acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
+          bool is_anchor_valid = true;
+          if constexpr (ANCHORED_SWA) {
+            is_anchor_valid = (global_n < anchor_len) ||
+                              (global_q_pos - global_n < anchored_window);
+          }
+
+          acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid &&
+                           is_anchor_valid)
                               ? acc_frag.x[i] * softmax_scale
                               : NEG_INF;
         }
@@ -1757,7 +1796,8 @@ void launcher_flash_attention_forward_paged_impl(
     int64_t bfla_mask_stride_h, int64_t bfla_mask_stride_q,
     int64_t bfla_mask_stride_k, float softmax_scale, bool is_causal,
     float k_scale, float v_scale, int window_size_left, int window_size_right,
-    cudaStream_t stream) {
+    cudaStream_t stream, const int* anchor_lens = nullptr,
+    int anchored_window = 0) {
   using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                               D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
                               D256_SW_PIPELINE_PV>;
@@ -1783,6 +1823,35 @@ void launcher_flash_attention_forward_paged_impl(
 
   TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB: ", smem,
               " bytes");
+
+  const bool use_anchored = anchor_lens != nullptr && anchored_window > 0;
+  TORCH_CHECK(!use_anchored || is_causal,
+              "anchored decode window requires causal attention");
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+    if (use_anchored) {
+      auto anchored_kernel = flash_attention_forward_kernel_paged<
+          D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
+          false, true, KV_DTYPE, D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
+          D256_SW_PIPELINE_PV, true>;
+      cudaFuncSetAttribute((void*)anchored_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+      anchored_kernel<<<grid, block, smem, stream>>>(
+          reinterpret_cast<const __half*>(Q.data_ptr()), K_cache.data_ptr(),
+          V_cache.data_ptr(), reinterpret_cast<__half*>(Out.data_ptr()),
+          softmax_lse.data_ptr<float>(), block_table.data_ptr<int>(),
+          seq_lens.data_ptr<int>(), B, H, M, N, bfla_mask_ptr,
+          bfla_mask_block_n, bfla_mask_stride_b, bfla_mask_stride_h,
+          bfla_mask_stride_q, bfla_mask_stride_k, page_block_size, num_kv_heads,
+          k_block_stride, k_token_stride, k_head_stride, v_block_stride,
+          v_token_stride, v_head_stride, softmax_scale, k_scale, v_scale,
+          window_size_left, window_size_right, nullptr, nullptr, nullptr, 0,
+          anchor_lens, anchored_window);
+      return;
+    }
+  } else {
+    TORCH_CHECK(!use_anchored,
+                "anchored decode window requires an fp16 KV cache");
+  }
 
   auto kernel =
       is_causal
@@ -1810,7 +1879,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
   } else {
     flash_attention_forward_kernel_paged<
         D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
@@ -1824,7 +1893,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
   }
 }
 
@@ -1987,7 +2056,7 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
   } else {
     flash_attention_forward_kernel_paged<D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                                          LOW_SMEM_SCALAR_QK, false, true, false,
@@ -2002,7 +2071,7 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
   }
 
   const dim3 merge_grid(grid_x, 1, B * H);
@@ -3105,7 +3174,27 @@ void launcher_flash_attention_forward_paged(
     cudaStream_t stream, const int* bfla_mask_ptr = nullptr,
     int bfla_mask_block_n = 0, int64_t bfla_mask_stride_b = 0,
     int64_t bfla_mask_stride_h = 0, int64_t bfla_mask_stride_q = 0,
-    int64_t bfla_mask_stride_k = 0) {
+    int64_t bfla_mask_stride_k = 0, const int* anchor_lens = nullptr,
+    int anchored_window = 0) {
+  if (anchor_lens != nullptr && anchored_window > 0) {
+    TORCH_CHECK(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
+                "anchored decode window requires an fp16 KV cache");
+    TORCH_CHECK(is_causal, "anchored decode window requires causal attention");
+    TORCH_CHECK(window_size_left < 0 && window_size_right < 0,
+                "anchored decode window cannot be combined with "
+                "sliding-window attention");
+    TORCH_CHECK(bfla_mask_ptr == nullptr,
+                "anchored decode window cannot be combined with a "
+                "block sparsity mask");
+    launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, false, false,
+                                                false, false>(
+        Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+        bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
+        bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
+        softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+        window_size_right, stream, anchor_lens, anchored_window);
+    return;
+  }
   if constexpr (D == 256 && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     const int M = Q.size(2);
     const int page_block_size = K_cache.size(1);
@@ -3442,7 +3531,8 @@ at::Tensor flash_attention_prefill_paged(
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool is_causal, const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0,
@@ -3482,6 +3572,31 @@ at::Tensor flash_attention_prefill_paged(
   TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
               "window sizes must be >= -1");
 
+  TORCH_CHECK(anchored_window >= 0 && anchored_window <= INT_MAX,
+              "anchored_window must fit in a non-negative int32");
+  TORCH_CHECK((anchored_window > 0) == anchor_lens.has_value(),
+              "anchor_lens and a positive anchored_window must be provided "
+              "together");
+  const bool use_anchored = anchor_lens.has_value();
+  const int* anchor_lens_ptr = nullptr;
+  if (use_anchored) {
+    const at::Tensor& anchors = anchor_lens.value();
+    TORCH_CHECK(anchors.is_cuda(), "anchor_lens must be on CUDA");
+    TORCH_CHECK(anchors.device() == q.device(),
+                "anchor_lens must be on the q device");
+    TORCH_CHECK(anchors.dtype() == torch::kInt32, "anchor_lens must be int32");
+    TORCH_CHECK(anchors.dim() == 1 && anchors.size(0) == B,
+                "anchor_lens must have shape [B]");
+    TORCH_CHECK(anchors.is_contiguous(), "anchor_lens must be contiguous");
+    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+                "anchored decode window requires an fp16 KV cache");
+    TORCH_CHECK(is_causal, "anchored decode window requires causal attention");
+    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
+                "anchored decode window cannot be combined with "
+                "sliding-window attention");
+    anchor_lens_ptr = anchors.data_ptr<int>();
+  }
+
   at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::zeros_like(q);
   auto softmax_lse =
       torch::zeros({B, H, M}, torch::dtype(torch::kFloat32).device(q.device()));
@@ -3491,11 +3606,12 @@ at::Tensor flash_attention_prefill_paged(
   bool sm70 = props->major == 7 && props->minor == 0;
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
-#define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                          \
-  launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(           \
-      q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens, \
-      softmax_scale, is_causal, k_scale, v_scale, window_size_left,      \
-      window_size_right, stream)
+#define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                           \
+  launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
+      q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
+      softmax_scale, is_causal, k_scale, v_scale, window_size_left,       \
+      window_size_right, stream, nullptr, 0, 0, 0, 0, 0, anchor_lens_ptr, \
+      static_cast<int>(anchored_window))
 
 #define LAUNCH_PAGED_BY_KV(HDIM)                                            \
   do {                                                                      \

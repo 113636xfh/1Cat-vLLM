@@ -5343,6 +5343,20 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # Prefix-anchored SWA: pass per-request prompt lengths so the
+        # attention backend can keep the prefix globally visible. The backend
+        # owns the persistent device buffer.
+        prefix_anchor_lens = None
+        if (
+            getattr(
+                self.vllm_config.attention_config,
+                "prefix_anchored_decode_window",
+                None,
+            )
+            is not None
+        ):
+            prefix_anchor_lens = num_prompt_tokens_cpu
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -5360,6 +5374,7 @@ class GPUModelRunner(
             cudagraph_graph_variant=cudagraph_graph_variant,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            prefix_anchor_lens=prefix_anchor_lens,
         )
 
         current_mamba_state_block_ids_by_gid: dict[int, torch.Tensor] = {}
