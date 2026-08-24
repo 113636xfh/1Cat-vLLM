@@ -49,6 +49,13 @@ class ModelServingDefaults:
     # output.
     required_logits_processors: tuple[str, ...] = ()
 
+    # Kwargs for SamplingParams.repetition_detection applied when the request
+    # does not set the field. Safety net for degeneration patterns that evade
+    # the n-gram processor (e.g. slow-drift table loops longer than its ban
+    # window): generation terminates instead of producing thousands of junk
+    # tokens. A request-supplied value always wins.
+    repetition_detection_defaults: dict[str, int] | None = None
+
 
 _REGISTRY: dict[str, ModelServingDefaults] = {}
 
@@ -105,6 +112,20 @@ def validate_required_logits_processors(
             )
 
 
+def apply_repetition_detection_default(defaults, sampling_params) -> None:
+    """Fill SamplingParams.repetition_detection from the model defaults when
+    the request left it unset."""
+    if (
+        defaults.repetition_detection_defaults
+        and getattr(sampling_params, "repetition_detection", None) is None
+    ):
+        from vllm.sampling_params import RepetitionDetectionParams
+
+        sampling_params.repetition_detection = RepetitionDetectionParams(
+            **defaults.repetition_detection_defaults
+        )
+
+
 def merge_extra_args(
     defaults: ModelServingDefaults,
     request_xargs: Mapping[str, Any] | None,
@@ -157,6 +178,16 @@ register_model_serving_defaults(
         extra_args_bounds={
             "ngram_size": (1, 512),
             "window_size": (1, 8192),
+        },
+        # Grounded in the observed failure (arXiv page-09 endpoint battery,
+        # w13): near-identical empty table rows repeated for ~6.5k tokens,
+        # evading the 90-token n-gram ban window. min_count=8 keeps legitimate
+        # dense tables (separators repeat, but full-row patterns rarely repeat
+        # 8x identically) while terminating clear degeneration.
+        repetition_detection_defaults={
+            "max_pattern_size": 60,
+            "min_pattern_size": 2,
+            "min_count": 8,
         },
         required_logits_processors=(
             "vllm.model_executor.models.deepseek_ocr.NGramPerReqLogitsProcessor",

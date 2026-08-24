@@ -88,3 +88,53 @@ def test_register_and_resolve_roundtrip():
     )
     got = get_model_serving_defaults(["OtherArch", "TestArchForCausalLM"])
     assert got is not None and got.sampling_defaults == {"top_k": 1}
+
+
+def test_repetition_detection_default_applied_and_request_wins():
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.openai.serving_defaults import (
+        ModelServingDefaults,
+        apply_repetition_detection_default,
+    )
+    from vllm.sampling_params import RepetitionDetectionParams
+
+    defaults = ModelServingDefaults(
+        repetition_detection_defaults={
+            "max_pattern_size": 60,
+            "min_pattern_size": 2,
+            "min_count": 8,
+        }
+    )
+    # Unset on the request -> default fills in.
+    sp = SimpleNamespace(repetition_detection=None)
+    apply_repetition_detection_default(defaults, sp)
+    assert isinstance(sp.repetition_detection, RepetitionDetectionParams)
+    assert sp.repetition_detection.min_count == 8
+
+    # Request-supplied value always wins.
+    own = RepetitionDetectionParams(
+        max_pattern_size=10, min_pattern_size=1, min_count=2
+    )
+    sp = SimpleNamespace(repetition_detection=own)
+    apply_repetition_detection_default(defaults, sp)
+    assert sp.repetition_detection is own
+
+    # No default configured -> untouched.
+    sp = SimpleNamespace(repetition_detection=None)
+    apply_repetition_detection_default(ModelServingDefaults(), sp)
+    assert sp.repetition_detection is None
+
+
+def test_dsocr_registration_includes_repetition_detection():
+    from vllm.entrypoints.openai.serving_defaults import (
+        get_model_serving_defaults,
+    )
+
+    d = get_model_serving_defaults(["DeepseekOCRForCausalLM"])
+    assert d is not None
+    assert d.repetition_detection_defaults == {
+        "max_pattern_size": 60,
+        "min_pattern_size": 2,
+        "min_count": 8,
+    }

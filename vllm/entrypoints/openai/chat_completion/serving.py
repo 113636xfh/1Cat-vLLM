@@ -62,6 +62,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_chat_output,
 )
 from vllm.entrypoints.openai.serving_defaults import (
+    apply_repetition_detection_default,
     get_model_serving_defaults,
     merge_extra_args,
     validate_required_logits_processors,
@@ -337,6 +338,9 @@ class OpenAIServingChat(OpenAIServing):
                     except ValueError as e:
                         return self.create_error_response(str(e))
                     sampling_params.extra_args = merged or None
+                    apply_repetition_detection_default(
+                        self.model_serving_defaults, sampling_params
+                    )
 
             self._log_inputs(
                 sub_request_id,
