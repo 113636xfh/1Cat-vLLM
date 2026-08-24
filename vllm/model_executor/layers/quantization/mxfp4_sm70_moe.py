@@ -64,6 +64,27 @@ def _mxfp4_grouped_m8_enabled() -> bool:
     return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8)
 
 
+def _mxfp4_grouped_verifier_enabled() -> bool:
+    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER)
+
+
+def _mxfp4_grouped_verifier_for_tokens(num_tokens: int) -> bool:
+    return bool(
+        (num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled())
+        or (
+            1 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS
+            and _mxfp4_grouped_verifier_enabled()
+        )
+    )
+
+
+def _mxfp4_grouped_m8_expert_rows_enabled() -> bool:
+    return bool(
+        (_mxfp4_grouped_m8_enabled() or _mxfp4_grouped_verifier_enabled())
+        and envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS
+    )
+
+
 @triton.jit
 def _compact_sorted_experts_kernel(
     sorted_expert_ids_ptr,
@@ -140,7 +161,13 @@ def _select_mxfp4_stage_dispatch(
         # tail entries as zero-row experts, avoiding a host readback of the
         # dynamic unique-expert count.
         graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
-        if num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled():
+        if _mxfp4_grouped_verifier_for_tokens(num_tokens):
+            if _mxfp4_grouped_m8_expert_rows_enabled():
+                return (
+                    buffers["compact_expert_offsets"],
+                    buffers["active_expert_ids"],
+                    graph_expert_slots,
+                )
             return (
                 buffers["slot_expert_offsets"],
                 buffers["permuted_experts_id"],
@@ -767,7 +794,8 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             num_tokens > 1
             and num_tokens <= _mxfp4_active_expert_max_tokens()
             and not (
-                num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled()
+                _mxfp4_grouped_verifier_for_tokens(num_tokens)
+                and not _mxfp4_grouped_m8_expert_rows_enabled()
             )
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts

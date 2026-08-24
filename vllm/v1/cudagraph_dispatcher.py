@@ -46,15 +46,13 @@ def _get_sm70_dsv4_decode_context_buckets(
     env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
     if env_name in os.environ:
         return _get_sm70_context_buckets(env_name)
+    # Speculative graphs cover multiple query rows and require a separate
+    # end-to-end long-context gate. They remain available through the explicit
+    # environment override above.
     if vllm_config.speculative_config is not None:
         return ()
 
     model_config = vllm_config.model_config
-    architectures = getattr(model_config, "architectures", ())
-    if not isinstance(architectures, (list, tuple)) or (
-        "DeepseekV4ForCausalLM" not in architectures
-    ):
-        return ()
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
     ):
@@ -73,17 +71,27 @@ def _get_sm70_dsv4_decode_context_buckets(
     if not positive_ratios:
         return ()
 
-    bucket = topk_tokens * min(positive_ratios)
-    if bucket <= 0 or model_config.max_model_len <= bucket:
+    short_bucket = topk_tokens * min(positive_ratios)
+    if short_bucket <= 0 or model_config.max_model_len <= short_bucket:
         return ()
+    # Keep the graph width close enough to the live context that the C4
+    # indexer does not score the model's entire maximum length immediately
+    # after crossing the short-context bypass. The sparse progression limits
+    # startup graph count while covering the first long-indexer bucket and the
+    # 16K/64K/128K service points used by the long-context quality gates.
+    bucket_multipliers = (1, 2, 8, 32, 64)
+    buckets = tuple(
+        short_bucket * multiplier
+        for multiplier in bucket_multipliers
+        if short_bucket * multiplier < model_config.max_model_len
+    )
     logger.info_once(
-        "Auto-enabling the SM70 DeepSeek V4 short-context decode CUDA graph "
-        "at %d tokens. Set %s explicitly to override or to an empty value "
-        "to disable.",
-        bucket,
+        "Auto-enabling SM70 compressed-index decode CUDA graph context buckets "
+        "%s. Set %s explicitly to override or to an empty value to disable.",
+        buckets,
         env_name,
     )
-    return (bucket,)
+    return buckets
 
 
 def _is_sm70_fp8_kv_decode_shape(
@@ -346,7 +354,9 @@ class CudagraphDispatcher:
 
     def _active_context_buckets(self) -> tuple[int, ...]:
         if self.uniform_decode_query_len > 1:
-            return self.sm70_mtp_context_buckets
+            if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
+                return self.sm70_mtp_context_buckets
+            return self.sm70_dsv4_decode_context_buckets
         return tuple(
             sorted(
                 set(self.sm70_dsv4_decode_context_buckets)
@@ -375,7 +385,9 @@ class CudagraphDispatcher:
 
         if self.uniform_decode_query_len > 1:
             if batch_descriptor.num_tokens == self.uniform_decode_query_len:
-                return self.sm70_mtp_context_buckets
+                if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
+                    return self.sm70_mtp_context_buckets
+                return self.sm70_dsv4_decode_context_buckets
             return ()
 
         buckets: set[int] = set()

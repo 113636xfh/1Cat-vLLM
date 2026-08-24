@@ -42763,3 +42763,28 @@ Interpretation:
   recorded profile remains evidence for the measured workload, not a runtime
   model whitelist. Full evidence is in
   `docs/design/sm70_dflash2_target_graph_20ms.md`.
+
+## 2026-08-24 DeepSeek V4 DSpark verifier and long-context campaign
+
+- The active TP8/V100 campaign, exact baseline contracts, admitted focused
+  gates, rejected paths, long-context sweep, and paired quality requirements
+  are recorded in
+  `docs/design/sm70_deepseek_v4_dspark_verifier_20ms_long_context.md`.
+- Latest-main DSpark has reproduced a 116.288 token/s median on the historical
+  3,500-token endpoint contract. The current complete verifier is 35.120 ms per
+  round; the active target is at most 20 ms without acceptance or dataset loss.
+- Do not cite indexer, mHC, compressor-ring, or MoE microbenchmarks as the final
+  verifier result. Promotion requires a synchronized TP8 full-model profile,
+  long-context 1K-252K evidence, paired no-speculation quality, and task-owned
+  GPU cleanup.
+- Source-audit disposition: incomplete-risk leaves are retained only as
+  explicit opt-ins. `VLLM_SM70_INDEXER_DECODE_CUBLAS=1` enables gather-plus-FP32
+  cuBLAS, `VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE=1` enables private state
+  rings, and speculative context buckets require an explicit list. Default
+  serving does not compute or retain confidence logits unless a threshold or
+  alignment diagnostic consumes them, and a requested missing confidence
+  projection fails before use.
+- Runtime gates express hardware, operator configuration, tensor/layout,
+  graph, cache, and concurrency contracts. The architecture-name check was
+  removed; measured checkpoint details remain evidence only and never select
+  an optimization route.

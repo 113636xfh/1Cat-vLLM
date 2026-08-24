@@ -41,8 +41,8 @@ def _reference_index_logits(
     does NOT factor to (sum_h weights[t, h] * q[t, h]) . k[s] - the relu sits
     between the weighting and the head sum.
     """
-    per_head = torch.einsum("thd,sd->ths", q.float(), k.float())
-    return torch.einsum("ths,th->ts", torch.relu(per_head), weights.float())
+    per_head = torch.einsum("mhd,nd->mhn", q.float(), k.float())
+    return torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.float())
 
 
 def _reference_factored_logits(
@@ -190,3 +190,136 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
         torch.testing.assert_close(
             actual[row, :seq_len].unsqueeze(0), expected, rtol=1e-2, atol=1e-2
         )
+
+
+@requires_sm70
+def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch):
+    torch.manual_seed(20260824)
+    generator = torch.Generator().manual_seed(20260824)
+    num_rows, num_heads = 8, 64
+    live_seq_len = 1017
+    graph_width = 2048
+    blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+
+    bits, _ = _random_fp8_keys(blocks * _BLOCK_SIZE, generator)
+    value_bits = bits.reshape(blocks, _BLOCK_SIZE, _HEAD_DIM)
+    scales = torch.rand((blocks, _BLOCK_SIZE), generator=generator).cuda() + 0.5
+    cache = _build_paged_index_cache(value_bits, scales)
+    block_table = torch.full(
+        (1, graph_width // _BLOCK_SIZE),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    block_table[0, :blocks] = torch.randperm(blocks, generator=generator).to(
+        device="cuda", dtype=torch.int32
+    )
+    seq_lens = torch.arange(
+        live_seq_len - num_rows + 1,
+        live_seq_len + 1,
+        dtype=torch.int32,
+        device="cuda",
+    ).view(1, num_rows)
+    q, weights = _make_queries(num_rows, num_heads)
+
+    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    baseline = sm70_indexer_decode_logits(
+        q, cache, weights, seq_lens, block_table, graph_width
+    )
+
+    static_workspace = (
+        torch.empty((graph_width, _HEAD_DIM), dtype=torch.float16, device="cuda"),
+        torch.empty((graph_width,), dtype=torch.float32, device="cuda"),
+        torch.empty(
+            (num_rows * num_heads, graph_width),
+            dtype=torch.float32,
+            device="cuda",
+        ),
+    )
+
+    class StaticWorkspace:
+        @staticmethod
+        def get_simultaneous(*specs):
+            assert len(specs) == len(static_workspace)
+            return static_workspace
+
+    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", True)
+    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS_MIN_KEYS", 1)
+    monkeypatch.setattr(
+        sm70_indexer, "current_workspace_manager", lambda: StaticWorkspace()
+    )
+
+    def candidate_call():
+        return sm70_indexer_decode_logits(
+            q, cache, weights, seq_lens, block_table, graph_width
+        )
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            candidate_call()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        candidate = candidate_call()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+        expected_topk = torch.topk(baseline[row, :row_len], 512).indices.sort().values
+        actual_topk = torch.topk(candidate[row, :row_len], 512).indices.sort().values
+        assert torch.equal(actual_topk, expected_topk)
+
+    # The graph bucket has no allocated blocks after the live request tail.
+    # Reaching this assertion proves the gather masked those -1 entries.
+    assert torch.isfinite(candidate[:, :live_seq_len]).all()
+
+    # Replay the same graph with a shorter live request. This exercises the
+    # device-derived bound instead of merely validating the capture-time row.
+    seq_lens.sub_(127)
+    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    replay_baseline = sm70_indexer_decode_logits(
+        q, cache, weights, seq_lens, block_table, graph_width
+    )
+    graph.replay()
+    torch.accelerator.synchronize()
+    for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
+        expected_topk = (
+            torch.topk(replay_baseline[row, :row_len], 512).indices.sort().values
+        )
+        actual_topk = torch.topk(candidate[row, :row_len], 512).indices.sort().values
+        assert torch.equal(actual_topk, expected_topk)
+
+
+@requires_sm70
+def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> None:
+    torch.manual_seed(20260804)
+    num_queries = 8
+    num_heads = 4
+    num_keys = 7
+    head_dim = 128
+    cache_block_size = 64
+
+    q = torch.randn(
+        (num_queries, num_heads, head_dim), device="cuda", dtype=torch.float16
+    )
+    weights = torch.randn((num_queries, num_heads), device="cuda", dtype=torch.float16)
+    cache = torch.zeros(
+        (1, cache_block_size, head_dim + 4), device="cuda", dtype=torch.uint8
+    )
+    cache[..., :head_dim].fill_(0x38)
+    cache[..., head_dim:].view(torch.float32).fill_(1.0)
+    seq_lens = torch.full((1, num_queries), num_keys, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+
+    narrow = sm70_indexer_decode_logits(
+        q, cache, weights, seq_lens, block_table, max_seq_len=16
+    )
+    wide = sm70_indexer_decode_logits(
+        q, cache, weights, seq_lens, block_table, max_seq_len=64
+    )
+
+    assert narrow.shape == (num_queries, 16)
+    assert wide.shape == (num_queries, 64)
+    torch.testing.assert_close(narrow[:, :num_keys], wide[:, :num_keys], rtol=0, atol=0)

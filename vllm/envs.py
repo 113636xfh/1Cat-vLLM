@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
@@ -281,6 +283,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
+    VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE: bool = False
     VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
     VLLM_SM70_REJECTION_PROFILE: bool = False
@@ -2142,6 +2145,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
     ),
+    # Extend the one-launch grouped verifier route from M=8 to M=2..M=8.
+    # Kept independent until each width passes its CUDA Graph and model gates.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER", "0"))
+    ),
+    # Group verifier slots routed to the same expert into one multi-row group.
+    # This changes the MXFP4 reduction tactic, so it stays behind an
+    # independent acceptance/quality gate.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS", "0"))
+    ),
     # Use deterministic W13/W2 tactics for the fixed 48 one-row
     # verifier groups instead of relying on capture-time autotune stability.
     "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR": lambda: bool(
@@ -2251,6 +2265,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
+    ),
+    # The private ring changes compressor-state ownership and lifetime. Keep it
+    # opt-in until its long-context quality and capacity gates are complete.
+    "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE", "0"))
     ),
     "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
