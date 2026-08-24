@@ -951,12 +951,18 @@ def _should_use_prefill_dense_splitkv3(
     return (
         envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3
         and splitkv3_op is not None
-        and query.shape == (1, 4096, 6, 256)
+        and (
+            query.shape == (1, 4096, 6, 256)
+            or (
+                envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL
+                and query.shape == (1, 8000, 6, 256)
+            )
+        )
         and key.ndim == 4
         and key.shape[0] == 1
         and key.shape[1] == max_seqlen_k
         and key.shape[2:] == (1, 256)
-        and max_seqlen_q == 4096
+        and max_seqlen_q == query.shape[1]
         and max_seqlen_k >= envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV
         and max_seqlen_k > max_seqlen_q
         and not _is_cuda_graph_capturing(query)

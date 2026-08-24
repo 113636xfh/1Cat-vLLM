@@ -215,6 +215,59 @@ exact dense D256 calls, 544 prefix-paged calls, and 544 E5M2 bridge calls.
 This promotes the small dependency-chain win, but it also establishes that
 barrier removal alone is not a double-digit long-context solution.
 
+## 2026-08-24 Q8000 Split-KV3 Tail-Wave Experiment
+
+The matched runtime does not present `Q=8192` to long prefix-attention calls.
+Although `max_num_batched_tokens` is 8192, Mamba/attention page alignment makes
+the repeated full chunks `Q=8000`; a 40K diagnostic observed
+`Q=(1,8000,6,256)` and `KV=(1,40000,1,256)`. The first Q8192 experiment was
+therefore a useful operator screen but had zero end-to-end route hits. Its
+first control measurement was also invalidated by a second TP4 job starting on
+GPUs 4-7 between warmup and measurement (`47.90 -> 64.45 s`). The uncontended
+candidate/control-B pair used the same unsplit route and differed by only
+0.15%, confirming that run did not measure split-KV3.
+
+The corrected candidate admits exactly `Q=(1,8000,6,256)` behind the
+default-off
+`VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL` gate. It leaves
+the existing production Q4096 policy unchanged and does not admit Q8192 or
+other nearby shapes. Three independent KV partitions turn 750 Q tiles into
+2250 CTAs at Q8000, avoiding the short last wave of the 72-SM V100. Bracketed
+CUDA-event operator results from the final K-stage binary are:
+
+| Q | KV | Unsplit | Split-KV3 | Throughput change | Causal TFLOP/s |
+|---:|---:|---:|---:|---:|---:|
+| 8000 | 40000 | 40.1736 ms | 38.6519 ms | +3.94% | 44.05 -> 45.78 |
+| 8000 | 64000 | 66.5214 ms | 64.6753 ms | +2.85% | 44.33 -> 45.60 |
+| 8000 | 96000 | 102.8820 ms | 99.4545 ms | +3.45% | 43.95 -> 45.47 |
+| 8000 | 128000 | 138.9150 ms | 134.3961 ms | +3.36% | 43.87 -> 45.35 |
+
+The three FP32 partial-output buffers plus max/sum state require 141.72 MiB
+per rank. Outputs are repeat-stable but not bitwise equal to unsplit because
+the partition merge changes reduction order. Across the four shapes, maximum
+absolute difference is `1.526e-5` to `3.052e-5`; mean absolute difference is
+`7.51e-7` to `1.38e-6`.
+
+The corrected full-model A/B/A uses the same TP4 128K official-sampling
+contract as the accepted K-stage endpoint. Control A/candidate/control B
+prefill times are `47.5940/47.1074/47.6612 s`. The bracketed control is
+`47.6276 s` or `2752.0 tok/s`; split-KV3 is `47.1074 s` or `2782.4 tok/s`,
+giving `-1.092%` latency and `+1.104%` throughput. TTFT improves 1.078%.
+Decode remains neutral: `5.1533 -> 5.1617 s` and
+`49.483 -> 49.402 tok/s`. Every rank reports 384 split-KV3 kernel hits, which
+matches 12 eligible long chunks times 16 full-attention layers times two
+requests. KV capacity remains 2,424,439 tokens per rank and no OOM fallback
+occurs.
+
+Quality does not yet justify a default-on promotion. Every lane is internally
+stable between warmup and measurement, and the candidate is token-for-token
+identical to control B for both 256-token outputs. However, identical unsplit
+control A selects a different stable sampled stream despite the same official
+seed. The candidate therefore shows no unique output divergence, but this
+cross-process sampling instability cannot prove equivalence for a non-bitwise
+route. Keep Q8000 split-KV3 explicit and default-off until a deterministic
+greedy/natural-text or dataset-quality gate passes.
+
 ## Artifacts
 
 - K-stage task root:
@@ -223,6 +276,13 @@ barrier removal alone is not a double-digit long-context solution.
   `build/formal-v6-final-cmake/_vllm_fa2_C.abi3.so` under that task root.
 - Endpoint A/B/A JSON:
   `results/tp4-128k-{baseline-a-v6,candidate-v6,baseline-b-v6}.json`.
+- Q8000 operator sweep:
+  `results/splitkv3-q8000-kv{40000,64000,96000,128000}-v6.json`.
+- Q8000 endpoint A/B/A:
+  `results/tp4-128k-splitkv3-q8000-{control-a,candidate,control-b}.json`.
+- Shape diagnostic and the zero-hit Q8192 negative run:
+  `logs/tp4-splitkv3-shape-diag.log` and
+  `results/tp4-128k-splitkv3-{control-a,candidate,control-b}.json`.
 - Root: task-local `qwen38-fp8-prefill-decay-20260815` artifact directory.
 - Nsight Systems:
   `profiles/qwen38-fp8-tp4-i128k-chunk15680-r2.nsys-rep`.

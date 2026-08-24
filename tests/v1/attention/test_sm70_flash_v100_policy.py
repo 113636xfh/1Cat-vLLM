@@ -379,10 +379,15 @@ def test_sm70_prefill_dense_splitkv3_env_is_default_on(monkeypatch):
 
     monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", raising=False)
     monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", raising=False)
+    monkeypatch.delenv(
+        "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
+        raising=False,
+    )
     envs.disable_envs_cache()
 
     assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3 is True
     assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV == 32768
+    assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL is False
 
     monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "0")
     envs.disable_envs_cache()
@@ -746,6 +751,8 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
     key = torch.empty((1, 65536, 1, 256), dtype=torch.float16, device="meta")
     key_32k = torch.empty((1, 32768, 1, 256), dtype=torch.float16, device="meta")
     key_16k = torch.empty((1, 16384, 1, 256), dtype=torch.float16, device="meta")
+    query_8k = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
+    query_8192 = torch.empty((1, 8192, 6, 256), dtype=torch.float16, device="meta")
 
     assert flash_v100._should_use_prefill_dense_splitkv3(
         query,
@@ -772,6 +779,30 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
         query[:, :, :4],
         key,
         max_seqlen_q=4096,
+        max_seqlen_k=65536,
+        splitkv3_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_dense_splitkv3(
+        query_8k,
+        key,
+        max_seqlen_q=8000,
+        max_seqlen_k=65536,
+        splitkv3_op=object(),
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL", "1")
+    envs.disable_envs_cache()
+    assert flash_v100._should_use_prefill_dense_splitkv3(
+        query_8k,
+        key,
+        max_seqlen_q=8000,
+        max_seqlen_k=65536,
+        splitkv3_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_dense_splitkv3(
+        query_8192,
+        key,
+        max_seqlen_q=8192,
         max_seqlen_k=65536,
         splitkv3_op=object(),
     )

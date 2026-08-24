@@ -41790,3 +41790,35 @@ Interpretation:
   The endpoint promotion gate is satisfied; the result is deliberately cited
   as a small dependency-chain gain, not as completion of the broader 128K
   utilization target.
+
+## 2026-08-24 Qwen3.8 Q8000 split-KV3 long-prefill experiment
+
+- A runtime-shape diagnostic closed the initial Q8192 assumption. With
+  chunk-8192 plus Mamba align, long prefix calls are actually Q8000; the first
+  Q8192-gated endpoint run had zero split-KV3 hits and is not performance
+  evidence. One control was additionally invalidated when another TP4 job
+  started between its 47.90-second warmup and 64.45-second measurement.
+- Added an exact-shape, default-off
+  `VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL` policy. Existing
+  production Q4096 admission is unchanged; Q8192 and nearby shapes remain
+  rejected. The policy suite passes 89/89 and Ruff lint/format checks pass.
+- Bracketed Q8000 operator sweeps at KV 40K/64K/96K/128K improve throughput by
+  3.94%/2.85%/3.45%/3.36%. At KV128K the kernel moves from 138.9150 to
+  134.3961 ms and 43.87 to 45.35 causal TFLOP/s. Workspace is 141.72 MiB per
+  rank. The FP16 outputs are repeat-stable but non-bitwise versus unsplit;
+  maximum absolute error is at most `3.052e-5` and mean error at most
+  `1.38e-6`.
+- Matched TP4 128K A/B/A measures control A/candidate/control B at
+  `47.5940/47.1074/47.6612 s`. The bracketed control is `47.6276 s` or
+  `2752.0 tok/s`; candidate is `47.1074 s` or `2782.4 tok/s`, for `-1.092%`
+  latency and `+1.104%` throughput. TTFT improves 1.078%; decode is neutral.
+  All ranks report exactly 384 Q8000 split-KV3 hits and unchanged surrounding
+  prefill/decode route counts. KV capacity remains 2,424,439 tokens per rank.
+- Each lane's warmup and measured 256-token stream is internally exact. The
+  candidate and control B are also token-for-token identical, but identical
+  unsplit control A selects a different stable sampled stream under the same
+  official seed. This cross-process sampling instability prevents default-on
+  promotion of a non-bitwise route. Keep the Q8000 gate experimental until a
+  deterministic greedy/natural-text or dataset-quality gate passes. Evidence
+  is under
+  `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824/`.
