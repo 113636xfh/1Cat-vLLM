@@ -66,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("/home/ymzx/models/Qwen3.8-27B-FP8"),
+        required=True,
     )
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -102,7 +102,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--trials", type=int, default=7)
     parser.add_argument("--seed", type=int, default=20260823)
-    parser.add_argument("--qwen38-prescaled-prefill", action="store_true")
+    parser.add_argument("--exact-8k-prescaled-prefill", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     return parser.parse_args()
 
@@ -215,8 +215,8 @@ def _event_trials(
 
     samples_ms: list[float] = []
     for _ in range(trials):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -259,7 +259,7 @@ def _run_case(
         raise ValueError(f"Unexpected {case} TP-local shape N={n}, K={k}.")
 
     tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(qweight, scales, 128)
-    if args.qwen38_prescaled_prefill:
+    if args.exact_8k_prescaled_prefill:
         tm_scales.mul_(256)
     k_ld, q_ld = (int(value) for value in meta.tolist())
     generator = torch.Generator(device=device).manual_seed(args.seed + m)
@@ -278,7 +278,7 @@ def _run_case(
         "resident-mm",
     ):
         reference_output = torch.empty_like(output)
-        if args.qwen38_prescaled_prefill:
+        if args.exact_8k_prescaled_prefill:
             sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
                 reference_output,
                 inputs,
@@ -365,7 +365,7 @@ def _run_case(
                 )
 
     else:
-        if args.qwen38_prescaled_prefill:
+        if args.exact_8k_prescaled_prefill:
 
             def launch(
                 output: torch.Tensor = output,
@@ -466,11 +466,11 @@ def main() -> int:
             "iters": args.iters,
             "trials": args.trials,
             "seed": args.seed,
-            "qwen38_prescaled_prefill": args.qwen38_prescaled_prefill,
+            "exact_8k_prescaled_prefill": args.exact_8k_prescaled_prefill,
             "cuda_graph": args.cuda_graph,
             "tm_gemm_tune": os.environ.get("TM_GEMM_TUNE"),
             "fast_targets": os.environ.get("VLLM_SM70_AWQ_TP2_FAST_TARGETS"),
-            "qwen38_prefill_fast_selector": os.environ.get(
+            "fp8_prefill_fast_selector": os.environ.get(
                 "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR"
             ),
         },

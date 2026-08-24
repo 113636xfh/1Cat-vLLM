@@ -42,11 +42,11 @@ def _event_trials(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples: list[float] = []
     for _ in range(trials):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -168,7 +168,7 @@ def _run_shape(
     ).mul_(0.02)
     reference = torch.empty((args.m, n), device=device, dtype=torch.float16)
     torch.mm(inputs, weight, out=reference)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     algorithms = [_CUBLAS_GEMM_DEFAULT_TENSOR_OP] + list(
         range(_CUBLAS_GEMM_ALGO0_TENSOR_OP, _CUBLAS_GEMM_ALGO0_TENSOR_OP + 16)
@@ -185,7 +185,7 @@ def _run_shape(
         try:
             timing = _event_trials(launch, args.warmup, args.iters, args.trials)
             launch()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             difference = (output.float() - reference.float()).abs()
             results.append(
                 {
@@ -202,7 +202,7 @@ def _run_shape(
                 }
             )
         except RuntimeError as error:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             results.append({"algo": algo, "status": "rejected", "error": str(error)})
     return {
         "m": args.m,
@@ -220,7 +220,7 @@ def main() -> int:
     device = torch.device(args.device)
     if torch.cuda.get_device_capability(device) != (7, 0):
         raise RuntimeError("This benchmark requires SM70/V100.")
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     cublas = _Cublas(torch.cuda.current_stream(device).cuda_stream)
     try:
         shapes = [_run_shape(args, device, cublas, n) for n in args.n]

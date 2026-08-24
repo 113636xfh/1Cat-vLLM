@@ -1639,8 +1639,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
-    # Memory-neutral QPN8 layout for model-, shape-, and runtime-gated
-    # Qwen3.8 TP4 no-MTP dense projections. Pure-FP8 checkpoints must opt in;
+    # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
+    # dense projections. Pure-FP8 checkpoints must opt in;
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),

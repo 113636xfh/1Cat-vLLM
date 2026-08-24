@@ -54,7 +54,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("/home/ymzx/models/Qwen3.8-27B-FP8"),
+        required=True,
     )
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -194,8 +194,8 @@ def _event_trials(
     torch.accelerator.synchronize()
     samples: list[float] = []
     for _ in range(trials):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -349,9 +349,7 @@ def main() -> int:
             "gated_silu": args.gated_silu,
             "backend": args.backend,
             "cuda_graph": args.cuda_graph,
-            "cutlass": os.getenv(
-                "VLLM_SM70_FP8_PREFILL_CUTLASS", "<unset:default-on>"
-            ),
+            "cutlass": os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "<unset:default-on>"),
             "vllm_c_extension": str(extension_path),
             "vllm_c_extension_sha256": _file_digest(extension_path),
             "tp_size": args.tp_size,

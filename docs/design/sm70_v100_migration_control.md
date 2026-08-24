@@ -42165,8 +42165,9 @@ Interpretation:
   the accepted TP-local gate/up `(K,N)=(5120,8704)`, down `(4352,5120)`, and
   output `(1536,5120)` projections. GDN input and full-attention QKV remain on
   TurboMind. The old layout is replaced at load time rather than retained.
-- Opt-in admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
-  TP4, no MTP, and configured `max_num_seqs <= 8`. Native QPN8 handles M=1-8.
+- Opt-in admission uses the engine contract only: SM70 block-FP8 layout, TP4,
+  exact projection shapes, no MTP, and configured `max_num_seqs <= 8`.
+  Native QPN8 handles M=1-8.
   Wider-concurrency and MTP configurations retain TurboMind until their own
   performance and quality gates pass; this is not a batch-one-only dispatch.
 - The opaque C++ M dispatch prevents an AOTInductor M=1 trace from being reused
@@ -42300,6 +42301,7 @@ Interpretation:
   pass.
 - Full results, route details, quality artifacts, trace/resource tables, and
   exact evidence paths are in `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
 ## 2026-08-24 Qwen3.8-27B-FP8 exact-8K CUTLASS projections
 
 - The accepted starting point is TP4 V100, input 8000, output 1, FP8-E5M2 KV,

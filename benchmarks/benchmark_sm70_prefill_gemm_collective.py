@@ -45,13 +45,13 @@ def _event_trials(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     samples: list[float] = []
     for _ in range(trials):
         dist.barrier()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -75,7 +75,7 @@ def _digest(tensor: torch.Tensor) -> str:
 def main() -> int:
     args = _parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -303,7 +303,7 @@ def main() -> int:
         launch()
     if not args.skip_symm_mem:
         pipelined()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     if args.include_gemma_norm:
         assert baseline_normalized is not None

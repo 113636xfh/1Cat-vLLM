@@ -48,13 +48,13 @@ def _event_trials(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     samples: list[float] = []
     for _ in range(trials):
         dist.barrier()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -78,7 +78,7 @@ def _digest(tensor: torch.Tensor) -> str:
 def main() -> int:
     args = _parse_args()
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     cpu_group = dist.new_group(backend="gloo")
     rank = dist.get_rank()
@@ -205,7 +205,7 @@ def main() -> int:
         graph_launches: dict[tuple[int, int], Callable[[], None]] = {}
         for variant, launch in candidate_launches.items():
             launch()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with communicator.capture(), torch.cuda.graph(graph):
@@ -221,7 +221,7 @@ def main() -> int:
     baseline()
     for launch in candidate_launches.values():
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     local_rows = args.m // world_size
     residual_reference = baseline_residual.narrow(0, rank * local_rows, local_rows)
     candidates: dict[str, Any] = {}

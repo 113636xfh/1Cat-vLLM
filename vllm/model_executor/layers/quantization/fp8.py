@@ -821,7 +821,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     persistent=False,
                 )
                 logger.info_once(
-                    "SM70 FP8 Qwen3.8 exact-8K pre-scaled projection path enabled."
+                    "SM70 block-FP8 exact-8K pre-scaled projection path enabled."
                 )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_EXACT_DENSE
