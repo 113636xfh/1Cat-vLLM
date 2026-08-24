@@ -125,8 +125,10 @@ shuffle/repack form.
 
 ## 2026-08-24 Exact-D256 K-Stage Ping-Pong
 
-The accepted exact-N32 arithmetic order is unchanged. The candidate uses the
-two existing K/V shared-memory regions as alternating K D64 stages. A next-K
+The accepted exact-N32 arithmetic order is unchanged. The candidate alternates
+K D64 panels between two non-overlapping shared-memory stages. The second K
+stage borrows bytes from the later V/P allocation: K is dead before V is
+loaded and P is materialized, so those lifetimes do not overlap. A next-K
 fragment is published to the stage that the current QK phase is not reading,
 so the pre-overwrite full-CTA barrier is no longer required. The visibility
 barrier before the next QK phase remains.
@@ -134,19 +136,21 @@ barrier before the next QK phase remains.
 The K layout's logical size is 2048 half elements, but its padded physical
 `cosize` is 2188. The final stage stride is therefore 2240 half elements: it
 is larger than the physical span, 16-byte aligned for `STS.128`, and keeps
-both stages on the same 128-byte shared-bank phase. Dynamic shared memory
-grows from 45,568 to 46,336 bytes. Dense/split-KV3 kernels remain at 254/253
-registers per thread with zero stack or spill.
+both stages on the same 128-byte shared-bank phase. The final lifetime-aliased
+layout leaves dynamic shared memory at 45,568 bytes. Dense/split-KV3 kernels
+remain at 254/253 registers per thread with zero stack or spill.
 
 SASS for the exact dense nonpaged specialization changes as follows:
 
 - static `BAR.SYNC.DEFER_BLOCKING` count: 15 to 12;
 - HMMA step counts: 128 each, unchanged;
 - `LDG`, `LDS`, `STS`, `SHFL`, and `MUFU` counts: unchanged;
+- `FADD` and `IADD3` static counts: 15 to 12 and 71 to 68;
 - full SASS from the clean repository-patch build is byte-identical to the
-  measured v5 artifact.
+  measured lifetime-alias artifact.
 
-Same-build, separate-process A/B/A CUDA-event measurements use FP16,
+The initial fully-disjoint v5 stage layout was screened across the length
+curve. Same-build, separate-process A/B/A CUDA-event measurements use FP16,
 `Hq=6`, `Hkv=1`, D256, causal attention, five warmups, five queued calls per
 sample, and seven samples. The control column is the mean of the two bracketing
 control medians except for the first 8K chunk, where the first process was a
@@ -160,12 +164,19 @@ visible clock-ramp outlier and the hot second control is reported.
 | 8192 | 131072 | 142.3325 ms | 140.9176 ms | -0.99% | bitwise |
 | 15680 | 125440 | 251.6402 ms | 250.2695 ms | -0.54% | bitwise |
 
-A second 128K run from the clean formal build measured
-`142.1020 -> 141.5512 ms` (`-0.39%`) and was again bitwise exact. Direct paged
-and split-KV3 gates at `Q4096/KV32768` are also bitwise equal over 6,291,456
-elements each; the dense gate covers 12,582,912 elements. The gain is small
-but length-directed: the hot first chunk is neutral while long-prefix calls
-consistently improve.
+A second 128K run from the clean v5 build measured
+`142.1020 -> 141.5512 ms` (`-0.39%`) and was again bitwise exact. The final
+lifetime-alias layout was then compared with v5 in both execution orders,
+each bracketed by fresh controls. Across the two orders, pooled control, v5,
+and lifetime-alias medians are `142.4068`, `141.8076`, and `141.7669 ms`:
+`-0.42%` for v5 and `-0.45%` for the final layout. The `0.03%` difference
+between candidates is noise-sized; the final layout is selected because it
+does not enlarge shared memory or alter the original V/P addresses.
+
+Direct paged and split-KV3 gates at `Q4096/KV32768` are bitwise equal over
+6,291,456 elements each; the dense gate covers 12,582,912 elements. The gain
+is small but length-directed: the hot first chunk is neutral while long-prefix
+calls consistently improve.
 
 Closed intermediate variants must not be repeated:
 
@@ -175,7 +186,10 @@ Closed intermediate variants must not be repeated:
   `STS.128` and raises a CUDA misaligned-address fault;
 - 2192-half spacing is exact but loses address/bank-phase efficiency;
 - 2304-half spacing is exact but is slower than the minimal same-phase 2240
-  spacing.
+  spacing;
+- allocating the two 2240-half stages as fully disjoint storage is exact and
+  performance-equivalent, but unnecessarily grows shared memory to 46,336
+  bytes; the lifetime-alias form retains the original 45,568-byte envelope.
 
 Nsight Compute recognized the exact mangled kernel but the host driver denied
 performance-counter access with `ERR_NVGPUCTRPERM`. No privilege or machine

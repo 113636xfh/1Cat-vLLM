@@ -1,29 +1,22 @@
 --- a/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
 +++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
-@@ -126,8 +126,12 @@
+@@ -126,8 +126,16 @@
                 Stride<_4, _1>>{}));
  
      static constexpr int kQElements = size(SmemLayoutQ{});
--    static constexpr int kKVElements = size(SmemLayoutKV{});
--    static_assert(size(SmemLayoutV{}) == kKVElements);
-+    // SmemLayoutK has a padded physical span even though its logical size is
-+    // kBlockN * kDChunk. Keep ping-pong stages disjoint and on the same 128B
-+    // bank phase by rounding the stage stride above the K layout's cosize.
-+    static constexpr int kKVElements = 2240;
-+    static_assert(kKVElements >= cosize(SmemLayoutK{}));
-+    static_assert(size(SmemLayoutV{}) <= kKVElements);
+     static constexpr int kKVElements = size(SmemLayoutKV{});
+     static_assert(size(SmemLayoutV{}) == kKVElements);
++    // The second K stage is live only before P is materialized, so it may
++    // alias the beginning of the later P region. Keep the K stages disjoint
++    // and on the same 128-byte bank phase without moving the V/P regions.
++    static constexpr int kKStageElements = 2240;
++    static_assert(kKStageElements >= cosize(SmemLayoutK{}));
++    static_assert(
++        kKStageElements + cosize(SmemLayoutK{})
++        <= 2 * kKVElements + size(SmemLayoutP{}));
      static constexpr int kPElements = size(SmemLayoutP{});
      static constexpr int kExchangeRows = kMmaGroups * kGroupRows;
      static constexpr int kTensorSmemBytes =
-@@ -135,7 +139,7 @@
-     static constexpr int kExchangeBytes =
-         2 * kExchangeRows * sizeof(float);
-     static constexpr int kSmemBytes = kTensorSmemBytes + kExchangeBytes;
--    static_assert(kSmemBytes == 45568);
-+    static_assert(kSmemBytes == 46336);
- };
- 
- template <typename TiledCopy, typename SrcTensor, typename DstTensor>
 @@ -521,11 +525,11 @@
          make_gmem_ptr(k + k_batch_offset + head_kv * k_head_stride),
          make_shape(kv_len, Int<Traits::kHeadDim>{}),
@@ -56,7 +49,7 @@
 +            auto sK = make_tensor(
 +                make_smem_ptr(
 +                    kv_smem_ptr
-+                    + (d_chunk & 1) * Traits::kKVElements),
++                    + (d_chunk & 1) * Traits::kKStageElements),
 +                typename Traits::SmemLayoutK{});
              if (d_chunk + 1 < Traits::kDChunks) {
                  auto gKNext = local_tile(
@@ -70,7 +63,7 @@
 +                auto sKNext = make_tensor(
 +                    make_smem_ptr(
 +                        kv_smem_ptr
-+                        + ((d_chunk + 1) & 1) * Traits::kKVElements),
++                        + ((d_chunk + 1) & 1) * Traits::kKStageElements),
 +                    typename Traits::SmemLayoutK{});
 +                auto tKsKNextRaw = gmem_k_thread.partition_D(sKNext);
 +                auto tKsKNext =

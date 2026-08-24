@@ -41746,21 +41746,30 @@ Interpretation:
   cycles lacking an eligible warp; DRAM is only 9.06%. This is an SM70
   shared-memory/dependency problem, not HBM saturation.
 - Added a third vendored-FA2 patch that alternates the four D64 K panels across
-  two disjoint shared stages. The stage stride is 2240 half elements, above the
-  padded 2188-half K `cosize`, aligned for 128-bit stores, and on a common
-  128-byte bank phase. This removes three static full-CTA barriers while
-  preserving every HMMA/load/store count and the exact N32 arithmetic order.
-- Shared memory changes `45,568 -> 46,336` bytes. Dense and split-KV3 remain
-  at 254/253 registers per thread with zero stack or spill. A clean CUDA 12.8
-  SM70 build has byte-identical SASS to the measured candidate.
+  two non-overlapping shared stages. The second stage borrows the later V/P
+  allocation because K and V/P lifetimes do not overlap. Its 2240-half stride
+  is above the padded 2188-half K `cosize`, aligned for 128-bit stores, and on
+  a common 128-byte bank phase. This removes three static full-CTA barriers
+  while preserving every HMMA/load/store count and the exact N32 arithmetic
+  order.
+- Shared memory remains 45,568 bytes. Dense and split-KV3 remain at 254/253
+  registers per thread with zero stack or spill. A clean CUDA 12.8 SM70 build
+  has byte-identical SASS to the measured candidate. The first clean-clone
+  build failed only because the CUTLASS submodule was absent (`cute/tensor.hpp`
+  not found); initializing pinned CUTLASS `62750a2b...` repaired the build.
 - Exact dense A/B/A improves 0.74%-1.11% at Q8192/KV32K-128K and 0.54% at the
   historical Q15680/KV125440 shape; a separate clean-build 128K run improves
   0.39%. The first Q8192/KV8192 chunk is neutral. Dense, randomized-paged, and
   split-KV3 output gates are all bitwise equal to their matching controls.
+  Two order-reversed 128K comparisons pool to `142.4068 ms` control,
+  `141.8076 ms` fully-disjoint v5, and `141.7669 ms` lifetime alias. The final
+  form is `-0.45%` versus control and preserves the smaller shared envelope.
 - Rejected 2048-half spacing because K stages overlap, 2188 because `STS.128`
   becomes misaligned, and 2192/2304 because they are slower than the final
-  same-bank-phase layout. Nsight Compute counter collection is unavailable to
-  this user (`ERR_NVGPUCTRPERM`); no driver security setting was changed.
+  same-bank-phase layout. The exact fully-disjoint 2240 form is superseded
+  because it grows shared memory without a measurable speed advantage. Nsight
+  Compute counter collection is unavailable to this user
+  (`ERR_NVGPUCTRPERM`); no driver security setting was changed.
 - Full TP4 Qwen3.8 128K E5M2-KV, chunk-8192, official-sampling A/B/A is the
   remaining promotion gate. Do not cite the operator result as an endpoint
   throughput claim until that gate records route hits, output quality, prefill,
