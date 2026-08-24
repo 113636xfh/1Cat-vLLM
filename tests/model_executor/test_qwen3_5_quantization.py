@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
+import torch
 
 
 class _QuantConfig:
@@ -9,6 +13,90 @@ class _QuantConfig:
         self.ignore: list[str] = []
         self.config: dict[str, object] = {}
         self.quantized_layers: dict[str, dict[str, str]] = {}
+
+
+@pytest.mark.parametrize(
+    ("split_enabled", "norm_enabled"),
+    [
+        (False, False),
+        (False, True),
+    ],
+)
+def test_sm70_gdn_qpn8_ba_split_is_disabled_without_split_flag(
+    monkeypatch,
+    split_enabled: bool,
+    norm_enabled: bool,
+) -> None:
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", split_enabled)
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", norm_enabled)
+
+    assert not gdn._sm70_gdn_qpn8_ba_split_enabled()
+
+
+def test_sm70_gdn_qpn8_ba_split_rejects_unpaired_route(monkeypatch) -> None:
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", False)
+
+    with pytest.raises(RuntimeError, match="requires the accepted"):
+        gdn._sm70_gdn_qpn8_ba_split_enabled()
+
+
+def test_sm70_gdn_qpn8_ba_split_requires_source_built_ops(monkeypatch) -> None:
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", True)
+    monkeypatch.setattr(
+        gdn,
+        "_missing_sm70_gdn_qpn8_ba_ops",
+        lambda: ["fp8_qpn8_dispatch_ba_split_sm70_out"],
+    )
+
+    with pytest.raises(RuntimeError, match="requires the source-built"):
+        gdn._sm70_gdn_qpn8_ba_split_enabled()
+
+
+def test_sm70_gdn_qpn8_ba_split_accepts_complete_contract(monkeypatch) -> None:
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_QPN8_BA_SPLIT", True)
+    monkeypatch.setattr(gdn.envs, "VLLM_SM70_GDN_RMSNORM_ONEPASS", True)
+    monkeypatch.setattr(gdn, "_missing_sm70_gdn_qpn8_ba_ops", lambda: [])
+
+    assert gdn._sm70_gdn_qpn8_ba_split_enabled()
+
+
+def test_sm70_gdn_qpn8_ba_weight_contract_is_layout_based() -> None:
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    qkvz = SimpleNamespace(
+        sm70_fp8_qpn8=True,
+        sm70_fp8_prefill_exact_dense_workspace_ptr=42,
+        weight=torch.empty((5120, 4096), dtype=torch.uint8, device="meta"),
+        weight_scale_inv=torch.empty((1, 4096), dtype=torch.float16, device="meta"),
+        bias=None,
+    )
+    ba = SimpleNamespace(
+        weight=torch.empty((24, 5120), dtype=torch.float16, device="meta"),
+        bias=None,
+    )
+    layer = SimpleNamespace(
+        enable_sm70_gdn_qpn8_ba_split=True,
+        in_proj_qkvz=qkvz,
+        in_proj_ba=ba,
+    )
+
+    assert gdn._sm70_gdn_qpn8_ba_weight_contract(layer)
+
+    qkvz.bias = object()
+    assert not gdn._sm70_gdn_qpn8_ba_weight_contract(layer)
+    qkvz.bias = None
+    qkvz.weight = torch.empty((4096, 5120), dtype=torch.uint8, device="meta")
+    assert not gdn._sm70_gdn_qpn8_ba_weight_contract(layer)
 
 
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():

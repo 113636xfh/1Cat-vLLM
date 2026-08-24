@@ -42783,6 +42783,44 @@ Interpretation:
 - Reproducible JSON and route logs are under
   `bench_results/qwen36_nvfp4_no_mtp_scaling_20260824/{results,logs,telemetry}`.
 
+## 2026-08-24 Qwen3.8-27B-NVFP4 GDN decode fusion
+
+- Frozen contract: TP4 on four V100-SXM2-32GB GPUs, input 1024, output cap
+  256, official random sampling, E4M3 KV, Flash-V100, full CUDA graph, and no
+  MTP. Pure decode excludes TTFT/prefill and each endpoint is the stable median
+  of three sequential requests.
+- The quality-safe QPN8 QKV/Z plus FP16 b/a split projection and one-pass GDN
+  RMSNorm improve the matched control from `12.249652 ms / 81.634970 tok/s`
+  to `11.921648 ms / 83.881019 tok/s`. All three requests exactly reproduce
+  the control's 256 token IDs and SHA256
+  `8b37337f4c393711cb8550db6bae909b1e85de8df1cf5ba8c60d8c000749c0a2`.
+- A final post-rebase default-wrapper admission recheck reports
+  `12.261727 ms / 81.554583 tok/s` for the matching control and
+  `11.956949 ms / 83.633383 tok/s` for the candidate. The C++ route oracle
+  fires on all four ranks and all three 256-token candidate streams exactly
+  match the current-main control hash
+  `ca77db3b032a1600a8567adea706108c1bd8c5472b3ace2318c41ab17c66c1f9`.
+- The GDN RMSNorm 48-layer operator gate is bitwise exact and saves
+  `55.946 us/token`. QKV is exact on all 48 layers; b/a has relative L2
+  `6.368e-8` and maximum absolute error `2.384e-7`. The split projection is
+  admitted only when its one-pass RMSNorm pair is also enabled. Runtime
+  selection uses SM70, exact tensor/layout, QPN8 workspace, bias, TP, and
+  no-speculation contracts; the measured model/checkpoint is evidence only.
+  Large-M and unsupported shapes retain the original paths. Archived evidence
+  uses the pre-audit Qwen-prefixed flag names; final source uses generic GDN
+  flags and leaves the measured kernels unchanged.
+- QPN8 QKV/Z plus b/a alone reaches `83.740763 tok/s` but diverges at token
+  202, so it is not an independent accepted configuration. It is accepted only
+  together with the exact one-pass RMSNorm, whose paired endpoint restores the
+  complete frozen output.
+- The Q/K RMSNorm plus MRoPE plus KV-write candidate reaches stable repeats of
+  `85.451/85.015 tok/s` but diverges at token 1 and stops at 208 tokens. Its
+  source, schema, flag, and rejected QPN4 communication experiments were
+  removed before submission.
+- Next target: quantify no-MTP pure-decode decay at exact final context lengths
+  16K, 64K, 128K, and 256K, reporting TTFT/prefill separately and preserving
+  the same model, quantization, TP, attention, KV, sampling, and graph routes.
+
 ## 2026-08-24 MRV2 DFlash2 score-gated verifier promotion
 
 - The native Flash-V100 grouped verifier keeps all eight MRV2 target rows and

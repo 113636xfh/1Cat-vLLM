@@ -12,6 +12,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -1329,6 +1330,60 @@ def _sm70_compile_graph_slice_dim(
     return tensor.index_select(dim, indices)
 
 
+def _sm70_gdn_rmsnorm_onepass_enabled() -> bool:
+    return envs.VLLM_SM70_GDN_RMSNORM_ONEPASS
+
+
+_SM70_GDN_QPN8_BA_REQUIRED_OPS = (
+    "fp8_qpn8_gemm_ba_split_sm70_out",
+    "fp8_qpn8_dispatch_ba_split_sm70_out",
+)
+
+
+def _missing_sm70_gdn_qpn8_ba_ops() -> list[str]:
+    return [
+        name
+        for name in _SM70_GDN_QPN8_BA_REQUIRED_OPS
+        if not hasattr(torch.ops._C, name)
+    ]
+
+
+def _sm70_gdn_qpn8_ba_split_enabled() -> bool:
+    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT and not envs.VLLM_SM70_GDN_RMSNORM_ONEPASS:
+        raise RuntimeError(
+            "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the accepted "
+            "VLLM_SM70_GDN_RMSNORM_ONEPASS=1 pair."
+        )
+    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT:
+        missing_ops = _missing_sm70_gdn_qpn8_ba_ops()
+        if missing_ops:
+            raise RuntimeError(
+                "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the source-built "
+                f"SM70 GDN extension; missing ops: {missing_ops}."
+            )
+    return envs.VLLM_SM70_GDN_QPN8_BA_SPLIT
+
+
+@triton.jit
+def _sm70_gdn_rmsnorm_gated_onepass_kernel(
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, D)
+    x = tl.load(x_ptr + row * D + offsets).to(tl.float32)
+    z = tl.load(z_ptr + row * D + offsets).to(tl.float32)
+    weight = tl.load(weight_ptr + offsets).to(tl.float32)
+    sumsq = tl.sum(x * x, axis=0)
+    rstd = tl.rsqrt(sumsq / D + EPS)
+    gated = z * tl.sigmoid(z)
+    tl.store(out_ptr + row * D + offsets, x * rstd * weight * gated)
+
+
 def _sm70_qwen_gdn_rmsnorm_gated_impl(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -1338,6 +1393,39 @@ def _sm70_qwen_gdn_rmsnorm_gated_impl(
     norm_before_gate: bool,
     activation: str,
 ) -> torch.Tensor:
+    if (
+        _sm70_gdn_rmsnorm_onepass_enabled()
+        and current_platform.is_device_capability(70)
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.shape == (12, 128)
+        and x.is_contiguous()
+        and z.is_cuda
+        and z.device == x.device
+        and z.dtype == x.dtype
+        and z.shape == x.shape
+        and z.is_contiguous()
+        and weight.is_cuda
+        and weight.device == x.device
+        and weight.dtype == x.dtype
+        and weight.shape == (128,)
+        and weight.is_contiguous()
+        and group_size <= 0
+        and norm_before_gate
+        and activation in ("silu", "swish")
+    ):
+        out = torch.empty_like(x)
+        _sm70_gdn_rmsnorm_gated_onepass_kernel[(12,)](
+            x,
+            z,
+            weight,
+            out,
+            D=128,
+            EPS=eps,
+            num_warps=2,
+        )
+        return out
+
     from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
 
     return rmsnorm_fn(
@@ -2274,6 +2362,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 1,
                 1 + int(vllm_config.speculative_config.num_speculative_state_tokens()),
             )
+        self.enable_sm70_gdn_rmsnorm_onepass = (
+            _sm70_gdn_rmsnorm_onepass_enabled()
+            and current_platform.is_device_capability(70)
+            and self._sm70_spec_cache_stride == 1
+            and self.hidden_size == 5120
+            and self.tp_size == 4
+            and self.num_v_heads == 48
+            and self.head_v_dim == 128
+            and not self.gqa_interleaved_layout
+        )
+        self.enable_sm70_gdn_qpn8_ba_split = (
+            current_platform.is_device_capability(70)
+            and self._sm70_spec_cache_stride == 1
+            and self.hidden_size == 5120
+            and self.tp_size == 4
+            and self.num_v_heads == 48
+            and self.head_v_dim == 128
+            and not self.gqa_interleaved_layout
+            and not self.disable_tp_for_ba_proj
+            and self.in_proj_ba is not None
+            and _sm70_gdn_qpn8_ba_split_enabled()
+        )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -3744,6 +3854,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         z = _sm70_dump_gdn_projection_tensor("proj_z", layer_name, z)
         profile_start = _sm70_gdn_prefill_profile_start()
+        use_sm70_onepass_norm = (
+            self.enable_sm70_gdn_rmsnorm_onepass
+            and num_tokens == 1
+            and core_attn_out.dtype == torch.float16
+            and core_attn_out.shape == (12, 128)
+            and core_attn_out.is_contiguous()
+            and z.dtype == core_attn_out.dtype
+            and z.shape == core_attn_out.shape
+            and z.is_contiguous()
+            and self.norm.weight.dtype == core_attn_out.dtype
+            and self.norm.weight.shape == (128,)
+            and self.norm.weight.is_contiguous()
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.activation in ("silu", "swish")
+        )
         if self.enable_sm70_dflash2_fused_gdn_norm:
             # RMSNormGated is decomposed into a nine-kernel native chain when
             # it is reached from the opaque Qwen GDN op under the default
@@ -3751,6 +3877,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # a one-pass Triton kernel with the same FP32 accumulation and
             # FP16 output contract, so call it directly on this isolated path.
             core_attn_out = self.norm.forward_cuda(core_attn_out, z)
+        elif use_sm70_onepass_norm:
+            _log_runtime_route_once(
+                "SM70 GDN 12x128 RMSNormGated one-pass route enabled."
+            )
+            core_attn_out = torch.ops.vllm.sm70_qwen_gdn_rmsnorm_gated(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                -1,
+                True,
+                self.norm.activation,
+            )
         else:
             core_attn_out = self.norm(core_attn_out, z)
         _sm70_gdn_prefill_profile_end(
@@ -6971,6 +7110,77 @@ def qwen_gdn_output_projection_fake(
     """Fake implementation for torch.compile."""
 
 
+def _sm70_gdn_qpn8_ba_weight_contract(
+    self: "QwenGatedDeltaNetAttention",
+) -> bool:
+    """Check the loaded operator layout without using model identity."""
+    qkvz = self.in_proj_qkvz
+    ba = self.in_proj_ba
+    qkvz_weight = getattr(qkvz, "weight", None)
+    qkvz_scales = getattr(qkvz, "weight_scale_inv", None)
+    ba_weight = getattr(ba, "weight", None) if ba is not None else None
+    return bool(
+        self.enable_sm70_gdn_qpn8_ba_split
+        and ba is not None
+        and getattr(qkvz, "sm70_fp8_qpn8", False)
+        and int(getattr(qkvz, "sm70_fp8_prefill_exact_dense_workspace_ptr", 0)) > 0
+        and isinstance(qkvz_weight, torch.Tensor)
+        and qkvz_weight.dtype == torch.uint8
+        and qkvz_weight.shape == (5120, 4096)
+        and qkvz_weight.is_contiguous()
+        and isinstance(qkvz_scales, torch.Tensor)
+        and qkvz_scales.dtype == torch.float16
+        and qkvz_scales.shape == (1, 4096)
+        and qkvz_scales.is_contiguous()
+        and isinstance(ba_weight, torch.Tensor)
+        and ba_weight.dtype == torch.float16
+        and ba_weight.shape == (24, 5120)
+        and ba_weight.is_contiguous()
+        and qkvz_weight.device == qkvz_scales.device == ba_weight.device
+        and getattr(qkvz, "bias", None) is None
+        and getattr(ba, "bias", None) is None
+    )
+
+
+def _sm70_gdn_qpn8_ba_dispatch_eligible(
+    self: "QwenGatedDeltaNetAttention",
+    hidden_states: torch.Tensor,
+    layer_name: LayerNameType,
+) -> bool:
+    qkvz = self.in_proj_qkvz
+    ba = self.in_proj_ba
+    return bool(
+        _sm70_gdn_qpn8_ba_weight_contract(self)
+        and ba is not None
+        and not _sm70_gdn_projection_dump_requested(layer_name)
+        and hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_split_sm70_out")
+        and hasattr(torch.ops._C, "fp8_qpn8_gemm_ba_split_sm70_out")
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.float16
+        and hidden_states.ndim == 2
+        and hidden_states.shape[1] == 5120
+        and hidden_states.is_contiguous()
+        and hidden_states.device == qkvz.weight.device == ba.weight.device
+    )
+
+
+def _sm70_gdn_qpn8_ba_split_eligible(
+    self: "QwenGatedDeltaNetAttention",
+    hidden_states: torch.Tensor,
+    z_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> bool:
+    return (
+        _sm70_gdn_qpn8_ba_dispatch_eligible(self, hidden_states, layer_name)
+        and hidden_states.shape == (1, 5120)
+        and z_out.is_cuda
+        and z_out.device == hidden_states.device
+        and z_out.dtype == hidden_states.dtype
+        and z_out.shape == (1, 12, 128)
+        and z_out.is_contiguous()
+    )
+
+
 def qwen_gdn_input_projection_core(
     hidden_states: torch.Tensor,
     z_out: torch.Tensor,
@@ -6989,46 +7199,75 @@ def qwen_gdn_input_projection_core(
         layer_name,
         hidden_states,
     )
-    mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-    ba, _ = self.in_proj_ba(hidden_states)
-    mixed_qkvz = _sm70_dump_gdn_projection_tensor(
-        "input_core_in_proj_qkvz",
+    if _sm70_gdn_qpn8_ba_split_eligible(
+        self,
+        hidden_states,
+        z_out,
         layer_name,
-        mixed_qkvz,
-    )
-    ba = _sm70_dump_gdn_projection_tensor("input_core_in_proj_ba", layer_name, ba)
-
-    if self.gqa_interleaved_layout:
-        query, key, value, z, b, a = self.fix_query_key_value_ordering(
-            mixed_qkvz,
-            ba,
+    ):
+        mixed_qkv = torch.empty(
+            (1, 2560), dtype=hidden_states.dtype, device=hidden_states.device
         )
-        query, key, value = map(
-            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+        b = torch.empty((1, 12), dtype=hidden_states.dtype, device=hidden_states.device)
+        a = torch.empty_like(b)
+        sm70_ops.fp8_qpn8_gemm_ba_split_sm70_out(
+            mixed_qkv,
+            z_out,
+            b,
+            a,
+            hidden_states,
+            self.in_proj_qkvz.weight,
+            self.in_proj_qkvz.weight_scale_inv,
+            self.in_proj_ba.weight,
         )
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        _log_runtime_route_once(
+            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+        )
+        z = z_out
     else:
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        z_size = self.value_dim // self.tp_size
-        mixed_qkv = mixed_qkvz[..., :qkv_size]
-        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
-            mixed_qkv = mixed_qkv.contiguous()
-        z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        ba_size = ba.shape[-1] // 2
-        b = ba[..., :ba_size]
-        a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
-        if self.disable_tp_for_ba_proj and self.tp_size > 1:
-            ba_chunk = self.num_v_heads // self.tp_size
-            ba_start = self.tp_rank * ba_chunk
-            b = b[:, ba_start : ba_start + ba_chunk]
-            a = a[:, ba_start : ba_start + ba_chunk]
-        b = b.contiguous()
-        a = a.contiguous()
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz = _sm70_dump_gdn_projection_tensor(
+            "input_core_in_proj_qkvz",
+            layer_name,
+            mixed_qkvz,
+        )
+        ba = _sm70_dump_gdn_projection_tensor("input_core_in_proj_ba", layer_name, ba)
 
-    if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(70):
-        z = z.contiguous()
-    z_out.copy_(z)
+        if self.gqa_interleaved_layout:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                mixed_qkvz,
+                ba,
+            )
+            query, key, value = map(
+                lambda x: rearrange(x, "l p d -> l (p d)"),
+                (query, key, value),
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+        else:
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv = mixed_qkvz[..., :qkv_size]
+            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                mixed_qkv = mixed_qkv.contiguous()
+            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            ba_size = ba.shape[-1] // 2
+            b = ba[..., :ba_size]
+            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+            if self.disable_tp_for_ba_proj and self.tp_size > 1:
+                ba_chunk = self.num_v_heads // self.tp_size
+                ba_start = self.tp_rank * ba_chunk
+                b = b[:, ba_start : ba_start + ba_chunk]
+                a = a[:, ba_start : ba_start + ba_chunk]
+            b = b.contiguous()
+            a = a.contiguous()
+
+        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
+            70
+        ):
+            z = z.contiguous()
+        z_out.copy_(z)
 
     _qwen_gdn_run_recurrent_core(
         self,
@@ -7073,7 +7312,29 @@ def qwen_gdn_input_projection(
         layer_name,
         hidden_states,
     )
+    if _sm70_gdn_qpn8_ba_split_eligible(
+        self,
+        hidden_states,
+        z_out,
+        layer_name,
+    ):
+        sm70_ops.fp8_qpn8_gemm_ba_split_sm70_out(
+            mixed_qkv_out,
+            z_out,
+            b_out,
+            a_out,
+            hidden_states,
+            self.in_proj_qkvz.weight,
+            self.in_proj_qkvz.weight_scale_inv,
+            self.in_proj_ba.weight,
+        )
+        _log_runtime_route_once(
+            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+        )
+        return
+
     mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+    assert self.in_proj_ba is not None
     ba, _ = self.in_proj_ba(hidden_states)
 
     if self.gqa_interleaved_layout:

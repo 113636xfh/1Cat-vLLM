@@ -649,6 +649,93 @@ if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
         return None
 
 
+def fp8_qpn8_gemm_ba_split_sm70_out(
+    qkv_out: torch.Tensor,
+    z_out: torch.Tensor,
+    b_out: torch.Tensor,
+    a_out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    ba_weight: torch.Tensor,
+) -> None:
+    """Run the exact-shape GDN QKV/Z FP8 and b/a FP16 projections."""
+    _op("fp8_qpn8_gemm_ba_split_sm70_out")(
+        qkv_out,
+        z_out,
+        b_out,
+        a_out,
+        input,
+        codes,
+        group_scales,
+        ba_weight,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gemm_ba_split_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gemm_ba_split_sm70_out")
+    def _fp8_qpn8_gemm_ba_split_sm70_out_fake(
+        qkv_out: torch.Tensor,
+        z_out: torch.Tensor,
+        b_out: torch.Tensor,
+        a_out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        ba_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_dispatch_ba_split_sm70_out(
+    qkv_out: torch.Tensor,
+    z_out: torch.Tensor,
+    b_out: torch.Tensor,
+    a_out: torch.Tensor,
+    qkvz_staging: torch.Tensor,
+    ba_staging: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    ba_weight: torch.Tensor,
+) -> None:
+    """Dispatch exact M=1 fusion or the original large-M projection path."""
+    _op("fp8_qpn8_dispatch_ba_split_sm70_out")(
+        qkv_out,
+        z_out,
+        b_out,
+        a_out,
+        qkvz_staging,
+        ba_staging,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        ba_weight,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dispatch_ba_split_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dispatch_ba_split_sm70_out")
+    def _fp8_qpn8_dispatch_ba_split_sm70_out_fake(
+        qkv_out: torch.Tensor,
+        z_out: torch.Tensor,
+        b_out: torch.Tensor,
+        a_out: torch.Tensor,
+        qkvz_staging: torch.Tensor,
+        ba_staging: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        ba_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_gated_pair_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
