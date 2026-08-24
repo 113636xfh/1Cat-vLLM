@@ -2,7 +2,7 @@
 +++ b/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu
 @@ -126,8 +126,16 @@
                 Stride<_4, _1>>{}));
- 
+
      static constexpr int kQElements = size(SmemLayoutQ{});
      static constexpr int kKVElements = size(SmemLayoutKV{});
      static_assert(size(SmemLayoutV{}) == kKVElements);
@@ -40,10 +40,10 @@
 -    copy_even_tile(gmem_k_copy, tKgKFirst, tKsK);
 +    copy_even_tile(gmem_k_copy, tKgKFirst, tKsKFirst);
      __syncthreads();
- 
+
      for (int n_block = n_block_max; n_block >= n_block_min; --n_block) {
 @@ -558,6 +562,11 @@
- 
+
  #pragma unroll
          for (int d_chunk = 0; d_chunk < Traits::kDChunks; ++d_chunk) {
 +            auto sK = make_tensor(

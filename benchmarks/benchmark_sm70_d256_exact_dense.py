@@ -54,12 +54,12 @@ def _event_trials(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     samples: list[float] = []
     for _ in range(trials):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
         start.record()
         for _ in range(iters):
             launch()
@@ -148,7 +148,7 @@ def main() -> int:
         trials=args.trials,
     )
     launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     output_cpu = output.cpu()
 
     comparison = None
