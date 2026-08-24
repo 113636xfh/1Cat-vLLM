@@ -26,7 +26,8 @@ at::Tensor flash_attention_decode_paged(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right);
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window);
 
 at::Tensor flash_attention_decode_paged_xqa(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
@@ -83,7 +84,8 @@ at::Tensor flash_attention_prefill_paged(
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool is_causal, const int window_size_left,
-    const int window_size_right);
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window);
 
 std::vector<at::Tensor>
 flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(

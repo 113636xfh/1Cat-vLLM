@@ -230,6 +230,81 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
+    """Validate the model-agnostic prefix-anchored SWA engine contract."""
+    window = cfg.attention_config.prefix_anchored_decode_window
+    if window is None:
+        return
+
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    ):
+        raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
+
+    model_config = cfg.model_config
+    if model_config is None:
+        raise ValueError("prefix_anchored_decode_window requires a model config")
+    if model_config.use_mla:
+        raise ValueError("prefix_anchored_decode_window does not support MLA attention")
+    if cfg.attention_config.use_non_causal:
+        raise ValueError(
+            "prefix_anchored_decode_window requires causal decoder attention"
+        )
+
+    cache_dtype = cfg.cache_config.cache_dtype
+    effective_cache_dtype = model_config.dtype if cache_dtype == "auto" else cache_dtype
+    if effective_cache_dtype not in (torch.float16, "float16"):
+        raise ValueError(
+            "prefix_anchored_decode_window requires an fp16 KV cache; "
+            f"got cache_dtype={cache_dtype!r} and model dtype={model_config.dtype}"
+        )
+
+    parallel_config = cfg.parallel_config
+    if (
+        parallel_config.decode_context_parallel_size != 1
+        or parallel_config.prefill_context_parallel_size != 1
+    ):
+        raise ValueError(
+            "prefix_anchored_decode_window does not support decode or prefill "
+            "context parallelism"
+        )
+    if cfg.cache_config.kv_offloading_size is not None:
+        raise ValueError(
+            "prefix_anchored_decode_window does not support KV-cache offloading"
+        )
+    if (
+        cfg.kv_transfer_config is not None
+        and cfg.kv_transfer_config.kv_connector is not None
+    ):
+        raise ValueError("prefix_anchored_decode_window does not support KV connectors")
+    if cfg.speculative_config is not None:
+        raise ValueError(
+            "prefix_anchored_decode_window does not yet support speculative decoding"
+        )
+
+    backend = cfg.attention_config.backend
+    if backend is None:
+        cfg.attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
+        logger.info(
+            "Prefix-anchored sliding-window attention: auto-selecting the "
+            "FLASH_ATTN_V100 backend."
+        )
+    elif backend != AttentionBackendEnum.FLASH_ATTN_V100:
+        raise ValueError(
+            "prefix_anchored_decode_window requires FLASH_ATTN_V100; "
+            f"got {backend.name}"
+        )
+    if cfg.cache_config.enable_prefix_caching:
+        cfg.cache_config.enable_prefix_caching = False
+        logger.info(
+            "Prefix-anchored sliding-window attention: disabling prefix "
+            "caching (windowed decode KV is not reusable across requests)."
+        )
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -964,6 +1039,8 @@ class VllmConfig:
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
+
+        apply_prefix_anchored_swa_constraints(self)
 
         if (
             self.mamba_config.enable_stochastic_rounding
@@ -1771,6 +1848,22 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
+
+            # Prefix-anchored sliding-window attention: full-graph capture
+            # bakes attention metadata that carries no per-request anchor
+            # lengths, so the anchored decode-window mask cannot run inside a
+            # full cudagraph. Piecewise graphs keep attention outside capture.
+            if (
+                self.attention_config.prefix_anchored_decode_window is not None
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                logger.info(
+                    "Prefix-anchored sliding-window attention does not "
+                    "support full cudagraphs. Overriding cudagraph_mode "
+                    "from %s to PIECEWISE.",
+                    self.compilation_config.cudagraph_mode.name,
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (
