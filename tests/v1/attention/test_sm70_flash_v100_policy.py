@@ -1530,8 +1530,12 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
     )
 
     assert result is output
-    assert captured["block_table"].data_ptr() == original_block_table.data_ptr()
-    assert captured["seq_lens"].data_ptr() == original_seq_lens.data_ptr()
+    captured_block_table = captured["block_table"]
+    captured_seq_lens = captured["seq_lens"]
+    assert isinstance(captured_block_table, torch.Tensor)
+    assert isinstance(captured_seq_lens, torch.Tensor)
+    assert captured_block_table.data_ptr() == original_block_table.data_ptr()
+    assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
     assert captured["one_pass"] is True
     assert torch.all(output == 1)
 

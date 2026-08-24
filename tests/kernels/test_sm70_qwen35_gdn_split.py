@@ -63,7 +63,7 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
     )
     mixed_ba = torch.randn((num_rows, 2 * ba_size), dtype=torch.float16, device="cuda")
     _sm70_materialize_qwen35_gdn_splits(mixed_qkvz, mixed_ba, qkv_size, z_size, ba_size)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -74,7 +74,7 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
     mixed_qkvz.copy_(torch.randn_like(mixed_qkvz))
     mixed_ba.copy_(torch.randn_like(mixed_ba))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.equal(actual_z, mixed_qkvz[:, qkv_size:].contiguous())
     assert torch.equal(actual_b, mixed_ba[:, :ba_size].contiguous())
@@ -112,7 +112,7 @@ def test_qwen35_gdn_qkv_pack_graph_replay_reads_current_values():
         device="cuda",
     )
     _sm70_pack_qwen_gdn_qkv(mixed_qkv, q_dim, k_dim, v_dim)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -120,7 +120,7 @@ def test_qwen35_gdn_qkv_pack_graph_replay_reads_current_values():
 
     mixed_qkv.copy_(torch.randn_like(mixed_qkv))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     q, k, v = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
     expected = torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)])

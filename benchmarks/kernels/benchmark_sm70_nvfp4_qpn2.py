@@ -180,11 +180,11 @@ def _qpn2_prepack(
 def _capture(call: Callable[[], Any]) -> tuple[torch.cuda.CUDAGraph, Any]:
     for _ in range(10):
         call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return graph, output
 
 
@@ -193,7 +193,7 @@ def _time_graph(
 ) -> dict[str, float | list[float]]:
     for _ in range(warmup):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples = []
     for _ in range(trials):
         start = torch.cuda.Event(enable_timing=True)
@@ -360,7 +360,7 @@ def _run_projection(
     qpn_timing = _time_graph(qpn_graph, warmup, iterations, trials)
     tm_graph.replay()
     qpn_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     reference = _fp32_reference(projection, x, device)
     saved_us = float(tm_timing["median_us"]) - float(qpn_timing["median_us"])
     return {

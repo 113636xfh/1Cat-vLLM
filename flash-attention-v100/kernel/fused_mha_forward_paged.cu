@@ -1176,12 +1176,12 @@ flash_attention_forward_kernel_paged(
                         const int block_offset = global_token_idx % page_block_size;
                         const int physical_block_idx_slow =
                             __ldg(&block_table_seq[virtual_block_idx]);
-                        const int64_t physical_offset_halfs =
+                        const int64_t physical_offset_halves =
                             (int64_t)physical_block_idx_slow * k_block_stride
                             + (int64_t)block_offset * k_token_stride
                             + (int64_t)kv_head_id * k_head_stride;
                         const int64_t physical_offset_uint4 =
-                            (physical_offset_halfs / PER_UINT4) + vec_col;
+                            (physical_offset_halves / PER_UINT4) + vec_col;
                         k_val = __ldg(&k_vec[physical_offset_uint4]);
                     }
                 }
@@ -1323,12 +1323,12 @@ flash_attention_forward_kernel_paged(
                         const int block_offset = global_token_idx % page_block_size;
                         const int physical_block_idx_slow =
                             __ldg(&block_table_seq[virtual_block_idx]);
-                        const int64_t physical_offset_halfs =
+                        const int64_t physical_offset_halves =
                             (int64_t)physical_block_idx_slow * v_block_stride
                             + (int64_t)block_offset * v_token_stride
                             + (int64_t)kv_head_id * v_head_stride;
                         const int64_t physical_offset_uint4 =
-                            (physical_offset_halfs / PER_UINT4) + vec_col;
+                            (physical_offset_halves / PER_UINT4) + vec_col;
                         v_val = __ldg(&v_vec[physical_offset_uint4]);
                     }
                 }

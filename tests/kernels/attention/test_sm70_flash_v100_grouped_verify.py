@@ -156,7 +156,7 @@ def test_grouped_verify_matches_fp32_reference_with_random_pages(
         max_seq_len_hint=prefix_len + query_len,
         workspace_seq_capacity_hint=prefix_len + query_len,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for actual in (two_pass, one_pass):
         difference = actual.float().sub(expected.float()).abs()
@@ -188,7 +188,7 @@ def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
         out=output,
         one_pass=True,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -205,7 +205,7 @@ def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
     for prefix_len in (127, 2049, 4097):
         seq_lens.fill_(prefix_len + query.shape[0])
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         expected = _reference(
             query,
             key_cache,

@@ -114,7 +114,7 @@ def test_sm70_fused_smallq_metadata_matches_repeat_interleave(
         num_query_tokens=num_query_tokens,
         real_num_query_tokens=real_num_query_tokens,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.equal(out_block_table, expected_block_table)
     assert torch.equal(out_seq_lens, expected_seq_lens)
@@ -195,7 +195,7 @@ def test_sm70_grouped_smallq_metadata_matches_individual_launches():
         reference_tables.append(out_table)
         reference_seq_lens.append(out_seq)
         assert torch.equal(out_query, query_start_loc)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for grouped, reference in zip(grouped_tables, reference_tables):
         assert torch.equal(grouped, reference)
@@ -219,7 +219,7 @@ def test_sm70_grouped_smallq_metadata_matches_individual_launches():
         real_num_query_tokens=real_num_query_tokens,
         descriptor=descriptor,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert replay_descriptor is descriptor
     _, expected_seq_lens = _reference_smallq_metadata(
         block_tables[0],

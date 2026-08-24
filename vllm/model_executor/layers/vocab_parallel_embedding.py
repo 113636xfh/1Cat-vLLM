@@ -178,7 +178,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
 
     codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(qweight, channel_scales)
     del qweight, channel_scales, weight_f32, scales
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
     device = weight.device
     max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
