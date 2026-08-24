@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
     CompressedTensorsW8A16Fp8,
     _sm70_channel_fp8_qpn8_config,
+    _sm70_fp8_qpn8_enabled,
 )
 from vllm.model_executor.layers.quantization.fp8 import (
     _SM70_FP8_PREFILL_DENSE_MIN_M,
@@ -31,7 +32,12 @@ from vllm.model_executor.layers.quantization.fp8 import (
 )
 
 
-def _make_channel_fp8_scheme(monkeypatch, *, static_input: bool = False):
+def _make_channel_fp8_scheme(
+    monkeypatch,
+    *,
+    static_input: bool = False,
+    enable_qpn8_by_default: bool = False,
+):
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
         "compressed_tensors_w8a16_fp8.get_current_vllm_config",
@@ -54,7 +60,11 @@ def _make_channel_fp8_scheme(monkeypatch, *, static_input: bool = False):
         strategy=QuantizationStrategy.CHANNEL,
         dynamic=False,
     )
-    return CompressedTensorsW8A16Fp8(weight_quant, static_input)
+    return CompressedTensorsW8A16Fp8(
+        weight_quant,
+        static_input,
+        enable_sm70_qpn8_by_default=enable_qpn8_by_default,
+    )
 
 
 def test_compressed_tensors_channel_fp8_selects_turbomind_on_sm70(monkeypatch):
@@ -65,6 +75,26 @@ def test_compressed_tensors_channel_fp8_selects_turbomind_on_sm70(monkeypatch):
         assert not _make_channel_fp8_scheme(
             monkeypatch, static_input=True
         ).use_sm70_fp8_turbomind
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_channel_fp8_qpn8_uses_mixed_nvfp4_default_only(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert not _make_channel_fp8_scheme(monkeypatch).use_sm70_fp8_qpn8
+        assert _make_channel_fp8_scheme(
+            monkeypatch,
+            enable_qpn8_by_default=True,
+        ).use_sm70_fp8_qpn8
+
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
+        envs.disable_envs_cache()
+        assert not _make_channel_fp8_scheme(
+            monkeypatch,
+            enable_qpn8_by_default=True,
+        ).use_sm70_fp8_qpn8
     finally:
         envs.disable_envs_cache()
 
@@ -318,16 +348,23 @@ def test_fp8_prefill_exact_dense_is_default_on(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_fp8_qpn8_is_auto_default_on_with_explicit_off(monkeypatch):
+def test_fp8_qpn8_is_opt_in_except_for_mixed_nvfp4(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8_LIBRARY", raising=False)
     envs.disable_envs_cache()
     try:
-        assert envs.VLLM_SM70_FP8_QPN8
+        assert not envs.VLLM_SM70_FP8_QPN8
         assert envs.VLLM_SM70_FP8_QPN8_LIBRARY is None
+        assert not _sm70_fp8_qpn8_enabled(False)
+        assert _sm70_fp8_qpn8_enabled(True)
         monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
         envs.disable_envs_cache()
         assert not envs.VLLM_SM70_FP8_QPN8
+        assert not _sm70_fp8_qpn8_enabled(True)
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
+        envs.disable_envs_cache()
+        assert envs.VLLM_SM70_FP8_QPN8
+        assert _sm70_fp8_qpn8_enabled(False)
     finally:
         envs.disable_envs_cache()
 

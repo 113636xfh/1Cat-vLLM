@@ -526,7 +526,7 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
         True,
     )
-    fp8_qpn8 = _env_bool("VLLM_SM70_FP8_QPN8", True)
+    fp8_qpn8 = _env_bool("VLLM_SM70_FP8_QPN8", False)
     nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
     nvfp4_moe_grouped_prefill = _env_bool("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", True)
     mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)

@@ -42156,6 +42156,7 @@ Interpretation:
   deterministic greedy/natural-text or dataset-quality gate passes. Evidence
   is under
   `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824/`.
+
 ## 2026-08-23 Qwen3.8-27B-FP8 TP4 no-MTP QPN8 decode acceptance
 
 - Integration base is `7aede2cf01`; the owned source worktree and Draft PR are
@@ -42164,7 +42165,7 @@ Interpretation:
   the accepted TP-local gate/up `(K,N)=(5120,8704)`, down `(4352,5120)`, and
   output `(1536,5120)` projections. GDN input and full-attention QKV remain on
   TurboMind. The old layout is replaced at load time rather than retained.
-- Default admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
+- Opt-in admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
   TP4, no MTP, and configured `max_num_seqs <= 8`. Native QPN8 handles M=1-8.
   Wider-concurrency and MTP configurations retain TurboMind until their own
   performance and quality gates pass; this is not a batch-one-only dispatch.
@@ -42173,12 +42174,14 @@ Interpretation:
   weight workspace, but fused gate/up additionally creates an `M x 8704` FP16
   temporary and is not accepted as a high-concurrency performance route.
 - Complete-source no-MTP E5M2 TP4 A/B at input 1024 and output cap 256 measured
-  TurboMind at `16.961295 ms/token`, `58.958 tok/s`, and default-on QPN8 at
+  TurboMind at `16.961295 ms/token`, `58.958 tok/s`, and QPN8 at
   `16.347973 ms/token`, `61.170 tok/s` (`+3.752%`). The candidate stopped
   normally at token 233; the control finished all 256 tokens. An earlier
   matched operator-integration run measured `15.808000 ms/token`,
   `63.259 tok/s` (`+7.448%`) and remains headroom evidence, not the conservative
-  complete-source claim.
+  complete-source observation. Because these arms contain 255 versus 232
+  steady intervals, respectively, this is not a pure-FP8 default-promotion
+  result; an equal-interval same-source rerun remains required.
 - Nsight Systems attributes about `0.944 ms/token` of the trace improvement to
   dense service (`10.335 -> 9.391 ms`), while launch count and GPU idle time are
   unchanged. The QPN8 dense service spends 6.172 ms in the 75-90% DRAM band and

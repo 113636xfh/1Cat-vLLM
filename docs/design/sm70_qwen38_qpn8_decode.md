@@ -4,12 +4,12 @@ Date: 2026-08-23
 
 ## Decision
 
-The memory-neutral QPN8 dense route is default-on for the accepted
+The memory-neutral QPN8 dense route is available as an opt-in for the
 Qwen3.8-27B-FP8 TP4 no-MTP model and projection shapes when configured
-`max_num_seqs` is at most eight. Set
-`VLLM_SM70_FP8_QPN8=0` to retain the prior TurboMind layout. An automatic
-route using an older `vllm._C` warns and falls back; an explicit request with
-missing QPN8 operators fails closed.
+`max_num_seqs` is at most eight. Set `VLLM_SM70_FP8_QPN8=1` to request it.
+The model-quality gate passes, but pure-FP8 default promotion still requires a
+same-source speed rerun with the same number of steady decode intervals. An
+explicit request with missing QPN8 operators fails closed.
 
 The gate checks the Qwen3.8 text architecture, 5120 hidden size, 17408
 intermediate size, 64 layers, full-attention interval 4, head dimension 256,
@@ -47,7 +47,7 @@ is replaced rather than retained, avoiding the approximately 6 GiB/rank
 duplicate-weight experiment. The matched candidate reported 19.89 GiB
 available KV memory versus 19.80 GiB for the control.
 
-The default model and shape gate admits only:
+The opt-in model and shape gate admits only:
 
 | Projection | TP-local K | TP-local N | Decode schedule |
 |---|---:|---:|---|
@@ -69,20 +69,22 @@ GEMM. The large-M gate/up temporary described above is bounded by the engine's
 | Matched TurboMind control | 16.985327 ms | 58.874 tok/s | baseline |
 | QPN8 accepted subset | 15.808000 ms | 63.259 tok/s | +7.448%, -1.177327 ms/token |
 | Complete-source TurboMind control | 16.961295 ms | 58.958 tok/s | source A/B baseline |
-| Complete-source default, env unset | 16.347973 ms | 61.170 tok/s | +3.752%, -0.613322 ms/token |
+| Complete-source QPN8 candidate | 16.347973 ms | 61.170 tok/s | +3.752%, -0.613322 ms/token |
 
-Both requests generated all 256 tokens and finished by length. Their sampled
-token streams first differ at output token 91; sampled token identity is not
-the quality gate because both trajectories are coherent and the accepted
-criterion is PPL plus fixed reasoning, knowledge, and Chinese datasets.
+The matched operator-integration pair generated all 256 tokens and finished by
+length. Their sampled token streams first differ at output token 91; sampled
+token identity is not the quality gate because both trajectories are coherent
+and the acceptance criterion is PPL plus fixed reasoning, knowledge, and
+Chinese datasets.
 
 The complete-source control generated 256 tokens and finished by length. The
-default-on complete-source request used the same prompt, sampling contract,
+complete-source QPN8 request used the same prompt, sampling contract,
 and source extension, but encountered the model's normal stop token 248044 at
 token 233. Its TPOT therefore covers 232 steady intervals rather than the
 control's 255. The earlier 63.259 tok/s matched operator-integration result is
-retained as evidence of headroom, while 61.170 tok/s is the conservative
-complete-source result until another same-source run closes system variance.
+retained as evidence of headroom. Because 61.170 tok/s uses 232 intervals while
+the control uses 255, another same-source equal-interval run is required before
+pure-FP8 default promotion.
 
 ## Nsight Systems Per-Token Decomposition
 
@@ -189,9 +191,8 @@ WikiText metrics; higher is better for the remaining accuracy metrics.
 | C-Eval high-school Chinese 5-shot | 19 | 73.684% | 73.684% | pass, equal |
 | C-Eval advanced mathematics 5-shot | 19 | 57.895% | 57.895% | pass, equal |
 
-No evaluated metric regresses. This is why the default decision does not
-depend on greedy token identity or the sampled A/B trajectory remaining
-bitwise identical.
+No evaluated metric regresses. This closes the quality side of the opt-in
+route; it does not replace the missing equal-interval performance rerun.
 
 ## Build and Tests
 
@@ -201,7 +202,7 @@ bitwise identical.
 - The operator race passed 960 rows. Maximum relative L2 was `2.851e-4`,
   minimum cosine was `0.99999988`, and maximum absolute error was `9.77e-4`;
   CUDA Graph replay deltas were zero.
-- Seventeen focused Python tests pass, covering default/explicit-off policy,
+- Seventeen focused Python tests pass, covering opt-in/explicit-off policy,
   model and shape gates, workspace reuse, M=1 and M>8 opaque dispatch, fused
   gate/up dispatch, and warmup registration.
 - Ruff lint/format, changed-line clang-format, Python byte compilation, shell

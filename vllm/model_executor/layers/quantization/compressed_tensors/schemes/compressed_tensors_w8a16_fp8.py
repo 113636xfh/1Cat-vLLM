@@ -66,6 +66,13 @@ _SM70_CHANNEL_FP8_QPN8_CONFIGS = {
 _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
 
+def _sm70_fp8_qpn8_enabled(enable_by_default: bool) -> bool:
+    """Resolve QPN8 while preserving the validated mixed-NVFP4 default."""
+    if os.getenv("VLLM_SM70_FP8_QPN8") is None:
+        return enable_by_default
+    return envs.VLLM_SM70_FP8_QPN8
+
+
 def _sm70_channel_fp8_qpn8_config(
     layer: torch.nn.Module,
 ) -> tuple[int, int, bool] | None:
@@ -79,7 +86,12 @@ def _sm70_channel_fp8_qpn8_config(
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
-    def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        is_static_input_scheme: bool,
+        enable_sm70_qpn8_by_default: bool = False,
+    ):
         self.weight_quant = weight_quant
         self.strategy = weight_quant.strategy
         self.out_dtype = torch.get_default_dtype()
@@ -97,7 +109,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             and sm70_tm.is_exact_sm70_cuda_platform()
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
         )
-        self.use_sm70_fp8_qpn8 = self.use_sm70_fp8_turbomind and envs.VLLM_SM70_FP8_QPN8
+        self.use_sm70_fp8_qpn8 = self.use_sm70_fp8_turbomind and _sm70_fp8_qpn8_enabled(
+            enable_sm70_qpn8_by_default
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
