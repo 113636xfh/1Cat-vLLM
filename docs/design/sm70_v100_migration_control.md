@@ -42358,7 +42358,14 @@ Interpretation:
 - Final evidence is under task-cache
   `qwen38-fp8-prefill-utilization-20260823/results/`, especially
   `full_model_cutlass_all_projections_final_source_tp4_fused_graph_i8000.raw.json`.
+
 ## 2026-08-24 Qwen3.6-35B NVFP4 MTP4 concurrency scaling
+
+- Audit disposition: the B10 compact-routing extension has its own matched
+  speed and GSM8K evidence and remains enabled. The broader high-width tune
+  limit, exact-shape drafter tile, all-reduce block policy, and eight-warp
+  sampler remain opt-in because their matched formal curve and combined
+  dataset-quality gate are incomplete.
 
 - The formal workload uses ModelOpt mixed FP8/NVFP4, TP4 on V100 GPU0-3,
   Flash-V100/FlashQLA, FP8-E5M2 KV cache, MTP4 probabilistic sampling with
@@ -42392,6 +42399,8 @@ Interpretation:
   measured `535.635/524.376/539.113 tok/s`; the candidate endpoint mean is
   `+2.48%`, summed pure decode is `+2.85%`, and P50 TPOT improves about `4.0%`
   with stable MTP acceptance.
+  Production keeps the prior 128-row default; reproducing this candidate
+  requires `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS=640`.
 - Two earlier low-width target-MoE candidates are rejected. Directly reusing
   sorted expert IDs instead of the compact metadata copy regressed the C1
   sandwich; splitting B9/B10 into 64-slot compact chunks was numerically
@@ -42411,10 +42420,12 @@ Interpretation:
   improve `1.543x/2.656x/2.879x/2.697x/2.625x` at the formal
   C2/C4/C8/C12/C16 widths.
 - The route-hit candidate initially exposed request-time old-tile MoE
-  signatures. Exact Qwen3.6 TP4 startup now warms tuned M1-M16 plus M33/M257
+  signatures. The exact E256/H2048/I128/top-k8 TP4 contract can warm tuned
+  M1-M16 plus M33/M257
   and explicitly covers legacy M1/M2/M9/M10 naive/aligned signatures; a fresh
-  48-request run then produced no inference-time `fused_moe_kernel` JIT. Other
-  MTP models retain the old `(9,33,257)` warmup set.
+  48-request run then produced no inference-time `fused_moe_kernel` JIT.
+  Unmatched shapes retain the old `(9,33,257)` warmup set, and the tuned route
+  requires `VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
 - Full-model evidence rejects the isolated M1 result. A physical-GPU4-7 C1
   candidate/control/candidate sandwich measured endpoint-mean summed pure
   decode `112.233` versus control `115.451 tok/s` (`-2.79%`) and endpoint-mean
@@ -42436,16 +42447,17 @@ Interpretation:
   `8.750 ms` (`-0.82%`). The source heuristic is limited to fully connected
   SM70 TP4, the exact MTP4 payloads, and ordinary all-reduce; the global block
   override still takes precedence and
-  `VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING=0` restores the legacy policy.
+  the policy is enabled only by
+  `VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING=1`; unset/zero retains the legacy policy.
 - The C1 graph also spends about `0.509 ms` per cycle in the combined
   top-k/top-p kernel over five 248,320-vocabulary verifier rows. Keeping the
   existing 8192/4096 tiles and masking algorithm but launching eight rather
   than four warps improves isolated B5/B10/B20/B40/B60/B80 means by
   `1.737x/1.943x/1.881x/1.732x/1.689x/1.646x`. Every candidate had zero finite
-  mask or retained-value mismatches against the four-warp result. The default
-  source change is therefore restricted to combined top-k plus top-p on SM70
-  with Qwen3.6's exact vocabulary; setting
-  `VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS=0` restores Triton's default launch.
+  mask or retained-value mismatches against the four-warp result. The opt-in
+  source change is restricted to combined top-k plus top-p on SM70, vocabulary
+  248,320, and measured row counts 5/10/20/40/60/80. Enable it with
+  `VLLM_SM70_TOPK_TOPP_8_WARPS=1`; unset/zero keeps Triton's default launch.
 - Corrected slot-independent compact metadata is finite and route-correct on a
   real TP4 layer through B20. B9 is bitwise equal to the dense route. B10 has
   cosine at least `0.99999988`, relative L2 at most `1.0115e-4`, and maximum

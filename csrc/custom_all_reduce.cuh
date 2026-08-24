@@ -125,7 +125,7 @@ inline int custom_allreduce_block_limit(int default_limit, int world_size,
     }
     const char* tune_raw = std::getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING");
     const bool tuning_enabled =
-        tune_raw == nullptr || tune_raw[0] == '\0' || std::atoi(tune_raw) != 0;
+        tune_raw != nullptr && tune_raw[0] != '\0' && std::atoi(tune_raw) != 0;
     if (tune_sm70_tp4_mtp && tuning_enabled &&
         default_limit == defaultBlockLimit && world_size == 4 &&
         fully_connected && custom_allreduce_current_device_is_sm70()) {

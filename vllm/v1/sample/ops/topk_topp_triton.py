@@ -1048,17 +1048,18 @@ def apply_top_k_top_p_triton(
 
     launch_kwargs: dict[str, int] = {}
     if (
-        envs.VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS
+        envs.VLLM_SM70_TOPK_TOPP_8_WARPS
         and logits.device.type == "cuda"
         and current_platform.is_cuda()
         and current_platform.is_device_capability((7, 0))
+        and logits.shape[0] in (5, 10, 20, 40, 60, 80)
         and vocab_size == 248_320
         and topk_enabled
         and topp_enabled
     ):
-        # Qwen3.6 MTP4 presents five verifier rows per live request. On V100,
-        # eight warps preserve this kernel's tile and masking algorithm while
-        # using the otherwise idle lanes in its reduction-heavy passes.
+        # The measured MTP4 contract has five verifier rows per live request.
+        # Eight warps preserve the tile and masking algorithm while using the
+        # otherwise idle lanes in its reduction-heavy passes.
         launch_kwargs["num_warps"] = 8
 
     _topk_topp_kernel[(NUM_PROGRAMS,)](

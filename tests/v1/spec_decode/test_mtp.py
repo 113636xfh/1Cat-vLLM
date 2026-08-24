@@ -100,7 +100,7 @@ def test_sm70_mtp_moe_warmup_runs_each_shape_once():
     assert all(call.kwargs["spec_step_idx"] == 0 for call in dummy_run.call_args_list)
 
 
-def test_sm70_qwen36_mtp_moe_warmup_covers_decode_tiles():
+def test_sm70_mtp_moe_warmup_covers_opted_in_exact_tiles():
     dummy_run = mock.Mock()
     draft_model_config = SimpleNamespace(
         is_moe=True,
@@ -126,6 +126,7 @@ def test_sm70_qwen36_mtp_moe_warmup_covers_decode_tiles():
     with (
         mock.patch.object(current_platform, "is_device_capability", return_value=True),
         mock.patch.object(torch.accelerator, "synchronize"),
+        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
     ):
         assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
             "mtp_draft_moe",

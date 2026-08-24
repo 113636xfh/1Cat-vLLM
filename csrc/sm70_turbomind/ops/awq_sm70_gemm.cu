@@ -1231,7 +1231,7 @@ int moe_tune_max_tokens() {
 
 int nvfp4_moe_tune_max_tokens() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS");
-  return raw ? std::max(std::atoi(raw), 0) : 640;
+  return raw ? std::max(std::atoi(raw), 0) : 128;
 }
 
 int sm70_f16_dense_max_m() {
@@ -7863,7 +7863,7 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
-  // Cover the Qwen3.6 C2 verifier bound. Duplicate expert selections
+  // Cover the validated top-k8 B10 verifier bound. Duplicate expert selections
   // remain separate one-row groups, so this is a routed-slot bound rather
   // than an active-expert bound. Keep the dense-grouped cutoff independent:
   // a disabled compact route above 64 rows must not fall back per expert.

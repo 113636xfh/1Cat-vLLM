@@ -99,7 +99,7 @@ def _prepare_compact_slot_groups(
 
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
-    """Reject every model or topology outside the Qwen3.6 SM70 contract."""
+    """Reject every topology outside the validated SM70 NVFP4 contract."""
     if moe.num_experts != _QWEN36_NUM_EXPERTS:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE currently supports Qwen3.6-35B-A3B "

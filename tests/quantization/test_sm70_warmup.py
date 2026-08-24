@@ -194,7 +194,8 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
     assert calls[2][3] == list(range(16))
 
 
-def test_nvfp4_moe_warmup_includes_supported_cuda_graph_shapes():
+def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
+    monkeypatch.setattr(warmup.envs, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", 640)
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(

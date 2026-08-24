@@ -36,19 +36,19 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-_force_sm70_qwen36_mtp_moe_legacy_config = False
+_force_sm70_mtp_moe_legacy_config = False
 
 
 @contextmanager
-def force_sm70_qwen36_mtp_moe_legacy_config() -> Iterator[None]:
+def force_sm70_mtp_moe_legacy_config() -> Iterator[None]:
     """Temporarily select the legacy SM70 MoE tile during startup warmup."""
-    global _force_sm70_qwen36_mtp_moe_legacy_config
-    previous = _force_sm70_qwen36_mtp_moe_legacy_config
-    _force_sm70_qwen36_mtp_moe_legacy_config = True
+    global _force_sm70_mtp_moe_legacy_config
+    previous = _force_sm70_mtp_moe_legacy_config
+    _force_sm70_mtp_moe_legacy_config = True
     try:
         yield
     finally:
-        _force_sm70_qwen36_mtp_moe_legacy_config = previous
+        _force_sm70_mtp_moe_legacy_config = previous
 
 
 @triton.jit
@@ -1216,18 +1216,15 @@ def should_moe_wna16_use_cuda(
     )
 
 
-def _get_sm70_qwen36_mtp_moe_decode_config(
+def _get_sm70_mtp_moe_decode_config(
     M: int,
     E: int,
     N: int,
     K: int,
     topk: int,
 ) -> dict[str, int] | None:
-    """Return the graph-tuned Qwen3.6 MTP drafter tile for M2-M16."""
-    if (
-        _force_sm70_qwen36_mtp_moe_legacy_config
-        or not envs.VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG
-    ):
+    """Return the graph-tuned exact-shape SM70 MTP tile for M2-M16."""
+    if _force_sm70_mtp_moe_legacy_config or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG:
         return None
     if (E, N, K, topk) != (256, 128, 2048, 8) or not 2 <= M <= 16:
         return None
@@ -1307,12 +1304,10 @@ def get_default_config(
         # upstream's larger small-batch tiles are poor for single-token SM70
         # decode, which is the FP8-MoE-dequant fallback route used by the
         # old 35B-FP8 baseline.
-        qwen36_mtp_config = _get_sm70_qwen36_mtp_moe_decode_config(M, E, N, K, topk)
-        if qwen36_mtp_config is not None:
-            config = qwen36_mtp_config
-            logger.info_once(
-                f"Using SM70 Qwen3.6 MTP unquantized MoE tuned decode config: {config}"
-            )
+        sm70_mtp_config = _get_sm70_mtp_moe_decode_config(M, E, N, K, topk)
+        if sm70_mtp_config is not None:
+            config = sm70_mtp_config
+            logger.info_once(f"Using tuned exact-shape SM70 MTP MoE config: {config}")
         elif M <= E:
             config = {
                 "BLOCK_SIZE_M": 16,

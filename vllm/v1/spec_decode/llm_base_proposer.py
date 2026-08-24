@@ -1051,8 +1051,8 @@ class SpecDecodeBaseProposer:
         top_k = int(getattr(text_config, "num_experts_per_tok", 0))
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        use_qwen36_decode_tiles = (
-            envs.VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG
+        use_mtp_decode_tiles = (
+            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
             and num_experts == 256
             and top_k == 8
             and self.draft_model_config.get_hidden_size() == 2048
@@ -1063,9 +1063,9 @@ class SpecDecodeBaseProposer:
             num_experts,
             top_k,
             self.max_num_tokens,
-            decode_tile_max_tokens=16 if use_qwen36_decode_tiles else 0,
+            decode_tile_max_tokens=16 if use_mtp_decode_tiles else 0,
         )
-        legacy_sizes = (1, 2, 9, 10) if use_qwen36_decode_tiles else ()
+        legacy_sizes = (1, 2, 9, 10) if use_mtp_decode_tiles else ()
         if not sizes:
             return ()
 
@@ -1084,10 +1084,10 @@ class SpecDecodeBaseProposer:
                 # cases for the naive (M1/M2) and aligned (M9/M10) assignment
                 # paths instead of allowing a first-request JIT spike.
                 from vllm.model_executor.layers.fused_moe.fused_moe import (
-                    force_sm70_qwen36_mtp_moe_legacy_config,
+                    force_sm70_mtp_moe_legacy_config,
                 )
 
-                with force_sm70_qwen36_mtp_moe_legacy_config():
+                with force_sm70_mtp_moe_legacy_config():
                     for num_tokens in legacy_sizes:
                         self.dummy_run(
                             num_tokens,

@@ -126,13 +126,19 @@ def test_sm70_concurrency_tuning_envs(
 ) -> None:
     names = (
         "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING",
-        "VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS",
+        "VLLM_SM70_TOPK_TOPP_8_WARPS",
+        "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is True
-        monkeypatch.setenv(name, "0")
         assert environment_variables[name]() is False
+        monkeypatch.setenv(name, "1")
+        assert environment_variables[name]() is True
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", raising=False)
+    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 128
+    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
+    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 640
 
 
 def test_flash_v100_g6_sawtooth_pipeline_envs(
