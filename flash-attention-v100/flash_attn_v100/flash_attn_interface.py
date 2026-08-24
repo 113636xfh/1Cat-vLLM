@@ -517,12 +517,12 @@ def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
     if workspace is None:
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (40, 8, 6, 256),
+                (80, 8, 6, 256),
                 dtype=torch.float16,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (40, 8, 6),
+                (80, 8, 6),
                 dtype=torch.float32,
                 device=q.device,
             ),
