@@ -125,6 +125,7 @@ def gumbel_block_argmax(
     pos_ptr,
     processed_logits_ptr,
     processed_logits_stride,
+    processed_logits_col_stride,
     processed_logits_col_ptr,
     vocab_size,
     APPLY_TEMPERATURE: tl.constexpr,
@@ -149,7 +150,7 @@ def gumbel_block_argmax(
         tl.store(
             processed_logits_ptr
             + req_state_idx * processed_logits_stride
-            + col * vocab_size
+            + col * processed_logits_col_stride
             + block,
             logits,
             mask=mask & is_valid_req,
@@ -177,6 +178,7 @@ def _gumbel_sample_kernel(
     local_max_stride,
     processed_logits_ptr,
     processed_logits_stride,
+    processed_logits_col_stride,
     processed_logits_col_ptr,
     logits_ptr,
     logits_stride,
@@ -211,6 +213,7 @@ def _gumbel_sample_kernel(
         pos_ptr,
         processed_logits_ptr,
         processed_logits_stride,
+        processed_logits_col_stride,
         processed_logits_col_ptr,
         vocab_size,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
@@ -245,6 +248,7 @@ def gumbel_sample(
         local_max.stride(0),
         output_processed_logits,
         output_processed_logits.stride(0) if output_processed_logits is not None else 0,
+        output_processed_logits.stride(1) if output_processed_logits is not None else 0,
         output_processed_logits_col,
         logits,
         logits.stride(0),

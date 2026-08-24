@@ -352,7 +352,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     assert args.max_num_seqs == 4
 
 
-def test_sm70_explicit_dflash_uses_greedy_with_align_prefix_cache(monkeypatch):
+def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
         speculative_config={"method": "dflash", "num_speculative_tokens": 7},
@@ -361,19 +361,24 @@ def test_sm70_explicit_dflash_uses_greedy_with_align_prefix_cache(monkeypatch):
     assert args.speculative_config == {
         "method": "dflash",
         "num_speculative_tokens": 7,
-        "draft_sample_method": "greedy",
+        "draft_sample_method": "probabilistic",
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
 
 
-def test_sm70_explicit_dflash_accepts_explicit_hybrid_prefix_cache(monkeypatch):
+def test_sm70_explicit_dflash_accepts_explicit_greedy(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
-        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+        speculative_config={
+            "method": "dflash",
+            "num_speculative_tokens": 7,
+            "draft_sample_method": "greedy",
+        },
         enable_prefix_caching=True,
     )
 
+    assert args.speculative_config["draft_sample_method"] == "greedy"
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
 

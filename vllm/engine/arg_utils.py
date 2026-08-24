@@ -1815,10 +1815,10 @@ class EngineArgs:
             return
 
         if "draft_sample_method" not in self.speculative_config:
-            # Native MTP keeps its validated probabilistic default. DFlash2's
-            # published/default performance lane is greedy; probabilistic
-            # drafting remains available when explicitly requested.
-            draft_sample_method = "probabilistic" if spec_method == "mtp" else "greedy"
+            # Preserve the validated probabilistic default for MTP and the
+            # DFlash family. DFlash2's greedy performance lane remains
+            # available when explicitly requested, without changing DFlash1.
+            draft_sample_method = "probabilistic"
             self.speculative_config["draft_sample_method"] = draft_sample_method
             profile_updates.append(
                 f"speculative_config.draft_sample_method={draft_sample_method}"

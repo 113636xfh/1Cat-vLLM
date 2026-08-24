@@ -27,6 +27,7 @@ from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
@@ -200,6 +201,38 @@ def test_probabilistic_selector_caches_temperature_applied_scores():
     torch.testing.assert_close(
         realized[0, 1], scores[0, 1, first_index] / temperature[0]
     )
+
+
+def test_probabilistic_cache_respects_column_stride():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the Gumbel kernel")
+
+    device = torch.device("cuda")
+    vocab_size = 17
+    padded_vocab_size = 23
+    logits = torch.arange(vocab_size, dtype=torch.float32, device=device)[None]
+    storage = torch.full(
+        (1, 2, padded_vocab_size),
+        float("nan"),
+        dtype=torch.float32,
+        device=device,
+    )
+    cache = storage[:, :, :vocab_size]
+
+    gumbel_sample(
+        logits,
+        expanded_idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        temperature=torch.tensor([1.0], dtype=torch.float32, device=device),
+        seed=torch.tensor([123], dtype=torch.int64, device=device),
+        pos=torch.tensor([7], dtype=torch.int64, device=device),
+        apply_temperature=True,
+        output_processed_logits=cache,
+        output_processed_logits_col=torch.tensor(1, device=device),
+    )
+
+    assert torch.isnan(cache[0, 0]).all()
+    torch.testing.assert_close(cache[0, 1], logits[0])
+    assert torch.isnan(storage[:, :, vocab_size:]).all()
 
 
 def test_dflash2_architecture_dispatches_to_mrv2(monkeypatch):
