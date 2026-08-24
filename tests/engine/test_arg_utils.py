@@ -299,18 +299,6 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
     assert args.max_num_seqs == 4
-    assert args.compilation_config.cudagraph_capture_sizes == [5, 10, 20]
-
-
-def test_sm70_mtp_split_cudagraphs_can_roll_back(monkeypatch):
-    args = _apply_sm70_defaults(
-        monkeypatch,
-        env={
-            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
-            "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": "0",
-        },
-    )
-
     assert args.compilation_config.cudagraph_capture_sizes == [
         1,
         2,
@@ -325,10 +313,25 @@ def test_sm70_mtp_split_cudagraphs_can_roll_back(monkeypatch):
     ]
 
 
+def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={
+            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
+            "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": "1",
+        },
+    )
+
+    assert args.compilation_config.cudagraph_capture_sizes == [5, 10, 20]
+
+
 def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
-        env={"VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1"},
+        env={
+            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
+            "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": "1",
+        },
         max_num_seqs=16,
     )
 
