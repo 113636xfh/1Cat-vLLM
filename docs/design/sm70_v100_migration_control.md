@@ -42743,6 +42743,46 @@ Interpretation:
   with zero invalid or repetitive records; the next quality gate belongs to
   any high-concurrency scheduler candidate that survives full-model A/B/A.
 
+### Matched no-MTP scaling control
+
+- A matched performance-only control disabled MTP while preserving the B10
+  source, model, TP4 physical GPU4-7 claim, 48 fixed ShareGPT requests,
+  sampling, FP8-E5M2 KV cache, TurboMind ModelOpt mixed FP8/NVFP4 route,
+  Flash-V100/FlashQLA, max length/batched tokens 8192, and
+  `FULL_AND_PIECEWISE` CUDA Graph policy. Every point reported
+  `speculative_config=None` and null speculative metrics, generated the exact
+  expected 9,115 prompt and 10,623 output tokens, and had no timed-request
+  Triton JIT warning. This control is not an MTP quality oracle; dataset-level
+  MTP quality remains gated independently.
+- The no-MTP curve is:
+
+  | concurrency | output tok/s | efficiency vs C1 | pure decode tok/s | serial prefill tok/s | P50 TPOT ms |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 92.260 | 100.00% | 111.256 | 454.959 | 9.007 |
+  | 2 | 141.946 | 76.93% | 84.615 | 432.510 | 10.197 |
+  | 4 | 210.221 | 56.96% | 61.679 | 385.377 | 12.333 |
+  | 8 | 305.539 | 41.40% | 46.288 | 330.254 | 20.327 |
+  | 12 | 388.944 | 35.13% | 41.609 | 288.067 | 25.511 |
+  | 16 | 448.918 | 30.41% | 35.490 | 688.532 | 29.957 |
+
+- Relative to this no-MTP control, MTP4 improves output throughput by
+  `5.89/6.19/17.21/14.82/14.19/18.24%` at C1/C2/C4/C8/C12/C16 and improves
+  pure-decode throughput by `2.69/7.37/15.63/13.20/11.30/26.05%`.
+  MTP4 scaling efficiency is `0.00/0.22/6.09/3.49/2.75/3.55` percentage
+  points higher. Disabling MTP therefore neither recovers the absolute
+  high-concurrency throughput nor improves scaling; verifier/drafter work is
+  not the primary scaling bottleneck. Continue on the shared target decode
+  path, especially high-width routed-MoE scheduling and TP4 synchronization,
+  while retaining the independent MTP dataset-quality gate.
+- The first completely cold C1 process also exposed a startup-only anomaly:
+  FULL decode graph capture took 230.21 s, total graph capture took 294 s, and
+  recorded load time was 380.46 s. Subsequent independent processes captured
+  FULL decode graphs in less than two seconds and total graphs in 35-68 s.
+  This one-time cold-cache cost was outside every timed throughput interval;
+  investigate it separately rather than attributing it to steady-state decode.
+- Reproducible JSON and route logs are under
+  `bench_results/qwen36_nvfp4_no_mtp_scaling_20260824/{results,logs,telemetry}`.
+
 ## 2026-08-24 MRV2 DFlash2 score-gated verifier promotion
 
 - The native Flash-V100 grouped verifier keeps all eight MRV2 target rows and
