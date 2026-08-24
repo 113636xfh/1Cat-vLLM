@@ -10874,6 +10874,13 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
+            if isinstance(hidden_states, IntermediateTensors):
+                assert not get_pp_group().is_last_rank
+                # Non-last PP ranks return intermediate tensors instead of
+                # logits-bearing hidden states. Dummy-run callers only need a
+                # tensor to preserve the profiling/capture return contract.
+                hidden_states = next(iter(hidden_states.tensors.values()))
+
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
