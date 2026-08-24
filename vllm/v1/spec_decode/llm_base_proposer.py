@@ -114,10 +114,14 @@ def _sm70_mtp_moe_warmup_sizes(
     return tuple(sorted(size for size in sizes if size <= max_num_tokens))
 
 
-def _sm70_mtp_hotpath_warmup_batch_sizes(max_batch_size: int) -> tuple[int, ...]:
-    """Cover Triton's single-request and concurrent scalar specializations."""
+def _sm70_mtp_hotpath_warmup_batch_sizes(
+    max_batch_size: int, include_alternate: bool = False
+) -> tuple[int, ...]:
+    """Preserve the primary warmup and optionally cover its alternate shape."""
     concurrent_batch_size = max(1, min(int(max_batch_size), 4))
-    return tuple(sorted({1, concurrent_batch_size}))
+    if include_alternate:
+        return tuple(sorted({1, concurrent_batch_size}))
+    return (concurrent_batch_size,)
 
 
 def _is_dflash_method(method: str | None) -> bool:
@@ -868,7 +872,9 @@ class SpecDecodeBaseProposer:
             summary,
         )
 
-    def _warmup_sm70_mtp_hotpath_batch(self, batch_size: int, vocab_size: int) -> None:
+    def _warmup_sm70_mtp_hotpath_batch(
+        self, batch_size: int, vocab_size: int, warm_draft_topk: bool
+    ) -> None:
         valid_sampled_tokens_count = None
         for num_sampled_tokens in sorted({1, self.num_speculative_tokens + 1}):
             sampled_token_ids = torch.zeros(
@@ -973,16 +979,17 @@ class SpecDecodeBaseProposer:
             input_batch_size=batch_size,
         )
 
-        draft_logits = torch.zeros(
-            (batch_size, vocab_size), dtype=torch.float32, device=self.device
-        )
-        draft_top_k = torch.full(
-            (batch_size,),
-            min(20, vocab_size),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        apply_top_k_top_p(draft_logits, draft_top_k, None)
+        if warm_draft_topk:
+            draft_logits = torch.zeros(
+                (batch_size, vocab_size), dtype=torch.float32, device=self.device
+            )
+            draft_top_k = torch.full(
+                (batch_size,),
+                min(20, vocab_size),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            apply_top_k_top_p(draft_logits, draft_top_k, None)
 
     def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
         """Warm MTP helper kernels that otherwise JIT on the first request."""
@@ -1000,20 +1007,27 @@ class SpecDecodeBaseProposer:
 
         try:
             vocab_size = max(2, self.draft_model_config.get_vocab_size())
-            for batch_size in _sm70_mtp_hotpath_warmup_batch_sizes(self.max_batch_size):
-                self._warmup_sm70_mtp_hotpath_batch(batch_size, vocab_size)
+            expanded_warmup = envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP
+            for batch_size in _sm70_mtp_hotpath_warmup_batch_sizes(
+                self.max_batch_size, include_alternate=expanded_warmup
+            ):
+                self._warmup_sm70_mtp_hotpath_batch(
+                    batch_size, vocab_size, warm_draft_topk=expanded_warmup
+                )
             torch.accelerator.synchronize()
         except Exception as err:  # pragma: no cover - best-effort warmup
             logger.warning_once("SM70 MTP hotpath warmup skipped: %s", err)
             return ()
 
-        return (
+        warmed_kernels = [
             "mtp_prepare_next_token",
             "mtp_prepare_inputs",
             "mtp_rejection_expand",
             "mtp_step_slot_mapping",
-            "mtp_draft_topk",
-        )
+        ]
+        if envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP:
+            warmed_kernels.append("mtp_draft_topk")
+        return tuple(warmed_kernels)
 
     def warmup_sm70_mtp_moe_kernels(self) -> tuple[str, ...]:
         """Warm the finite Triton-MoE shape specializations used by MTP."""

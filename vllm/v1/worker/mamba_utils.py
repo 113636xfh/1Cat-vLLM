@@ -660,14 +660,17 @@ class MambaSpecDecodeGPUContext:
         )
 
     def warmup_fused_postprocess(self) -> bool:
-        """Compile single and concurrent MTP signatures without state copies."""
+        """Compile MTP postprocess signatures without copying model state."""
         if not self.is_initialized:
             return False
 
         device = self.state_base_addrs.device
         total_states = self.num_layers * self.num_state_types
-        max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
-        for num_reqs in sorted({1, max(1, min(max_num_reqs, 4))}):
+        warmup_sizes = {1}
+        if envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP:
+            max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
+            warmup_sizes.add(max(1, min(max_num_reqs, 4)))
+        for num_reqs in sorted(warmup_sizes):
             num_accepted_tokens = torch.ones(num_reqs, dtype=torch.int32, device=device)
             spec_state_slot_selectors = torch.ones(
                 num_reqs, dtype=torch.int32, device=device

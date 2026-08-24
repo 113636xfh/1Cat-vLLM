@@ -13,6 +13,7 @@ from tests.v1.attention.utils import (
     create_standard_kv_cache_spec,
     try_get_attention_backend,
 )
+from vllm import envs
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -45,8 +46,18 @@ def test_sm70_mtp_moe_warmup_sizes():
 
 def test_sm70_mtp_hotpath_warmup_batch_sizes():
     assert _sm70_mtp_hotpath_warmup_batch_sizes(1) == (1,)
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(4) == (1, 4)
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(64) == (1, 4)
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(4) == (4,)
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(4, include_alternate=True) == (1, 4)
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(64, include_alternate=True) == (1, 4)
+
+
+def test_sm70_mtp_concurrency_warmup_is_default_off(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert not envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP
+    finally:
+        envs.disable_envs_cache()
 
 
 def test_sm70_mtp_moe_warmup_runs_each_shape_once():
