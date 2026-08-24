@@ -1229,6 +1229,11 @@ int moe_tune_max_tokens() {
   return raw ? std::max(std::atoi(raw), 0) : 128;
 }
 
+int nvfp4_moe_tune_max_tokens() {
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS");
+  return raw ? std::max(std::atoi(raw), 0) : 128;
+}
+
 int sm70_f16_dense_max_m() {
   const char* raw = std::getenv("VLLM_SM70_F16_DENSE_MAX_M");
   return raw ? std::max(std::atoi(raw), 0) : 64;
@@ -1331,8 +1336,11 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled) {
-  if (!tune_enabled || total_tokens > moe_tune_max_tokens()) {
+    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
+    int max_tune_tokens = -1) {
+  const int tune_limit =
+      max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
+  if (!tune_enabled || total_tokens > tune_limit) {
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
 
@@ -1387,7 +1395,8 @@ turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
     cudaStream_t stream) {
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled());
+      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled(),
+      nvfp4_moe_tune_max_tokens());
 }
 
 WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
@@ -7853,7 +7862,12 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       logged_nvfp4_dense_stage,
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
-  constexpr int kNvfp4MaxCompactGroups = 8 * 8;
+  constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
+  // Cover the validated top-k8 B10 verifier bound. Duplicate expert selections
+  // remain separate one-row groups, so this is a routed-slot bound rather
+  // than an active-expert bound. Keep the dense-grouped cutoff independent:
+  // a disabled compact route above 64 rows must not fall back per expert.
+  constexpr int kNvfp4MaxCompactGroups = 10 * 8;
   const bool compact_decode_shape =
       input.size(0) == num_experts && num_experts <= kNvfp4MaxCompactGroups;
   if (compact_decode_shape) {
@@ -7863,7 +7877,7 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
     return;
   }
   const bool exact_qwen36_prefill_shape =
-      input.size(0) > kNvfp4MaxCompactGroups && num_experts == 256 &&
+      input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 256 &&
       ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
        (n == 2048 && (k == 512 || k == 256 || k == 128)));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&

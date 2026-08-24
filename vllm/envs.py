@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
+    VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
@@ -192,12 +193,14 @@ if TYPE_CHECKING:
     VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
     VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
+    VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
+    VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = False
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
     VLLM_SM70_TP4_SMALL_AR_PACK32: bool = False
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
@@ -488,6 +491,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
+    VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = False
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -1765,6 +1769,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
     ),
+    "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "128")
+    ),
     # Experimental unquantized FP16 SM70 TurboMind fast paths. Keep default-off:
     # these must pass the numeric policy and model-level token gate before
     # becoming part of the default V100 route.
@@ -1811,6 +1818,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))
     ),
+    # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
+    "VLLM_SM70_TOPK_TOPP_8_WARPS": lambda: bool(
+        int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))
+    ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
     # decode steps before collecting CPU-visible outputs; this changes queueing
@@ -1837,6 +1848,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
         if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
         else None
+    ),
+    # Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.
+    "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING", "0"))
     ),
     "VLLM_SM70_TP4_M5_AR_THREADS": lambda: (
         int(os.environ["VLLM_SM70_TP4_M5_AR_THREADS"])
@@ -2875,6 +2890,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))
+    ),
+    # Opt-in decode tiles for the exact E256/N128/K2048/top-k8 SM70 contract.
+    # Larger or unmatched token shapes retain the 0.0.3 config.
+    "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on

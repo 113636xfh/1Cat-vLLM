@@ -160,18 +160,19 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
 )
-def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent():
-    sorted_expert_ids = torch.tensor(
-        [3, 3, 3, 17, 17, 42, 88, 88], dtype=torch.int32, device="cuda"
-    )
-    compact_offsets = torch.empty(9, dtype=torch.int32, device="cuda")
-    active_expert_ids = torch.empty(8, dtype=torch.int32, device="cuda")
+@pytest.mark.parametrize("total_slots", (8, 72, 80))
+def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slots):
+    sorted_expert_ids = (
+        torch.arange(total_slots, dtype=torch.int32, device="cuda") // 3
+    ) % 256
+    compact_offsets = torch.empty(total_slots + 1, dtype=torch.int32, device="cuda")
+    active_expert_ids = torch.empty(total_slots, dtype=torch.int32, device="cuda")
 
     _prepare_compact_slot_groups(sorted_expert_ids, compact_offsets, active_expert_ids)
 
     assert torch.equal(
         compact_offsets.cpu(),
-        torch.arange(9, dtype=torch.int32, device="cpu"),
+        torch.arange(total_slots + 1, dtype=torch.int32, device="cpu"),
     )
     assert torch.equal(active_expert_ids.cpu(), sorted_expert_ids.cpu())
 

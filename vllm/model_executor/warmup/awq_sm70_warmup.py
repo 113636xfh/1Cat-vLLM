@@ -15,6 +15,9 @@ import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
+from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+    _prepare_compact_slot_groups,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -710,7 +713,7 @@ def _warmup_mxfp4_moe_b1_layers(moe_layers: list[torch.nn.Module]) -> int:
 def _warmup_nvfp4_moe_decode_layers(
     moe_layers: list[torch.nn.Module], token_counts: list[int]
 ) -> int:
-    """Tune compact B1-B8 and full-group B9+ NVFP4 graph shapes."""
+    """Tune compact and full-group NVFP4 graph shapes."""
     if not hasattr(torch.ops._C, "nvfp4_moe_dense_stage_sm70_out"):
         return 0
 
@@ -719,26 +722,29 @@ def _warmup_nvfp4_moe_decode_layers(
         device = layer.w13_tm_weight.device
         top_k = int(layer.moe_config.experts_per_token)
         max_experts = int(layer.sm70_nvfp4_num_experts)
+        compact_max_tokens = int(
+            getattr(layer, "sm70_nvfp4_compact_grouped_max_tokens", 8)
+        )
         for num_tokens in token_counts:
             total_slots = num_tokens * top_k
-            if total_slots > max_experts:
-                continue
-            if num_tokens <= 8:
+            if num_tokens <= compact_max_tokens:
                 stage_experts = total_slots
-                expert_offsets = torch.arange(
+                sorted_expert_ids = layer._nvfp4_sm70_dense_expert_ids[:total_slots]
+                expert_offsets = torch.empty(
                     total_slots + 1, dtype=torch.int32, device=device
                 )
-                active_expert_ids = layer._nvfp4_sm70_dense_expert_ids[:total_slots]
+                active_expert_ids = torch.empty(
+                    total_slots, dtype=torch.int32, device=device
+                )
+                _prepare_compact_slot_groups(
+                    sorted_expert_ids,
+                    expert_offsets,
+                    active_expert_ids,
+                )
             else:
                 stage_experts = max_experts
-                expert_offsets = torch.full(
-                    (max_experts + 1,),
-                    total_slots,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                expert_offsets[: total_slots + 1] = torch.arange(
-                    total_slots + 1, dtype=torch.int32, device=device
+                expert_offsets = _build_balanced_offsets(
+                    total_slots, max_experts, device
                 )
                 active_expert_ids = layer._nvfp4_sm70_dense_expert_ids
             permuted_input = torch.empty(
@@ -804,19 +810,29 @@ def _get_nvfp4_moe_token_counts(
     moe_layers: list[torch.nn.Module],
     base_token_counts: list[int],
 ) -> list[int]:
-    """Include every NVFP4 CUDA-graph shape covered by persistent buffers."""
+    """Include graph-safe and tuned NVFP4 CUDA-graph token widths."""
     if not moe_layers:
         return base_token_counts
-    max_tokens = max(
+    graph_safe_max_tokens = max(
         int(getattr(layer, "sm70_nvfp4_graph_safe_max_tokens", 8))
         for layer in moe_layers
     )
+    compact_max_tokens = max(
+        int(getattr(layer, "sm70_nvfp4_compact_grouped_max_tokens", 8))
+        for layer in moe_layers
+    )
+    max_top_k = max(int(layer.moe_config.experts_per_token) for layer in moe_layers)
+    tuned_max_tokens = max(0, int(envs.VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS)) // max(
+        max_top_k, 1
+    )
+    max_tokens = max(graph_safe_max_tokens, tuned_max_tokens)
     compilation_config = getattr(
         getattr(worker, "vllm_config", None), "compilation_config", None
     )
     capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or []
     return sorted(
         set(base_token_counts)
+        | set(range(1, compact_max_tokens + 1))
         | {int(size) for size in capture_sizes if 0 < int(size) <= max_tokens}
     )
 

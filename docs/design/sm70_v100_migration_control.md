@@ -42015,17 +42015,20 @@ Interpretation:
   shapes, TP8, EP, and all-to-all fail closed rather than taking a generic
   fallback.
 - The native Qwen3.6-35B-A3B MoE contract is H2048, expert I512, 256 experts,
-  top-k 8, replicated experts, and TP1/2/4. B1-B8 decode uses compact active
-  expert groups. B9-B18 CUDA Graph/MTP decode and larger prefill use persistent
+  top-k 8, replicated experts, and TP1/2/4. B1-B10 decode uses compact routed
+  slot groups. B11-B18 CUDA Graph/MTP decode and larger prefill use persistent
   buffers with the full 256-expert grouped TurboMind operation. The grouped
   prefill policy is default-on and may be disabled only for diagnosis with
   `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=0`.
 - A real layer-0 TP4 checkpoint oracle matched the previous per-expert route:
   M4096 W13/W2 were bitwise identical and improved 20.39x/9.48x. Full-grouped
   B9 and B18 had cosine 1.0, maximum absolute error at most 1.221e-4, and
-  21.59x-35.21x isolated-stage speedups. Expanding the compact path to 144
-  groups produced a roughly 0.495 W13 relative-L2 error and catastrophic W2
-  output, so the compact limit remains 64 groups; do not repeat that candidate.
+  21.59x-35.21x isolated-stage speedups. A rejected 144-group experiment
+  coalesced repeated expert IDs even though the forced-one-row scheduler
+  requires routed slots to remain independent; its roughly 0.495 W13
+  relative-L2 error and catastrophic W2 output do not establish a general
+  64-group correctness limit. The corrected slot-independent B9/B10 evidence
+  is recorded in the concurrency section below.
 - Matching TP4, FP8-E5M2 KV-cache, Flash-V100/FlashQLA, full CUDA Graph,
   input-4096/output-1024, max-length-8192 runs measured AWQ at 0.3813 s prefill
   and 113.71 token/s steady decode. Default-grouped NVFP4 measured 0.4216 s and
@@ -42057,6 +42060,12 @@ Interpretation:
   `[2, 12, 37, 87, 89, 102, 119]`. Record 37 is a cap-induced truncation and is
   correct at 1024 output tokens, so effective MTP4 accuracy is 122/128. A
   standard-GDN diagnostic scored only 108/128 and is rejected.
+- The bounded B10 source at `5422173e99` passes the same pinned GSM8K-128
+  MTP4 gate at 122/128 (95.3125%), with zero invalid answers, zero repetitive
+  records, and wrong indices `[2, 12, 87, 89, 102, 119]`. It generated 19,434
+  output tokens in 135.967 s. This is dataset-level evidence that the B10
+  extension does not regress the accepted MTP4 quality band; no-MTP token
+  equality is not used as its oracle.
 - A final default-grouped, no-MTP natural-text gate used two identical Chinese
   prompts and one Python prompt. All three requests reached EOS with `stop`;
   the duplicate outputs were token-for-token identical, and the code response
@@ -42069,6 +42078,8 @@ Interpretation:
   `results/tp4_mtp4_fp8kv_gsm8k_chat_nothink_5shot_128_coldstart_rebased_final_graph.json`;
   the all-JIT-warm ShareGPT artifact is
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
+  The bounded-B10 dataset artifact is
+  `bench_results/qwen36_nvfp4_concurrency_scaling_20260824/results/candidate_final_mtp4_gsm8k_chat_nothink_5shot_128.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
 
@@ -42347,3 +42358,143 @@ Interpretation:
 - Final evidence is under task-cache
   `qwen38-fp8-prefill-utilization-20260823/results/`, especially
   `full_model_cutlass_all_projections_final_source_tp4_fused_graph_i8000.raw.json`.
+
+## 2026-08-24 Qwen3.6-35B NVFP4 MTP4 concurrency scaling
+
+- Audit disposition: the B10 compact-routing extension has its own matched
+  speed and GSM8K evidence and remains enabled. The broader high-width tune
+  limit, exact-shape drafter tile, all-reduce block policy, and eight-warp
+  sampler remain opt-in because their matched formal curve and combined
+  dataset-quality gate are incomplete.
+
+- The formal workload uses ModelOpt mixed FP8/NVFP4, TP4 on V100 GPU0-3,
+  Flash-V100/FlashQLA, FP8-E5M2 KV cache, MTP4 probabilistic sampling with
+  local argmax, max length/batched tokens 8192, and 48 fixed ShareGPT requests
+  totaling 9,115 prompt and 10,623 output tokens. Forty-eight requests give
+  C16 three complete waves and remove the tail-underfill artifact in the
+  earlier 16-request localization sweep.
+- Current-main output throughput at C1/C2/C4/C8/C12/C16 is respectively
+  98.265/146.124/276.600/414.315/491.270/542.982 tok/s. Scaling efficiency
+  relative to C1 is 100.00%/74.35%/70.37%/52.70%/41.66%/34.54%. Mean MTP
+  acceptance length remains 2.887-2.955 and draft acceptance remains
+  47.18%-48.87%, so the scaling loss is not an acceptance collapse.
+- The old AWQ scheduling pair is rejected for this route. Shared-expert stream
+  overlap plus `all_reduce_sum2` regressed corrected C16 output 4.10%; isolated
+  overlap and sum2 regressed 4.66% and 4.06%. The pair also regressed C1 from
+  98.265 to 94.880 tok/s (3.45%). Leave both switches default-off for NVFP4.
+- MTP4 verifier width is five times request concurrency. Before this work,
+  production warmup stopped at NVFP4 MoE M15 while captured C4/C8/C12/C16
+  shapes require M20/M40/M60/M80, or 160/320/480/640 routed rows.
+- Clean independent-process graph microbenchmarks on one exclusively claimed
+  V100 show measured routed-MoE W13/W2 speedups at M20/M40/M60/M80 of
+  1.107x/1.311x, 1.200x/1.179x, 1.195x/1.181x, and 1.177x/1.117x. Shared-dense
+  W13/W2 speedups are 1.742x/1.261x, 2.749x/1.181x, 2.004x/1.179x, and
+  1.519x/1.348x. All outputs are finite; maximum accumulation-order difference
+  is 6.104e-5, which still requires the dataset-level quality gate.
+- The high-width candidate raises only the NVFP4 MoE tune limit to 640 routed
+  rows, derives warmup widths from the already-captured CUDA Graph sizes, and
+  builds balanced 256-expert offsets above 32 verifier tokens. The dense-NVFP4
+  M80 extension was isolated and withdrawn; its default remains M16. In a
+  48-request C16 candidate/control/candidate sandwich, routed-MoE tuning
+  measured `535.635/524.376/539.113 tok/s`; the candidate endpoint mean is
+  `+2.48%`, summed pure decode is `+2.85%`, and P50 TPOT improves about `4.0%`
+  with stable MTP acceptance.
+  Production keeps the prior 128-row default; reproducing this candidate
+  requires `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS=640`.
+- Two earlier low-width target-MoE candidates are rejected. Directly reusing
+  sorted expert IDs instead of the compact metadata copy regressed the C1
+  sandwich; splitting B9/B10 into 64-slot compact chunks was numerically
+  healthy but `41.5%/10.3%` slower. The old conclusion that every direct
+  compact execution above 64 slots was invalid was too broad: that experiment
+  coalesced repeated expert IDs even though TurboMind's forced-one-row
+  scheduler requires each routed slot to remain an independent group.
+- A C1 Nsight graph-node trace identified the bundled unquantized MTP drafter
+  MoE as a separate `2.825 ms` per-cycle hotspot. An initial oracle incorrectly
+  used the checkpoint-global I512 shape. The first candidate startup log proved
+  that TP4 shards it to local I128 (`E=256,N=128` config lookup); the candidate
+  therefore did not route-hit and its full-model run was stopped before
+  measurement. The global-I512 speedups are not TP4 selection evidence. The
+  corrected local E256/H2048/I128/top-k8 M1-M16 graph oracle is bitwise equal
+  at every width. The isolated M1 operation improved `1.290x` by retaining
+  N32/K64 and reducing to two warps; M2-M16 select M8/N128/K32/W4/S3 and
+  improve `1.543x/2.656x/2.879x/2.697x/2.625x` at the formal
+  C2/C4/C8/C12/C16 widths.
+- The route-hit candidate initially exposed request-time old-tile MoE
+  signatures. The exact E256/H2048/I128/top-k8 TP4 contract can warm tuned
+  M1-M16 plus M33/M257
+  and explicitly covers legacy M1/M2/M9/M10 naive/aligned signatures; a fresh
+  48-request run then produced no inference-time `fused_moe_kernel` JIT.
+  Unmatched shapes retain the old `(9,33,257)` warmup set, and the tuned route
+  requires `VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
+- Full-model evidence rejects the isolated M1 result. A physical-GPU4-7 C1
+  candidate/control/candidate sandwich measured endpoint-mean summed pure
+  decode `112.233` versus control `115.451 tok/s` (`-2.79%`) and endpoint-mean
+  P50 TPOT `8.874` versus `8.758 ms` (`+1.33%`). M1 therefore retains the exact
+  0.0.3 tile; balanced single-GPU kernel means are not a substitute for TP4
+  rank-imbalance and synchronization behavior.
+- The narrowed M2-M16 candidate passes C2. Candidate/control/candidate output
+  was `154.865/147.180/163.480 tok/s`; endpoint mean is `+8.15%`. Summed pure
+  decode improves `+4.47%`, P50 TPOT is effectively flat (`+0.14%`), and mean
+  acceptance is lower than control rather than artificially favorable. M17+
+  retains the old prefill tile.
+- Every C1 graph all-reduce in the Nsight trace is the exact 10,240-element
+  FP16 verifier payload. A TP4 operator sweep found that one CTA is faster for
+  this 20-KiB payload, while eight CTAs are faster only for the exact
+  C8/C12/C16 verifier payloads; C2/C4 retain the default. A physical-GPU4-7 C1
+  candidate/control/candidate sandwich with the one-CTA launch measured
+  endpoint-mean pure decode `116.405` versus `112.842 tok/s` (`+3.16%`), output
+  `103.070` versus `100.112 tok/s` (`+2.96%`), and P50 TPOT `8.678` versus
+  `8.750 ms` (`-0.82%`). The source heuristic is limited to fully connected
+  SM70 TP4, the exact MTP4 payloads, and ordinary all-reduce; the global block
+  override still takes precedence and
+  the policy is enabled only by
+  `VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING=1`; unset/zero retains the legacy policy.
+- The C1 graph also spends about `0.509 ms` per cycle in the combined
+  top-k/top-p kernel over five 248,320-vocabulary verifier rows. Keeping the
+  existing 8192/4096 tiles and masking algorithm but launching eight rather
+  than four warps improves isolated B5/B10/B20/B40/B60/B80 means by
+  `1.737x/1.943x/1.881x/1.732x/1.689x/1.646x`. Every candidate had zero finite
+  mask or retained-value mismatches against the four-warp result. The opt-in
+  source change is restricted to combined top-k plus top-p on SM70, vocabulary
+  248,320, and measured row counts 5/10/20/40/60/80. Enable it with
+  `VLLM_SM70_TOPK_TOPP_8_WARPS=1`; unset/zero keeps Triton's default launch.
+- Corrected slot-independent compact metadata is finite and route-correct on a
+  real TP4 layer through B20. B9 is bitwise equal to the dense route. B10 has
+  cosine at least `0.99999988`, relative L2 at most `1.0115e-4`, and maximum
+  absolute error `2.38e-7`; its isolated graph stage is `1.091x` faster. The
+  production candidate stops at B10/80 routed slots and prewarms the exact
+  B1-B10 metadata signatures before CUDA Graph capture.
+- A physical-GPU4-7 C2 candidate/control/candidate sandwich accepts B10.
+  Output was `154.608/147.135/160.890 tok/s`; candidate-mean output improves
+  `7.21%`. Pure decode was `91.962/89.762/94.566 tok/s`, a `3.90%` candidate
+  mean gain. Candidate mean acceptance length was lower than control
+  (`2.909` versus `2.963`), so acceptance does not explain the win. Extending
+  compact routing through B20 is rejected by a matching C4 sandwich: candidate
+  mean output/pure decode regressed `1.90%/2.48%`, with P50 TPOT about `1.18%`
+  worse. B11+ therefore keeps the 256-expert dense-grouped route.
+- The final B10 48-request curve on one exclusive physical-GPU4-7 claim is:
+
+  | concurrency | output tok/s | efficiency vs C1 | pure decode tok/s | serial prefill tok/s | P50 TPOT ms | mean acceptance |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 97.693 | 100.00% | 114.247 | 564.795 | 8.522 | 2.890 |
+  | 2 | 150.736 | 77.15% | 90.851 | 423.341 | 10.207 | 2.946 |
+  | 4 | 246.399 | 63.05% | 71.322 | 596.885 | 13.559 | 2.884 |
+  | 8 | 350.834 | 44.89% | 52.398 | 629.601 | 20.006 | 2.969 |
+  | 12 | 444.117 | 37.88% | 46.313 | 631.019 | 22.274 | 2.909 |
+  | 16 | 530.810 | 33.96% | 44.734 | 720.400 | 23.478 | 2.900 |
+
+- Relative to the preceding final-source single-run curve, output/pure-decode
+  movement was C1 `-2.73/-3.08%`, C2 `+3.13/+2.41%`, C4
+  `-0.73/-0.18%`, C8 `-2.93/-2.99%`, C12 `+4.21/+3.93%`, and C16
+  `-4.47/-6.38%`. This alternating high-width movement is not attributable to
+  the bounded B10 route; B11+ still uses the same dense-grouped main shape and
+  only drain-tail widths can reach B9/B10. Treat B10 as a low-concurrency win,
+  not as high-concurrency recovery.
+- The next target-side candidate must compact GPU-resident active expert IDs
+  for B20/B40/B60/B80 and use a device-count guard with an exact full-group
+  fallback. It may reduce padded grouped scheduling without a host readback or
+  a probabilistic correctness assumption. A persistent tile scheduler remains
+  the larger follow-up if guarded active-group bucketing cannot beat its extra
+  CUDA Graph launch. B10 has passed the pinned GSM8K-128 MTP4 gate at 122/128,
+  with zero invalid or repetitive records; the next quality gate belongs to
+  any high-concurrency scheduler candidate that survives full-model A/B/A.

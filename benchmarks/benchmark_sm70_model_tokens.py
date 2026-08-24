@@ -543,6 +543,10 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
         True,
     )
+    qwen36_mtp_moe_tuned_config = _env_bool(
+        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG",
+        True,
+    )
     awq_warmup = _env_bool("VLLM_SM70_AWQ_WARMUP", True)
     awq_moe_disable = _env_bool("VLLM_SM70_AWQ_MOE_DISABLE", False)
     awq_moe_batched = _env_bool("VLLM_SM70_AWQ_MOE_BATCHED_GEMM", True)
@@ -621,6 +625,10 @@ def _sm70_turbomind_policy(
             "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG"
         ),
         "unquantized_moe_0dot3_config_effective": (unquantized_moe_0dot3_config),
+        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG": os.environ.get(
+            "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG"
+        ),
+        "qwen36_mtp_moe_tuned_config_effective": qwen36_mtp_moe_tuned_config,
         "VLLM_SM70_AWQ_WARMUP": os.environ.get("VLLM_SM70_AWQ_WARMUP"),
         "awq_warmup_effective": awq_warmup,
         "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get("VLLM_SM70_AWQ_WARMUP_MAX_M"),
@@ -1643,11 +1651,6 @@ def _dump(args: argparse.Namespace) -> int:
         args.cuda_profiler_capture_generate or capture_decode_after_prefix_warmup
     ):
         raise ValueError("CUDA-profiler capture does not support repeated requests")
-    if capture_decode_after_prefix_warmup and len(prompts) != 1:
-        raise ValueError(
-            "--cuda-profiler-capture-decode-after-prefix-warmup requires "
-            "exactly one prompt"
-        )
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -2597,9 +2600,9 @@ def _parse_args() -> argparse.Namespace:
         "--cuda-profiler-capture-decode-after-prefix-warmup",
         action="store_true",
         help=(
-            "Prime one prompt with prefix caching while the CUDA profiler is "
+            "Prime the prompts with prefix caching while the CUDA profiler is "
             "off, then capture only the second matching llm.generate call. "
-            "Requires one non-sequential prompt and CUDA graphs."
+            "Requires non-sequential prompts and CUDA graphs."
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=16)

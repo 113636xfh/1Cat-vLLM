@@ -121,6 +121,7 @@ def _nvfp4_moe_layer() -> nn.Module:
     layer.sm70_nvfp4_w2_n_dim = 2048
     layer.sm70_nvfp4_group_size = 16
     layer.sm70_nvfp4_graph_safe_max_tokens = 18
+    layer.sm70_nvfp4_compact_grouped_max_tokens = 10
     layer.w13_tm_weight = nn.Parameter(
         torch.empty((1, 1), dtype=torch.uint8), requires_grad=False
     )
@@ -167,6 +168,14 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
 
     monkeypatch.setattr(warmup.sm70_ops, "nvfp4_moe_dense_stage_sm70_out", record_call)
     monkeypatch.setattr(
+        warmup,
+        "_prepare_compact_slot_groups",
+        lambda sorted_ids, offsets, active_ids: (
+            offsets.copy_(torch.arange(offsets.numel(), dtype=torch.int32)),
+            active_ids.copy_(sorted_ids),
+        ),
+    )
+    monkeypatch.setattr(
         torch.ops._C,
         "silu_and_mul",
         lambda out, gate_up: out.zero_(),
@@ -185,21 +194,56 @@ def test_nvfp4_moe_warmup_discovers_and_uses_compact_decode_shapes(monkeypatch):
     assert calls[2][3] == list(range(16))
 
 
-def test_nvfp4_moe_warmup_includes_supported_cuda_graph_shapes():
+def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
+    monkeypatch.setattr(warmup.envs, "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", 640)
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
-                cudagraph_capture_sizes=[1, 2, 4, 5, 8, 9, 18, 20]
+                cudagraph_capture_sizes=[1, 2, 4, 5, 8, 9, 18, 20, 40, 60, 80, 81]
             )
         )
     )
 
     assert warmup._get_nvfp4_moe_token_counts(
         worker, [_nvfp4_moe_layer()], [1, 2, 4, 8]
-    ) == [1, 2, 4, 5, 8, 9, 18]
+    ) == [*range(1, 11), 18, 20, 40, 60, 80]
 
 
-def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b8(monkeypatch):
+def test_nvfp4_moe_warmup_uses_slot_compact_through_b10(monkeypatch):
+    layer = _nvfp4_moe_layer()
+    calls = []
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_moe_dense_stage_sm70_out", object(), raising=False
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_moe_dense_stage_sm70_out",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        warmup,
+        "_prepare_compact_slot_groups",
+        lambda sorted_ids, offsets, active_ids: (
+            offsets.copy_(torch.arange(offsets.numel(), dtype=torch.int32)),
+            active_ids.copy_(sorted_ids),
+        ),
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "silu_and_mul",
+        lambda out, gate_up: out.zero_(),
+        raising=False,
+    )
+
+    assert warmup._warmup_nvfp4_moe_decode_layers([layer], [9, 10]) == 4
+    assert [call[6] for call in calls] == [72, 72, 80, 80]
+    assert all(call[2].numel() == call[6] + 1 for call in calls)
+    assert all(call[3].numel() == call[6] for call in calls)
+    assert calls[0][2].tolist() == list(range(73))
+    assert calls[2][2].tolist() == list(range(81))
+
+
+def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b10(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
     monkeypatch.setattr(
@@ -217,12 +261,39 @@ def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b8(monkeypatch):
         raising=False,
     )
 
-    assert warmup._warmup_nvfp4_moe_decode_layers([layer], [9]) == 2
+    assert warmup._warmup_nvfp4_moe_decode_layers([layer], [11]) == 2
     assert [call[6] for call in calls] == [256, 256]
     assert all(call[2].numel() == 257 for call in calls)
     assert all(call[3].numel() == 256 for call in calls)
-    assert calls[0][2][:73].tolist() == list(range(73))
-    assert calls[0][2][73:].tolist() == [72] * (257 - 73)
+    assert calls[0][2][:89].tolist() == list(range(89))
+    assert calls[0][2][89:].tolist() == [88] * (257 - 89)
+
+
+def test_nvfp4_moe_warmup_supports_mtp4_c16_width(monkeypatch):
+    layer = _nvfp4_moe_layer()
+    calls = []
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_moe_dense_stage_sm70_out", object(), raising=False
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_moe_dense_stage_sm70_out",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "silu_and_mul",
+        lambda out, gate_up: out.zero_(),
+        raising=False,
+    )
+
+    assert warmup._warmup_nvfp4_moe_decode_layers([layer], [80]) == 2
+    assert [tuple(call[0].shape) for call in calls] == [(640, 256), (640, 2048)]
+    assert [call[6] for call in calls] == [256, 256]
+    offsets = calls[0][2]
+    assert offsets.numel() == 257
+    assert offsets[:4].tolist() == [0, 3, 6, 9]
+    assert offsets[-1].item() == 640
 
 
 def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
