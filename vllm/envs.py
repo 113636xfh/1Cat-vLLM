@@ -136,6 +136,9 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
+    VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM: bool = False
+    VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS: int = 512
+    VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS: int = 80
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
     VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
@@ -153,12 +156,16 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
+    VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
+    VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
+    VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
+    VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
@@ -1604,6 +1611,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION": lambda: bool(
         int(os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "0"))
     ),
+    # Default-off exact-8K TP4 experiment: fuse the row-parallel reduction,
+    # mixed-FP32-residual Gemma RMSNorm, and normalized-output all-gather.
+    "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM", "0"))
+    ),
+    "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS": lambda: int(
+        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS", "512")
+    ),
+    "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")
+    ),
     # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
     # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
     # epilogue for M=1/TP2 while keeping the existing down_proj/reduce path.
@@ -1621,8 +1639,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
-    # Memory-neutral QPN8 layout for model-, shape-, and runtime-gated
-    # Qwen3.8 TP4 no-MTP dense projections. Pure-FP8 checkpoints must opt in;
+    # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
+    # dense projections. Pure-FP8 checkpoints must opt in;
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
@@ -1630,6 +1648,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
     "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
+    "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
+    ),
+    "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))
+    ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -1680,6 +1704,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
+    ),
+    "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1"))
+    ),
+    "VLLM_SM70_FP8_PREFILL_PRESCALED": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))

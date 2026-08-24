@@ -24,7 +24,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 )
 from vllm.model_executor.layers.quantization.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
-    _is_qwen38_27b_fp8_qpn8_model,
     _is_sm70_fp8_qpn8_runtime_contract,
     _missing_sm70_fp8_qpn8_ops,
 )
@@ -205,7 +204,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             qpn8_config = (
                 _sm70_channel_fp8_qpn8_config(layer)
                 if getattr(self, "use_sm70_fp8_qpn8", False)
-                and _is_qwen38_27b_fp8_qpn8_model()
                 else None
             )
             qpn8_concurrency = (

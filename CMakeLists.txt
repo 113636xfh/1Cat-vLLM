@@ -398,6 +398,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
 
     set_gencode_flags_for_srcs(

@@ -20,15 +20,17 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
     _sm70_fp8_qpn8_enabled,
 )
 from vllm.model_executor.layers.quantization.fp8 import (
+    _SM70_FP8_EXACT_8K_PREFILL_M,
     _SM70_FP8_PREFILL_DENSE_MIN_M,
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES,
     Fp8LinearMethod,
     _get_sm70_fp8_prefill_exact_dense_workspace,
-    _is_qwen38_27b_fp8_qpn8_model,
+    _is_sm70_fp8_exact_8k_prefill_layer,
     _is_sm70_fp8_prefill_exact_dense_layer,
     _is_sm70_fp8_qpn8_layer,
     _is_sm70_fp8_qpn8_runtime_contract,
     _sm70_fp8_prefill_dense_workspaces,
+    _sm70_fp8_prefill_visible_dense_mm,
 )
 
 
@@ -232,7 +234,6 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
     monkeypatch.setattr(
         f"{module}._sm70_channel_fp8_qpn8_config", lambda layer: (16, 2, False)
     )
-    monkeypatch.setattr(f"{module}._is_qwen38_27b_fp8_qpn8_model", lambda: True)
     monkeypatch.setattr(f"{module}._is_sm70_fp8_qpn8_runtime_contract", lambda: True)
     monkeypatch.setattr(f"{module}._missing_sm70_fp8_qpn8_ops", lambda: [])
     monkeypatch.setattr(
@@ -348,6 +349,24 @@ def test_fp8_prefill_exact_dense_is_default_on(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_fp8_exact_8k_prefill_controls_are_generic_defaults(monkeypatch):
+    for name in (
+        "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR",
+        "VLLM_SM70_FP8_PREFILL_PRESCALED",
+        "VLLM_SM70_FP8_PREFILL_CUTLASS",
+        "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
+        assert envs.VLLM_SM70_FP8_PREFILL_PRESCALED
+        assert envs.VLLM_SM70_FP8_PREFILL_CUTLASS
+        assert not envs.VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_fp8_qpn8_is_opt_in_except_for_mixed_nvfp4(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8_LIBRARY", raising=False)
@@ -372,6 +391,7 @@ def test_fp8_qpn8_is_opt_in_except_for_mixed_nvfp4(monkeypatch):
 def test_fp8_prefill_exact_dense_shape_gate_is_narrow():
     layer = SimpleNamespace(
         tp_size=4,
+        weight_block_size=[128, 128],
         prefix="model.language_model.layers.1.mlp.gate_up_proj",
         weight=SimpleNamespace(shape=(5120, 8704)),
     )
@@ -383,18 +403,45 @@ def test_fp8_prefill_exact_dense_shape_gate_is_narrow():
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.self_attn.qkv_proj"
     layer.weight = SimpleNamespace(shape=(5120, 3584))
-    assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
+    assert _is_sm70_fp8_prefill_exact_dense_layer(layer)
     layer.prefix = "model.language_model.layers.1.linear_attn.in_proj_qkvz"
     layer.weight = SimpleNamespace(shape=(5120, 4096))
-    assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
+    assert _is_sm70_fp8_prefill_exact_dense_layer(layer)
     layer.prefix = "model.language_model.layers.1.mlp.gate_up_proj"
     layer.weight = SimpleNamespace(shape=(5120, 8192))
     assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
+    layer.weight_block_size = [64, 128]
+    layer.weight = SimpleNamespace(shape=(5120, 8704))
+    assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
+
+
+def test_fp8_exact_8k_prefill_gate_uses_operator_contract_only():
+    layer = SimpleNamespace(
+        tp_size=4,
+        weight_block_size=[128, 128],
+        prefix="engine.layers.1.linear_attn.in_proj_qkvz",
+        weight=SimpleNamespace(shape=(5120, 4096)),
+    )
+
+    assert _is_sm70_fp8_exact_8k_prefill_layer(layer)
+    layer.prefix = "engine.layers.3.self_attn.qkv_proj"
+    layer.weight = SimpleNamespace(shape=(5120, 3584))
+    assert _is_sm70_fp8_exact_8k_prefill_layer(layer)
+
+    layer.tp_size = 2
+    assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
+    layer.tp_size = 4
+    layer.weight_block_size = [64, 128]
+    assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
+    layer.weight_block_size = [128, 128]
+    layer.weight = SimpleNamespace(shape=(5120, 4096))
+    assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
 
 
 def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     layer = SimpleNamespace(
         tp_size=4,
+        weight_block_size=[128, 128],
         prefix="model.language_model.layers.1.mlp.gate_up_proj",
         weight=SimpleNamespace(shape=(8704, 5120)),
     )
@@ -412,24 +459,8 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert not _is_sm70_fp8_qpn8_layer(layer)
 
 
-def test_fp8_qpn8_model_gate_is_qwen38_27b_specific(monkeypatch):
-    text_config = SimpleNamespace(
-        model_type="qwen3_5_text",
-        hidden_size=5120,
-        intermediate_size=17408,
-        num_hidden_layers=64,
-        full_attention_interval=4,
-        head_dim=256,
-    )
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            model_type="qwen3_5",
-            architectures=["Qwen3_5ForConditionalGeneration"],
-        ),
-        hf_text_config=text_config,
-    )
+def test_fp8_qpn8_runtime_gate_uses_engine_contract_only(monkeypatch):
     vllm_config = SimpleNamespace(
-        model_config=model_config,
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         speculative_config=None,
     )
@@ -438,15 +469,12 @@ def test_fp8_qpn8_model_gate_is_qwen38_27b_specific(monkeypatch):
         lambda: vllm_config,
     )
 
-    assert _is_qwen38_27b_fp8_qpn8_model()
     assert _is_sm70_fp8_qpn8_runtime_contract()
     vllm_config.scheduler_config.max_num_seqs = 16
     assert not _is_sm70_fp8_qpn8_runtime_contract()
     vllm_config.scheduler_config.max_num_seqs = 8
     vllm_config.speculative_config = object()
     assert not _is_sm70_fp8_qpn8_runtime_contract()
-    text_config.hidden_size = 4096
-    assert not _is_qwen38_27b_fp8_qpn8_model()
 
 
 def test_fp8_prefill_exact_dense_workspace_is_bounded():
@@ -474,6 +502,51 @@ def test_fp8_prefill_exact_dense_workspace_is_reused(monkeypatch):
         assert len(allocations) == 1
     finally:
         _sm70_fp8_prefill_dense_workspaces.clear()
+
+
+def test_fp8_prefill_visible_dense_mm_is_long_prefill_only(monkeypatch):
+    workspace = torch.empty(24, dtype=torch.float16)
+    weight = torch.empty((4, 6), dtype=torch.uint8)
+    scales = torch.empty((1, 6), dtype=torch.float16)
+    calls = []
+
+    def fake_dequantize(out, qweight, factors, group_size):
+        calls.append((qweight, factors, group_size))
+        out.fill_(1)
+
+    monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "1")
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_sm70_dequantize_out",
+        fake_dequantize,
+    )
+    envs.disable_envs_cache()
+    _sm70_fp8_prefill_dense_workspaces[(0, torch.float16)] = workspace
+    try:
+        long_prefill = _sm70_fp8_prefill_visible_dense_mm(
+            torch.ones((_SM70_FP8_PREFILL_DENSE_MIN_M, 4), dtype=torch.float16),
+            weight,
+            scales,
+            workspace.data_ptr(),
+            gated_silu=False,
+            min_prefill_m=_SM70_FP8_PREFILL_DENSE_MIN_M,
+        )
+        tail = _sm70_fp8_prefill_visible_dense_mm(
+            torch.ones((1, 4), dtype=torch.float16),
+            weight,
+            scales,
+            workspace.data_ptr(),
+            gated_silu=False,
+            min_prefill_m=_SM70_FP8_PREFILL_DENSE_MIN_M,
+        )
+    finally:
+        _sm70_fp8_prefill_dense_workspaces.clear()
+        envs.disable_envs_cache()
+
+    assert long_prefill is not None
+    assert long_prefill.shape == (_SM70_FP8_PREFILL_DENSE_MIN_M, 6)
+    assert tail is None
+    assert calls == [(weight, scales, 128)]
 
 
 def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypatch):
@@ -526,6 +599,70 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
             False,
         ),
     ]
+
+
+def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
+    calls = []
+
+    def fake_default(out, input, qweight, scales, *args):
+        calls.append(("default", input.shape[0], scales))
+        out.zero_()
+
+    def fake_prescaled(out, input, qweight, scales, *args):
+        calls.append(("prescaled", input.shape[0], scales))
+        out.zero_()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_gemm_sm70_out",
+        fake_default,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "fp8_gemm_sm70_prefill_prescaled_out",
+        fake_prescaled,
+    )
+    normal_scales = torch.empty((1, 6), dtype=torch.float16)
+    prescaled_scales = torch.empty((1, 6), dtype=torch.float16)
+    layer = SimpleNamespace(
+        sm70_fp8_turbomind=True,
+        sm70_fp8_bmm=False,
+        output_size_per_partition=6,
+        weight=torch.empty((4, 6), dtype=torch.uint8),
+        weight_scale_inv=normal_scales,
+        sm70_fp8_prefill_prescaled_scales=prescaled_scales,
+        sm70_fp8_k_ld=4,
+        sm70_fp8_q_ld=6,
+    )
+    method = SimpleNamespace()
+
+    monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1")
+    envs.disable_envs_cache()
+    try:
+        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
+        Fp8LinearMethod.apply(
+            method,
+            layer,
+            torch.empty((_SM70_FP8_EXACT_8K_PREFILL_M, 4), dtype=torch.float16),
+        )
+        monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "0")
+        envs.disable_envs_cache()
+        Fp8LinearMethod.apply(
+            method,
+            layer,
+            torch.empty((_SM70_FP8_EXACT_8K_PREFILL_M, 4), dtype=torch.float16),
+        )
+    finally:
+        envs.disable_envs_cache()
+
+    assert [(route, m) for route, m, _ in calls] == [
+        ("default", 1),
+        ("prescaled", _SM70_FP8_EXACT_8K_PREFILL_M),
+        ("default", _SM70_FP8_EXACT_8K_PREFILL_M),
+    ]
+    assert calls[0][2] is normal_scales
+    assert calls[1][2] is prescaled_scales
+    assert calls[2][2] is normal_scales
 
 
 def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):

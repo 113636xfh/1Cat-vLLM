@@ -42165,8 +42165,9 @@ Interpretation:
   the accepted TP-local gate/up `(K,N)=(5120,8704)`, down `(4352,5120)`, and
   output `(1536,5120)` projections. GDN input and full-attention QKV remain on
   TurboMind. The old layout is replaced at load time rather than retained.
-- Opt-in admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
-  TP4, no MTP, and configured `max_num_seqs <= 8`. Native QPN8 handles M=1-8.
+- Opt-in admission uses the engine contract only: SM70 block-FP8 layout, TP4,
+  exact projection shapes, no MTP, and configured `max_num_seqs <= 8`.
+  Native QPN8 handles M=1-8.
   Wider-concurrency and MTP configurations retain TurboMind until their own
   performance and quality gates pass; this is not a batch-one-only dispatch.
 - The opaque C++ M dispatch prevents an AOTInductor M=1 trace from being reused
@@ -42300,3 +42301,49 @@ Interpretation:
   pass.
 - Full results, route details, quality artifacts, trace/resource tables, and
   exact evidence paths are in `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-24 Qwen3.8-27B-FP8 exact-8K CUTLASS projections
+
+- The accepted starting point is TP4 V100, input 8000, output 1, FP8-E5M2 KV,
+  Flash-V100/FlashQLA, FULL_AND_PIECEWISE CUDA Graph, bounded exact-dense FP8
+  projections, and the fused TP4 reduce-scatter/Gemma norm/all-gather boundary.
+  Its request-wall median was `1.616075 s`, or `4950.27 prompt tok/s`.
+- The fused graph trace put `506.081/254.947/93.510 ms` into 64 gate/up, down,
+  and attention-output FP16 GEMMs. Their current useful rates were only about
+  `90.2/89.5/86.1 TFLOP/s`, despite the V100 SXM2's 125-TFLOP/s Tensor Core
+  peak. QKVZ plus QKV retained another `241.625 ms` at exact 8K.
+- NVIDIA CUTLASS profiler selected its generated SM70
+  `f16_s884gemm_f16_128x256_32x2_nn_align8` operation for all five exact TP4
+  shapes. It uses CTA `128x256x32`, warp `64x64x32`, native `m8n8k4`, two
+  stages, and split-K one. The compiled kernel uses 220 registers/thread,
+  256 threads, and no stack or local spill.
+- Real-checkpoint CUDA Graph operator tests passed bitwise equality. The key
+  complete-boundary medians improved gate/up `8.67876 -> 8.26086 ms`, down
+  `4.26622 -> 4.02442 ms`, and attention output `1.54365 -> 1.48992 ms`.
+  Gate/up reuses the same graph-captured full projection temporary and existing
+  interleaved SiLU kernel; it adds no resident weight or second workspace.
+- The final source-matching accepted extension SHA256 is
+  `6a7e8493ca04bd7738c9b016a6a0b4914b2c582598c920f99bb67626ae3e11c1`.
+  It is default-on only at `M=8000` for TP4 shapes
+  `(K,N)={5120x4096,5120x3584,5120x8704,4352x5120,1536x5120}`. Decode,
+  tails, other M values, and other shapes retain existing dispatch. Rollback is
+  `VLLM_SM70_FP8_PREFILL_CUTLASS=0`.
+- The source-matching final full-model run produced six steady request-wall
+  samples `1.559085/1.561460/1.560481/1.562664/1.564697/1.564643 s`.
+  Their `1.562062 s` median is `5121.44 prompt tok/s` with `0.132%` CV. The
+  pure prefill median is `1.547100 s`, or `5170.96 tok/s`. This saves
+  `54.013 ms`, raises wall throughput `3.46%`, and clears the 5000-tok/s
+  requirement by `121.44 tok/s`.
+- Route proof contains exactly 20 one-time messages, five admitted shapes on
+  each of four TP ranks. The accepted 766 graph-address registration count and
+  fused collective backend remain intact. Seven of seven official-sampling
+  outputs remain token `[1061]`, text `" This"`.
+- The side-stream two-workspace FP8 dequant prototype is rejected: placing its
+  two dequantizations across the RMSNorm window changed
+  `7.98956 -> 8.00819 ms` (`0.99767x`) despite bitwise equality. The
+  cuBLAS-algorithm-106 candidate
+  was also rejected. Both implementations were removed; do not repeat them as
+  substitutes for the accepted CUTLASS shape route.
+- Final evidence is under task-cache
+  `qwen38-fp8-prefill-utilization-20260823/results/`, especially
+  `full_model_cutlass_all_projections_final_source_tp4_fused_graph_i8000.raw.json`.
