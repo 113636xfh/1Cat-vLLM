@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // The QPN8 execution layout is derived from dnv2003/v100-skinny (MIT) and
-// its block-scale adaptation in haohervchb/sglang-V100. Automatic model
-// dispatch is restricted to accepted Qwen3.8-27B TP4 shapes and can be
+// its block-scale adaptation in haohervchb/sglang-V100. Automatic operator
+// dispatch is restricted to accepted SM70 tensor/layout contracts and can be
 // disabled with VLLM_SM70_FP8_QPN8=0.
 // See LICENSE.v100-skinny in this directory for the retained MIT notice.
 
@@ -936,8 +936,8 @@ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
   TORCH_CHECK(qkv_out.numel() == qkv_n && z_out.numel() == z_n &&
                   b_out.numel() == ba_n / 2 && a_out.numel() == ba_n / 2,
               "fp8_qpn8_gemm_ba_split_sm70_out: output shape mismatch");
-  TORCH_CHECK(codes.numel() == n * k,
-              "fp8_qpn8_gemm_ba_split_sm70_out: packed code size mismatch");
+  TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k && codes.size(1) == n,
+              "fp8_qpn8_gemm_ba_split_sm70_out: expected codes [5120, 4096]");
   TORCH_CHECK(group_scales.dim() == 2 && group_scales.size(0) == 1 &&
                   group_scales.size(1) == n,
               "fp8_qpn8_gemm_ba_split_sm70_out: expected channel scales");
@@ -1008,6 +1008,17 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
           b_out.numel() == m * ba_n / 2 && a_out.numel() == m * ba_n / 2 &&
           qkvz_staging.numel() == m * n && ba_staging.numel() == m * ba_n,
       "fp8_qpn8_dispatch_ba_split_sm70_out: output shape mismatch");
+  TORCH_CHECK(
+      qkv_out.get_device() == z_out.get_device() &&
+          qkv_out.get_device() == b_out.get_device() &&
+          qkv_out.get_device() == a_out.get_device() &&
+          qkv_out.get_device() == qkvz_staging.get_device() &&
+          qkv_out.get_device() == ba_staging.get_device() &&
+          qkv_out.get_device() == input.get_device() &&
+          qkv_out.get_device() == codes.get_device() &&
+          qkv_out.get_device() == group_scales.get_device() &&
+          qkv_out.get_device() == ba_weight.get_device(),
+      "fp8_qpn8_dispatch_ba_split_sm70_out: tensors must share one device");
   TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k && codes.size(1) == n,
               "fp8_qpn8_dispatch_ba_split_sm70_out: code shape mismatch");
   TORCH_CHECK(group_scales.dim() == 2 && group_scales.size(0) == 1 &&
@@ -1016,14 +1027,16 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
   TORCH_CHECK(ba_weight.dim() == 2 && ba_weight.size(0) == ba_n &&
                   ba_weight.size(1) == k,
               "fp8_qpn8_dispatch_ba_split_sm70_out: b/a weight mismatch");
+  TORCH_CHECK(m <= 8 || dense_weight_ptr != 0,
+              "fp8_qpn8_dispatch_ba_split_sm70_out: large-M requires the "
+              "dense QPN8 workspace");
 
   if (m == 1) {
     static std::once_flag route_log_once;
     std::call_once(route_log_once, []() {
-      std::fprintf(
-          stderr,
-          "SM70 Qwen3.8-27B no-MTP QPN8 qkv/z + FP16 b/a split C++ route "
-          "enabled.\n");
+      std::fprintf(stderr,
+                   "SM70 GDN QPN8 K5120/N4096 + FP16 b/a N24 split C++ route "
+                   "enabled.\n");
       std::fflush(stderr);
     });
     fp8_qpn8_gemm_ba_split_sm70_out(qkv_out, z_out, b_out, a_out, input, codes,

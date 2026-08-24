@@ -360,10 +360,16 @@ unchanged and removes work at the GDN boundary. The exact Qwen3.8 TP4 decode
 shape can issue its channel-FP8 QKV/Z projection and FP16 b/a projection from
 one QPN8 launch, writing the four destination tensors directly. A separate
 one-pass Triton kernel performs the 12-by-128 gated RMSNorm without changing
-the accepted arithmetic. Both paths are opt-in through
-`VLLM_SM70_QWEN_GDN_QPN8_BA_SPLIT=1` and
-`VLLM_SM70_QWEN_GDN_RMSNORM_ONEPASS=1`; other shapes and prefill retain the
-existing operators.
+the accepted arithmetic. The accepted pair is opt-in through both
+`VLLM_SM70_GDN_QPN8_BA_SPLIT=1` and
+`VLLM_SM70_GDN_RMSNORM_ONEPASS=1`; the split projection cannot activate
+without its paired RMSNorm gate. Other operator shapes and prefill retain the
+existing operators. These are hardware/layout/operator gates; the measured
+checkpoint identifies the evidence workload and does not select the route.
+The archived JSON predates this audit naming cleanup and records the former
+Qwen-prefixed flag names; kernel arithmetic is unchanged. The final source
+also rechecks the loaded QPN8 code/scales, workspace pointer, bias, dtype,
+contiguity, and same-device contracts before dispatch.
 
 The matched endpoint used the same four V100-SXM2-32GB GPUs, TP4, input 1024,
 output cap 256, official random sampling, E4M3 KV, Flash-V100, full CUDA graph,

@@ -48,6 +48,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
     _sm70_dump_gdn_projection_tensor,
+    _sm70_gdn_qpn8_ba_dispatch_eligible,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -401,7 +402,11 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if self.enable_sm70_qwen_gdn_qpn8_ba_split:
+        if _sm70_gdn_qpn8_ba_dispatch_eligible(
+            self,
+            hidden_states,
+            layer_name,
+        ):
             mixed_qkv = torch.empty(
                 (num_tokens, qkv_size),
                 dtype=hidden_states.dtype,

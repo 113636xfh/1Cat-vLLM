@@ -659,7 +659,7 @@ def fp8_qpn8_gemm_ba_split_sm70_out(
     group_scales: torch.Tensor,
     ba_weight: torch.Tensor,
 ) -> None:
-    """Run exact Qwen3.8 decode qkvz FP8 and b/a FP16 projections."""
+    """Run the exact-shape GDN QKV/Z FP8 and b/a FP16 projections."""
     _op("fp8_qpn8_gemm_ba_split_sm70_out")(
         qkv_out,
         z_out,

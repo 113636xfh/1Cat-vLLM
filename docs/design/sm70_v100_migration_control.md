@@ -42802,9 +42802,13 @@ Interpretation:
   `ca77db3b032a1600a8567adea706108c1bd8c5472b3ace2318c41ab17c66c1f9`.
 - The GDN RMSNorm 48-layer operator gate is bitwise exact and saves
   `55.946 us/token`. QKV is exact on all 48 layers; b/a has relative L2
-  `6.368e-8` and maximum absolute error `2.384e-7`. Both endpoint routes are
-  exact-shape, no-MTP, SM70, TP4 opt-ins and retain the original large-M and
-  unsupported-shape paths.
+  `6.368e-8` and maximum absolute error `2.384e-7`. The split projection is
+  admitted only when its one-pass RMSNorm pair is also enabled. Runtime
+  selection uses SM70, exact tensor/layout, QPN8 workspace, bias, TP, and
+  no-speculation contracts; the measured model/checkpoint is evidence only.
+  Large-M and unsupported shapes retain the original paths. Archived evidence
+  uses the pre-audit Qwen-prefixed flag names; final source uses generic GDN
+  flags and leaves the measured kernels unchanged.
 - QPN8 QKV/Z plus b/a alone reaches `83.740763 tok/s` but diverges at token
   202, so it is not an independent accepted configuration. It is accepted only
   together with the exact one-pass RMSNorm, whose paired endpoint restores the
