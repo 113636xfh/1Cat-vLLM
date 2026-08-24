@@ -8,6 +8,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -45,7 +46,8 @@ def _can_use_sm70_private_compressor_state(vllm_config: VllmConfig) -> bool:
     kv_transfer_config = vllm_config.kv_transfer_config
     spec_config = vllm_config.speculative_config
     return (
-        current_platform.is_cuda()
+        envs.VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE
+        and current_platform.is_cuda()
         and current_platform.is_device_capability((7, 0))
         and vllm_config.scheduler_config.max_num_seqs == 1
         and not vllm_config.cache_config.enable_prefix_caching

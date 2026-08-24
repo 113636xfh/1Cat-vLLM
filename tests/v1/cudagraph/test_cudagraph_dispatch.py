@@ -378,7 +378,9 @@ class TestCudagraphDispatcher:
             cudagraph_capture_sizes=[1, 2],
         )
         config = _create_vllm_config(comp_config, max_num_seqs=2)
-        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        # Route by the compressed-index operator contract, not architecture or
+        # checkpoint identity.
+        config.model_config.architectures = ["UnrelatedForCausalLM"]
         config.model_config.max_model_len = 4096
         config.model_config.hf_config.index_topk = 512
         config.model_config.hf_config.compress_ratios = [128, 4, 128]
@@ -406,7 +408,9 @@ class TestCudagraphDispatcher:
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
-    def test_dsv4_context_bucket_is_derived_for_mtp_on_sm70(self, monkeypatch):
+    def test_dsv4_context_bucket_requires_explicit_override_for_mtp_on_sm70(
+        self, monkeypatch
+    ):
         monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
         monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
         comp_config = CompilationConfig(
@@ -425,7 +429,11 @@ class TestCudagraphDispatcher:
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
         ):
-            dispatcher = CudagraphDispatcher(config)
+            default_dispatcher = CudagraphDispatcher(config)
+        assert not default_dispatcher.has_attention_context_buckets
+
+        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "2048")
+        dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
             uniform_decode_query_len=8,
@@ -457,7 +465,10 @@ class TestCudagraphDispatcher:
         assert not explicitly_disabled.has_attention_context_buckets
 
     def test_dsv4_long_context_buckets_bound_mtp_graph_width(self, monkeypatch):
-        monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
+        monkeypatch.setenv(
+            "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS",
+            "2048,4096,16384,65536,131072",
+        )
         monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",

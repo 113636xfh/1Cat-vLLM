@@ -10,6 +10,7 @@ import torch
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -57,12 +58,12 @@ _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
 
 # At long context the paged Triton decode kernel rescans the same FP8 MQA keys
-# once for every verifier row and head. For the one-request DSpark shape, gather
-# the keys once and let cuBLAS score all rows/heads together. FP32 output is
-# deliberate: an FP16 score intermediate produced rare top-k set changes at
-# 16K/64K compressed tokens. Short and generic shapes retain the fused paged
-# kernel, whose launch overhead is lower there.
-_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "1") == "1"
+# once for every verifier row and head. For a bounded one-request verifier
+# shape, gather the keys once and let cuBLAS score all rows/heads together.
+# FP32 output is deliberate: an FP16 score intermediate produced rare top-k
+# set changes at 16K/64K compressed tokens. Short and generic shapes retain the
+# fused paged kernel, whose launch overhead is lower there.
+_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "0") == "1"
 _DECODE_CUBLAS_MIN_KEYS = int(
     os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS", "1024")
 )
@@ -786,12 +787,39 @@ def sm70_indexer_decode_logits(
     if (
         _RELU_LOGITS
         and _DECODE_CUBLAS
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
         and max_seq_len >= _DECODE_CUBLAS_MIN_KEYS
         and single_request
+        and (native_rows or total_rows == 1)
         and 0 < total_rows <= _DECODE_CUBLAS_MAX_ROWS
+        and q.ndim == 3
+        and q.dtype == torch.float16
+        and q.shape[2] == _INDEX_HEAD_DIM
+        and q.shape[1] > 0
         and q.shape[1] % _EPILOGUE_BLOCK_H == 0
+        and weights.ndim == 2
+        and weights.shape == q.shape[:2]
+        and weights.dtype == torch.float32
+        and cache.ndim == 3
+        and cache.dtype == torch.uint8
+        and cache.shape[1] > 0
+        and cache.shape[2] == _INDEX_CACHE_BYTES
+        and cache.stride(1) == _INDEX_CACHE_BYTES
+        and cache.stride(2) == 1
+        and block_table.ndim == 2
+        and block_table.dtype == torch.int32
+        and flat_lens.dtype == torch.int32
+        and triton.cdiv(max_seq_len, cache.shape[1]) <= block_table.shape[1]
+        and q.device
+        == cache.device
+        == weights.device
+        == flat_lens.device
+        == block_table.device
         and q.is_contiguous()
         and weights.is_contiguous()
+        and cache.is_contiguous()
+        and flat_lens.is_contiguous()
         and block_table.is_contiguous()
     ):
         return _decode_logits_cublas(

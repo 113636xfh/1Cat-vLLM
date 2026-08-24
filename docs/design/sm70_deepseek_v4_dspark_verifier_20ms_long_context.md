@@ -59,18 +59,21 @@ their stated end-to-end promotion gate:
 1. FP32 mHC staging now covers verifier rows M=1..8. M=8 falls from 0.05383 to
    0.01257 ms per call and projects 3.507 ms saved across 85 calls. Four V100
    numerical cases were bitwise exact.
-2. The M=8 graph derives a bounded 2,048-token short-context bucket instead of
-   reserving the whole maximum context. CPU dispatcher tests pass; synchronized
-   TP8 transfer remains required.
-3. Single-request SM70 compressor C4/C128 intermediates use bounded private
+2. The M=8 graph can use a bounded 2,048-token short-context bucket instead of
+   reserving the whole maximum context. Speculative buckets require an explicit
+   `VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS`; CPU dispatcher tests pass, while the
+   synchronized TP8 transfer remains required.
+3. A default-off `VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE=1` route stores
+   single-request SM70 compressor C4/C128 intermediates in bounded private
    device rings when prefix caching, pipeline parallelism, KV transfer, and
    parallel drafting are absent. Seven V100 ring/workspace tests and eleven CPU
-   route tests pass. This removes paged intermediate growth without changing the
-   sparse attention/index cache.
-4. The long-context C4 indexer gathers paged FP8 keys once and uses FP32 cuBLAS
-   scores for all M=8 rows and 64 heads. It retains per-head ReLU and FP8 scale
-   semantics. The captured-graph test, shorter dynamic replay, graph-tail mask,
-   and workspace-width gate pass on V100.
+   route tests pass. It cannot become the default before the long-context
+   quality and capacity gates finish.
+4. A default-off `VLLM_SM70_INDEXER_DECODE_CUBLAS=1` route gathers long-context
+   paged FP8 keys once and uses FP32 cuBLAS scores for bounded row shapes. It
+   retains per-head ReLU and FP8 scale semantics. The captured-graph test,
+   shorter dynamic replay, graph-tail mask, and workspace-width gate pass on
+   V100; the incomplete long-context quality gate keeps it opt-in.
 
 5. A default-off `VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER=1` route extends the
    single-launch, one-row-per-slot MXFP4 contract from M=8 to M=2..M=8. This is
@@ -95,8 +98,11 @@ retained under `/data/models/dsv4-verifier-20ms-variable-grouped-r1`; the
 single V100 was released after the gate.
 
 The 0731 checkpoint declares an official DSpark block size of five and stores
-`mtp.2.confidence_head.proj.weight`. The current runtime explicitly discards
-that weight. DeepSpec computes conditional step probabilities with a sigmoid,
+`mtp.2.confidence_head.proj.weight`. The runtime instantiates and loads that
+optional head only for explicit confidence-threshold scheduling or alignment
+diagnostics and fails cleanly if a requested projection is absent. Ordinary
+serving performs no confidence projection. DeepSpec computes conditional step
+probabilities with a sigmoid,
 uses their cumulative product for prefix reliability reporting, and truncates
 at the first conditional probability below a threshold. Before production
 confidence scheduling, this runtime must first collect calibration data on the
@@ -117,7 +123,7 @@ M=8, H=64, D=128, and CUDA Graph replay:
 | 16,384 | 0.85016 ms | 0.14493 ms | -14.810 ms |
 
 All 40 rows retained the exact top-k set; maximum logit absolute difference was
-`1.221e-4`. The default crossover is 1,024 compressed keys. Generic batches,
+`1.221e-4`. The opt-in crossover is 1,024 compressed keys. Generic batches,
 noncontiguous inputs, more than eight rows, and non-ReLU semantics retain the
 existing fused paged kernel.
 
@@ -136,10 +142,13 @@ gate retained the exact top-k set in all 30 rows and measured:
 The maximum logit absolute difference was `1.221e-4`. The microbenchmark owner
 released its V100 immediately after writing the artifact.
 
-SM70 DeepSeek V4 graph context buckets now follow raw widths 2K, 4K, 16K, 64K,
-and 128K when the model maximum is 256K. Longer requests retain the generic
-full-context graph. An explicit `VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS`, or an
-explicit MTP bucket override including an empty value, remains authoritative.
+The speculative SM70 graph context candidate uses explicit raw widths 2K, 4K,
+16K, 64K, and 128K when the maximum is 256K. Longer requests retain the generic
+full-context graph. `VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS` is required to
+enable the candidate; an explicit MTP bucket override, including an empty
+value, remains authoritative. Automatic non-speculative selection uses only
+the compressed-index operator configuration and never architecture or
+checkpoint identity.
 
 ## Long-Context Diagnosis
 
@@ -147,8 +156,9 @@ DeepSeek V4 does not use the repository's classic Flash-V100 dense-attention
 decode route. Its production log identifies packed-FP8 SM70 sparse MLA with C4,
 C128, SWA-128, and top-k 512. Sparse attention after selection is nearly fixed
 work; the C4 indexer scan grows with compressed history and was the expected
-linear decay source. The private compressor rings address capacity and memory
-growth, while gather-once FP32 cuBLAS addresses the repeated index scan.
+linear decay source. The opt-in private compressor rings address capacity and
+memory growth, while opt-in gather-once FP32 cuBLAS addresses the repeated
+index scan.
 
 `benchmarks/benchmark_dsv4_dspark_long_context.py` records each completed
 context incrementally. It uses server-reported prompt usage, separates TTFT

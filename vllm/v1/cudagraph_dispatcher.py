@@ -46,13 +46,13 @@ def _get_sm70_dsv4_decode_context_buckets(
     env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
     if env_name in os.environ:
         return _get_sm70_context_buckets(env_name)
+    # Speculative graphs cover multiple query rows and require a separate
+    # end-to-end long-context gate. They remain available through the explicit
+    # environment override above.
+    if vllm_config.speculative_config is not None:
+        return ()
 
     model_config = vllm_config.model_config
-    architectures = getattr(model_config, "architectures", ())
-    if not isinstance(architectures, (list, tuple)) or (
-        "DeepseekV4ForCausalLM" not in architectures
-    ):
-        return ()
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
     ):
@@ -86,7 +86,7 @@ def _get_sm70_dsv4_decode_context_buckets(
         if short_bucket * multiplier < model_config.max_model_len
     )
     logger.info_once(
-        "Auto-enabling SM70 DeepSeek V4 decode CUDA graph context buckets "
+        "Auto-enabling SM70 compressed-index decode CUDA graph context buckets "
         "%s. Set %s explicitly to override or to an empty value to disable.",
         buckets,
         env_name,

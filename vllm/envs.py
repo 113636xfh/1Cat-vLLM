@@ -283,6 +283,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
+    VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE: bool = False
     VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
     VLLM_SM70_REJECTION_PROFILE: bool = False
@@ -2264,6 +2265,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
+    ),
+    # The private ring changes compressor-state ownership and lifetime. Keep it
+    # opt-in until its long-context quality and capacity gates are complete.
+    "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE", "0"))
     ),
     "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"

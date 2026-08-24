@@ -5,6 +5,7 @@
 import torch
 from typing_extensions import override
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -27,15 +28,17 @@ class DSparkProposer(DFlashProposer):
             torch.arange(self.max_batch_size, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
-        temperatures = self.speculative_config.dspark_confidence_temperatures
-        if temperatures is None:
-            temperatures = [1.0] * self.num_speculative_tokens
-        self._confidence_temperatures = torch.tensor(
-            temperatures,
-            dtype=torch.float32,
-            device=device,
-        ).view(1, -1)
         self._confidence_threshold = self.speculative_config.dspark_confidence_threshold
+        self._confidence_temperatures: torch.Tensor | None = None
+        if self._confidence_threshold > 0.0:
+            temperatures = self.speculative_config.dspark_confidence_temperatures
+            if temperatures is None:
+                temperatures = [1.0] * self.num_speculative_tokens
+            self._confidence_temperatures = torch.tensor(
+                temperatures,
+                dtype=torch.float32,
+                device=device,
+            ).view(1, -1)
         configured_cap = self.speculative_config.dspark_max_verification_tokens
         self._max_verification_tokens = (
             self.num_speculative_tokens if configured_cap is None else configured_cap
@@ -44,14 +47,24 @@ class DSparkProposer(DFlashProposer):
             self._confidence_threshold > 0.0
             or self._max_verification_tokens < self.num_speculative_tokens
         )
+        # A fixed cap needs verification lengths but not a confidence
+        # projection. Collect logits only when the calibrated threshold or the
+        # explicit alignment diagnostic consumes them.
+        self.collect_confidence_logits = (
+            self._confidence_threshold > 0.0 or envs.VLLM_SPEC_DUMP_ALIGNMENT
+        )
         self._last_confidence_logits: torch.Tensor | None = None
         self._last_verification_lengths: torch.Tensor | None = None
 
     def take_last_confidence_logits(self) -> torch.Tensor | None:
-        return self._last_confidence_logits
+        confidence_logits = self._last_confidence_logits
+        self._last_confidence_logits = None
+        return confidence_logits
 
     def take_last_verification_lengths(self) -> torch.Tensor | None:
-        return self._last_verification_lengths
+        verification_lengths = self._last_verification_lengths
+        self._last_verification_lengths = None
+        return verification_lengths
 
     def _select_verification_lengths(
         self,
@@ -112,11 +125,19 @@ class DSparkProposer(DFlashProposer):
         # contents across asynchronous scheduling and CUDA Graph replay.
         prev = self.input_ids[self._anchor_indices[:batch_size]].to(torch.long)
         draft_tokens: list[torch.Tensor] = []
-        markov_embeds: list[torch.Tensor] = []
+        self._last_confidence_logits = None
+        self._last_verification_lengths = None
+        collect_confidence_logits = bool(
+            getattr(self, "collect_confidence_logits", False)
+        )
+        markov_embeds: list[torch.Tensor] | None = (
+            [] if collect_confidence_logits else None
+        )
         draft_probs: list[torch.Tensor] | None = None
         for step in range(self.num_speculative_tokens):
             markov_embed = self.model.markov_embed(prev)
-            markov_embeds.append(markov_embed)
+            if markov_embeds is not None:
+                markov_embeds.append(markov_embed)
             step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
             sampled, step_probs = self._sample_from_logits(
                 step_logits,
@@ -129,16 +150,26 @@ class DSparkProposer(DFlashProposer):
                     draft_probs = []
                 draft_probs.append(step_probs)
 
-        block_hidden_states = hidden_states.view(
-            batch_size, self.num_speculative_tokens, -1
-        )
-        self._last_confidence_logits = self.model.confidence_logits(
-            block_hidden_states,
-            torch.stack(markov_embeds, dim=1),
-        )
-        self._last_verification_lengths = self._select_verification_lengths(
-            self._last_confidence_logits
-        )
+        if markov_embeds is not None:
+            block_hidden_states = hidden_states.view(
+                batch_size, self.num_speculative_tokens, -1
+            )
+            self._last_confidence_logits = self.model.confidence_logits(
+                block_hidden_states,
+                torch.stack(markov_embeds, dim=1),
+            )
+        if bool(getattr(self, "confidence_scheduling_enabled", False)):
+            if self._last_confidence_logits is None:
+                self._last_verification_lengths = torch.full(
+                    (batch_size,),
+                    int(self._max_verification_tokens),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+            else:
+                self._last_verification_lengths = self._select_verification_lengths(
+                    self._last_confidence_logits
+                )
         flat_tokens = torch.stack(draft_tokens, dim=1).reshape(-1)
         if draft_probs is None:
             return flat_tokens, None

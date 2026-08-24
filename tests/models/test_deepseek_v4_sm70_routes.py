@@ -211,7 +211,24 @@ def test_sm70_private_compressor_state_requires_a_contiguous_single_request():
     config.kv_transfer_config = None
     config.speculative_config.parallel_drafting = False
 
-    with patch.object(compressor, "current_platform", platform):
+    with (
+        patch.object(compressor, "current_platform", platform),
+        patch.object(
+            compressor.envs,
+            "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE",
+            False,
+        ),
+    ):
+        assert not compressor._can_use_sm70_private_compressor_state(config)
+
+    with (
+        patch.object(compressor, "current_platform", platform),
+        patch.object(
+            compressor.envs,
+            "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE",
+            True,
+        ),
+    ):
         assert compressor._can_use_sm70_private_compressor_state(config)
 
         config.speculative_config.parallel_drafting = True

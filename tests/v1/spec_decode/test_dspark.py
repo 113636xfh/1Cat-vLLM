@@ -70,6 +70,8 @@ def test_dspark_markov_sampling_is_sequential(
     proposer.model = _FakeDSparkModel()
     proposer._enable_probabilistic_draft_probs = False
     proposer._static_draft_vocab = None
+    proposer.collect_confidence_logits = False
+    proposer.confidence_scheduling_enabled = False
     proposer.input_ids = torch.zeros(2 * num_speculative_tokens, dtype=torch.int32)
     proposer.input_ids[0] = 1
     proposer.input_ids[num_speculative_tokens] = 4
@@ -92,7 +94,8 @@ def test_dspark_markov_sampling_is_sequential(
         for anchor in (1, 4)
     ]
     assert output.view(2, num_speculative_tokens).tolist() == expected
-    assert proposer._last_confidence_logits.shape == (2, num_speculative_tokens)
+    assert proposer._last_confidence_logits is None
+    assert proposer._last_verification_lengths is None
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [5, 7])
@@ -104,6 +107,8 @@ def test_dspark_probabilistic_sampling_returns_sequential_probs(
     proposer.model = _FakeDSparkModel()
     proposer._enable_probabilistic_draft_probs = True
     proposer._static_draft_vocab = None
+    proposer.collect_confidence_logits = True
+    proposer.confidence_scheduling_enabled = True
     proposer.input_ids = torch.zeros(2 * num_speculative_tokens, dtype=torch.int32)
     proposer.input_ids[0] = 1
     proposer.input_ids[num_speculative_tokens] = 4
@@ -143,6 +148,36 @@ def test_dspark_probabilistic_sampling_returns_sequential_probs(
     ]
     assert output.view(2, num_speculative_tokens).tolist() == expected
     assert proposer._last_confidence_logits.shape == (2, num_speculative_tokens)
+    assert proposer._last_verification_lengths.shape == (2,)
+    confidence_logits = proposer.take_last_confidence_logits()
+    verification_lengths = proposer.take_last_verification_lengths()
+    assert confidence_logits is not None
+    assert verification_lengths is not None
+    assert proposer.take_last_confidence_logits() is None
+    assert proposer.take_last_verification_lengths() is None
+
+
+def test_dspark_static_verification_cap_skips_confidence_projection() -> None:
+    proposer = object.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.model = _FakeDSparkModel()
+    proposer._enable_probabilistic_draft_probs = False
+    proposer._static_draft_vocab = None
+    proposer.collect_confidence_logits = False
+    proposer.confidence_scheduling_enabled = True
+    proposer._max_verification_tokens = 2
+    proposer.input_ids = torch.zeros(5, dtype=torch.int32)
+    proposer._anchor_indices = torch.tensor([0], dtype=torch.int64)
+
+    output, draft_probs = proposer._sample_draft_tokens(
+        torch.zeros(5, 2),
+        sampling_metadata=None,  # type: ignore[arg-type]
+    )
+
+    assert output.shape == (5,)
+    assert draft_probs is None
+    assert proposer._last_confidence_logits is None
+    assert proposer._last_verification_lengths.tolist() == [2]
 
 
 def test_dspark_replicated_linears_return_tensors() -> None:
@@ -165,6 +200,15 @@ def test_dspark_replicated_linears_return_tensors() -> None:
     markov_head.markov_w2 = nn.Identity()
     markov_embed = torch.randn(3, 4)
     assert torch.equal(markov_head.bias(markov_embed), markov_embed)
+
+
+def test_dspark_confidence_projection_rejects_missing_weight() -> None:
+    draft_model = object.__new__(DSparkDeepseekV4ForCausalLM)
+    nn.Module.__init__(draft_model)
+    draft_model._confidence_head_loaded = False
+
+    with pytest.raises(RuntimeError, match="did not provide confidence_head"):
+        draft_model.confidence_logits(torch.empty(1, 1), torch.empty(1, 1))
 
 
 def test_dspark_confidence_scheduler_keeps_only_confident_prefix() -> None:
