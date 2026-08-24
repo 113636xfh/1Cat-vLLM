@@ -112,6 +112,41 @@ random physical-page cases against the FP32 reference, and CUDA Graph replay
 while mutating runtime sequence length. These are operator correctness gates;
 acceptance length, PPL, and task scores remain required before promotion.
 
+## Full-model 128K confirmation
+
+A TP4 FULL-Graph Nsight run used the same 128K prompt, 128 generated tokens,
+probabilistic sampling seed, model/KV dtypes, and route gates as retained
+split-40 run `v80`. The only implementation change was the split-80 Flash-V100
+extension:
+
+| Phase | Split 40 | Split 80 | Delta |
+| --- | ---: | ---: | ---: |
+| Complete verification round | 40.778072 ms | 36.683712 ms | -4.094360 ms (-10.04%) |
+| Target | 34.646866 ms | 30.557332 ms | -4.089534 ms (-11.80%) |
+| Draft | 4.604373 ms | 4.627743 ms | +0.023370 ms |
+| Draft to target | 0.230538 ms | 0.225575 ms | -0.004963 ms |
+| Target to draft | 1.296296 ms | 1.273062 ms | -0.023233 ms |
+
+The partial kernel changed from grid `(2, 40, 1)` to `(2, 80, 1)`. Its mean
+service time fell from 1.198762 ms to 0.944041 ms per full-attention layer
+(-21.25%); combine rose from 0.008295 ms to 0.010430 ms. Across sixteen layers,
+the net attention prediction is -4.041 ms, explaining 98.8% of the measured
+target-phase improvement. The earlier operator projection was -3.989 ms, only
+about 0.10 ms from the full target result.
+
+The fixed diagnostic request retained identical accepted-token counts
+`[17, 17, 17, 16, 16, 15, 15]`, mean acceptance length 7.647059, and all 128
+output token IDs. This is trajectory evidence, not a substitute for the
+required score/PPL gates.
+
+An attempted compact mapping for the two-head GQA tail passed the six operator
+correctness tests but was 6.3-7.0% slower than split 80 across the micro sweep.
+The run also observed a late external-worker ownership race, so its absolute
+timings are not promotion evidence; the uniformly negative direction was
+sufficient to revert the experiment completely. Nsight Compute hardware
+counters are unavailable to the current user (`ERR_NVGPUCTRPERM`), so no NCU
+counter claim is made.
+
 ## Measurement order
 
 1. Reproduce low-overhead full-model B1 baselines at 1K/32K/128K/256K.
@@ -140,5 +175,6 @@ acceptance length, PPL, and task scores remain required before promotion.
 
 The 32K/128K trace attribution is closed: target grouped attention is the
 long-context verification bottleneck. The split-40/80 operator A/B is complete
-and split 80 is the current candidate. Full-model TP4 timing and quality gates
-are pending; no end-to-end split-count speedup is claimed yet.
+and the 128K full-model trace confirms the predicted critical-path improvement.
+The 32K/1K boundary checks and score/PPL gates remain pending before split 80
+can be promoted as the default.
