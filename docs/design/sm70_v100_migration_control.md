@@ -42902,3 +42902,98 @@ Interpretation:
   ordering, dense and multi-pool interleaved zeroing, Mamba align allocation,
   and the existing GDN state-window contracts. No full-model end-to-end run
   was required for this source-level repair.
+
+## 2026-08-24 Qwen3.8-27B NVFP4 no-MTP concurrency scaling
+
+- The heading names the matched performance workload, not an activation
+  identity. Runtime admission does not inspect a model name, checkpoint, or
+  architecture: it uses only SM70 capability, FP8 format, batch and tensor
+  shapes, paged-KV layout, graph context, and sampler operator settings.
+- Contract: four V100s with TP4, compressed-tensors NVFP4 weights, FP16
+  activations, E4M3 FP8 KV cache, Flash-V100 attention, prefix caching, Mamba
+  align mode, no speculation, and CUDA Graph decode sizes 1/2/4/8/16. The
+  throughput workload is official SPEED-Bench `low_entropy` at 1K and 16K,
+  512 output tokens, one warmup plus three measured repeats, temperature 1.0,
+  top-k 20, top-p 0.95, fixed seed 20260822, and natural EOS. Reported decode
+  throughput uses only the interval in which every request is actively
+  decoding, so TTFT and prefill are excluded.
+- The admitted E4M3 G6/D256 XQA route covers exact B2-B16 only. It uses paired
+  128-bit KV loads, packed exact E4M3-to-half2 conversion, the existing
+  partition workspace, and the established long-context graph variants. At
+  16K, B8 captures `dual_cta_split` and B16 captures `dual_cta`; the baseline
+  CUDA Graph remains selected below 16K. `VLLM_FLASH_V100_E4M3_BATCH_XQA=0`
+  restores scalar paged attention. The separate
+  `VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED=0` switch retains XQA while
+  restoring scalar KV loads, the original E4M3 conversion, and baseline CTA
+  routing. B1 keeps the original converter regardless of this batch-only
+  optimization.
+- The exact 248,320-column, no-spec B8/B16 sampler contract now selects eight
+  Triton warps for combined top-k/top-p masking. The operation and reduction
+  math are unchanged; `VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS=0` restores Triton's
+  launch heuristic. Existing MTP verifier-row tuning remains independently
+  opt-in.
+- Development A/B on base `a8ce98ba34` measured the following median pure
+  decode rates. The candidate includes batched XQA, eight-warp sampling, and
+  the long-context graph variants.
+
+  | Context | Batch | Control tok/s | Candidate tok/s | Speedup | Candidate scaling efficiency | FP8 reference efficiency |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 1K | 1 | 72.82 | 72.94 | 1.002x | 100.0% | 100.0% |
+  | 1K | 8 | 402.51 | 465.92 | 1.158x | 79.8% | 87.4% |
+  | 1K | 16 | 642.37 | 774.18 | 1.205x | 66.3% | 72.3% |
+  | 16K | 1 | 63.03 | 63.12 | 1.001x | 100.0% | 100.0% |
+  | 16K | 8 | 186.43 | 356.50 | 1.912x | 70.6% | 67.7% |
+  | 16K | 16 | 222.03 | 526.59 | 2.372x | 52.1% | 49.1% |
+
+- Thus the 16K NVFP4 scaling efficiency exceeds the same-criterion FP8
+  reference by 4.2% at B8 and 6.2% at B16. The remaining short-context gap is
+  8.6% at B8 and 8.2% at B16; do not repeat the attention experiment to close
+  it. At 1K the next target is non-attention concurrent work, primarily GDN
+  state traffic and dense projection scheduling.
+- A clean production revalidation on base `febf1fc962` reproduced the result
+  with one warmup and three measured repeats per cell. Only the steady window
+  in which every request was decoding is reported; endpoint throughput, TTFT,
+  and prefill are excluded from the table.
+
+  | Context | Batch | Control decode tok/s | Candidate decode tok/s | Speedup | Candidate scaling efficiency | FP8 reference efficiency |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 1K | 1 | 72.65 | 72.62 | 1.000x | 100.0% | 100.0% |
+  | 1K | 8 | 402.98 | 465.24 | 1.154x | 80.1% | 87.4% |
+  | 1K | 16 | 641.95 | 772.44 | 1.203x | 66.5% | 72.3% |
+  | 16K | 1 | 63.10 | 63.00 | 0.998x | 100.0% | 100.0% |
+  | 16K | 8 | 186.97 | 356.52 | 1.907x | 70.7% | 67.7% |
+  | 16K | 16 | 222.61 | 527.00 | 2.367x | 52.3% | 49.1% |
+
+  The B8 geometric-mean efficiency gap to the FP8 reference is 2.2%, and the
+  B16 gap is 1.0%. Both therefore reach the revised near-FP8 scaling target;
+  at 16K they exceed FP8 by 4.4% and 6.5%, respectively. Every timed request
+  succeeded and produced its full 512-token cap without empty or replacement-
+  character output. The original implementation was rebased without conflict
+  onto `onecat/main@6fc9fe9492`; the Flash-V100 and sampler source blobs were
+  byte-identical to the measured tree. The final audit rebased the same two
+  commits onto `onecat/main@f6a5b57b64` after generic prefix-anchored SWA was
+  merged. `git range-diff` reports both patches as exactly equivalent. The
+  combined Flash-V100 extension builds for SM70, 24 focused E4M3/graph/sampler
+  policy tests pass, and all 32 prefix-anchored SWA CPU regressions remain
+  green. The audit also prevents E4M3-only Flash-V100 graph variants from
+  being captured for an explicitly selected FlashInfer backend. A
+  same-toolchain `cuobjdump` comparison against the prefix-anchored main build
+  finds all 115 common XQA kernel instances SASS-identical, with zero missing
+  or changed instances; the candidate adds only six batch-optimized instances.
+- GPU operator validation covers B2/B16 at partition sizes 64/128/256 plus
+  B8/B16 long-context routing. All eight comparisons stay within one FP16 ULP
+  of scalar paged attention with mean absolute error at most `1e-5`. Separate
+  B8/B16 full-vocabulary tests show bitwise-identical top-k/top-p masks between
+  the eight-warp schedule and its rollback path.
+- Matched GSM8K main/test quality uses 32 prompts per B1/B8/B16 with the same
+  official stochastic sampling and 512-token natural-EOS cap. Changed batches
+  move numeric exact match from 22/32 to 23/32 at B8 and remain 23/32 at B16;
+  all requests complete with no empty or replacement-character output. The
+  unchanged B1 route moves 25/32 to 24/32 while only 21/32 texts reproduce
+  across independent processes, so that one-sample movement is recorded as
+  stochastic run variance rather than attributed to the candidate.
+- The first metadata-only long-context probe was invalid: the CUDA Graph
+  dispatcher still admitted specialized variants for E5M2 only. It produced
+  no E4M3 route trace and must not be cited. The accepted implementation gates
+  both metadata and dispatcher creation; capture logs prove eight FULL graphs
+  and explicit B8/B16 long-context route hits.

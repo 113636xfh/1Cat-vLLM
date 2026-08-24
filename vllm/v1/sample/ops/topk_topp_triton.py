@@ -20,6 +20,29 @@ from vllm.utils.platform_utils import num_compute_units
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
 
+
+def _use_sm70_topk_topp_8_warps(
+    device: torch.device,
+    batch_size: int,
+    vocab_size: int,
+    topk_enabled: bool,
+    topp_enabled: bool,
+) -> bool:
+    if (
+        device.type != "cuda"
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability((7, 0))
+        or vocab_size != 248_320
+        or not topk_enabled
+        or not topp_enabled
+    ):
+        return False
+
+    if batch_size in (8, 16) and envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS:
+        return True
+    return envs.VLLM_SM70_TOPK_TOPP_8_WARPS and batch_size in (5, 10, 20, 40, 60, 80)
+
+
 # fmt: off
 _NORMAL_CDF_TO_SIGMA_TABLE = [
   3.656,  3.650,  3.650,  3.650,  3.626,  3.626,  3.626,  3.514,  3.514,  3.503, 
@@ -1047,19 +1070,16 @@ def apply_top_k_top_p_triton(
         block_size, block_size_trunc = 8192, 4096
 
     launch_kwargs: dict[str, int] = {}
-    if (
-        envs.VLLM_SM70_TOPK_TOPP_8_WARPS
-        and logits.device.type == "cuda"
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
-        and logits.shape[0] in (5, 10, 20, 40, 60, 80)
-        and vocab_size == 248_320
-        and topk_enabled
-        and topp_enabled
+    if _use_sm70_topk_topp_8_warps(
+        logits.device,
+        batch_size,
+        vocab_size,
+        topk_enabled,
+        topp_enabled,
     ):
-        # The measured MTP4 contract has five verifier rows per live request.
         # Eight warps preserve the tile and masking algorithm while using the
-        # otherwise idle lanes in its reduction-heavy passes.
+        # otherwise idle lanes in its reduction-heavy passes. B8/B16 no-MTP
+        # rows are default-on; the measured MTP verifier rows remain opt-in.
         launch_kwargs["num_warps"] = 8
 
     _topk_topp_kernel[(NUM_PROGRAMS,)](

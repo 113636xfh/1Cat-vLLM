@@ -474,6 +474,13 @@ def _batch_context_routing_for_graph_variant(
     return graph_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
 
 
+def _batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> bool:
+    """Admit the exact FP8 XQA formats implemented by Flash-V100."""
+    return cache_dtype == "fp8_e5m2" or (
+        cache_dtype in ("fp8", "fp8_e4m3") and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+    )
+
+
 def _sm70_profile_trace(message: str, *args: object) -> None:
     if envs.VLLM_SM70_PROFILE_TRACE:
         if args:
@@ -904,6 +911,15 @@ def _decode_xqa_allowed_for_q_per_kv(
     if seq_hint is None:
         return False
     return int(seq_hint) >= _decode_xqa_q4_min_seq_len()
+
+
+def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
+    """Gate the exact SM70 E4M3 G6 batched XQA route."""
+    return (
+        envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+        and 1 < query.shape[0] <= 16
+        and query.shape[1:] == (6, 256)
+    )
 
 
 def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -2926,7 +2942,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
             and envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is None
             and spec_config is None
-            and getattr(cache_config, "cache_dtype", None) == "fp8_e5m2"
+            and _batch_context_routing_cache_dtype_supported(
+                getattr(cache_config, "cache_dtype", None)
+            )
             and batch_context_shape_supported
         )
         self._is_dflash_draft_model = self._is_speculative_draft_model and (
@@ -6397,7 +6415,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
             and (
                 self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
-                or (query.shape[0] == 1 and q_per_kv == 6)
+                or (
+                    q_per_kv == 6
+                    and (query.shape[0] == 1 or _e4m3_batch_xqa_allowed(query))
+                )
             )
             and (
                 self.kv_cache_dtype != "fp8_e5m2"
