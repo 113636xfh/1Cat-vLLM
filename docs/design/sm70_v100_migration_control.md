@@ -41817,8 +41817,16 @@ Interpretation:
 - Each lane's warmup and measured 256-token stream is internally exact. The
   candidate and control B are also token-for-token identical, but identical
   unsplit control A selects a different stable sampled stream under the same
-  official seed. This cross-process sampling instability prevents default-on
-  promotion of a non-bitwise route. Keep the Q8000 gate experimental until a
-  deterministic greedy/natural-text or dataset-quality gate passes. Evidence
-  is under
+  official seed. This cross-process sampling instability is not equivalence
+  evidence for a non-bitwise route.
+- A deterministic greedy follow-up uses two identical Chinese exact-128K
+  prompts and one exact-128K Python task. Both routes are internally stable and
+  coherent, and both code responses stop normally with the same correct
+  `add(a, b)` implementation. Cross-route strict identity fails: Chinese first
+  differs at token 7 with 126/128 tokens aligned; Python first differs at token
+  20 with all 67 control tokens aligned in the 70-token candidate response.
+  Candidate ranks each report the expected 576 split-KV3 hits and controls
+  report zero. Keep the Q8000 gate default-off until fixed-text
+  logprob/perplexity or dataset-level evidence proves no quality loss from the
+  classified Type-B reduction-order drift. Evidence is under
   `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824/`.
