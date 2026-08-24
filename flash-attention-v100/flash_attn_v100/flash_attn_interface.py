@@ -24,6 +24,7 @@ _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
+_grouped_verify_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +52,12 @@ class _PrefillSplitkv3Workspace:
     row_sum: torch.Tensor
     out: torch.Tensor
     softmax_lse: torch.Tensor
+
+
+@dataclass
+class _GroupedVerifyWorkspace:
+    partial_out: torch.Tensor
+    partial_lse: torch.Tensor
 
 
 def maybe_contiguous(x):
@@ -493,6 +500,35 @@ def _get_prefill_splitkv3_workspace(
     if workspace is None:
         workspace = _allocate_prefill_splitkv3_workspace(q)
         _prefill_splitkv3_workspace_cache[key] = workspace
+    return workspace
+
+
+def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (
+        q.device.type,
+        device_index,
+        _workspace_stream_id(q.device),
+        q.dtype,
+    )
+    workspace = (
+        _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    )
+    if workspace is None:
+        workspace = _GroupedVerifyWorkspace(
+            partial_out=torch.empty(
+                (40, 8, 6, 256),
+                dtype=torch.float16,
+                device=q.device,
+            ),
+            partial_lse=torch.empty(
+                (40, 8, 6),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+        )
+        if _can_cache_workspace(q):
+            _grouped_verify_workspace_cache[key] = workspace
     return workspace
 
 
@@ -974,6 +1010,49 @@ def flash_attn_decode_paged_xqa_available() -> bool:
 
 def flash_attn_decode_paged_xqa_staged_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
+
+
+def flash_attn_grouped_verify_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "fp8_e5m2",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    one_pass: bool = False,
+) -> torch.Tensor:
+    """Exact grouped q8/H6/D256 DFlash2 verifier prototype for SM70.
+
+    The native entry keeps all causal verifier rows together and reuses each
+    paged-KV scan across four GQA heads. Workspaces are stream-local and fixed
+    size so a warmed entry is CUDA-graph safe. Unsupported shapes fail closed.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    workspace = _get_grouped_verify_workspace(q)
+    return flash_attn_v100_cuda.grouped_verify_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        seq_lens,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        bool(one_pass),
+    )
 
 
 def flash_attn_decode_paged_xqa(
@@ -1552,6 +1631,7 @@ __all__ = [
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
+    "flash_attn_grouped_verify_paged",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

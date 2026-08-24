@@ -122,8 +122,14 @@ _SM70_FP8_QPN8_CONFIGS = {
     # (K, N, fused gated-SiLU): (split-K, accumulator chains, prefetch codes)
     (4352, 5120, False): (16, 1, False),
     (1536, 5120, False): (16, 1, False),
+    (5120, 4096, False): (16, 2, False),
+    (5120, 3584, False): (16, 2, False),
     (5120, 8704, False): (16, 1, True),
     (5120, 8704, True): (8, 2, True),
+}
+_SM70_FP8_QPN8_EXTRA_SHAPES = {
+    "in_proj_qkvz": (5120, 4096),
+    "qkv_proj": (5120, 3584),
 }
 _SM70_FP8_QPN8_REQUIRED_OPS = (
     "fp8_qpn8_prepare_sm70",
@@ -171,6 +177,8 @@ def _is_sm70_fp8_qpn8_layer(layer: torch.nn.Module) -> bool:
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
     expected_kn = _SM70_FP8_PREFILL_DENSE_SHAPES.get(suffix)
     if expected_kn is None:
+        expected_kn = _SM70_FP8_QPN8_EXTRA_SHAPES.get(suffix)
+    if expected_kn is None:
         return False
     # Checkpoint-native block-FP8 weights are [N, K]; the shared prefill
     # workspace and QPN8 replacement parameter are [K, N].
@@ -183,7 +191,13 @@ def _is_sm70_fp8_qpn8_runtime_contract() -> bool:
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 1))
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    return max_num_seqs <= _SM70_FP8_QPN8_MAX_NUM_SEQS and speculative_config is None
+    if max_num_seqs > _SM70_FP8_QPN8_MAX_NUM_SEQS:
+        return False
+    if speculative_config is None:
+        return True
+    # Speculative workloads require an explicit operator opt-in; admission is
+    # still based only on bounded concurrency and the layer tensor contract.
+    return os.getenv("VLLM_SM70_FP8_QPN8") is not None
 
 
 def _missing_sm70_fp8_qpn8_ops() -> list[str]:
@@ -721,9 +735,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if qpn8_candidate_layer and not qpn8_concurrency:
                 logger.info_once(
-                    "The SM70 FP8 QPN8 route retains TurboMind when MTP is "
-                    "enabled or max_num_seqs exceeds 8; the accepted native "
-                    "QPN8 contract is no-MTP with M<=8."
+                    "The SM70 FP8 QPN8 route retains TurboMind unless its "
+                    "bounded-concurrency runtime contract is explicit."
                 )
             if qpn8_candidate_layer and qpn8_concurrency:
                 missing_ops = _missing_sm70_fp8_qpn8_ops()

@@ -2145,7 +2145,8 @@ __global__ void flash_attention_forward_paged_splitkv_merge_kernel(
     }
 }
 
-template<int D, bool LOW_SMEM_CONTIG_FAST, bool LOW_SMEM_SCALAR_QK>
+template<int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
+         bool LOW_SMEM_SCALAR_QK>
 void launcher_flash_attention_forward_paged_splitkv_impl(
     const torch::Tensor& Q,
     const torch::Tensor& K_cache,
@@ -2168,8 +2169,14 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
     cudaStream_t stream
 ) {
     static_assert(D == 256, "split-KV paged prefill is D=256 only");
-    using Config = KernelConfig<D, true, LOW_SMEM_SCALAR_QK>;
-    constexpr int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16;
+    static_assert(LOW_SMEM || !LOW_SMEM_CONTIG_FAST,
+                  "contiguous low-smem loads require LOW_SMEM");
+    static_assert(LOW_SMEM || !LOW_SMEM_SCALAR_QK,
+                  "scalar low-smem QK requires LOW_SMEM");
+    static_assert(!LOW_SMEM
+                      || KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
+                  "low-smem split-KV supports FP16 KV only");
+    using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK>;
 
     const int B = Q.size(0);
     const int H = Q.size(1);
@@ -2210,18 +2217,18 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
 
     auto kernel = is_causal
                       ? (void*)flash_attention_forward_kernel_paged<
-                            D, true, LOW_SMEM_CONTIG_FAST,
+                            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                             LOW_SMEM_SCALAR_QK, false, true, true, KV_DTYPE>
                       : (void*)flash_attention_forward_kernel_paged<
-                            D, true, LOW_SMEM_CONTIG_FAST,
+                            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                             LOW_SMEM_SCALAR_QK, false, true, false, KV_DTYPE>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
 
     if (is_causal) {
         flash_attention_forward_kernel_paged<
-            D, true, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true, true,
-            KV_DTYPE>
+            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false,
+            true, true, KV_DTYPE>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -2260,8 +2267,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
         );
     } else {
         flash_attention_forward_kernel_paged<
-            D, true, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true, false,
-            KV_DTYPE>
+            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false,
+            true, false, KV_DTYPE>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -3843,10 +3850,23 @@ at::Tensor flash_attention_prefill_paged_splitkv(
 ) {
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
     const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
-    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
-                "split-KV paged prefill supports fp16 KV cache only");
-    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
-    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+    TORCH_CHECK(
+        kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16
+            || kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+        "split-KV paged prefill supports fp16 and fp8_e5m2 KV cache only");
+    if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+        TORCH_CHECK(k_cache.dtype() == torch::kFloat16,
+                    "fp16 split-KV requires fp16 k_cache");
+        TORCH_CHECK(v_cache.dtype() == torch::kFloat16,
+                    "fp16 split-KV requires fp16 v_cache");
+    } else {
+        TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
+                    "fp8_e5m2 split-KV requires uint8 k_cache");
+        TORCH_CHECK(v_cache.dtype() == torch::kUInt8,
+                    "fp8_e5m2 split-KV requires uint8 v_cache");
+        TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+                    "fp8_e5m2 split-KV requires positive K/V scales");
+    }
     TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
                 "Tensors must be on CUDA");
     TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
@@ -3883,15 +3903,20 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     bool sm70 = props->major == 7 && props->minor == 0;
     TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
+    const bool fp16_kv =
+        kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16;
     const bool use_low_smem_contig_fast =
-        page_block_size == 16 ||
-        env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
+        fp16_kv
+        && (page_block_size == 16
+            || env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST"));
     const bool use_low_smem_scalar_qk =
-        env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
-    const int block_n =
-        use_low_smem_scalar_qk
-            ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
-            : BLOCK_N_256_LOW_SMEM;
+        fp16_kv
+        && env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
+    const int block_n = fp16_kv
+                            ? (use_low_smem_scalar_qk
+                                   ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
+                                   : BLOCK_N_256_LOW_SMEM)
+                            : KernelConfig<256, false>::BLOCK_N;
     const int split_tokens_rounded = std::max(split_kv_tokens, block_n);
     const int split_kv_tiles =
         std::max(1, (split_tokens_rounded + block_n - 1) / block_n);
@@ -3901,10 +3926,19 @@ at::Tensor flash_attention_prefill_paged_splitkv(
         std::max(1, (max_kv_tiles + split_kv_tiles - 1) / split_kv_tiles);
 
     if (num_partitions <= 1) {
-        launcher_flash_attention_forward_paged<256, flash_v100::KV_CACHE_DTYPE_FP16>(
-            q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,
-            softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-            window_size_right, stream);
+        if (fp16_kv) {
+            launcher_flash_attention_forward_paged<
+                256, flash_v100::KV_CACHE_DTYPE_FP16>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
+                seq_lens, softmax_scale, is_causal, k_scale, v_scale,
+                window_size_left, window_size_right, stream);
+        } else {
+            launcher_flash_attention_forward_paged<
+                256, flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
+                seq_lens, softmax_scale, is_causal, k_scale, v_scale,
+                window_size_left, window_size_right, stream);
+        }
         return out_fp16;
     }
 
@@ -3916,17 +3950,24 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     auto split_tmp_row_sum =
         torch::empty({B, H, num_partitions, M}, tmp_options);
 
-    if (use_low_smem_contig_fast) {
+    if (!fp16_kv) {
+        launcher_flash_attention_forward_paged_splitkv_impl<
+            256, flash_v100::KV_CACHE_DTYPE_FP8_E5M2, false, false, false>(
+            q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
+            split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
+            softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+            window_size_right, split_kv_tokens, max_seq_len_hint, stream);
+    } else if (use_low_smem_contig_fast) {
         if (use_low_smem_scalar_qk) {
             launcher_flash_attention_forward_paged_splitkv_impl<
-                256, true, true>(
+                256, flash_v100::KV_CACHE_DTYPE_FP16, true, true, true>(
                 q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
                 split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
                 window_size_right, split_kv_tokens, max_seq_len_hint, stream);
         } else {
             launcher_flash_attention_forward_paged_splitkv_impl<
-                256, true, false>(
+                256, flash_v100::KV_CACHE_DTYPE_FP16, true, true, false>(
                 q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
                 split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
@@ -3935,14 +3976,14 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     } else {
         if (use_low_smem_scalar_qk) {
             launcher_flash_attention_forward_paged_splitkv_impl<
-                256, false, true>(
+                256, flash_v100::KV_CACHE_DTYPE_FP16, true, false, true>(
                 q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
                 split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
                 window_size_right, split_kv_tokens, max_seq_len_hint, stream);
         } else {
             launcher_flash_attention_forward_paged_splitkv_impl<
-                256, false, false>(
+                256, flash_v100::KV_CACHE_DTYPE_FP16, true, false, false>(
                 q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
                 split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,

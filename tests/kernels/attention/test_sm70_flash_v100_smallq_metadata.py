@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends.flash_attn_v100 import (
+    _sm70_prepare_grouped_smallq_decode_metadata,
     _sm70_prepare_smallq_decode_metadata,
 )
 
@@ -118,3 +119,114 @@ def test_sm70_fused_smallq_metadata_matches_repeat_interleave(
     assert torch.equal(out_block_table, expected_block_table)
     assert torch.equal(out_seq_lens, expected_seq_lens)
     assert torch.equal(out_query_start_loc, query_start_loc)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm70_grouped_smallq_metadata_matches_individual_launches():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA device required")
+
+    device = torch.device("cuda")
+    num_groups = 5
+    num_reqs = 3
+    num_query_tokens = 8
+    real_num_query_tokens = 6
+    block_cols_by_group = [3, 5, 4, 5, 3]
+    query_start_loc = torch.tensor([0, 3, 5, 6], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([19, 13, 9], dtype=torch.int32, device=device)
+    block_tables = [
+        (
+            torch.arange(
+                num_reqs * block_cols,
+                dtype=torch.int32,
+                device=device,
+            )
+            .view(num_reqs, block_cols)
+            .add_(group_id * 1000)
+        )
+        for group_id, block_cols in enumerate(block_cols_by_group)
+    ]
+    for table in block_tables:
+        table[:, 0] = -1
+
+    grouped_tables = [
+        torch.empty((num_query_tokens, block_cols), dtype=torch.int32, device=device)
+        for block_cols in block_cols_by_group
+    ]
+    grouped_seq_lens = [
+        torch.empty(num_query_tokens, dtype=torch.int32, device=device)
+        for _ in range(num_groups)
+    ]
+    grouped_query_locs = [
+        torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
+        for _ in range(num_groups)
+    ]
+    descriptor = _sm70_prepare_grouped_smallq_decode_metadata(
+        grouped_tables,
+        grouped_seq_lens,
+        grouped_query_locs,
+        block_tables,
+        seq_lens,
+        query_start_loc,
+        num_reqs=num_reqs,
+        num_query_tokens=num_query_tokens,
+        real_num_query_tokens=real_num_query_tokens,
+    )
+
+    reference_tables = []
+    reference_seq_lens = []
+    for table in block_tables:
+        out_table = torch.empty(
+            (num_query_tokens, table.shape[1]), dtype=torch.int32, device=device
+        )
+        out_seq = torch.empty_like(grouped_seq_lens[0])
+        out_query = torch.empty_like(grouped_query_locs[0])
+        _sm70_prepare_smallq_decode_metadata(
+            out_table,
+            out_seq,
+            out_query,
+            table,
+            seq_lens,
+            query_start_loc,
+            num_reqs=num_reqs,
+            num_query_tokens=num_query_tokens,
+            real_num_query_tokens=real_num_query_tokens,
+        )
+        reference_tables.append(out_table)
+        reference_seq_lens.append(out_seq)
+        assert torch.equal(out_query, query_start_loc)
+    torch.cuda.synchronize()
+
+    for grouped, reference in zip(grouped_tables, reference_tables):
+        assert torch.equal(grouped, reference)
+    for grouped, reference in zip(grouped_seq_lens, reference_seq_lens):
+        assert torch.equal(grouped, reference)
+    for grouped in grouped_query_locs:
+        assert torch.equal(grouped, query_start_loc)
+
+    # Reuse the persistent pointer tables and prove that no stale group output
+    # survives a replay with different sequence metadata.
+    seq_lens.add_(7)
+    replay_descriptor = _sm70_prepare_grouped_smallq_decode_metadata(
+        grouped_tables,
+        grouped_seq_lens,
+        grouped_query_locs,
+        block_tables,
+        seq_lens,
+        query_start_loc,
+        num_reqs=num_reqs,
+        num_query_tokens=num_query_tokens,
+        real_num_query_tokens=real_num_query_tokens,
+        descriptor=descriptor,
+    )
+    torch.cuda.synchronize()
+    assert replay_descriptor is descriptor
+    _, expected_seq_lens = _reference_smallq_metadata(
+        block_tables[0],
+        seq_lens,
+        query_start_loc,
+        num_query_tokens=num_query_tokens,
+        real_num_query_tokens=real_num_query_tokens,
+    )
+    for grouped in grouped_seq_lens:
+        assert torch.equal(grouped, expected_seq_lens)

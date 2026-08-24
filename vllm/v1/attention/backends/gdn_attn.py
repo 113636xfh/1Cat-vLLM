@@ -434,6 +434,12 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # Pure DFlash2 full-graph replay updates these persistent tensors in place.
+    # Cache the tuple consumed by the layer registry so the prepared fast path
+    # does not allocate two empty CUDA tensors and rebuild the same tuple for
+    # every GDN cache group on every verification round.
+    _prepared_spec_metadata_tensors: GDN_SPEC_METADATA_TENSORS | None = None
+
 
 @dataclass
 class GDNSpecDecodeStateContract:
@@ -1305,13 +1311,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 raise ValueError(
                     "Prepared DFlash2 GDN metadata does not belong to this builder"
                 )
-            register_gdn_spec_metadata_tensors(
-                self.layer_names,
-                gdn_spec_metadata_tensors(
+            prepared_tensors = prepared_dflash2_metadata._prepared_spec_metadata_tensors
+            if prepared_tensors is None:
+                prepared_tensors = gdn_spec_metadata_tensors(
                     prepared_dflash2_metadata,
                     query_start_loc.device,
-                ),
-            )
+                )
+                prepared_dflash2_metadata._prepared_spec_metadata_tensors = (
+                    prepared_tensors
+                )
+            register_gdn_spec_metadata_tensors(self.layer_names, prepared_tensors)
             return prepared_dflash2_metadata
         if fast_build and _dflash_ddtree_gdn_fast_build_enabled():
             fast_metadata = self._build_fast_pure_ddtree_full_graph(

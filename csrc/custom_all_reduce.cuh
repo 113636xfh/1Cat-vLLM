@@ -1522,7 +1522,11 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
+      // The push protocol amortizes its peer polling across the verifier's
+      // captured 128-call chain. A lone eager call is materially faster on
+      // the ordinary registered-buffer pull path.
       if (sm70_tp4_push_buffers_registered_ &&
+          status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           bytes == kSm70Tp4PushAllreduceBytes &&
           custom_allreduce_current_device_is_sm70()) {

@@ -29,6 +29,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_decode_paged_xqa_staged,
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
     m.def(
+        "grouped_verify_paged_fwd",
+        &flash_attention_grouped_verify_paged,
+        "Exact grouped DFlash2 verification over paged KV cache (Volta)");
+    m.def(
         "decode_paged_wmma_fwd",
         &flash_attention_decode_paged_wmma,
         "FlashAttention single-query decode through paged-prefill WMMA order (Volta)");

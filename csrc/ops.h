@@ -208,6 +208,32 @@ void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
                                          int64_t group_size, int64_t k_ld,
                                          int64_t q_ld);
 
+std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(
+    torch::Tensor weight_packed, torch::Tensor weight_scale);
+
+void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out,
+                              torch::Tensor input,
+                              torch::Tensor codes,
+                              torch::Tensor scales,
+                              double global_scale,
+                              int64_t split_k,
+                              int64_t accumulator_chains);
+
+void nvfp4_qpn2_gated_sm70_out(torch::Tensor out,
+                               torch::Tensor input,
+                               torch::Tensor codes,
+                               torch::Tensor scales,
+                               double global_scale,
+                               int64_t split_k,
+                               int64_t accumulator_chains);
+
+void nvfp4_qpn2_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
@@ -251,6 +277,39 @@ void fp8_gemm_sm70_out_meta(torch::Tensor out, torch::Tensor _in_feats,
 
 void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, int64_t k_ld, bool gated_silu);
+
+void sm70_f16_indexed_rerank_out(torch::Tensor out,
+                                 torch::Tensor _in_feats,
+                                 torch::Tensor _kernel,
+                                 torch::Tensor candidate_ids,
+                                 torch::Tensor selected_raw,
+                                 torch::Tensor selected_packed,
+                                 torch::Tensor expanded,
+                                 torch::Tensor partials,
+                                 torch::Tensor barriers,
+                                 int64_t cta_n,
+                                 int64_t split_k);
+
+void sm70_f16_indexed_rerank_packed_out(torch::Tensor out,
+                                        torch::Tensor _in_feats,
+                                        torch::Tensor _packed_kernel,
+                                        torch::Tensor candidate_ids,
+                                        torch::Tensor selected_packed,
+                                        torch::Tensor expanded,
+                                        torch::Tensor partials,
+                                        torch::Tensor barriers,
+                                        int64_t cta_n,
+                                        int64_t split_k);
+
+void sm70_f16_rerank_keys_out(torch::Tensor keys,
+                              torch::Tensor logits,
+                              torch::Tensor candidate_ids);
+
+void sm70_f16_rerank_topk_out(torch::Tensor values_out,
+                              torch::Tensor ids_out,
+                              torch::Tensor logits,
+                              torch::Tensor candidate_ids,
+                              int64_t vocab_start_index);
 
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,
                                torch::Tensor indices_out,

@@ -309,6 +309,34 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &fp8_gemm_sm70_prefill_prescaled_out);
 
   ops.def(
+      "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
+      "Tensor[]");
+  ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA,
+           &nvfp4_qpn2_prepare_sm70);
+
+  ops.def(
+      "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains) -> ()");
+  ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_gemm_sm70_out);
+
+  ops.def(
+      "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains) -> ()");
+  ops.impl("nvfp4_qpn2_gated_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_gated_sm70_out);
+
+  ops.def(
+      "nvfp4_qpn2_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains, Tensor tm_weight, Tensor tm_scales, "
+      "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn2_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_dispatch_sm70_out);
+
+  ops.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
       "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
@@ -360,6 +388,36 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "int k_ld, bool gated_silu) -> ()");
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
+
+  ops.def(
+      "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor candidate_ids, Tensor(b!) selected_raw, "
+      "Tensor(c!) selected_packed, Tensor(d!) expanded, Tensor(e!) partials, "
+      "Tensor(f!) barriers, int cta_n, int split_k) -> ()");
+  ops.impl("sm70_f16_indexed_rerank_out", torch::kCUDA,
+           &sm70_f16_indexed_rerank_out);
+
+  ops.def(
+      "sm70_f16_indexed_rerank_packed_out(Tensor(a!) out, "
+      "Tensor _in_feats, Tensor _packed_kernel, Tensor candidate_ids, "
+      "Tensor(b!) selected_packed, Tensor(c!) expanded, "
+      "Tensor(d!) partials, Tensor(e!) barriers, int cta_n, int split_k) "
+      "-> ()");
+  ops.impl("sm70_f16_indexed_rerank_packed_out", torch::kCUDA,
+           &sm70_f16_indexed_rerank_packed_out);
+
+  ops.def(
+      "sm70_f16_rerank_keys_out(Tensor(a!) keys, Tensor logits, "
+      "Tensor candidate_ids) -> ()");
+  ops.impl("sm70_f16_rerank_keys_out", torch::kCUDA,
+           &sm70_f16_rerank_keys_out);
+
+  ops.def(
+      "sm70_f16_rerank_topk_out(Tensor(a!) values_out, "
+      "Tensor(b!) ids_out, Tensor logits, Tensor candidate_ids, "
+      "int vocab_start_index) -> ()");
+  ops.impl("sm70_f16_rerank_topk_out", torch::kCUDA,
+           &sm70_f16_rerank_topk_out);
 
   ops.def(
       "sm70_f16_lm_head_top1_out(Tensor(a!) values_out, "

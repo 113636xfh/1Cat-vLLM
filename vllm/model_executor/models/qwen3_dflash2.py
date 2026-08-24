@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -17,6 +18,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
@@ -323,6 +325,48 @@ class CandidateSelector(nn.Module):
 
 class DFlash2Qwen3Model(DFlashQwen3Model):
     decoder_layer_cls = DFlash2Qwen3DecoderLayer
+
+    def _make_context_projection(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+    ) -> nn.Module:
+        use_sharded_fc = (
+            envs.VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC
+            and self.quant_config is None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and input_size == 25600
+            and output_size == 5120
+        )
+        if not use_sharded_fc:
+            return super()._make_context_projection(
+                vllm_config=vllm_config,
+                input_size=input_size,
+                output_size=output_size,
+                prefix=prefix,
+            )
+
+        projection = ColumnParallelLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            gather_output=True,
+            params_dtype=vllm_config.model_config.dtype,
+            quant_config=None,
+            prefix=prefix,
+            return_bias=False,
+        )
+        projection._sm70_f16_force_enable = True
+        logger.info_once(
+            "Using TP4 output-sharded DFlash2 target-hidden projection on SM70 "
+            "(25600->5120 plus compact all-gather)."
+        )
+        return projection
 
     def __init__(
         self,

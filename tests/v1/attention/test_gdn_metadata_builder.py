@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -41,9 +42,56 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
+from vllm.v1.worker.gpu.model_states import mamba_hybrid
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
+    """Flash-V100 metadata must not lazily copy seq_lens back from the GPU."""
+
+    captured_kwargs = None
+
+    def capture_build_attn_metadata(**kwargs):
+        nonlocal captured_kwargs
+        captured_kwargs = kwargs
+        return {}
+
+    monkeypatch.setattr(
+        mamba_hybrid,
+        "build_attn_metadata",
+        capture_build_attn_metadata,
+    )
+    state = object.__new__(MambaHybridModelState)
+    state.max_model_len = 4096
+    seq_lens_cpu_upper_bound = torch.tensor([130], dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=8,
+        num_reqs_after_padding=1,
+        num_tokens_after_padding=8,
+        query_start_loc_np=np.array([0, 8], dtype=np.int32),
+        num_scheduled_tokens=np.array([8], dtype=np.int32),
+        is_prefilling_np=np.array([False]),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([123], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        dcp_local_seq_lens=None,
+    )
+    state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        block_tables=(),
+        slot_mappings=torch.empty((0, 8), dtype=torch.int32),
+        attn_groups=[],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        for_capture=True,
+    )
+
+    assert captured_kwargs is not None
+    assert captured_kwargs["seq_lens_cpu_upper_bound"] is seq_lens_cpu_upper_bound
 
 
 @pytest.fixture
@@ -533,6 +581,19 @@ def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
         prepared_dflash2_metadata=prepared,
     )
     assert actual is prepared
+    cached_contract = prepared._prepared_spec_metadata_tensors
+    assert cached_contract is not None
+
+    replayed = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+        prepared_dflash2_metadata=prepared,
+    )
+    assert replayed is prepared
+    assert prepared._prepared_spec_metadata_tensors is cached_contract
 
     other_builder = _create_gdn_builder(
         local_gdn_model,

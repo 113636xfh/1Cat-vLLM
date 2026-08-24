@@ -453,9 +453,11 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.linear_attn.in_proj_qkvz"
     layer.weight = SimpleNamespace(shape=(4096, 5120))
-    assert not _is_sm70_fp8_qpn8_layer(layer)
+    assert _is_sm70_fp8_qpn8_layer(layer)
     layer.prefix = "model.language_model.layers.3.self_attn.qkv_proj"
     layer.weight = SimpleNamespace(shape=(3584, 5120))
+    assert _is_sm70_fp8_qpn8_layer(layer)
+    layer.weight_block_size = [64, 128]
     assert not _is_sm70_fp8_qpn8_layer(layer)
 
 
@@ -475,6 +477,8 @@ def test_fp8_qpn8_runtime_gate_uses_engine_contract_only(monkeypatch):
     vllm_config.scheduler_config.max_num_seqs = 8
     vllm_config.speculative_config = object()
     assert not _is_sm70_fp8_qpn8_runtime_contract()
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
+    assert _is_sm70_fp8_qpn8_runtime_contract()
 
 
 def test_fp8_prefill_exact_dense_workspace_is_bounded():

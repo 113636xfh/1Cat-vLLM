@@ -42734,3 +42734,31 @@ Interpretation:
   CUDA Graph launch. B10 has passed the pinned GSM8K-128 MTP4 gate at 122/128,
   with zero invalid or repetitive records; the next quality gate belongs to
   any high-concurrency scheduler candidate that survives full-model A/B/A.
+## 2026-08-24 MRV2 DFlash2 score-gated verifier promotion
+
+- The native Flash-V100 grouped verifier keeps all eight MRV2 target rows and
+  does not reuse DDTree indices. Its one-pass paged-GQA kernel is 0.356/1.214/
+  2.396 ms at 32K/128K/256K versus 1.024/3.021/6.011 ms for the previous XQA
+  verifier. Matched FULL-Graph endpoints reduce complete rounds from 36.311 to
+  26.361 ms at 32K and 69.855 to 40.778 ms at 128K; paired output and
+  acceptance counters match.
+- Two independent short-context traces of the complete pre-grouped bundle
+  measure 19.897/19.943 ms mean and 19.896/19.948 ms median. Their maxima are
+  20.099/20.146 ms, so this is a replicated mean/median sub-20 result, not an
+  all-tail claim.
+- The final quality contract is probabilistic sampling at T=1/top-p=.95/top-k
+  20/xhigh, maximum 2,048 tokens, and natural EOS. Greedy token identity is not
+  a hard gate. Grouped matches target-only at 83/96 across GSM8K, MATH-500, and
+  HumanEval, and at 25/32 on corrected MBPP. Paired McNemar p is 1.0 for both
+  aggregates. WikiText PPL changes 5.497872 -> 5.497376 (-0.0090%), so no
+  measured score or PPL regression remains.
+- The invalid raw-MBPP speed prompts omitted function names/tests and are
+  permanently excluded from intelligence claims. Official DFlash2 publishes
+  acceptance and throughput but not task pass@1; local target-only is the
+  quality baseline, while official acceptance is reference-only.
+- Audit disposition: the acceleration leaves remain explicit opt-ins and use
+  hardware, tensor layout, algorithm configuration, cache/graph, and bounded
+  concurrency contracts rather than model or checkpoint identity. The
+  recorded profile remains evidence for the measured workload, not a runtime
+  model whitelist. Full evidence is in
+  `docs/design/sm70_dflash2_target_graph_20ms.md`.
