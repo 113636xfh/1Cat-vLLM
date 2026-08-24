@@ -98,6 +98,7 @@ def _is_sm70_fp8_kv_decode_shape(
     vllm_config: VllmConfig,
     *,
     q_per_kv_values: tuple[int, ...],
+    cache_dtypes: tuple[str, ...] = ("fp8_e5m2",),
 ) -> bool:
     if vllm_config.speculative_config is not None:
         return False
@@ -109,7 +110,7 @@ def _is_sm70_fp8_kv_decode_shape(
         return False
 
     cache_config = getattr(vllm_config, "cache_config", None)
-    if getattr(cache_config, "cache_dtype", None) != "fp8_e5m2":
+    if getattr(cache_config, "cache_dtype", None) not in cache_dtypes:
         return False
 
     attention_config = getattr(vllm_config, "attention_config", None)
@@ -173,9 +174,13 @@ def _sm70_fp8_kv_batch_context_routing_enabled(
         or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
     ):
         return False
+    cache_dtypes: tuple[str, ...] = ("fp8_e5m2",)
+    if envs.VLLM_FLASH_V100_E4M3_BATCH_XQA:
+        cache_dtypes += ("fp8", "fp8_e4m3")
     return _is_sm70_fp8_kv_decode_shape(
         vllm_config,
         q_per_kv_values=(6,),
+        cache_dtypes=cache_dtypes,
     )
 
 

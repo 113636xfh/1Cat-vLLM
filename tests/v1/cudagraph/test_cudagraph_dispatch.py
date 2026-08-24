@@ -688,6 +688,63 @@ class TestCudagraphDispatcher:
         )
         assert variants[first_long:] == [CUDAGRAPH_VARIANT_LONG_CONTEXT] * 3
 
+    @pytest.mark.parametrize(
+        ("e4m3_enabled", "expected_routing"),
+        ((True, True), (False, False)),
+    )
+    def test_fp8_e4m3_batch_context_graph_routing_on_sm70(
+        self,
+        monkeypatch,
+        e4m3_enabled,
+        expected_routing,
+    ):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=16)
+        config.cache_config.cache_dtype = "fp8_e4m3"
+        config.attention_config.backend = None
+        config.model_config.max_model_len = 32768
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = e4m3_enabled
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            attention_context_len=16384,
+        )
+
+        assert dispatcher.sm70_fp8_kv_batch_context_routing is expected_routing
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(
+            num_tokens=8,
+            num_reqs=8,
+            uniform=True,
+            graph_variant=(
+                CUDAGRAPH_VARIANT_LONG_CONTEXT
+                if expected_routing
+                else CUDAGRAPH_VARIANT_DEFAULT
+            ),
+        )
+
     def test_fp8_e5m2_batch_context_graph_routing_rollback(self, monkeypatch):
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",

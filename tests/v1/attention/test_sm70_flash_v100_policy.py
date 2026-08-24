@@ -237,6 +237,22 @@ def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
 
 
+def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA is True
+    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is True
+
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "0")
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA is False
+    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is False
+
+
 def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     import vllm.envs as envs
 
@@ -1715,6 +1731,66 @@ def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("batch_size", "enabled", "expected_route"),
+    ((2, False, "scalar"), (2, True, "xqa"), (16, True, "xqa"), (17, True, "scalar")),
+)
+def test_flash_v100_e4m3_batched_xqa_is_exactly_gated(
+    monkeypatch, batch_size, enabled, expected_route
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1" if enabled else "0")
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e4m3",
+    )
+    calls: list[str] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append("xqa")
+        kwargs["out"].fill_(1)
+
+    def hit_scalar(*args, **kwargs):
+        calls.append("scalar")
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=batch_size,
+        block_table=torch.zeros((batch_size, 2), dtype=torch.int32),
+        seq_lens=torch.full((batch_size,), 16384, dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=16384,
+        flash_v100_decode_workspace_seq_capacity_hint=32768,
+        flash_v100_decode_active_num_partitions=torch.tensor([64], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=0.04, _v_scale_float=0.25)
+    query = torch.zeros((batch_size, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 2, 1568, 1, 256), dtype=torch.uint8)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == [expected_route]
+    assert torch.all(output == 1)
+
+
+@pytest.mark.parametrize(
     ("num_heads", "seq_len", "expected_route"),
     (
         (6, 4096, "scalar"),
@@ -1945,6 +2021,28 @@ def test_flash_v100_batch_context_routing_isolated_by_graph_variant(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "e4m3_enabled", "expected"),
+    (
+        ("fp8_e5m2", False, True),
+        ("fp8_e4m3", True, True),
+        ("fp8", True, True),
+        ("fp8_e4m3", False, False),
+        ("auto", True, False),
+    ),
+)
+def test_flash_v100_batch_context_routing_accepts_exact_fp8_xqa_formats(
+    monkeypatch,
+    cache_dtype,
+    e4m3_enabled,
+    expected,
+):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1" if e4m3_enabled else "0")
+    assert mod._batch_context_routing_cache_dtype_supported(cache_dtype) is expected
 
 
 @pytest.mark.parametrize("routing_enabled", (True, False))

@@ -148,6 +148,16 @@ bool xqa_g6_dual_cta_enabled() {
   return value != nullptr && value[0] == '1';
 }
 
+bool xqa_e4m3_batch_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_e4m3_batch_optimized_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED");
+  return value == nullptr || value[0] != '0';
+}
+
 bool xqa_e5m2_g6_dual_cta_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA");
   return value == nullptr || value[0] != '0';
@@ -572,13 +582,37 @@ fp8_e4m3fn_pair_to_half2_bits(const uint16_t raw_pair) {
           << 16);
 }
 
+__device__ __forceinline__ uint32_t
+fp8_e4m3fn_pair_to_half2_bits_fast(const uint16_t raw_pair) {
+  const uint8_t raw0 = static_cast<uint8_t>(raw_pair);
+  const uint8_t raw1 = static_cast<uint8_t>(raw_pair >> 8);
+  if ((raw0 & 0x7fu) == 0x7fu || (raw1 & 0x7fu) == 0x7fu) {
+    return fp8_e4m3fn_pair_to_half2_bits(raw_pair);
+  }
+
+  // Moving a finite E4M3 encoding into the corresponding fp16 sign,
+  // exponent, and mantissa fields represents exactly value / 256. A packed
+  // half2 multiply restores both values without per-byte exponent branches.
+  const uint32_t expanded = (static_cast<uint32_t>(raw_pair & 0x0080u) << 8) |
+                            (static_cast<uint32_t>(raw_pair & 0x007fu) << 7) |
+                            (static_cast<uint32_t>(raw_pair & 0x8000u) << 16) |
+                            (static_cast<uint32_t>(raw_pair & 0x7f00u) << 15);
+  union {
+    uint32_t u;
+    __half2 h2;
+  } converter;
+  converter.u = expanded;
+  converter.h2 = __hmul2(converter.h2, __float2half2_rn(256.0f));
+  return converter.u;
+}
+
 __device__ __forceinline__ uint4
 fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
   return make_uint4(
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 16)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 32)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
@@ -642,7 +676,7 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT, int NUM_THREADS,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16,
-          bool E5M2_PAIR_LOAD = false>
+          bool FP8_PAIR_LOAD = false>
 __device__ __forceinline__ void load_xqa_tc_kv_panel(
     __half* __restrict__ shared_kv, const void* __restrict__ kv_cache,
     const int* __restrict__ page_ids, const int valid_kv_tile_rows,
@@ -652,9 +686,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx = threadIdx.x) {
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
-  if constexpr (E5M2_PAIR_LOAD) {
-    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "Paired XQA loads are only valid for FP8 E5M2 KV");
+  if constexpr (FP8_PAIR_LOAD) {
+    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+                  "Paired XQA loads require FP8 KV");
     const int pair_stride = panel_d_stride_uint4 / 2;
     const int pair_count = valid_kv_tile_rows * pair_stride;
     for (int pair_idx = copy_thread_idx; pair_idx < pair_count;
@@ -693,10 +728,16 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const int shared_offset = row * kv_smem_stride_uint4 + vec_pair * 2;
       const uint64_t raw_lo =
           static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
-      shared_vec[shared_offset] = fp8_e5m2_vector_to_half8(raw_lo);
+      shared_vec[shared_offset] =
+          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+              ? fp8_e4m3fn_vector_to_half8(raw_lo)
+              : fp8_e5m2_vector_to_half8(raw_lo);
       const uint64_t raw_hi =
           static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
-      shared_vec[shared_offset + 1] = fp8_e5m2_vector_to_half8(raw_hi);
+      shared_vec[shared_offset + 1] =
+          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+              ? fp8_e4m3fn_vector_to_half8(raw_hi)
+              : fp8_e5m2_vector_to_half8(raw_hi);
     }
   } else {
     const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
@@ -1015,7 +1056,7 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM, int NUM_THREADS,
           int MIN_BLOCKS_PER_SM, int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           bool ALIGNED_PADDED_SMEM, int KV_DTYPE,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
-          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false>
+          bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false>
 __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     flash_attention_decode_xqa_tc_partition_kernel_256_wide(
         const __half* __restrict__ q, const void* __restrict__ k_cache,
@@ -1255,7 +1296,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         for (int panel_idx = 0; panel_idx < kNumQKPanels; ++panel_idx) {
           const int panel_offset = panel_idx * kQKPanelDim;
           load_xqa_tc_kv_panel<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, NUM_THREADS,
-                               KV_DTYPE, E5M2_PAIR_LOAD>(
+                               KV_DTYPE, FP8_PAIR_LOAD>(
               sK, k_cache, smem.page_ids, valid_kv_tile_rows,
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
@@ -1404,7 +1445,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int valid_kv_tile_rows =
             min(kXQATCBlockN, valid_k_rows - kv_tile_start);
         load_xqa_tc_kv_panel<BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT, NUM_THREADS,
-                             KV_DTYPE, E5M2_PAIR_LOAD>(
+                             KV_DTYPE, FP8_PAIR_LOAD>(
             sV, v_cache, smem.page_ids, valid_kv_tile_rows,
             pv_panel_d_stride_uint4, kv_smem_stride_uint4, tile_page_offset,
             kv_tile_start, block_size, kv_head_idx, v_block_stride,
@@ -2844,7 +2885,7 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           int BLOCK_SIZE = 0, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool ALIGNED_PADDED_SMEM = false,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
-          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false,
+          bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false,
           int KV_DTYPE_OVERRIDE = -1>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
@@ -2873,7 +2914,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,              \
             MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,             \
             ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,      \
-            PARTITION_PAGE_IDS, E5M2_PAIR_LOAD>;                               \
+            PARTITION_PAGE_IDS, FP8_PAIR_LOAD>;                                \
     cudaFuncSetAttribute(partition_kernel,                                     \
                          cudaFuncAttributeMaxDynamicSharedMemorySize,          \
                          shared_mem);                                          \
@@ -2886,7 +2927,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
         PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,                  \
         MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,                 \
         ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,          \
-        PARTITION_PAGE_IDS, E5M2_PAIR_LOAD>                                    \
+        PARTITION_PAGE_IDS, FP8_PAIR_LOAD>                                     \
         <<<partition_grid, NUM_THREADS, shared_mem, stream>>>(                 \
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),           \
             k_cache.data_ptr(), v_cache.data_ptr(),                            \
@@ -2904,14 +2945,12 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   } while (0)
 
   if constexpr (KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
-    static_assert(!E5M2_PAIR_LOAD,
-                  "E5M2 paired loads cannot be used for E4M3 KV");
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
                 "E4M3 XQA requires uint8 KV cache");
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
-  } else if constexpr (E5M2_PAIR_LOAD) {
+  } else if constexpr (FP8_PAIR_LOAD) {
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
-                "Paired XQA loads require FP8 E5M2 KV cache");
+                "Paired XQA loads require uint8 FP8 KV cache");
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
   } else if (k_cache.scalar_type() == at::kByte) {
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
@@ -3495,36 +3534,72 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
-    TORCH_CHECK(q.size(0) == 1 && q_per_kv == 6 &&
+    TORCH_CHECK((q.size(0) == 1 || (q.size(0) > 1 && q.size(0) <= 16 &&
+                                    xqa_e4m3_batch_enabled())) &&
+                    q_per_kv == 6 &&
                     (partition_size == 64 || partition_size == 128 ||
                      partition_size == 256),
-                "E4M3 XQA currently supports B=1, q_per_kv=6, D=256, and "
-                "partition_size in {64, 128, 256} only");
+                "E4M3 XQA supports B=1 by default, or B=2..16 when "
+                "VLLM_FLASH_V100_E4M3_BATCH_XQA=1; q_per_kv=6, D=256, and "
+                "partition_size in {64, 128, 256} are required");
+    const bool e4m3_batch_optimized =
+        q.size(0) > 1 && xqa_e4m3_batch_optimized_enabled() &&
+        k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+        k_cache.size(2) == 1 && k_cache.scalar_type() == at::kByte;
+    const XQABatchContextRoute e4m3_batch_route =
+        e4m3_batch_optimized && batch_context_max_seq_len > 0 && q.size(0) >= 4
+            ? select_xqa_batch_context_route(
+                  q.size(0), batch_context_max_seq_len, partition_size)
+            : XQABatchContextRoute::kDisabled;
+    const bool e4m3_dual_cta =
+        e4m3_batch_route == XQABatchContextRoute::kDualCta ||
+        e4m3_batch_route == XQABatchContextRoute::kDualCtaSplit;
+    const bool e4m3_split_reduce =
+        e4m3_batch_route == XQABatchContextRoute::kDualCtaSplit;
+    trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
+                                  partition_size, k_cache.size(1),
+                                  e4m3_batch_route);
+    const int split_reduce_dim_tile = xqa_split_reduce_dim_tile();
+
+#define LAUNCH_E4M3_BATCH_XQA(PARTITION)                                       \
+  do {                                                                         \
+    if (e4m3_dual_cta) {                                                       \
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<                     \
+          PARTITION, 6, true, kXQATCG6DualCtaThreads, 2, 0, false, false,      \
+          kXQARouteAllSeqLens, false, true, true,                              \
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(                                \
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,            \
+          max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale, \
+          v_scale, launch_num_partitions, e4m3_split_reduce,                   \
+          split_reduce_dim_tile, stream);                                      \
+    } else if (e4m3_batch_optimized) {                                         \
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<                     \
+          PARTITION, 6, true, kXQATC256WideThreads, 1, 0, false, false,        \
+          kXQARouteAllSeqLens, false, true, true,                              \
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(                                \
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,            \
+          max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale, \
+          v_scale, launch_num_partitions, false, split_reduce_dim_tile,        \
+          stream);                                                             \
+    } else {                                                                   \
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<                     \
+          PARTITION, 6, true, kXQATC256WideThreads, 1, 0, false, false,        \
+          kXQARouteAllSeqLens, false, false, false,                            \
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(                                \
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,            \
+          max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale, \
+          v_scale, launch_num_partitions, false, 8, stream);                   \
+    }                                                                          \
+  } while (0)
+
     if (partition_size == 64) {
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<
-          64, 6, true, kXQATC256WideThreads, 1, 0, false, false,
-          kXQARouteAllSeqLens, false, false, false,
-          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
-          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
-          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, false, 8, stream);
+      LAUNCH_E4M3_BATCH_XQA(64);
     } else if (partition_size == 128) {
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<
-          128, 6, true, kXQATC256WideThreads, 1, 0, false, false,
-          kXQARouteAllSeqLens, false, false, false,
-          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
-          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
-          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, false, 8, stream);
+      LAUNCH_E4M3_BATCH_XQA(128);
     } else {
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<
-          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
-          kXQARouteAllSeqLens, false, false, false,
-          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
-          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
-          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, false, 8, stream);
+      LAUNCH_E4M3_BATCH_XQA(256);
     }
+#undef LAUNCH_E4M3_BATCH_XQA
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
   }

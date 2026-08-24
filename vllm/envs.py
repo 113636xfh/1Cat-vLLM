@@ -212,6 +212,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
+    VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -395,6 +396,8 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
     VLLM_FLASH_V100_XQA_G6_DUAL_CTA: bool = False
     VLLM_FLASH_V100_XQA_SPLIT_REDUCE: bool = False
+    VLLM_FLASH_V100_E4M3_BATCH_XQA: bool = True
+    VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED: bool = True
     VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING: bool = True
     VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE: bool = False
     VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA: bool = True
@@ -1953,6 +1956,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TOPK_TOPP_8_WARPS": lambda: bool(
         int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))
     ),
+    # B8/B16 no-MTP Qwen3.8 decode uses one full-vocabulary row per request.
+    # Eight warps preserves Qrita's masking math while improving SM70
+    # reduction parallelism. Set to 0 to restore Triton's launch heuristic.
+    "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS": lambda: bool(
+        int(os.getenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1"))
+    ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
     # decode steps before collecting CPU-visible outputs; this changes queueing
@@ -2613,6 +2622,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))
+    ),
+    # Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the scalar
+    # paged decoder for matched control runs or emergency rollback.
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1"))
+    ),
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))
     ),
     "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))
