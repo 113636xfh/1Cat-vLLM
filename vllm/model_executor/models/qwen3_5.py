@@ -401,7 +401,48 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if self.use_split_input_projections:
+        if self.enable_sm70_qwen_gdn_qpn8_ba_split:
+            mixed_qkv = torch.empty(
+                (num_tokens, qkv_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            z = torch.empty(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            b = torch.empty(
+                (num_tokens, ba_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            a = torch.empty_like(b)
+            qkvz_staging = torch.empty(
+                (num_tokens, qkv_size + z_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            ba_staging = torch.empty(
+                (num_tokens, ba_size * 2),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            assert self.in_proj_ba is not None
+            torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out(
+                mixed_qkv,
+                z,
+                b,
+                a,
+                qkvz_staging,
+                ba_staging,
+                int(self.in_proj_qkvz.sm70_fp8_prefill_exact_dense_workspace_ptr),
+                hidden_states,
+                self.in_proj_qkvz.weight,
+                self.in_proj_qkvz.weight_scale_inv,
+                self.in_proj_ba.weight,
+            )
+        elif self.use_split_input_projections:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             assert self.in_proj_ba is not None
             ba, _ = self.in_proj_ba(hidden_states)

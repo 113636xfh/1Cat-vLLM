@@ -266,6 +266,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_qpn8_gemm_sm70_out", torch::kCUDA, &fp8_qpn8_gemm_sm70_out);
 
   ops.def(
+      "fp8_qpn8_gemm_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
+      "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor input, Tensor codes, "
+      "Tensor group_scales, Tensor ba_weight) -> ()");
+  ops.impl("fp8_qpn8_gemm_ba_split_sm70_out", torch::kCUDA,
+           &fp8_qpn8_gemm_ba_split_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_dispatch_ba_split_sm70_out(Tensor(a!) qkv_out, Tensor(b!) "
+      "z_out, Tensor(c!) b_out, Tensor(d!) a_out, Tensor(e!) qkvz_staging, "
+      "Tensor(f!) ba_staging, int dense_weight_ptr, Tensor input, Tensor "
+      "codes, Tensor group_scales, Tensor ba_weight) -> ()");
+  ops.impl("fp8_qpn8_dispatch_ba_split_sm70_out", torch::kCUDA,
+           &fp8_qpn8_dispatch_ba_split_sm70_out);
+
+  ops.def(
       "fp8_qpn8_gated_pair_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor codes, Tensor group_scales, int split_k, "
       "int accumulator_chains, bool fast_decoder, bool prefetch_codes) -> ()");

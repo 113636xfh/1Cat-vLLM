@@ -497,6 +497,8 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP: bool = False
     VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP: bool = False
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
+    VLLM_SM70_QWEN_GDN_QPN8_BA_SPLIT: bool = False
+    VLLM_SM70_QWEN_GDN_RMSNORM_ONEPASS: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
@@ -2968,6 +2970,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recurrent core in the latest split path.
     "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))
+    ),
+    # Exact-shape Qwen3.8 no-MTP GDN decode fusions. Keep an explicit rollback
+    # switch even after the endpoint speed and frozen-output gates pass.
+    "VLLM_SM70_QWEN_GDN_QPN8_BA_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_QPN8_BA_SPLIT", "0"))
+    ),
+    "VLLM_SM70_QWEN_GDN_RMSNORM_ONEPASS": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_RMSNORM_ONEPASS", "0"))
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
