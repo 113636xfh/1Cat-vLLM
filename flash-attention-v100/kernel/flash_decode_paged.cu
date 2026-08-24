@@ -609,6 +609,15 @@ fp8_e4m3fn_pair_to_half2_bits_fast(const uint16_t raw_pair) {
 __device__ __forceinline__ uint4
 fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
   return make_uint4(
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
+}
+
+__device__ __forceinline__ uint4
+fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
+  return make_uint4(
       fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw)),
       fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 16)),
       fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 32)),
@@ -730,13 +739,13 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
           static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
       shared_vec[shared_offset] =
           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8(raw_lo)
+              ? fp8_e4m3fn_vector_to_half8_fast(raw_lo)
               : fp8_e5m2_vector_to_half8(raw_lo);
       const uint64_t raw_hi =
           static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
       shared_vec[shared_offset + 1] =
           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8(raw_hi)
+              ? fp8_e4m3fn_vector_to_half8_fast(raw_hi)
               : fp8_e5m2_vector_to_half8(raw_hi);
     }
   } else {

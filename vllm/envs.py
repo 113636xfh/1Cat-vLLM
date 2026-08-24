@@ -1956,8 +1956,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TOPK_TOPP_8_WARPS": lambda: bool(
         int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))
     ),
-    # B8/B16 no-MTP Qwen3.8 decode uses one full-vocabulary row per request.
-    # Eight warps preserves Qrita's masking math while improving SM70
+    # The exact B8/B16, 248320-column sampler contract uses one logits row per
+    # request. Eight warps preserves Qrita's masking math while improving SM70
     # reduction parallelism. Set to 0 to restore Triton's launch heuristic.
     "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS": lambda: bool(
         int(os.getenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1"))

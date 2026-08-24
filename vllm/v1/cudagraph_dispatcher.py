@@ -99,6 +99,10 @@ def _is_sm70_fp8_kv_decode_shape(
     *,
     q_per_kv_values: tuple[int, ...],
     cache_dtypes: tuple[str, ...] = ("fp8_e5m2",),
+    backend_names: tuple[str, ...] = (
+        "FLASH_ATTN_V100",
+        "FLASHINFER_SM70",
+    ),
 ) -> bool:
     if vllm_config.speculative_config is not None:
         return False
@@ -116,10 +120,7 @@ def _is_sm70_fp8_kv_decode_shape(
     attention_config = getattr(vllm_config, "attention_config", None)
     attention_backend = getattr(attention_config, "backend", None)
     attention_backend_name = getattr(attention_backend, "name", attention_backend)
-    if attention_backend is not None and attention_backend_name not in (
-        "FLASH_ATTN_V100",
-        "FLASHINFER_SM70",
-    ):
+    if attention_backend is not None and attention_backend_name not in backend_names:
         return False
 
     model_config = vllm_config.model_config
@@ -174,13 +175,24 @@ def _sm70_fp8_kv_batch_context_routing_enabled(
         or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
     ):
         return False
-    cache_dtypes: tuple[str, ...] = ("fp8_e5m2",)
-    if envs.VLLM_FLASH_V100_E4M3_BATCH_XQA:
-        cache_dtypes += ("fp8", "fp8_e4m3")
+    cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+    cache_dtypes: tuple[str, ...]
+    backend_names: tuple[str, ...]
+    if cache_dtype in ("fp8", "fp8_e4m3"):
+        if not envs.VLLM_FLASH_V100_E4M3_BATCH_XQA:
+            return False
+        cache_dtypes = ("fp8", "fp8_e4m3")
+        # E4M3 batch-context variants exist to select Flash-V100 XQA launch
+        # routes. An explicit FlashInfer backend cannot consume that metadata.
+        backend_names = ("FLASH_ATTN_V100",)
+    else:
+        cache_dtypes = ("fp8_e5m2",)
+        backend_names = ("FLASH_ATTN_V100", "FLASHINFER_SM70")
     return _is_sm70_fp8_kv_decode_shape(
         vllm_config,
         q_per_kv_values=(6,),
         cache_dtypes=cache_dtypes,
+        backend_names=backend_names,
     )
 
 

@@ -42905,6 +42905,10 @@ Interpretation:
 
 ## 2026-08-24 Qwen3.8-27B NVFP4 no-MTP concurrency scaling
 
+- The heading names the matched performance workload, not an activation
+  identity. Runtime admission does not inspect a model name, checkpoint, or
+  architecture: it uses only SM70 capability, FP8 format, batch and tensor
+  shapes, paged-KV layout, graph context, and sampler operator settings.
 - Contract: four V100s with TP4, compressed-tensors NVFP4 weights, FP16
   activations, E4M3 FP8 KV cache, Flash-V100 attention, prefix caching, Mamba
   align mode, no speculation, and CUDA Graph decode sizes 1/2/4/8/16. The
@@ -42920,11 +42924,14 @@ Interpretation:
   CUDA Graph remains selected below 16K. `VLLM_FLASH_V100_E4M3_BATCH_XQA=0`
   restores scalar paged attention. The separate
   `VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED=0` switch retains XQA while
-  restoring scalar KV loads and baseline CTA routing.
-- Exact Qwen3.8 vocabulary rows at no-MTP B8/B16 now select eight Triton warps
-  for combined top-k/top-p masking. The operation and reduction math are
-  unchanged; `VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS=0` restores Triton's launch
-  heuristic. Existing MTP verifier-row tuning remains independently opt-in.
+  restoring scalar KV loads, the original E4M3 conversion, and baseline CTA
+  routing. B1 keeps the original converter regardless of this batch-only
+  optimization.
+- The exact 248,320-column, no-spec B8/B16 sampler contract now selects eight
+  Triton warps for combined top-k/top-p masking. The operation and reduction
+  math are unchanged; `VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS=0` restores Triton's
+  launch heuristic. Existing MTP verifier-row tuning remains independently
+  opt-in.
 - Development A/B on base `a8ce98ba34` measured the following median pure
   decode rates. The candidate includes batched XQA, eight-warp sampling, and
   the long-context graph variants.
@@ -42961,9 +42968,18 @@ Interpretation:
   B16 gap is 1.0%. Both therefore reach the revised near-FP8 scaling target;
   at 16K they exceed FP8 by 4.4% and 6.5%, respectively. Every timed request
   succeeded and produced its full 512-token cap without empty or replacement-
-  character output. The branch was then rebased without conflict onto
-  `onecat/main@6fc9fe9492`; the Flash-V100 and sampler source blobs are
-  byte-identical to the measured tree.
+  character output. The original implementation was rebased without conflict
+  onto `onecat/main@6fc9fe9492`; the Flash-V100 and sampler source blobs were
+  byte-identical to the measured tree. The final audit rebased the same two
+  commits onto `onecat/main@f6a5b57b64` after generic prefix-anchored SWA was
+  merged. `git range-diff` reports both patches as exactly equivalent. The
+  combined Flash-V100 extension builds for SM70, 24 focused E4M3/graph/sampler
+  policy tests pass, and all 32 prefix-anchored SWA CPU regressions remain
+  green. The audit also prevents E4M3-only Flash-V100 graph variants from
+  being captured for an explicitly selected FlashInfer backend. A
+  same-toolchain `cuobjdump` comparison against the prefix-anchored main build
+  finds all 115 common XQA kernel instances SASS-identical, with zero missing
+  or changed instances; the candidate adds only six batch-optimized instances.
 - GPU operator validation covers B2/B16 at partition sizes 64/128/256 plus
   B8/B16 long-context routing. All eight comparisons stay within one FP16 ULP
   of scalar paged attention with mean absolute error at most `1e-5`. Separate

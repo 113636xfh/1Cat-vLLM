@@ -745,6 +745,33 @@ class TestCudagraphDispatcher:
             ),
         )
 
+    def test_fp8_e4m3_batch_context_graph_routing_rejects_flashinfer(self, monkeypatch):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=16)
+        config.cache_config.cache_dtype = "fp8_e4m3"
+        config.attention_config.backend = "FLASHINFER_SM70"
+        config.model_config.max_model_len = 32768
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = True
+            dispatcher = CudagraphDispatcher(config)
+
+        assert not dispatcher.sm70_fp8_kv_batch_context_routing
+
     def test_fp8_e5m2_batch_context_graph_routing_rollback(self, monkeypatch):
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",
