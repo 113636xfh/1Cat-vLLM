@@ -1651,11 +1651,6 @@ def _dump(args: argparse.Namespace) -> int:
         args.cuda_profiler_capture_generate or capture_decode_after_prefix_warmup
     ):
         raise ValueError("CUDA-profiler capture does not support repeated requests")
-    if capture_decode_after_prefix_warmup and len(prompts) != 1:
-        raise ValueError(
-            "--cuda-profiler-capture-decode-after-prefix-warmup requires "
-            "exactly one prompt"
-        )
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -2605,9 +2600,9 @@ def _parse_args() -> argparse.Namespace:
         "--cuda-profiler-capture-decode-after-prefix-warmup",
         action="store_true",
         help=(
-            "Prime one prompt with prefix caching while the CUDA profiler is "
+            "Prime the prompts with prefix caching while the CUDA profiler is "
             "off, then capture only the second matching llm.generate call. "
-            "Requires one non-sequential prompt and CUDA graphs."
+            "Requires non-sequential prompts and CUDA graphs."
         ),
     )
     parser.add_argument("--max-tokens", type=int, default=16)
