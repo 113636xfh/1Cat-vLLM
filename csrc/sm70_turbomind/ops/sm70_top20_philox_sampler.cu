@@ -27,9 +27,8 @@ constexpr int kNativeUnroll = 4;
 constexpr int kMaxGeneratorOffsetsPerCurandCall = 4;
 
 __device__ __forceinline__ bool top1_better(float value, int token,
-                                             float best_value, int best_token) {
-  return value > best_value ||
-         (value == best_value && token < best_token);
+                                            float best_value, int best_token) {
+  return value > best_value || (value == best_value && token < best_token);
 }
 
 __device__ __forceinline__ float native_exponential_for_index(
@@ -72,20 +71,18 @@ __global__ void sm70_sample_sorted_top20_philox_kernel(
       if (position >= 0 && position < local_candidate_count) {
         const int64_t local_index = local_indices[position];
         if (local_index >= 0 && local_index < chunk_size) {
-          lane_token64 =
-              (position / kTopK) * chunk_size + local_index;
+          lane_token64 = (position / kTopK) * chunk_size + local_index;
         }
       }
     } else {
       lane_token64 = top_indices[lane];
     }
   }
-  const bool lane_valid = lane < kTopK && lane_token64 >= 0 &&
-                          lane_token64 < vocab_size;
+  const bool lane_valid =
+      lane < kTopK && lane_token64 >= 0 && lane_token64 < vocab_size;
   const int lane_token = lane_valid ? static_cast<int>(lane_token64) : -1;
   const float lane_raw_value = lane < kTopK ? top_values[lane] : -FLT_MAX;
-  const float lane_value =
-      isfinite(lane_raw_value) ? lane_raw_value : -FLT_MAX;
+  const float lane_value = isfinite(lane_raw_value) ? lane_raw_value : -FLT_MAX;
   const int valid_count = __popc(__ballot_sync(0xffffffff, lane_valid));
   int lane_rank = 0;
 #pragma unroll
@@ -179,12 +176,12 @@ void launch_sm70_sample_sorted_top20_philox(
     philox_args = cuda_generator->philox_cuda_state(counter_offset);
   }
 
-  sm70_sample_sorted_top20_philox_kernel<EmitMetadata, ChunkedIndices><<<
-      1, kWarpSize, 0, at::cuda::getCurrentCUDAStream()>>>(
-      sampled_token_out.data_ptr<int64_t>(), sparse_ids_out, sparse_probs_out,
-      top_values.data_ptr<float>(), top_indices, local_indices,
-      global_positions, local_candidate_count, chunk_size, vocab_size,
-      total_threads, static_cast<float>(top_p), philox_args);
+  sm70_sample_sorted_top20_philox_kernel<EmitMetadata, ChunkedIndices>
+      <<<1, kWarpSize, 0, at::cuda::getCurrentCUDAStream()>>>(
+          sampled_token_out.data_ptr<int64_t>(), sparse_ids_out,
+          sparse_probs_out, top_values.data_ptr<float>(), top_indices,
+          local_indices, global_positions, local_candidate_count, chunk_size,
+          vocab_size, total_threads, static_cast<float>(top_p), philox_args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -208,14 +205,13 @@ void sm70_sample_sorted_top20_philox_out(
   TORCH_CHECK(sampled_token_out.numel() == 1 &&
                   sparse_ids_out.numel() == kTopK &&
                   sparse_probs_out.numel() == kTopK &&
-                  top_values.numel() == kTopK &&
-                  top_indices.numel() == kTopK,
+                  top_values.numel() == kTopK && top_indices.numel() == kTopK,
               "sm70_sample_sorted_top20_philox_out: shape mismatch");
-  TORCH_CHECK(sampled_token_out.is_contiguous() &&
-                  sparse_ids_out.is_contiguous() &&
-                  sparse_probs_out.is_contiguous() &&
-                  top_values.is_contiguous() && top_indices.is_contiguous(),
-              "sm70_sample_sorted_top20_philox_out: tensors must be contiguous");
+  TORCH_CHECK(
+      sampled_token_out.is_contiguous() && sparse_ids_out.is_contiguous() &&
+          sparse_probs_out.is_contiguous() && top_values.is_contiguous() &&
+          top_indices.is_contiguous(),
+      "sm70_sample_sorted_top20_philox_out: tensors must be contiguous");
   TORCH_CHECK(vocab_size >= kTopK && top_p > 0.0 && top_p <= 1.0,
               "sm70_sample_sorted_top20_philox_out: invalid parameters");
 
@@ -231,20 +227,21 @@ void sm70_sample_sorted_top20_philox_token_out(
     torch::Tensor sampled_token_out, torch::Tensor top_values,
     torch::Tensor top_indices, const std::optional<at::Generator>& generator,
     int64_t vocab_size, double top_p) {
-  TORCH_CHECK(sampled_token_out.is_cuda() && top_values.is_cuda() &&
-                  top_indices.is_cuda(),
-              "sm70_sample_sorted_top20_philox_token_out: tensors must be CUDA");
+  TORCH_CHECK(
+      sampled_token_out.is_cuda() && top_values.is_cuda() &&
+          top_indices.is_cuda(),
+      "sm70_sample_sorted_top20_philox_token_out: tensors must be CUDA");
   TORCH_CHECK(sampled_token_out.scalar_type() == torch::kInt64 &&
                   top_values.scalar_type() == torch::kFloat32 &&
                   top_indices.scalar_type() == torch::kInt64,
               "sm70_sample_sorted_top20_philox_token_out: dtype mismatch");
-  TORCH_CHECK(sampled_token_out.numel() == 1 &&
-                  top_values.numel() == kTopK &&
+  TORCH_CHECK(sampled_token_out.numel() == 1 && top_values.numel() == kTopK &&
                   top_indices.numel() == kTopK,
               "sm70_sample_sorted_top20_philox_token_out: shape mismatch");
-  TORCH_CHECK(sampled_token_out.is_contiguous() && top_values.is_contiguous() &&
-                  top_indices.is_contiguous(),
-              "sm70_sample_sorted_top20_philox_token_out: tensors must be contiguous");
+  TORCH_CHECK(
+      sampled_token_out.is_contiguous() && top_values.is_contiguous() &&
+          top_indices.is_contiguous(),
+      "sm70_sample_sorted_top20_philox_token_out: tensors must be contiguous");
   TORCH_CHECK(vocab_size >= kTopK && top_p > 0.0 && top_p <= 1.0,
               "sm70_sample_sorted_top20_philox_token_out: invalid parameters");
 
@@ -260,25 +257,24 @@ void sm70_sample_chunked_top20_philox_token_out(
     torch::Tensor local_indices, torch::Tensor global_positions,
     const std::optional<at::Generator>& generator, int64_t vocab_size,
     double top_p, int64_t chunk_size) {
-  TORCH_CHECK(sampled_token_out.is_cuda() && global_values.is_cuda() &&
-                  local_indices.is_cuda() && global_positions.is_cuda(),
-              "sm70_sample_chunked_top20_philox_token_out: tensors must be CUDA");
+  TORCH_CHECK(
+      sampled_token_out.is_cuda() && global_values.is_cuda() &&
+          local_indices.is_cuda() && global_positions.is_cuda(),
+      "sm70_sample_chunked_top20_philox_token_out: tensors must be CUDA");
   TORCH_CHECK(sampled_token_out.scalar_type() == torch::kInt64 &&
                   global_values.scalar_type() == torch::kFloat32 &&
                   local_indices.scalar_type() == torch::kInt64 &&
                   global_positions.scalar_type() == torch::kInt64,
               "sm70_sample_chunked_top20_philox_token_out: dtype mismatch");
   TORCH_CHECK(sampled_token_out.numel() == 1 &&
-                  global_values.numel() == kTopK &&
-                  local_indices.dim() == 2 &&
+                  global_values.numel() == kTopK && local_indices.dim() == 2 &&
                   local_indices.size(1) == kTopK &&
                   global_positions.numel() == kTopK,
               "sm70_sample_chunked_top20_philox_token_out: shape mismatch");
-  TORCH_CHECK(sampled_token_out.is_contiguous() &&
-                  global_values.is_contiguous() &&
-                  local_indices.is_contiguous() &&
-                  global_positions.is_contiguous(),
-              "sm70_sample_chunked_top20_philox_token_out: tensors must be contiguous");
+  TORCH_CHECK(
+      sampled_token_out.is_contiguous() && global_values.is_contiguous() &&
+          local_indices.is_contiguous() && global_positions.is_contiguous(),
+      "sm70_sample_chunked_top20_philox_token_out: tensors must be contiguous");
   TORCH_CHECK(chunk_size > 0 &&
                   local_indices.size(0) * chunk_size == vocab_size &&
                   vocab_size >= kTopK && top_p > 0.0 && top_p <= 1.0,
@@ -287,7 +283,7 @@ void sm70_sample_chunked_top20_philox_token_out(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(global_values));
   launch_sm70_sample_sorted_top20_philox<false, true>(
       sampled_token_out, nullptr, nullptr, global_values, nullptr,
-      local_indices.data_ptr<int64_t>(),
-      global_positions.data_ptr<int64_t>(), local_indices.numel(),
-      static_cast<int>(chunk_size), generator, vocab_size, top_p);
+      local_indices.data_ptr<int64_t>(), global_positions.data_ptr<int64_t>(),
+      local_indices.numel(), static_cast<int>(chunk_size), generator,
+      vocab_size, top_p);
 }

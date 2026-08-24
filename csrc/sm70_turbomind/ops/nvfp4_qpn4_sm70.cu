@@ -55,12 +55,10 @@ __global__ void nvfp4_qpn4_prepack_codes_kernel(
   const int physical_k0 = physical_byte * 2;
   const int logical_k0 = logical_k_from_physical(physical_k0);
   const int logical_k1 = logical_k_from_physical(physical_k0 + 1);
-  const uint8_t lo = qweight[static_cast<size_t>(group * 16 + logical_k0) * n +
-                             col] &
-                     0x0fU;
-  const uint8_t hi = qweight[static_cast<size_t>(group * 16 + logical_k1) * n +
-                             col] &
-                     0x0fU;
+  const uint8_t lo =
+      qweight[static_cast<size_t>(group * 16 + logical_k0) * n + col] & 0x0fU;
+  const uint8_t hi =
+      qweight[static_cast<size_t>(group * 16 + logical_k1) * n + col] & 0x0fU;
   codes[index] = lo | (hi << 4);
 }
 
@@ -79,9 +77,8 @@ __global__ void nvfp4_qpn4_prepack_scales_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int col = tile * 32 + qpn_col_from_lane(lane);
-  packed_scales[index] = __hmul(
-      scales[static_cast<size_t>(group) * n + col],
-      __float2half_rn(kFp4Bias));
+  packed_scales[index] = __hmul(scales[static_cast<size_t>(group) * n + col],
+                                __float2half_rn(kFp4Bias));
 }
 
 __global__ void nvfp4_qpn4_prepack_scale_codes_kernel(
@@ -99,8 +96,7 @@ __global__ void nvfp4_qpn4_prepack_scale_codes_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int col = tile * 32 + qpn_col_from_lane(lane);
-  packed_scale_codes[index] =
-      scale_codes[static_cast<size_t>(group) * n + col];
+  packed_scale_codes[index] = scale_codes[static_cast<size_t>(group) * n + col];
 }
 
 __device__ __forceinline__ void fp4x8_to_half2x4(unsigned x, half2 out[4]) {
@@ -117,14 +113,14 @@ __device__ __forceinline__ void fp4x8_to_half2x4(unsigned x, half2 out[4]) {
   }
 }
 
-__device__ __forceinline__ void fp4x16_to_half2x8(uint2 packed,
-                                                   half2 out[8]) {
+__device__ __forceinline__ void fp4x16_to_half2x8(uint2 packed, half2 out[8]) {
   fp4x8_to_half2x4(packed.x, out);
   fp4x8_to_half2x4(packed.y, out + 4);
 }
 
-__device__ __forceinline__ half nvfp4_scale_code_to_half(
-    uint8_t scale_code, half scale_hi, half scale_lo) {
+__device__ __forceinline__ half nvfp4_scale_code_to_half(uint8_t scale_code,
+                                                         half scale_hi,
+                                                         half scale_lo) {
   // NVFP4 group scales are positive, normal E4M3FN values. Adding the bias
   // delta while shifting the E4M3 payload produces the exact FP16 value.
   const unsigned half_bits =
@@ -137,8 +133,8 @@ __device__ __forceinline__ half nvfp4_scale_code_to_half(
 template <bool UseScaleCode>
 __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
-    const void* __restrict__ packed_scales, half scale_hi, half scale_lo,
-    int n, int k) {
+    const void* __restrict__ packed_scales, half scale_hi, half scale_lo, int n,
+    int k) {
   const size_t word_index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t word_count = static_cast<size_t>(k) * n / 16;
@@ -155,14 +151,13 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
   half scale;
   if constexpr (UseScaleCode) {
     scale = nvfp4_scale_code_to_half(
-        reinterpret_cast<const uint8_t*>(packed_scales)[word_index],
-        scale_hi, scale_lo);
+        reinterpret_cast<const uint8_t*>(packed_scales)[word_index], scale_hi,
+        scale_lo);
   } else {
     scale = reinterpret_cast<const half*>(packed_scales)[word_index];
   }
   half2 weights[8];
-  fp4x16_to_half2x8(
-      reinterpret_cast<const uint2*>(codes)[word_index], weights);
+  fp4x16_to_half2x8(reinterpret_cast<const uint2*>(codes)[word_index], weights);
   const half2 scale2 = __halves2half2(scale, scale);
 #pragma unroll
   for (int pair = 0; pair < 8; ++pair) {
@@ -205,11 +200,12 @@ __global__ void nvfp4_qpn4_silu_and_mul_sm70_kernel(
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
 template <int SplitK, int NAcc, bool PrefetchCodes, bool UseScaleCode>
-__global__ void nvfp4_qpn4_sm70_kernel(
-    const uint8_t* __restrict__ codes,
-    const void* __restrict__ packed_scales,
-    half scale_hi, half scale_lo, const half* __restrict__ input,
-    half* __restrict__ output, int n, int k, int m) {
+__global__ void nvfp4_qpn4_sm70_kernel(const uint8_t* __restrict__ codes,
+                                       const void* __restrict__ packed_scales,
+                                       half scale_hi, half scale_lo,
+                                       const half* __restrict__ input,
+                                       half* __restrict__ output, int n, int k,
+                                       int m) {
   __shared__ float partials[SplitK][32];
 
   const int lane = threadIdx.x & 31;
@@ -224,8 +220,8 @@ __global__ void nvfp4_qpn4_sm70_kernel(
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const size_t scale_offset =
       static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half* scale_ptr = reinterpret_cast<const half*>(packed_scales) +
-                          scale_offset;
+  const half* scale_ptr =
+      reinterpret_cast<const half*>(packed_scales) + scale_offset;
   const uint8_t* scale_code_ptr =
       reinterpret_cast<const uint8_t*>(packed_scales) + scale_offset;
 
@@ -303,8 +299,7 @@ __global__ void nvfp4_qpn4_sm70_kernel(
 #pragma unroll
       for (int offset = 0; offset < 2; ++offset) {
         const int i = pair * 4 + offset;
-        const int output_col =
-            offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+        const int output_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
         partials[warp][quadpair * 8 + output_col] = accum[0][i];
       }
     }
@@ -323,8 +318,7 @@ __global__ void nvfp4_qpn4_sm70_kernel(
 
 template <int SplitK, int NAcc, bool PrefetchCodes, bool UseScaleCode>
 __global__ void nvfp4_qpn4_gated_sm70_kernel(
-    const uint8_t* __restrict__ codes,
-    const void* __restrict__ packed_scales,
+    const uint8_t* __restrict__ codes, const void* __restrict__ packed_scales,
     half scale_hi, half scale_lo, const half* __restrict__ input,
     half* __restrict__ output, int hidden, int k, int m) {
   __shared__ float partials[2][SplitK][32];
@@ -344,8 +338,8 @@ __global__ void nvfp4_qpn4_gated_sm70_kernel(
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const size_t scale_offset =
       static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half* scale_ptr = reinterpret_cast<const half*>(packed_scales) +
-                          scale_offset;
+  const half* scale_ptr =
+      reinterpret_cast<const half*>(packed_scales) + scale_offset;
   const uint8_t* scale_code_ptr =
       reinterpret_cast<const uint8_t*>(packed_scales) + scale_offset;
 
@@ -443,19 +437,18 @@ __global__ void nvfp4_qpn4_gated_sm70_kernel(
 }
 
 template <int SplitK, int NAcc, bool PrefetchCodes, bool UseScaleCode>
-void launch_qpn4(const uint8_t* codes, const void* scales,
-                 half scale_hi, half scale_lo, const half* input,
-                 half* output, int n, int k, int m, cudaStream_t stream) {
+void launch_qpn4(const uint8_t* codes, const void* scales, half scale_hi,
+                 half scale_lo, const half* input, half* output, int n, int k,
+                 int m, cudaStream_t stream) {
   nvfp4_qpn4_sm70_kernel<SplitK, NAcc, PrefetchCodes, UseScaleCode>
       <<<(n / 32), (32 * SplitK), 0, stream>>>(
           codes, scales, scale_hi, scale_lo, input, output, n, k, m);
 }
 
 template <int SplitK, int NAcc, bool PrefetchCodes, bool UseScaleCode>
-void launch_qpn4_gated(const uint8_t* codes, const void* scales,
-                       half scale_hi, half scale_lo, const half* input,
-                       half* output, int hidden, int k, int m,
-                       cudaStream_t stream) {
+void launch_qpn4_gated(const uint8_t* codes, const void* scales, half scale_hi,
+                       half scale_lo, const half* input, half* output,
+                       int hidden, int k, int m, cudaStream_t stream) {
   nvfp4_qpn4_gated_sm70_kernel<SplitK, NAcc, PrefetchCodes, UseScaleCode>
       <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
           codes, scales, scale_hi, scale_lo, input, output, hidden, k, m);
@@ -489,15 +482,16 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_sm70(torch::Tensor qweight,
       torch::TensorOptions().device(qweight.device()).dtype(torch::kUInt8));
   auto packed_scales = torch::empty_like(scales);
   const int64_t code_numel = packed_codes.numel();
-  const int code_blocks = static_cast<int>(
-      (code_numel + kPrepareThreads - 1) / kPrepareThreads);
+  const int code_blocks =
+      static_cast<int>((code_numel + kPrepareThreads - 1) / kPrepareThreads);
   nvfp4_qpn4_prepack_codes_kernel<<<code_blocks, kPrepareThreads, 0, stream>>>(
       packed_codes.data_ptr<uint8_t>(), qweight.data_ptr<uint8_t>(),
       static_cast<int>(k), static_cast<int>(n));
   const int64_t scale_numel = packed_scales.numel();
-  const int scale_blocks = static_cast<int>(
-      (scale_numel + kPrepareThreads - 1) / kPrepareThreads);
-  nvfp4_qpn4_prepack_scales_kernel<<<scale_blocks, kPrepareThreads, 0, stream>>>(
+  const int scale_blocks =
+      static_cast<int>((scale_numel + kPrepareThreads - 1) / kPrepareThreads);
+  nvfp4_qpn4_prepack_scales_kernel<<<scale_blocks, kPrepareThreads, 0,
+                                     stream>>>(
       reinterpret_cast<half*>(packed_scales.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
       static_cast<int>(k), static_cast<int>(n));
@@ -510,8 +504,7 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
   TORCH_CHECK(qweight.is_cuda() && scale_codes.is_cuda(),
               "nvfp4_qpn4_prepare_scale_code_sm70: tensors must be CUDA");
   TORCH_CHECK(qweight.scalar_type() == torch::kUInt8 &&
-                  scale_codes.scalar_type() ==
-                      at::ScalarType::Float8_e4m3fn,
+                  scale_codes.scalar_type() == at::ScalarType::Float8_e4m3fn,
               "nvfp4_qpn4_prepare_scale_code_sm70: expected uint8 weights and "
               "float8_e4m3fn scale codes");
   TORCH_CHECK(qweight.dim() == 2 && scale_codes.dim() == 2 &&
@@ -537,14 +530,14 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
       {k / 16, n},
       torch::TensorOptions().device(qweight.device()).dtype(torch::kUInt8));
   const int64_t code_numel = packed_codes.numel();
-  const int code_blocks = static_cast<int>(
-      (code_numel + kPrepareThreads - 1) / kPrepareThreads);
+  const int code_blocks =
+      static_cast<int>((code_numel + kPrepareThreads - 1) / kPrepareThreads);
   nvfp4_qpn4_prepack_codes_kernel<<<code_blocks, kPrepareThreads, 0, stream>>>(
       packed_codes.data_ptr<uint8_t>(), qweight.data_ptr<uint8_t>(),
       static_cast<int>(k), static_cast<int>(n));
   const int64_t scale_numel = packed_scale_codes.numel();
-  const int scale_blocks = static_cast<int>(
-      (scale_numel + kPrepareThreads - 1) / kPrepareThreads);
+  const int scale_blocks =
+      static_cast<int>((scale_numel + kPrepareThreads - 1) / kPrepareThreads);
   nvfp4_qpn4_prepack_scale_codes_kernel<<<scale_blocks, kPrepareThreads, 0,
                                           stream>>>(
       packed_scale_codes.data_ptr<uint8_t>(),
@@ -554,19 +547,18 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
   return {packed_codes, packed_scale_codes};
 }
 
-void nvfp4_qpn4_dequantize_sm70_out(
-    torch::Tensor out, torch::Tensor codes, torch::Tensor scales,
-    double global_scale, bool use_scale_code) {
+void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
+                                    torch::Tensor scales, double global_scale,
+                                    bool use_scale_code) {
   TORCH_CHECK(out.is_cuda() && codes.is_cuda() && scales.is_cuda(),
               "nvfp4_qpn4_dequantize_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
                   codes.scalar_type() == torch::kUInt8,
               "nvfp4_qpn4_dequantize_sm70_out: output must be FP16 and codes "
               "must be uint8");
-  TORCH_CHECK(
-      (use_scale_code && scales.scalar_type() == torch::kUInt8) ||
-          (!use_scale_code && scales.scalar_type() == torch::kFloat16),
-      "nvfp4_qpn4_dequantize_sm70_out: scale dtype mismatch");
+  TORCH_CHECK((use_scale_code && scales.scalar_type() == torch::kUInt8) ||
+                  (!use_scale_code && scales.scalar_type() == torch::kFloat16),
+              "nvfp4_qpn4_dequantize_sm70_out: scale dtype mismatch");
   TORCH_CHECK(out.dim() == 2 && codes.dim() == 2 && scales.dim() == 2 &&
                   out.is_contiguous() && codes.is_contiguous() &&
                   scales.is_contiguous(),
@@ -579,14 +571,13 @@ void nvfp4_qpn4_dequantize_sm70_out(
   const int64_t n = out.size(1);
   TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0,
               "nvfp4_qpn4_dequantize_sm70_out: shape alignment mismatch");
-  TORCH_CHECK(codes.numel() == k * n / 2 &&
-                  scales.numel() == k * n / 16,
+  TORCH_CHECK(codes.numel() == k * n / 2 && scales.numel() == k * n / 16,
               "nvfp4_qpn4_dequantize_sm70_out: packed tensor size mismatch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
   const int64_t word_count = k * n / 16;
-  const int blocks = static_cast<int>(
-      (word_count + kPrepareThreads - 1) / kPrepareThreads);
+  const int blocks =
+      static_cast<int>((word_count + kPrepareThreads - 1) / kPrepareThreads);
   const SplitHalfScale split_scale =
       split_half_scale(static_cast<float>(global_scale) * kFp4Bias);
   const half zero_scale = __float2half_rn(0.0f);
@@ -607,10 +598,10 @@ void nvfp4_qpn4_dequantize_sm70_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qpn4_prefill_sm70_out(
-    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor input,
-    torch::Tensor codes, torch::Tensor scales, double global_scale,
-    bool use_scale_code, bool gated_silu) {
+void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+                                 torch::Tensor input, torch::Tensor codes,
+                                 torch::Tensor scales, double global_scale,
+                                 bool use_scale_code, bool gated_silu) {
   TORCH_CHECK(input.is_cuda() && out.is_cuda(),
               "nvfp4_qpn4_prefill_sm70_out: input and output must be CUDA");
   TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
@@ -630,7 +621,7 @@ void nvfp4_qpn4_prefill_sm70_out(
   auto dense_weight = torch::from_blob(
       reinterpret_cast<void*>(dense_weight_ptr), {k, n}, input.options());
   nvfp4_qpn4_dequantize_sm70_out(dense_weight, codes, scales, global_scale,
-                                  use_scale_code);
+                                 use_scale_code);
   if (!gated_silu) {
     at::mm_out(out, input, dense_weight);
     return;
@@ -638,12 +629,11 @@ void nvfp4_qpn4_prefill_sm70_out(
 
   auto gate_up = at::mm(input, dense_weight);
   constexpr int kThreads = 256;
-  nvfp4_qpn4_silu_and_mul_sm70_kernel
-      <<<static_cast<int>(m), kThreads, 0,
-         at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(gate_up.data_ptr<at::Half>()),
-          static_cast<int>(m), static_cast<int>(n / 2));
+  nvfp4_qpn4_silu_and_mul_sm70_kernel<<<static_cast<int>(m), kThreads, 0,
+                                        at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(gate_up.data_ptr<at::Half>()),
+      static_cast<int>(m), static_cast<int>(n / 2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -651,9 +641,9 @@ void nvfp4_qpn4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               int64_t split_k, int64_t accumulator_chains,
                               bool prefetch_codes) {
-  TORCH_CHECK(out.is_cuda() && input.is_cuda() && codes.is_cuda() &&
-                  scales.is_cuda(),
-              "nvfp4_qpn4_gemm_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(
+      out.is_cuda() && input.is_cuda() && codes.is_cuda() && scales.is_cuda(),
+      "nvfp4_qpn4_gemm_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
                   input.scalar_type() == torch::kFloat16 &&
                   codes.scalar_type() == torch::kUInt8 &&
@@ -671,8 +661,8 @@ void nvfp4_qpn4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "nvfp4_qpn4_gemm_sm70_out: shape alignment mismatch");
   TORCH_CHECK(codes.numel() == k * n / 2 && scales.numel() == k * n / 16,
               "nvfp4_qpn4_gemm_sm70_out: packed tensor size mismatch");
-  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 10 ||
-                  split_k == 16 || split_k == 17,
+  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 10 || split_k == 16 ||
+                  split_k == 17,
               "nvfp4_qpn4_gemm_sm70_out: unsupported split_k");
   TORCH_CHECK((k / 16) % split_k == 0,
               "nvfp4_qpn4_gemm_sm70_out: invalid split_k for K");
@@ -689,22 +679,21 @@ void nvfp4_qpn4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
   const half zero_scale = __float2half_rn(0.0f);
 
-#define LAUNCH_QPN4(SPLIT, NACC, PREFETCH)                              \
-  launch_qpn4<SPLIT, NACC, PREFETCH, false>(                            \
+#define LAUNCH_QPN4(SPLIT, NACC, PREFETCH)                                \
+  launch_qpn4<SPLIT, NACC, PREFETCH, false>(                              \
       code_ptr, scale_ptr, zero_scale, zero_scale, input_ptr, output_ptr, \
-      static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),     \
-      stream)
-#define DISPATCH_NACC_PREFETCH(SPLIT)                         \
-  do {                                                        \
-    if (accumulator_chains == 1 && !prefetch_codes) {         \
-      LAUNCH_QPN4(SPLIT, 1, false);                           \
-    } else if (accumulator_chains == 2 && !prefetch_codes) {  \
-      LAUNCH_QPN4(SPLIT, 2, false);                           \
-    } else if (accumulator_chains == 1) {                     \
-      LAUNCH_QPN4(SPLIT, 1, true);                            \
-    } else {                                                  \
-      LAUNCH_QPN4(SPLIT, 2, true);                            \
-    }                                                         \
+      static_cast<int>(n), static_cast<int>(k), static_cast<int>(m), stream)
+#define DISPATCH_NACC_PREFETCH(SPLIT)                        \
+  do {                                                       \
+    if (accumulator_chains == 1 && !prefetch_codes) {        \
+      LAUNCH_QPN4(SPLIT, 1, false);                          \
+    } else if (accumulator_chains == 2 && !prefetch_codes) { \
+      LAUNCH_QPN4(SPLIT, 2, false);                          \
+    } else if (accumulator_chains == 1) {                    \
+      LAUNCH_QPN4(SPLIT, 1, true);                           \
+    } else {                                                 \
+      LAUNCH_QPN4(SPLIT, 2, true);                           \
+    }                                                        \
   } while (0)
   if (split_k == 4) {
     DISPATCH_NACC_PREFETCH(4);
@@ -726,9 +715,9 @@ void nvfp4_qpn4_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
                                int64_t split_k, int64_t accumulator_chains,
                                bool prefetch_codes) {
-  TORCH_CHECK(out.is_cuda() && input.is_cuda() && codes.is_cuda() &&
-                  scales.is_cuda(),
-              "nvfp4_qpn4_gated_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(
+      out.is_cuda() && input.is_cuda() && codes.is_cuda() && scales.is_cuda(),
+      "nvfp4_qpn4_gated_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
                   input.scalar_type() == torch::kFloat16 &&
                   codes.scalar_type() == torch::kUInt8 &&
@@ -764,22 +753,22 @@ void nvfp4_qpn4_gated_sm70_out(torch::Tensor out, torch::Tensor input,
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
   const half zero_scale = __float2half_rn(0.0f);
 
-#define LAUNCH_QPN4_GATED(SPLIT, NACC, PREFETCH)                        \
-  launch_qpn4_gated<SPLIT, NACC, PREFETCH, false>(                      \
+#define LAUNCH_QPN4_GATED(SPLIT, NACC, PREFETCH)                          \
+  launch_qpn4_gated<SPLIT, NACC, PREFETCH, false>(                        \
       code_ptr, scale_ptr, zero_scale, zero_scale, input_ptr, output_ptr, \
-      static_cast<int>(hidden), static_cast<int>(k),                     \
-      static_cast<int>(m), stream)
-#define DISPATCH_GATED_NACC_PREFETCH(SPLIT)                   \
-  do {                                                        \
-    if (accumulator_chains == 1 && !prefetch_codes) {         \
-      LAUNCH_QPN4_GATED(SPLIT, 1, false);                     \
-    } else if (accumulator_chains == 2 && !prefetch_codes) {  \
-      LAUNCH_QPN4_GATED(SPLIT, 2, false);                     \
-    } else if (accumulator_chains == 1) {                     \
-      LAUNCH_QPN4_GATED(SPLIT, 1, true);                      \
-    } else {                                                  \
-      LAUNCH_QPN4_GATED(SPLIT, 2, true);                      \
-    }                                                         \
+      static_cast<int>(hidden), static_cast<int>(k), static_cast<int>(m), \
+      stream)
+#define DISPATCH_GATED_NACC_PREFETCH(SPLIT)                  \
+  do {                                                       \
+    if (accumulator_chains == 1 && !prefetch_codes) {        \
+      LAUNCH_QPN4_GATED(SPLIT, 1, false);                    \
+    } else if (accumulator_chains == 2 && !prefetch_codes) { \
+      LAUNCH_QPN4_GATED(SPLIT, 2, false);                    \
+    } else if (accumulator_chains == 1) {                    \
+      LAUNCH_QPN4_GATED(SPLIT, 1, true);                     \
+    } else {                                                 \
+      LAUNCH_QPN4_GATED(SPLIT, 2, true);                     \
+    }                                                        \
   } while (0)
   if (split_k == 4) {
     DISPATCH_GATED_NACC_PREFETCH(4);
@@ -795,10 +784,12 @@ void nvfp4_qpn4_gated_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qpn4_gemm_scale_code_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
-    torch::Tensor scale_codes, double global_scale, int64_t split_k,
-    int64_t accumulator_chains, bool prefetch_codes) {
+void nvfp4_qpn4_gemm_scale_code_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor codes,
+                                         torch::Tensor scale_codes,
+                                         double global_scale, int64_t split_k,
+                                         int64_t accumulator_chains,
+                                         bool prefetch_codes) {
   TORCH_CHECK(out.is_cuda() && input.is_cuda() && codes.is_cuda() &&
                   scale_codes.is_cuda(),
               "nvfp4_qpn4_gemm_scale_code_sm70_out: tensors must be CUDA");
@@ -824,12 +815,11 @@ void nvfp4_qpn4_gemm_scale_code_sm70_out(
   TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0,
               "nvfp4_qpn4_gemm_scale_code_sm70_out: shape alignment "
               "mismatch");
-  TORCH_CHECK(codes.numel() == k * n / 2 &&
-                  scale_codes.numel() == k * n / 16,
+  TORCH_CHECK(codes.numel() == k * n / 2 && scale_codes.numel() == k * n / 16,
               "nvfp4_qpn4_gemm_scale_code_sm70_out: packed tensor size "
               "mismatch");
-  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 10 ||
-                  split_k == 16 || split_k == 17,
+  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 10 || split_k == 16 ||
+                  split_k == 17,
               "nvfp4_qpn4_gemm_scale_code_sm70_out: unsupported split_k");
   TORCH_CHECK((k / 16) % split_k == 0,
               "nvfp4_qpn4_gemm_scale_code_sm70_out: invalid split_k for K");
@@ -847,23 +837,22 @@ void nvfp4_qpn4_gemm_scale_code_sm70_out(
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
 
-#define LAUNCH_QPN4_LUT(SPLIT, NACC, PREFETCH)                         \
-  launch_qpn4<SPLIT, NACC, PREFETCH, true>(                            \
+#define LAUNCH_QPN4_LUT(SPLIT, NACC, PREFETCH)                             \
+  launch_qpn4<SPLIT, NACC, PREFETCH, true>(                                \
       code_ptr, scale_code_ptr, split_scale.hi, split_scale.lo, input_ptr, \
-      output_ptr,                                                       \
-      static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),    \
-      stream)
-#define DISPATCH_QPN4_LUT(SPLIT)                              \
-  do {                                                        \
-    if (accumulator_chains == 1 && !prefetch_codes) {         \
-      LAUNCH_QPN4_LUT(SPLIT, 1, false);                       \
-    } else if (accumulator_chains == 2 && !prefetch_codes) {  \
-      LAUNCH_QPN4_LUT(SPLIT, 2, false);                       \
-    } else if (accumulator_chains == 1) {                     \
-      LAUNCH_QPN4_LUT(SPLIT, 1, true);                        \
-    } else {                                                  \
-      LAUNCH_QPN4_LUT(SPLIT, 2, true);                        \
-    }                                                         \
+      output_ptr, static_cast<int>(n), static_cast<int>(k),                \
+      static_cast<int>(m), stream)
+#define DISPATCH_QPN4_LUT(SPLIT)                             \
+  do {                                                       \
+    if (accumulator_chains == 1 && !prefetch_codes) {        \
+      LAUNCH_QPN4_LUT(SPLIT, 1, false);                      \
+    } else if (accumulator_chains == 2 && !prefetch_codes) { \
+      LAUNCH_QPN4_LUT(SPLIT, 2, false);                      \
+    } else if (accumulator_chains == 1) {                    \
+      LAUNCH_QPN4_LUT(SPLIT, 1, true);                       \
+    } else {                                                 \
+      LAUNCH_QPN4_LUT(SPLIT, 2, true);                       \
+    }                                                        \
   } while (0)
   if (split_k == 4) {
     DISPATCH_QPN4_LUT(4);
@@ -911,8 +900,7 @@ void nvfp4_qpn4_gated_scale_code_sm70_out(
   TORCH_CHECK(k > 0 && k % 128 == 0 && hidden > 0 && hidden % 32 == 0,
               "nvfp4_qpn4_gated_scale_code_sm70_out: shape alignment "
               "mismatch");
-  TORCH_CHECK(codes.numel() == k * n / 2 &&
-                  scale_codes.numel() == k * n / 16,
+  TORCH_CHECK(codes.numel() == k * n / 2 && scale_codes.numel() == k * n / 16,
               "nvfp4_qpn4_gated_scale_code_sm70_out: packed tensor size "
               "mismatch");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 10 || split_k == 16,
@@ -933,23 +921,22 @@ void nvfp4_qpn4_gated_scale_code_sm70_out(
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
 
-#define LAUNCH_QPN4_GATED_LUT(SPLIT, NACC, PREFETCH)                   \
-  launch_qpn4_gated<SPLIT, NACC, PREFETCH, true>(                      \
+#define LAUNCH_QPN4_GATED_LUT(SPLIT, NACC, PREFETCH)                       \
+  launch_qpn4_gated<SPLIT, NACC, PREFETCH, true>(                          \
       code_ptr, scale_code_ptr, split_scale.hi, split_scale.lo, input_ptr, \
-      output_ptr,                                                       \
-      static_cast<int>(hidden), static_cast<int>(k),                    \
+      output_ptr, static_cast<int>(hidden), static_cast<int>(k),           \
       static_cast<int>(m), stream)
-#define DISPATCH_QPN4_GATED_LUT(SPLIT)                        \
-  do {                                                        \
-    if (accumulator_chains == 1 && !prefetch_codes) {         \
-      LAUNCH_QPN4_GATED_LUT(SPLIT, 1, false);                 \
-    } else if (accumulator_chains == 2 && !prefetch_codes) {  \
-      LAUNCH_QPN4_GATED_LUT(SPLIT, 2, false);                 \
-    } else if (accumulator_chains == 1) {                     \
-      LAUNCH_QPN4_GATED_LUT(SPLIT, 1, true);                  \
-    } else {                                                  \
-      LAUNCH_QPN4_GATED_LUT(SPLIT, 2, true);                  \
-    }                                                         \
+#define DISPATCH_QPN4_GATED_LUT(SPLIT)                       \
+  do {                                                       \
+    if (accumulator_chains == 1 && !prefetch_codes) {        \
+      LAUNCH_QPN4_GATED_LUT(SPLIT, 1, false);                \
+    } else if (accumulator_chains == 2 && !prefetch_codes) { \
+      LAUNCH_QPN4_GATED_LUT(SPLIT, 2, false);                \
+    } else if (accumulator_chains == 1) {                    \
+      LAUNCH_QPN4_GATED_LUT(SPLIT, 1, true);                 \
+    } else {                                                 \
+      LAUNCH_QPN4_GATED_LUT(SPLIT, 2, true);                 \
+    }                                                        \
   } while (0)
   if (split_k == 4) {
     DISPATCH_QPN4_GATED_LUT(4);
@@ -965,21 +952,21 @@ void nvfp4_qpn4_gated_scale_code_sm70_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qpn4_dispatch_sm70_out(
-    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor input,
-    torch::Tensor codes, torch::Tensor scales, double global_scale,
-    bool use_scale_code, bool gated_silu) {
+void nvfp4_qpn4_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+                                  torch::Tensor input, torch::Tensor codes,
+                                  torch::Tensor scales, double global_scale,
+                                  bool use_scale_code, bool gated_silu) {
   // Keep the dynamic-M decision inside the opaque operator so one compiled
   // graph can safely serve both M=1 decode and large-M prefill.
   if (input.size(0) == 1) {
     if (gated_silu) {
       TORCH_CHECK(use_scale_code,
                   "QPN4 gated decode requires E4M3 scale codes");
-      nvfp4_qpn4_gated_scale_code_sm70_out(
-          out, input, codes, scales, global_scale, 8, 2, false);
+      nvfp4_qpn4_gated_scale_code_sm70_out(out, input, codes, scales,
+                                           global_scale, 8, 2, false);
     } else if (use_scale_code) {
-      nvfp4_qpn4_gemm_scale_code_sm70_out(
-          out, input, codes, scales, global_scale, 17, 1, false);
+      nvfp4_qpn4_gemm_scale_code_sm70_out(out, input, codes, scales,
+                                          global_scale, 17, 1, false);
     } else {
       nvfp4_qpn4_gemm_sm70_out(out, input, codes, scales, 17, 1, false);
     }
@@ -991,10 +978,8 @@ void nvfp4_qpn4_dispatch_sm70_out(
 
 #ifdef VLLM_QPN4_STANDALONE
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
-  ops.def(
-      "nvfp4_qpn4_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
-  ops.impl("nvfp4_qpn4_prepare_sm70", torch::kCUDA,
-           &nvfp4_qpn4_prepare_sm70);
+  ops.def("nvfp4_qpn4_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
+  ops.impl("nvfp4_qpn4_prepare_sm70", torch::kCUDA, &nvfp4_qpn4_prepare_sm70);
   ops.def(
       "nvfp4_qpn4_prepare_scale_code_sm70(Tensor qweight, Tensor scale_codes) "
       "-> Tensor[]");
@@ -1004,8 +989,7 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "nvfp4_qpn4_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, int split_k, int accumulator_chains, "
       "bool prefetch_codes) -> ()");
-  ops.impl("nvfp4_qpn4_gemm_sm70_out", torch::kCUDA,
-           &nvfp4_qpn4_gemm_sm70_out);
+  ops.impl("nvfp4_qpn4_gemm_sm70_out", torch::kCUDA, &nvfp4_qpn4_gemm_sm70_out);
   ops.def(
       "nvfp4_qpn4_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, int split_k, int accumulator_chains, "

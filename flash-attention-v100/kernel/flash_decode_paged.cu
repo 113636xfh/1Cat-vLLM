@@ -537,8 +537,7 @@ __device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
       fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
 }
 
-__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(
-    const uint8_t raw) {
+__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(const uint8_t raw) {
   const uint16_t sign = static_cast<uint16_t>(raw & 0x80u) << 8;
   const uint8_t magnitude = raw & 0x7fu;
   const uint8_t exponent = magnitude >> 3;
@@ -563,17 +562,17 @@ __device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(
          static_cast<uint16_t>(mantissa << 7);
 }
 
-__device__ __forceinline__ uint32_t fp8_e4m3fn_pair_to_half2_bits(
-    const uint16_t raw_pair) {
+__device__ __forceinline__ uint32_t
+fp8_e4m3fn_pair_to_half2_bits(const uint16_t raw_pair) {
   return static_cast<uint32_t>(
              fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair))) |
-         (static_cast<uint32_t>(fp8_e4m3fn_to_half_bits(
-              static_cast<uint8_t>(raw_pair >> 8)))
+         (static_cast<uint32_t>(
+              fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair >> 8)))
           << 16);
 }
 
-__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8(
-    const uint64_t raw) {
+__device__ __forceinline__ uint4
+fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
   return make_uint4(
       fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
       fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
@@ -2361,8 +2360,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             route_seq_len_end, route_seq_len_final);                           \
   } while (0)
 
-  if constexpr (KV_DTYPE_OVERRIDE ==
-                flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+  if constexpr (KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     static_assert(!E5M2_PAIR_LOAD,
                   "E5M2 paired loads cannot be used for E4M3 KV");
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
@@ -2784,10 +2782,10 @@ at::Tensor flash_attention_decode_paged_xqa(
   const int q_per_kv = num_heads_q / num_heads_kv;
   TORCH_CHECK(q_per_kv == 4 || q_per_kv == 6 || q_per_kv == 8,
               "XQA decode supports q_per_kv in {4, 6, 8}, got ", q_per_kv);
-  TORCH_CHECK(
-      partition_size == 64 || partition_size == 128 || partition_size == 256 ||
-          partition_size == 512 || partition_size == 1024,
-      "Unsupported XQA decode partition_size: ", partition_size);
+  TORCH_CHECK(partition_size == 64 || partition_size == 128 ||
+                  partition_size == 256 || partition_size == 512 ||
+                  partition_size == 1024,
+              "Unsupported XQA decode partition_size: ", partition_size);
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
   TORCH_CHECK(tmp_out.dtype() == torch::kFloat16,

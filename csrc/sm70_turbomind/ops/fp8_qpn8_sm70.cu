@@ -111,8 +111,7 @@ __global__ void fp8_qpn8_channel_scale_sm70_kernel(
 
 __global__ void fp8_qpn8_dequantize_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
-    const half* __restrict__ group_scales, int n, int k,
-    bool channel_scales) {
+    const half* __restrict__ group_scales, int n, int k, bool channel_scales) {
   const size_t word_index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t word_count = static_cast<size_t>(n) * k / 16;
@@ -288,12 +287,10 @@ __global__ void fp8_qpn8_sm70_kernel(const uint8_t* __restrict__ codes,
   } else {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const int output_row =
-          (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
       const int output_col =
           (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[warp][output_row * 32 + quadpair * 8 + output_col] =
-          accum[0][i];
+      partials[warp][output_row * 32 + quadpair * 8 + output_col] = accum[0][i];
     }
   }
   __syncthreads();
@@ -439,20 +436,18 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
           const int i = pair * 4 + offset;
           const int output_col =
               offset | (((lane >> 1) & 1) << 1) | (pair << 2);
-          partials[projection][warp][quadpair * 8 + output_col] =
-              accum[0][i];
+          partials[projection][warp][quadpair * 8 + output_col] = accum[0][i];
         }
       }
     }
   } else {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const int output_row =
-          (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
       const int output_col =
           (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[projection][warp]
-              [output_row * 32 + quadpair * 8 + output_col] = accum[0][i];
+      partials[projection][warp][output_row * 32 + quadpair * 8 + output_col] =
+          accum[0][i];
     }
   }
   __syncthreads();
@@ -491,9 +486,8 @@ void launch_fp8_qpn8_gated_pair_sm70(const uint8_t* codes,
                                      bool channel_scales, cudaStream_t stream) {
   fp8_qpn8_gated_pair_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes,
                                   M1Only>
-      <<<(hidden / 32), (64 * SplitK), 0, stream>>>(codes, group_scales, input,
-                                                    output, hidden, k, m,
-                                                    channel_scales);
+      <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
+          codes, group_scales, input, output, hidden, k, m, channel_scales);
 }
 
 }  // namespace
@@ -552,7 +546,8 @@ std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
         reinterpret_cast<half*>(group_scales.data_ptr<at::Half>()),
         scales.data_ptr<float>(), static_cast<int>(n));
   } else {
-    fp8_qpn8_scale_sm70_kernel<<<scale_blocks, kQpn8PrepareThreads, 0, stream>>>(
+    fp8_qpn8_scale_sm70_kernel<<<scale_blocks, kQpn8PrepareThreads, 0,
+                                 stream>>>(
         reinterpret_cast<half*>(group_scales.data_ptr<at::Half>()),
         scales.data_ptr<float>(), static_cast<int>(n / 128),
         static_cast<int>(k / 128));
@@ -586,8 +581,8 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
               "fp8_qpn8_dequantize_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
-  const bool block_scales = group_scales.size(0) == k / 128 &&
-                            group_scales.size(1) == n / 32;
+  const bool block_scales =
+      group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_dequantize_sm70_out: scale shape mismatch");
 
@@ -680,12 +675,12 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
-  const bool block_scales = group_scales.size(0) == k / 128 &&
-                            group_scales.size(1) == n / 32;
+  const bool block_scales =
+      group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
-  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 ||
-                  split_k == 16 || split_k == 32,
+  TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
+                  split_k == 32,
               "fp8_qpn8_gemm_sm70_out: unsupported split_k");
   TORCH_CHECK((k / 16) % split_k == 0,
               "fp8_qpn8_gemm_sm70_out: K/16 must be divisible by split_k");
@@ -712,8 +707,8 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   // Keep the M=1 reduction order restricted to the two tuned output/down
   // projections. Extending it to the other split variants changed the frozen
   // random-sampling token stream without an end-to-end decode win.
-  if (m == 1 && accumulator_chains == 2 && fast_decoder &&
-      !prefetch_codes && (split_k == 12 || split_k == 16)) {
+  if (m == 1 && accumulator_chains == 2 && fast_decoder && !prefetch_codes &&
+      (split_k == 12 || split_k == 16)) {
     if (split_k == 12) {
       launch_fp8_qpn8_sm70<12, 2, true, false, true>(
           code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
@@ -827,8 +822,8 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gated_pair_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
-  const bool block_scales = group_scales.size(0) == k / 128 &&
-                            group_scales.size(1) == n / 32;
+  const bool block_scales =
+      group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gated_pair_sm70_out: scale shape mismatch");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 16,
@@ -855,9 +850,8 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   if (m == 1 && split_k == 8 && accumulator_chains == 2 && fast_decoder &&
       !prefetch_codes) {
     launch_fp8_qpn8_gated_pair_sm70<8, 2, true, false, true>(
-        code_ptr, scale_ptr, input_ptr, output_ptr,
-        static_cast<int>(hidden), static_cast<int>(k), 1, channel_scales,
-        stream);
+        code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(hidden),
+        static_cast<int>(k), 1, channel_scales, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
