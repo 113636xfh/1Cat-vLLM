@@ -518,3 +518,194 @@ SHA256 `70816f9655e36fcd04b07d75be1b3abafabc81a30c261d4fd99b06389cbf82a2`.
 The full SM70 SASS dump is byte-identical to the measured binary, with SHA256
 `b30031fa4f29181b8e1c757bc408c608bae97df380893e613b96a2cf7d3e9a51`;
 the differing full-ELF hash is build metadata, not device code.
+
+## 2026-08-25 No-MTP Long-Context Decode Acceptance
+
+### Contract and route
+
+The long-context gate keeps the accepted Qwen3.8-27B-NVFP4 computation and
+sampling paths unchanged. It uses four V100-SXM2-32GB GPUs with TP4,
+compressed-tensors weights, FP16 activations/output, E4M3 KV, TurboMind for
+the admitted FP8/NVFP4 projections, Flash-V100 attention, full CUDA Graph,
+prefix caching, aligned Mamba state, and no MTP. Each request ends at an exact
+128K or 256K context after 64 generated tokens. Pure decode is the 63 steady
+token intervals and excludes prefill and TTFT. The acceptance thresholds are
+60 tok/s at 128K and 45 tok/s at 256K.
+
+The new Flash-V100 route is restricted to batch one, G6/D256, 1,568-token
+interleaved paged KV, and E4M3. It selects p64 below 12,288 tokens, p256 below
+49,152, p512 below 98,304, p896 below 196,608, and p1664 thereafter. A single
+long-wave partition kernel and matching reducer select p512/p896/p1664 from
+device-resident sequence lengths, so CUDA Graph replay does not need a host
+readback or three long inactive launch pairs. The existing short p64/p256
+launch remains separate. Other batch sizes, KV formats, head layouts, page
+sizes, explicit partition overrides, and attention routes are unchanged.
+
+Full CUDA Graph capture has two semantic batch-one variants at the p512
+boundary. Contexts below 49,152 tokens replay the default graph, which contains
+only the p64/p256 launch and reducer pair. Contexts at or above 49,152 tokens
+replay the long-context graph, where `batch_context_routing` admits the wave
+launch and reducer pair. The dispatcher uses its existing host scheduler
+context length to select an already-captured graph; the attention kernel still
+reads the live sequence length from device memory. This keeps the 1K decode
+graph free of inactive long-wave launches without adding a device-to-host
+sequence-length readback.
+
+E4M3 conversion uses a 256-entry exact half-bit lookup table initialized in
+CTA shared memory. It adds 512 bytes of dynamic shared memory and avoids the
+long integer conversion chain on every KV element. The final SM70 cubin uses
+168 registers/thread and 32 bytes of stack for the 192-thread long-wave
+partition kernel; total dynamic shared memory is about 44.8 KiB, retaining two
+CTAs/SM. Its reducer uses 32 registers/thread and 80 bytes of static shared
+memory. The route is enabled with
+`VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO=1`,
+`VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS=1`, and
+`VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH=1`. Setting the wave flag to
+zero restores the prior p64/p256 policy. Setting the merged-launch flag to zero
+retains the wave thresholds but restores the separate long-wave launches.
+Setting the auto flag to zero restores the original explicit-partition route.
+
+### Exact endpoint result
+
+The control and candidate use the same model, projections, sampler, TP/GPU
+set, max length, input/output lengths, attention backend, KV type, graph mode,
+and no-MTP state. Only the Flash-V100 E4M3 attention partition policy changes.
+
+| Final context | Route | Prefill | TTFT | Pure TPOT | Steady decode | Target |
+|---:|---|---:|---:|---:|---:|---:|
+| 128K | p64/p256 control | 283.296 s | 283.327 s | 24.654 ms | 40.561 tok/s | 60 tok/s |
+| 128K | LUT merged-wave | 283.127 s | 283.154 s | **16.172 ms** | **61.834 tok/s** | pass, +3.06% |
+| 256K | p64/p256 control | 1085.628 s | 1085.673 s | 36.422 ms | 27.456 tok/s | 45 tok/s |
+| 256K | LUT merged-wave | 1085.519 s | 1085.568 s | **19.851 ms** | **50.376 tok/s** | pass, +11.95% |
+
+At 128K, throughput improves 52.45% and TPOT falls 34.40%. At 256K,
+throughput improves 83.48% and TPOT falls 45.50%. Both requests emitted all
+64 tokens, finished by length, and reported no corruption. The complete token
+streams are exactly unchanged from control: 128K SHA256 is
+`66a130ea9d68faaf40f7c7cfb942c579f759b9535394cce958699bd620df2d6f`;
+256K SHA256 is
+`e1bc9ab8a979e43cda22348c0ff0056b5a7c3212ba57e830b731f3cf51906524`.
+This is an attention-only optimization and does not credit a sampler change.
+
+The post-integration 1K regression guard keeps the accepted TurboMind
+projection routes, FlashQLA GDN BA-split route, official sampler, disabled
+compile cache, and 256 output tokens. After excluding the first cold request,
+the accepted GDN BA-split control is 83.761/83.721 tok/s and the
+graph-specialized candidate is 83.184/83.187 tok/s, a 0.66% median delta. All
+three candidate repetitions are token-for-token identical to one another and
+to that accepted GDN control; their compact token-list SHA256 is
+`c243818da5cced8b8653df4c441f713e978f8dfe7d8343d1b78c0eb3aeffe8ef`.
+The short default graph therefore removes the inactive long-wave pair without
+changing the admitted output stream or causing a material short-context
+regression. A cache-reload diagnostic is not used as quality evidence.
+
+### Operator and resource evidence
+
+A same-GPU operator A/B uses the production interleaved K/V layout. At 128K,
+the merged route takes 370.087 us versus 377.429 us for separate long-wave
+dispatch; at 256K it takes 599.839 us versus 611.925 us. The selected explicit
+p896/p1664 controls take 362.175/593.954 us respectively. Merged-route eager
+and CUDA Graph outputs are bit-exact to those explicit controls. The small
+remaining dispatch delta is preferable to three long kernel/reducer pairs in
+the captured full-model graph.
+
+The final 256K Nsight Systems CUDA-profiler-range trace uses the same
+production interleaved layout and final extension. The active merged p1664
+partition kernel takes 0.576603 ms and its reducer takes 0.033280 ms. The
+device-routed short guard kernel/reducer take 0.004544/0.003552 ms, for
+0.617979 ms across Flash attention kernels. The old p256 trace takes
+1.391781 ms in the partition kernel and 0.316769 ms in the reducer, or
+1.708550 ms total. The retained route therefore cuts traced Flash attention
+time by 63.83% (2.76x), while remaining bit-exact to the explicit p1664
+control. The trace is an isolated per-rank attention operator capture, not a
+full-model TPOT decomposition.
+
+During the exact decode windows NVML reports 100% GPU-busy duty on every rank.
+At 128K, memory-active duty averages about 48.2%, allocation is
+29.45-29.75 GiB/GPU, and mean power is 200.7-215.8 W. At 256K, memory-active
+duty averages about 45.5%, allocation is unchanged, and mean power is
+211.6-226.8 W. SM and memory clocks remain 1530/877 MHz. NVML memory-active
+duty is not achieved HBM bandwidth; exact SM, Tensor Core, occupancy, and DRAM
+counters remain unavailable because Nsight Compute returns
+`ERR_NVGPUCTRPERM` on this host.
+
+The production-layout correction is material: treating the unbound K/V views
+as contiguous produced full-model output corruption and is rejected. A QK
+software pipeline slowed the p896/p1664 kernels by roughly 30-38%; a split
+reducer did not beat the retained route; paired E4M3 conversion measured
+409.958/683.428 us at 128K/256K and lost to the shared LUT. All three
+experiments are absent from the admitted path.
+
+### Post-acceptance kernel headroom
+
+Three additional changes retain the same admitted route and the real unbound
+interleaved K/V views. First, the long-wave CTA stages its partition page IDs
+once instead of reloading them for every tile. Second, a strict host-side
+stride gate specializes the production `(blocks, 2, 1568, 1, 256).unbind(1)`
+layout: the physical block stride is `2 * 1568 * 256`, while token and head
+strides remain 256. Any other view uses the generic stride path. Third, the
+fixed-layout E4M3 PV loop reads adjacent shared-memory values as `half2` while
+retaining one FP32 FMA per dimension and the original token accumulation
+order. It only changes lane ownership and restores dimensions explicitly at
+the output store.
+
+Each stage was measured as a four-arm control/candidate/candidate/control A/B
+on one otherwise idle V100. Every arm contains five repetitions for each of
+three page-table layouts; the table reports the median of the ten samples per
+layout followed by the median across layouts. The exact partition-boundary
+companions at 131,071 and 262,080 tokens pass as well.
+
+| Exact context | Stage | Control | Candidate | Kernel delta |
+|---:|---|---:|---:|---:|
+| 128K | partition page IDs | 373.076 us | 368.604 us | -1.199% |
+| 256K | partition page IDs | 602.017 us | 594.632 us | -1.227% |
+| 128K | fixed interleaved stride | 370.102 us | 364.585 us | -1.491% |
+| 256K | fixed interleaved stride | 598.257 us | 587.909 us | -1.730% |
+| 128K | shared-V `half2` PV | 362.739 us | 348.265 us | -3.990% |
+| 256K | shared-V `half2` PV | 584.745 us | 558.515 us | -4.486% |
+
+All 12 sequence/layout cases have one output SHA256 across all four arms and
+are bit-exact to their explicit p896/p1664 controls (`max_abs=0`). The final
+partition kernel remains at 168 registers/thread and two CTAs/SM; the PV
+change removes the prior 32-byte stack frame. Relative to the fixed-stride
+binary, its static SASS instruction count falls from 2,424 to 2,248 and shared
+loads fall from 118 to 90, with the same 57 FFMA instructions. These are
+static cubin counts, not NCU throughput counters. The timed binary SHA256 is
+`43f742cc228100dd0a58aed37bf1cb6007447129bcf3f1d28148bee71b6ff2a5`.
+The clang-formatted final build SHA256 is
+`5e66a5331aaf83e5e15080c5122c78047b94d3cb47a721572613bbbba9172d47`;
+its target-kernel SASS is byte-identical to the timed build (normalized SASS
+SHA256 `0684d453072ed630aa68477b618ab4c090eb18c87422a6de90af3fd43740a1ee`)
+and its resource record is unchanged. The final build is bit-exact in eager
+and CUDA Graph replay at 128K/p896 and 256K/p1664 (`max_abs=0`); all eight
+parameterized page-1568 wave-boundary regressions pass.
+
+Applying the three independently matched operator ratios to the measured
+5.921/9.597 ms attention slices, while leaving the measured 10.251/10.253 ms
+non-attention residuals unchanged, projects 15.784 ms (63.354 tok/s) at 128K
+and 19.151 ms (52.216 tok/s) at 256K. These are decomposition-based
+projections, not replacement end-to-end measurements; the accepted measured
+endpoint remains 61.834/50.376 tok/s.
+
+A packed pair-LUT initialization experiment is rejected because it is about
+1.0-1.2% slower at 128K and 0.78% slower at 256K. Replacing constant division
+with compare/subtract address normalization passed 2,801,664 exhaustive host
+address checks and all GPU exactness cases but was statistically neutral. A
+scalar PV-accumulator rewrite removed the stack frame but was neutral or
+slower at 256K. None of these rejected variants is present in the admitted
+path.
+
+Primary retained evidence is:
+
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/e4m3_xqa_auto_single_p12288_long_i16k_64k_128k_256k_o64.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/e4m3_xqa_lut_merged_wave_p12288_long_i128k_256k_o64.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/telemetry/e4m3_xqa_lut_merged_wave_p12288_long_i128k_256k_o64.nvml.csv`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_lut_separate_same_gpu4.json`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_lut_merged_same_gpu4.json`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_wave_boundaries_graph_workspace.json`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fixed_stride/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fixed_stride_pv_half2/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_packed_lut/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fast_address/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/profiles/e4m3_xqa_final_merged_wave_p1664_l262144_nsys.nsys-rep`

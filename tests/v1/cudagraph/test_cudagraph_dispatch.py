@@ -745,6 +745,78 @@ class TestCudagraphDispatcher:
             ),
         )
 
+    @pytest.mark.parametrize(
+        ("auto_enabled", "wave_enabled", "expected_variant"),
+        (
+            (True, True, CUDAGRAPH_VARIANT_LONG_CONTEXT),
+            (False, True, CUDAGRAPH_VARIANT_DEFAULT),
+            (True, False, CUDAGRAPH_VARIANT_DEFAULT),
+        ),
+    )
+    def test_fp8_e4m3_b1_wave_graph_routing_on_sm70(
+        self,
+        monkeypatch,
+        auto_enabled,
+        wave_enabled,
+        expected_variant,
+    ):
+        monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
+        monkeypatch.setenv(
+            "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO",
+            "1" if auto_enabled else "0",
+        )
+        monkeypatch.setenv(
+            "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS",
+            "1" if wave_enabled else "0",
+        )
+        monkeypatch.setenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN", "49152")
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=16)
+        config.cache_config.cache_dtype = "fp8_e4m3"
+        config.attention_config.backend = None
+        config.model_config.max_model_len = 262144
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = True
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        mode, below = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=49151,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert below.graph_variant == CUDAGRAPH_VARIANT_DEFAULT
+
+        mode, at_boundary = dispatcher.dispatch(
+            num_tokens=1,
+            uniform_decode=True,
+            attention_context_len=49152,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert at_boundary.graph_variant == expected_variant
+        assert dispatcher.sm70_e4m3_b1_wave_context_routing is (
+            expected_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
+        )
+
     def test_fp8_e4m3_batch_context_graph_routing_rejects_flashinfer(self, monkeypatch):
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",
