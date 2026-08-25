@@ -846,6 +846,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
+            # [patch 2026-08-25] Let --cpu-offload-gb / --cpu-offload-params
+            # move the vision tower into pinned host RAM (UVA zero-copy).
+            from vllm.model_executor.offloader import get_offloader
+
+            self.visual = get_offloader().wrap_modules([self.visual])[0]
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
