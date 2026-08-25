@@ -117,6 +117,33 @@ vllm serve <target-model> \
   }'
 ```
 
+#### DFlash2 with n-gram assistance
+
+Set `ngram_assist` on a DFlash2 configuration to try prompt lookup before the
+neural DFlash2 query and selector. A full-width lookup hit skips that neural
+proposal work; a miss falls back to DFlash2. The target model still verifies
+every proposed token, including probabilistic sampling, so this does not
+change the target sampling distribution.
+
+```bash
+vllm serve <target-model> \
+  --speculative-config '{
+    "method": "dflash",
+    "model": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "probabilistic",
+    "ngram_assist": true,
+    "prompt_lookup_min": 5,
+    "prompt_lookup_max": 5
+  }'
+```
+
+This hybrid route currently requires `method=dflash` and a DFlash2 checkpoint.
+It is intentionally not enabled for DFlash1, Eagle, MTP, or
+`dflash_ddtree`. Structured-output requests bypass prompt lookup and continue
+through DFlash2 until grammar-aware proposal masking is available.
+
 #### Suffix decoding
 
 | Key | Type | Default | Meaning |

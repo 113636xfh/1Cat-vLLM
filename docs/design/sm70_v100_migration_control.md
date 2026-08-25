@@ -43045,3 +43045,21 @@ Interpretation:
   measured `10.58--10.65 s` cold; the identical prefix hit measured `1.405 s`.
   The older public server's nominal cold result may have retained an identical
   prefix, so only the fresh-server numbers are treated as strict cold evidence.
+
+## 2026-08-25 DFlash2 n-gram hybrid
+
+- Development is isolated on
+  `agent/v100-dflash2-ngram-hybrid-20260825-050018` and rebased onto the
+  restored `onecat/main@d62ef5cb20`; Draft PR #287 contains only the MRV2
+  DFlash2 dependency closure.
+- The opt-in assistant reads the authoritative UVA token state, uses the same
+  reverse-KMP policy as standalone vLLM n-gram lookup, skips DFlash2 query and
+  selector only on a full seven-token hit, and preserves context-KV
+  materialization. Misses remain on the unchanged DFlash2 route.
+- V100 unit coverage is 22/22, including probabilistic one-hot rejection,
+  mixed rows, overlap state, and the CUDA override kernel. Practical TP4 graph
+  startup with prefix cache, FP8 E5M2 KV, 256K max context, 4096 batched-token
+  limit, and tool/reasoning parsers is proven. The earlier 27--31 ms clean-main
+  measurements predate the merged production closure and are invalid as a
+  speed baseline; collect `ngram_assist=false/true` numbers from the same
+  restored build.

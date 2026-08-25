@@ -86,3 +86,18 @@ This work is based on `onecat/main` at
   `top_p=1.0/0.95`; existing DFlash2 CPU suite passes 61 tests with 12 expected
   CUDA skips, and the MRV2 route suite passes 10 tests. End-to-end model and
   dataset validation remain in progress.
+- The first practical TP4 CUDA Graph run used FP8 E5M2 target KV, FP16 draft
+  KV, 256K maximum context, 4096 maximum batched tokens, prefix caching, Mamba
+  alignment, and the Qwen tool/reasoning parsers. Repeated text reached 92 full
+  hits in 93 eligible rounds and a warmed `328.32 tok/s`; lookup itself averaged
+  about `0.018 ms` on TP0. A natural coding completion reached `148.89 tok/s`
+  with about 15% of rounds skipping the DFlash2 query/selector and average
+  accepted length near 3.9. These are route proofs, not the final paired speed
+  result: the existing public server uses additional uncommitted production
+  optimizations, so its `418.02 tok/s` repeated-text result is not a valid
+  baseline for this clean branch.
+- Existing same-sampling 16K natural-stop quality runs provide the target and
+  DFlash2 control. DFlash2 completed HumanEval32 in `374.08 s`, MBPP32 in
+  `363.19 s`, and LiveCodeBench16 in `885.02 s` (`1622.29 s`, or 27.04 minutes,
+  for 80 cases). A hybrid-only full rerun is therefore budgeted at roughly
+  25--28 minutes after the paired micro-suite passes.

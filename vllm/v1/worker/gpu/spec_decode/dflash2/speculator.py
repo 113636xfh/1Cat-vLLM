@@ -302,7 +302,9 @@ class DFlash2Speculator(DFlashSpeculator):
         self._ngram_rounds = 0
         self._ngram_skipped_rounds = 0
         speculative_config = getattr(self, "speculative_config", None)
-        if getattr(speculative_config, "ngram_assist", False):
+        if speculative_config is not None and getattr(
+            speculative_config, "ngram_assist", False
+        ):
             min_ngram = speculative_config.prompt_lookup_min
             max_ngram = speculative_config.prompt_lookup_max
             assert min_ngram is not None and max_ngram is not None
