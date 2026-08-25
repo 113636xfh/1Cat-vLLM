@@ -176,6 +176,20 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
         assert environment_variables[name]() == expected_int + 1
 
 
+def test_flash_v100_e4m3_page800_fastpath_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bool_defaults = {
+        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": True,
+        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": False,
+    }
+    for name, expected_bool in bool_defaults.items():
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is expected_bool
+        monkeypatch.setenv(name, "0" if expected_bool else "1")
+        assert environment_variables[name]() is not expected_bool
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 

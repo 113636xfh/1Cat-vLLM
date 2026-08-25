@@ -778,17 +778,20 @@ def test_sm70_flash_v100_fp8_e4m3_batched_g6_xqa_matches_scalar(
 
 
 @pytest.mark.parametrize("batch_size", (8, 16))
+@pytest.mark.parametrize("partition_size", (64, 128, 256))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_sm70_flash_v100_fp8_e4m3_batched_long_context_route_matches_scalar(
     monkeypatch,
     batch_size,
+    partition_size,
 ):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
 
     monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1")
     monkeypatch.delenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", raising=False)
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE", "0")
     flash_attn_v100 = pytest.importorskip("flash_attn_v100")
     torch.manual_seed(20260824 + batch_size)
     block_size = 800
@@ -797,17 +800,13 @@ def test_sm70_flash_v100_fp8_e4m3_batched_long_context_route_matches_scalar(
     max_seq_len = int(seq_lens_cpu.max().item())
     blocks_per_seq = (max_seq_len + block_size - 1) // block_size
     num_blocks = batch_size * blocks_per_seq
-    cache_shape = (num_blocks, block_size, 1, head_dim)
-    key_cache = (
+    cache_shape = (num_blocks, 2, block_size, 1, head_dim)
+    kv_cache = (
         torch.randn(cache_shape, dtype=torch.float16, device="cuda")
         .to(torch.float8_e4m3fn)
         .view(torch.uint8)
     )
-    value_cache = (
-        torch.randn(cache_shape, dtype=torch.float16, device="cuda")
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
-    )
+    key_cache, value_cache = kv_cache.unbind(1)
     query = torch.randn(
         batch_size,
         6,
@@ -838,18 +837,31 @@ def test_sm70_flash_v100_fp8_e4m3_batched_long_context_route_matches_scalar(
         partition_size_hint=256,
         **kwargs,
     )
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "0")
+    fallback = flash_attn_v100.flash_attn_decode_paged_xqa(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        partition_size_hint=partition_size,
+        batch_context_routing=True,
+        **kwargs,
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "1")
     actual = flash_attn_v100.flash_attn_decode_paged_xqa(
         query,
         key_cache,
         value_cache,
         block_table,
         seq_lens,
-        partition_size_hint=256,
+        partition_size_hint=partition_size,
         batch_context_routing=True,
         **kwargs,
     )
 
     torch.accelerator.synchronize()
+    assert torch.equal(actual, fallback)
     delta = (actual.float() - expected.float()).abs()
     positive = torch.full_like(expected, torch.inf)
     negative = torch.full_like(expected, -torch.inf)
