@@ -43105,6 +43105,7 @@ Interpretation:
   to `0.022538 ms` (`2.884x`). The full CUDA 12.8
   extension builds with target architecture 7.0 only; 28 CPU checks and the
   changed-file static gate pass.
+
 ## 2026-08-25 Qwen3.8-27B-NVFP4 no-MTP long-context decode
 
 - Frozen acceptance is TP4 on four V100-SXM2-32GB GPUs, E4M3 KV,
@@ -43169,3 +43170,11 @@ Interpretation:
   kernels by about 30-38%, and the paired converter loses to the exact shared
   LUT. Detailed evidence and rollback flags are in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.
+- The merge audit rebases this route onto `main@1ce39810b` and retains the
+  existing page-800 E4M3 specialization beside page 1568. The combined CUDA
+  12.8 build contains only SM70 cubins; three host CUDA Graph routing checks,
+  six page-800 V100 fallback comparisons, and eight page-1568 wave-boundary
+  comparisons pass. Both GPU suites require bitwise equality. Runtime source
+  admission remains limited to device capability, dtype, batch/head geometry,
+  cache strides, page size, graph semantics, and partition thresholds; no
+  model, checkpoint, `model_type`, or architecture identity is consulted.
