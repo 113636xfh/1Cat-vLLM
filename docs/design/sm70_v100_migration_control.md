@@ -43405,3 +43405,25 @@ Interpretation:
   contract, validate artifact self-consistency, and gate aggregate HumanEval,
   LongBench, GSM8K, and needle-retrieval quality. They report directional
   sample flips but do not treat greedy identity as task quality.
+
+## 2026-08-26 generic multimodal-tower UVA offload
+
+- PR #297 originally wrapped one named vision module by invoking the layer
+  offloader a second time. That form is not admitted: it is model-specific,
+  loses the tower prefix needed by `--cpu-offload-params visual`, and violates
+  the prefetch backend's single-call contract.
+- The accepted path is an engine-level component hook on every module recorded
+  by the existing multimodal tower lifecycle. UVA qualifies relative parameter
+  names with the recorded module path before applying exact segment matching;
+  layer-prefetch and no-op backends inherit a single-component no-op. Parameters
+  already visited through `make_layers()` are not copied or counted twice.
+- Admission uses only the configured offload backend and budget, the explicit
+  parameter-path selector, and the module's generic tower role. It never reads
+  a model name, checkpoint path, `model_type`, or architecture identity. With no
+  CPU-offload budget the global offloader remains a no-op.
+- The submitted V100 evidence reports about 0.78 GiB additional device memory
+  per rank, a 152,056-token KV pool, and successful 151,296-token context on
+  two 16-GiB V100 ranks. Text-only decode does not execute the tower; image
+  prefill accepts the expected PCIe/UVA cost. This is capacity evidence, not a
+  general throughput claim, so the route remains explicitly configured rather
+  than becoming an unconditional default.
