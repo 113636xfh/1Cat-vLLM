@@ -736,10 +736,9 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
                     BLOCK_SIZE == 800 || BLOCK_SIZE == 1568 ||
                     BLOCK_SIZE == 1648 || BLOCK_SIZE == 3296,
                 "Unsupported paged-KV block-size specialization");
-  static_assert(
-      !CONTIGUOUS_HKV1_LAYOUT || BLOCK_SIZE == 16 || BLOCK_SIZE == 800 ||
-          BLOCK_SIZE == 1568,
-      "The fixed-stride Hkv=1 layout requires a specialized page");
+  static_assert(!CONTIGUOUS_HKV1_LAYOUT || BLOCK_SIZE == 16 ||
+                    BLOCK_SIZE == 800 || BLOCK_SIZE == 1568,
+                "The fixed-stride Hkv=1 layout requires a specialized page");
   int logical_block;
   int block_offset;
   if constexpr (BLOCK_SIZE == 16) {
@@ -770,9 +769,9 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     constexpr int64_t kHeadDim = 256;
     constexpr int64_t kBlockStride =
         BLOCK_SIZE == 16 ? 16 * kHeadDim : 2 * BLOCK_SIZE * kHeadDim;
-    physical_offset =
-        static_cast<int64_t>(physical_block) * kBlockStride +
-        static_cast<int64_t>(block_offset) * kHeadDim + panel_offset;
+    physical_offset = static_cast<int64_t>(physical_block) * kBlockStride +
+                      static_cast<int64_t>(block_offset) * kHeadDim +
+                      panel_offset;
   } else {
     physical_offset = static_cast<int64_t>(physical_block) * block_stride +
                       static_cast<int64_t>(block_offset) * token_stride +
