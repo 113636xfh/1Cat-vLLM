@@ -95,6 +95,13 @@ def _fill_short_context_topk_indices(
     )
 
 
+def _can_skip_static_short_indexer_cache(
+    compressed_max_model_len: int, topk_tokens: int
+) -> bool:
+    """Whether the indexer cache is unreachable for the whole server."""
+    return compressed_max_model_len <= topk_tokens
+
+
 def _is_exact_sm70_cuda() -> bool:
     return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
@@ -429,35 +436,36 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         if self.indexer is not None:
             indexer = self.indexer
+            if not indexer.skip_unused_static_short_path:
 
-            def indexer_weights_proj() -> torch.Tensor:
-                output = maybe_sm70_dsv4_fp16_gemv(
-                    hidden_states,
-                    indexer.weights_proj.weight,
-                    hidden_states.dtype,
-                )
-                if output is not None:
-                    return output
-                # ReplicatedLinear returns (output, bias); bias is None.
-                weights, _ = indexer.weights_proj(hidden_states)
-                return weights
+                def indexer_weights_proj() -> torch.Tensor:
+                    output = maybe_sm70_dsv4_fp16_gemv(
+                        hidden_states,
+                        indexer.weights_proj.weight,
+                        hidden_states.dtype,
+                    )
+                    if output is not None:
+                        return output
+                    # ReplicatedLinear returns (output, bias); bias is None.
+                    weights, _ = indexer.weights_proj(hidden_states)
+                    return weights
 
-            def indexer_compressor_kv_score() -> torch.Tensor:
-                output = maybe_sm70_dsv4_fp16_gemv(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight,
-                    torch.float32,
-                )
-                if output is not None:
-                    return output
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                def indexer_compressor_kv_score() -> torch.Tensor:
+                    output = maybe_sm70_dsv4_fp16_gemv(
+                        hidden_states,
+                        indexer.compressor.fused_wkv_wgate.weight,
+                        torch.float32,
+                    )
+                    if output is not None:
+                        return output
+                    return torch.mm(
+                        hidden_states,
+                        indexer.compressor.fused_wkv_wgate.weight.T,
+                        out_dtype=torch.float32,
+                    )
 
-            aux_fns[1] = indexer_weights_proj
-            aux_fns[2] = indexer_compressor_kv_score
+                aux_fns[1] = indexer_weights_proj
+                aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
             # MergedColumnParallelLinear returns (output, bias); bias is None.
@@ -860,6 +868,19 @@ class DeepseekV4Indexer(nn.Module):
         self.max_model_len = (
             vllm_config.model_config.max_model_len // self.compress_ratio
         )
+        self.skip_unused_static_short_path = bool(
+            envs.VLLM_SM70_DSV4_STATIC_SHORT_INDEXER_SKIP
+            and _can_skip_static_short_indexer_cache(
+                self.max_model_len, self.topk_tokens
+            )
+        )
+        if self.skip_unused_static_short_path:
+            logger.info_once(
+                "SM70 DeepSeek V4 static short-indexer cache skip enabled "
+                "(compressed max length %d <= top-k %d).",
+                self.max_model_len,
+                self.topk_tokens,
+            )
         self.prefix = prefix
 
         self.max_total_seq_len = (
@@ -914,8 +935,8 @@ class DeepseekV4Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
-        compressed_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        compressed_kv_score: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
@@ -925,7 +946,9 @@ class DeepseekV4Indexer(nn.Module):
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
             if indexer_metadata.compressed_max_seq_len <= self.topk_tokens:
-                compressor(compressed_kv_score, positions, rotary_emb)
+                if not self.skip_unused_static_short_path:
+                    assert compressed_kv_score is not None
+                    compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
@@ -941,6 +964,13 @@ class DeepseekV4Indexer(nn.Module):
                         num_warps=8,
                     )
                 return self.topk_indices_buffer
+
+        if self.skip_unused_static_short_path:
+            raise RuntimeError(
+                "Static short-indexer skip invariant was violated at runtime."
+            )
+        assert compressed_kv_score is not None
+        assert indexer_weights is not None
 
         def wq_b_and_q_quant():
             # ReplicatedLinear returns (output, bias); bias is None.

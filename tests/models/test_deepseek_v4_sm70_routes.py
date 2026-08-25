@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -53,6 +54,81 @@ def test_sm70_selects_triton_sparse_impl():
     )
     with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
+
+
+def test_static_short_indexer_cache_skip_requires_full_context_bound():
+    from vllm.models.deepseek_v4.attention import (
+        _can_skip_static_short_indexer_cache,
+    )
+
+    assert _can_skip_static_short_indexer_cache(2048, 2048)
+    assert _can_skip_static_short_indexer_cache(32, 2048)
+    assert not _can_skip_static_short_indexer_cache(2049, 2048)
+
+
+def test_static_short_indexer_skip_omits_unreachable_input_gemms():
+    from vllm.models.deepseek_v4 import attention
+
+    hidden_states = torch.ones((1, 4), dtype=torch.float16)
+    projected = hidden_states + 1
+    wrapper = SimpleNamespace(
+        aux_stream_list=[object(), object(), object()],
+        compressor=None,
+        indexer=SimpleNamespace(skip_unused_static_short_path=True),
+        fused_wqa_wkv=MagicMock(return_value=(projected, None)),
+        ln_events=[object(), object(), object(), object()],
+    )
+    recorded_aux_fns = None
+
+    def fake_execute(main_fn, aux_fns, *args, **kwargs):
+        del args, kwargs
+        nonlocal recorded_aux_fns
+        recorded_aux_fns = aux_fns
+        return main_fn(), tuple(fn() if fn is not None else None for fn in aux_fns)
+
+    method = (
+        attention.DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
+    )
+    with patch.object(attention, "execute_in_parallel", fake_execute):
+        result = method(wrapper, hidden_states)
+
+    assert recorded_aux_fns == [None, None, None]
+    torch.testing.assert_close(result[0], projected)
+    assert result[1:] == (None, None, None)
+
+
+def test_static_short_indexer_skip_omits_unreachable_cache_write():
+    from vllm.models.deepseek_v4 import attention
+
+    topk_indices = torch.empty((1, 4), dtype=torch.int32)
+    indexer = SimpleNamespace(
+        compressor=MagicMock(),
+        k_cache=SimpleNamespace(prefix="indexer_cache"),
+        topk_tokens=4,
+        skip_unused_static_short_path=True,
+        topk_indices_buffer=topk_indices,
+        compress_ratio=1,
+    )
+    metadata = SimpleNamespace(
+        compressed_max_seq_len=4,
+        num_decode_tokens=0,
+        num_prefill_tokens=0,
+    )
+    context = SimpleNamespace(attn_metadata={"indexer_cache": metadata})
+
+    with patch.object(attention, "get_forward_context", return_value=context):
+        result = attention.DeepseekV4Indexer.forward(
+            indexer,
+            hidden_states=torch.empty((0, 4)),
+            qr=torch.empty((0, 4)),
+            compressed_kv_score=None,
+            indexer_weights=None,
+            positions=torch.empty(0, dtype=torch.int64),
+            rotary_emb=MagicMock(),
+        )
+
+    assert result is topk_indices
+    indexer.compressor.assert_not_called()
 
 
 def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
