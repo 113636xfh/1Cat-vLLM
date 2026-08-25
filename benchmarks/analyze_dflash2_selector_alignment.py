@@ -323,6 +323,27 @@ def summarize(pattern: str, top_n: int) -> dict[str, Any]:
     }
     current_tune = tune_results[0]["completion_length_proxy"]
     current_holdout = holdout_by_name["current"]["completion_length_proxy"]
+    position_policy = []
+    position_tune_overlaps = []
+    position_holdout_overlaps = []
+    for position in range(records[0].candidate_ids.shape[0]):
+        best = max(
+            tune_results,
+            key=lambda result: result["mean_overlap_by_position"][position],
+        )
+        holdout_best = holdout_by_name[best["config"]["name"]]
+        position_policy.append(
+            {
+                "position": position,
+                "config": best["config"],
+                "tune_overlap": best["mean_overlap_by_position"][position],
+                "holdout_overlap": holdout_best["mean_overlap_by_position"][position],
+            }
+        )
+        position_tune_overlaps.append(best["mean_overlap_by_position"][position])
+        position_holdout_overlaps.append(
+            holdout_best["mean_overlap_by_position"][position]
+        )
     ranked = sorted(
         tune_results[1:],
         key=lambda result: result["completion_length_proxy"],
@@ -364,6 +385,18 @@ def summarize(pattern: str, top_n: int) -> dict[str, Any]:
             "tune": tune_results[0],
             "holdout": holdout_by_name["current"],
         },
+        "position_policy": {
+            "selection": "best tune overlap independently at each depth",
+            "rows": position_policy,
+            "tune_completion_length_proxy": _completion_proxy(position_tune_overlaps),
+            "tune_delta": (_completion_proxy(position_tune_overlaps) - current_tune),
+            "holdout_completion_length_proxy": _completion_proxy(
+                position_holdout_overlaps
+            ),
+            "holdout_delta": (
+                _completion_proxy(position_holdout_overlaps) - current_holdout
+            ),
+        },
         "leaders": leaders,
     }
 
@@ -372,6 +405,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     contract = summary["contract"]
     baseline = summary["baseline"]
     current = summary["current"]
+    position_policy = summary["position_policy"]
     lines = [
         "# DFlash2 Selector Alignment Sweep",
         "",
@@ -401,6 +435,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
             "- Cached/lattice max absolute mismatch: "
             f"`{baseline['cached_vs_lattice_max_abs']:.3e}`"
         ),
+        (
+            "- Position-wise held-out proxy/delta: "
+            f"`{position_policy['holdout_completion_length_proxy']:.4f}` / "
+            f"`{position_policy['holdout_delta']:+.4f}`"
+        ),
         "",
         "| candidate | tune proxy | tune delta | holdout proxy | holdout delta |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -412,6 +451,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"{row['tune_delta']:+.4f} | "
             f"{row['holdout_completion_length_proxy']:.4f} | "
             f"{row['holdout_delta']:+.4f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Position-wise calibration policy",
+            "",
+            "| position | tune overlap | holdout overlap | configuration |",
+            "| ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in position_policy["rows"]:
+        lines.append(
+            f"| {row['position']} | {row['tune_overlap']:.4f} | "
+            f"{row['holdout_overlap']:.4f} | `{row['config']['name']}` |"
         )
     lines.append("")
     return "\n".join(lines)
