@@ -906,7 +906,7 @@ class Worker(WorkerBase):
             tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
             if tensor_dict is not None:
                 comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
-                comm_postprocess = []
+                comm_postprocess: list[Callable[[], None]] = []
                 logger.info_once(
                     "SM70 metadata-free static PP hidden transfer enabled."
                 )

@@ -8,12 +8,13 @@ import argparse
 import hashlib
 import http.client
 import json
-import re
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import regex as re
 
 _NUMBER_RE = re.compile(r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w.])")
 _STOP_SEQUENCES = ["Question", "Assistant:", "<|separator|>"]

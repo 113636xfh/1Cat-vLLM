@@ -8088,8 +8088,7 @@ void mxfp4_moe_gemm_sm70_out_impl(
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     torch::Tensor b_group_indices, bool compact_grouped_rows = false,
-    int64_t logical_total_tokens = -1,
-    torch::Tensor a_ptrs = torch::Tensor()) {
+    int64_t logical_total_tokens = -1, torch::Tensor a_ptrs = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "mxfp4_moe_gemm_sm70: input must be CUDA float16.");
@@ -8252,11 +8251,10 @@ void mxfp4_moe_gemm_sm70_out_impl(
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
   void* a_data = use_a_ptrs ? a_ptrs.data_ptr() : sorted_input.data_ptr();
-  const int ec =
-      gemm.Run(op, 1.f, a_data, desc_A, nullptr, desc_U,
-               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
-               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
-               workspace_holder.workspace, stream);
+  const int ec = gemm.Run(
+      op, 1.f, a_data, desc_A, nullptr, desc_U, strided_ptrs_w.data_ptr(),
+      desc_B, strided_ptrs_s.data_ptr(), desc_V, 0.f, out.data_ptr(), desc_D,
+      out.data_ptr(), desc_D, workspace_holder.workspace, stream);
   TORCH_CHECK(ec == 0,
               "mxfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
@@ -8305,10 +8303,10 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       logged_mxfp4_dense_stage,
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
-  const bool compact_decode_shape =
-      input.size(0) == num_experts && num_experts == 6 &&
-      ((k == 4096 && (n == 512 || n == 1024)) ||
-       (n == 4096 && (k == 256 || k == 512)));
+  const bool compact_decode_shape = input.size(0) == num_experts &&
+                                    num_experts == 6 &&
+                                    ((k == 4096 && (n == 512 || n == 1024)) ||
+                                     (n == 4096 && (k == 256 || k == 512)));
   if (vllm::awq_sm70::mxfp4_moe_compact_grouped_decode_enabled() &&
       compact_decode_shape) {
     mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
@@ -8668,8 +8666,7 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
         broadcast_input
             ? nullptr
             : reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
-        nullptr,
-        expert_offsets.data_ptr<int32_t>(), nullptr,
+        nullptr, expert_offsets.data_ptr<int32_t>(), nullptr,
         inv_permuted_idx.data_ptr<int32_t>(),
         sorted_expert_ids.data_ptr<int32_t>(), kTopK,
         static_cast<int>(hidden_logical_size), src_row_stride, src_row_stride,
@@ -8686,8 +8683,7 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
         broadcast_input
             ? nullptr
             : reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
-        nullptr,
-        expert_offsets.data_ptr<int32_t>(), nullptr,
+        nullptr, expert_offsets.data_ptr<int32_t>(), nullptr,
         inv_permuted_idx.data_ptr<int32_t>(),
         sorted_expert_ids.data_ptr<int32_t>(), kTopK,
         static_cast<int>(hidden_logical_size), src_row_stride, src_row_stride,
@@ -8699,10 +8695,10 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
   torch::Tensor w13_input = broadcast_input ? x : compact_input;
   torch::Tensor w13_input_ptrs =
       broadcast_input ? broadcast_input_ptrs : torch::Tensor();
-  mxfp4_moe_gemm_sm70_out_impl(
-      gate_up, w13_input, expert_offsets, w13_ptrs_w, w13_ptrs_s, kTopK,
-      w13_k, w13_n, group_size, sorted_expert_ids, true,
-      broadcast_input ? kTopK : -1, w13_input_ptrs);
+  mxfp4_moe_gemm_sm70_out_impl(gate_up, w13_input, expert_offsets, w13_ptrs_w,
+                               w13_ptrs_s, kTopK, w13_k, w13_n, group_size,
+                               sorted_expert_ids, true,
+                               broadcast_input ? kTopK : -1, w13_input_ptrs);
 }
 
 void fp8_moe_single_token_dense_stage_sm70_out(
