@@ -362,6 +362,10 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             return_bias=False,
         )
         projection._sm70_f16_force_enable = True
+        # TurboMind wins at the 8-row decode shape, while cuBLAS is faster for
+        # 128+ context rows. Keep the exact small-M path and let ordinary
+        # F.linear handle chunked-prefill projection shapes.
+        projection._sm70_f16_max_m = 64
         logger.info_once(
             "Using TP4 output-sharded DFlash2 target-hidden projection on SM70 "
             "(25600->5120 plus compact all-gather)."

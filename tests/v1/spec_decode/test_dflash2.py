@@ -127,6 +127,7 @@ def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(monkeypatch)
     assert created["input_size"] == 25600
     assert created["output_size"] == 5120
     assert projection._sm70_f16_force_enable is True
+    assert projection._sm70_f16_max_m == 64
 
 
 @pytest.mark.parametrize(
@@ -917,6 +918,91 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     assert config.model_config is draft_model_config
     assert config.attention_config.source is attention_config
     assert config.attention_config.use_non_causal is True
+
+
+@pytest.mark.parametrize(
+    ("mask", "expected"),
+    [
+        (np.array([True], dtype=np.bool_), True),
+        (np.array([True, True], dtype=np.bool_), True),
+        (np.array([True, False], dtype=np.bool_), False),
+        (np.array([False], dtype=np.bool_), False),
+        (None, False),
+    ],
+)
+def test_dflash_context_only_prefill_requires_every_live_request(mask, expected):
+    batch = SimpleNamespace(
+        num_reqs=1 if mask is None else mask.size,
+        is_incomplete_prefilling_np=mask,
+    )
+    assert dflash_speculator._is_context_only_prefill(batch) is expected
+
+
+def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypatch):
+    prepare_inputs = Mock()
+    monkeypatch.setattr(dflash_speculator, "prepare_dflash_inputs", prepare_inputs)
+
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.max_model_len = 256
+    speculator.num_query_per_req = 8
+    speculator.num_speculative_steps = 7
+    speculator.max_num_reqs = 1
+    speculator.max_num_tokens = 8
+    speculator.hidden_states = torch.zeros(8, 3)
+    speculator.draft_tokens = torch.zeros(1, 7, dtype=torch.int64)
+    speculator.input_buffers = object()
+    speculator.context_positions = torch.zeros(8, dtype=torch.int64)
+    speculator.sample_indices = torch.zeros(7, dtype=torch.int64)
+    speculator.sample_pos = torch.zeros(7, dtype=torch.int64)
+    speculator.sample_idx_mapping = torch.zeros(7, dtype=torch.int32)
+    speculator.temperature = torch.ones(1)
+    speculator.seeds = torch.zeros(1, dtype=torch.int64)
+    speculator.parallel_drafting_token_id = 0
+    speculator.sample_from_anchor = False
+    speculator.draft_kv_cache_group_id = 0
+    speculator.draft_kv_cache_group_ids = [0]
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=[torch.zeros(8, dtype=torch.int64)],
+        input_block_tables=[torch.zeros(1, 8, dtype=torch.int32)],
+        kernel_block_sizes=[1],
+        cp_rank=0,
+        cp_size=1,
+        cp_interleave=1,
+    )
+    speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
+    speculator._layer_group_idx = None
+    speculator._context_only_prefill_logged = False
+    speculator.model = SimpleNamespace(
+        precompute_and_store_context_kv=Mock(),
+    )
+
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=4,
+        seq_lens_cpu_upper_bound=torch.tensor([4], dtype=torch.int32),
+        is_incomplete_prefilling_np=np.array([True], dtype=np.bool_),
+    )
+    output = speculator.propose(
+        input_batch=input_batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.arange(12, dtype=torch.float32).view(4, 3),
+        aux_hidden_states=None,
+        num_sampled=torch.zeros(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+        last_sampled=torch.zeros(1, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(1, dtype=torch.int64),
+        temperature=torch.ones(1),
+        seeds=torch.zeros(1, dtype=torch.int64),
+    )
+
+    prepare_inputs.assert_called_once()
+    speculator.model.precompute_and_store_context_kv.assert_called_once()
+    torch.testing.assert_close(
+        speculator.hidden_states[:4],
+        torch.arange(12, dtype=torch.float32).view(4, 3),
+    )
+    assert output.tolist() == [[-1] * 7]
 
 
 def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
