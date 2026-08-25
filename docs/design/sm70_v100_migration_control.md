@@ -1915,9 +1915,9 @@ D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
   driver-visible free memory for both workspaces plus 128 MiB of downstream
   headroom; failure raises a typed OOM without touching the caching allocator
   or launching a kernel, so the Python path can fall back safely.
-- Strict task-local Torch A/B/A measured the existing exact operator at
-  `139.74426 ms / 43.61 TFLOP/s` and the complete architecture at
-  `100.22127 ms / 60.81416 TFLOP/s`: `28.2824%` lower latency and `1.39436x`
+- The final frozen-extension Torch A/B/A measured the existing exact operator
+  at `140.00213 ms / 43.53414 TFLOP/s` and the complete architecture at
+  `100.76979 ms / 60.48313 TFLOP/s`: `28.0227%` lower latency and `1.38933x`
   speedup. All 12,288,000 outputs are finite; versus the exact operator,
   max absolute difference is `2.2888e-4`, mean absolute difference
   `2.5430e-5`, and relative L2 `6.8629e-3`. Peak allocated memory is
@@ -1939,15 +1939,28 @@ D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
   pipeline, split-KV3, and K-ping-pong patches, and a fresh CUDA 12.8 / Torch
   cu128 SM70 build passes its operator-schema load test. The full Flash-V100
   policy file passes 111/111 CPU tests; Ruff and `git diff --check` pass.
-- Real-model memory tests at `gpu_memory_utilization=0.88` rejected the fully
-  persistent and score-cache layouts after their first successful route call:
-  the following 80-MiB PYNCCL all-reduce had only 62-74 MiB free. This is a
-  downstream-headroom failure, not an Attention compute failure. A matched
-  `.875` TP4 control/candidate/control validation is queued on GPUs 4-7.
-- This checkpoint passes the 60-TFLOP/s microkernel/Torch gate but is not yet a
-  production model claim. Default enablement requires a clean Nsight timeline,
-  real Qwen3.8-27B-FP8 route-hit and prompt-throughput A/B, and fixed-prompt
-  logits/tokens quality evidence. Evidence and the experiment ledger are under
+- Early real-model memory tests at `gpu_memory_utilization=0.88` rejected the
+  fully persistent and pre-preflight score-cache layouts after their first
+  successful route call: the following 80-MiB PYNCCL all-reduce had only
+  62-74 MiB free. This is a downstream-headroom failure, not an Attention
+  compute failure.
+- The final matched `.875` TP4 Qwen3.8-27B-FP8
+  control/candidate/control prefill times are `46.45658 / 45.47797 /
+  46.11195 s`. Against the `46.28426-s` bracketed control, the candidate is
+  `1.7421%` lower latency and `1.01773x` faster (`2831.89 -> 2882.10`
+  prompt token/s). Every candidate rank logs 16 architecture hits and no
+  architecture OOM/fallback. All three runs produce the same 32 output token
+  IDs and SHA256
+  `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+- A final `.88` run also completes in `45.53427 s`, with the same token hash
+  and 16 route hits/rank. Its profiler left enough headroom for the route, so
+  this validates high-memory route success rather than directly exercising
+  the preflight fallback branch.
+- This checkpoint passes the 60-TFLOP/s operator and real-model quality gates,
+  but remains default-off because the exact `KV=128000` admission covers only
+  the last long-prefill chunk. The next gate generalizes the architecture over
+  the observed `Q=8000`, `KV=40000..128000` shape family and measures the full
+  128K decay curve. Evidence and the experiment ledger are under
   `/data/minimax-h3/task-cache/qwen38-d256-attn-arch60-20260825/`.
 
 Latest target state:

@@ -311,10 +311,10 @@ different scheduling and dataflow architecture:
 - export max/sum from the accepted exact 8K tail and merge the two online
   softmax states.
 
-The retained score block is BN8192. Strict Torch A/B/A for the score-cache
-layout measures `139.74426 -> 100.22127 ms`, or
-`43.61448 -> 60.81416` useful causal TFLOP/s: 28.2824% lower latency and a
-1.39436x speedup. All 12,288,000 outputs are finite; max/mean absolute error
+The retained score block is BN8192. Final frozen-extension Torch A/B/A for the
+score-cache layout measures `140.00213 -> 100.76979 ms`, or
+`43.53414 -> 60.48313` useful causal TFLOP/s: 28.0227% lower latency and a
+1.38933x speedup. All 12,288,000 outputs are finite; max/mean absolute error
 is `2.2888e-4 / 2.5430e-5` and relative L2 is `6.8629e-3` versus the exact
 FP32-accumulator route. BN7168 reaches only 58.42057 TFLOP/s and BN8000 only
 59.92825 TFLOP/s, so neither is promoted or rounded into a pass.
@@ -337,11 +337,34 @@ and falls back to the exact route.
 The route is default-off behind
 `VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1`, rejects CUDA graph
 capture, and admits only the frozen shape and scale. The final `.875` TP4
-control/candidate/control and `.88` fallback-safety runs remain the promotion
-gate; no whole-model speed claim is made before those results complete.
+Qwen3.8-27B-FP8 control/candidate/control prefill times are
+`46.45658 / 45.47797 / 46.11195 s`. Relative to the `46.28426-s` bracketed
+control, the candidate lowers latency by 1.7421% and raises prompt throughput
+from 2831.89 to 2882.10 token/s (1.7729%). Every candidate rank logs 16
+architecture hits, with no architecture OOM/fallback, and all three runs emit
+the same 32 output token IDs and SHA256
+`df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+
+The `.88` run also succeeds at 45.53427-s prefill with the same hash and 16
+hits/rank. Its memory profiler left enough headroom, so the route passed rather
+than exercising the fallback branch. This exact-shape win is not the complete
+128K decay solution: it accelerates only the final `KV=128000` chunk. The next
+architecture gate expands admission across `Q=8000`, `KV=40000..128000`, where
+the same bounded score cache can cover up to 12 long chunks per full-attention
+layer.
 
 ## Artifacts
 
+- D256 GQA architecture task root:
+  `/data/minimax-h3/task-cache/qwen38-d256-attn-arch60-20260825`.
+- Final operator A/B/A:
+  `results/torch-architecture-scorecache-final-v1-aba.json` under that task
+  root.
+- Final TP4 `.875` model gate:
+  `results/tp4-128k-architecture-scorecache-final-{control-a,candidate,control-b}-0875.json`.
+- Final high-memory `.88` route-success run:
+  `results/tp4-128k-architecture-scorecache-final-preflight-fallback-088.json`;
+  despite the retained filename, the preflight passed and no fallback ran.
 - K-stage task root:
   `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824`.
 - Final clean FA2 binary:
