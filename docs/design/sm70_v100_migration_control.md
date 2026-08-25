@@ -42997,3 +42997,29 @@ Interpretation:
   no E4M3 route trace and must not be cited. The accepted implementation gates
   both metadata and dispatcher creation; capture logs prove eight FULL graphs
   and explicit B8/B16 long-context route hits.
+
+## 2026-08-25 DFlash2 practical-performance closure
+
+- PRs #252, #253, #257, #266, and #284 are already merged. The missing
+  performance closure was twelve post-#284 files that remained only in the
+  measured production worktree, not an open historical PR.
+- A matched single-request coding probe with FP8 E5M2 KV, 256K maximum
+  context, 4096 maximum batched tokens, prefix caching, Mamba align, CUDA
+  Graph, and tool/reasoning parsers measured `18.66--18.83 ms` per complete
+  round (`131.2--139.9 tok/s`) on that production tree. The clean
+  `onecat/main@05d5aa4e57` route hit the same visible QPN8, sharded projection,
+  grouped verifier, and CUDA Graph logs but measured `27.84--27.96 ms`
+  (`90.5--92.6 tok/s`). Route-hit logs alone are therefore not an acceptable
+  performance proof.
+- Draft PR #288 restores the exact missing source closure on latest main. The
+  decode hot path enables fused GDN group metadata for `mamba_cache_mode=align`
+  and makes disabled GDN dump hooks return before CUDA runtime queries. The
+  prefill half skips unused DFlash queries on intermediate 4096-token chunks
+  and keeps the small-M TurboMind projection out of large-M prefill shapes.
+- Focused pre-commit passes. On the latest-main worktree, DFlash2/GDN CPU
+  suites report `110 passed, 32 skipped`; the V100 align-metadata replay and
+  AOT fullgraph predicate tests both pass. The first end-to-end launch produced
+  no timing result because an external TP4 job acquired GPUs 4--7 between API
+  startup and worker memory admission. Wait for the cards and rerun the exact
+  practical contract before merging; do not lower memory utilization or cite
+  that failed launch as implementation evidence.
