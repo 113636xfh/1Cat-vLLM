@@ -237,6 +237,19 @@ def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
 
 
+def test_sm70_d256_gqa_architecture_env_is_default_off(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is False
+
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is True
+
+
 def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
     import vllm.envs as envs
 
@@ -604,6 +617,7 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     impl.head_size = 256
     impl.scale = 0.0625
     impl.sliding_window = None
+    impl.prefix_anchored_decode_window = None
     impl.kv_cache_dtype = "auto"
     impl.use_flash_v100_decode = False
     impl.use_decode_paged_prefill = False
@@ -724,6 +738,36 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
 
 
+def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    fake_package = types.ModuleType("vllm.vllm_flash_attn")
+    fake_package.__dict__["flash_attn_interface"] = fake_interface
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        fake_interface,
+    )
+
+    architecture = object()
+    fake_ops = SimpleNamespace(
+        _vllm_fa2_C=SimpleNamespace(
+            sm70_d256_gqa_architecture_fwd=architecture,
+        )
+    )
+    monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
+    monkeypatch.setattr(
+        flash_v100,
+        "_sm70_d256_gqa_architecture_op_checked",
+        False,
+    )
+    monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
+
+    assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
+
+
 def test_prefill_dense_splitkv3_workspace_reuses_exact_shape(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
@@ -821,6 +865,67 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
         max_seqlen_q=8192,
         max_seqlen_k=65536,
         splitkv3_op=object(),
+    )
+
+
+def test_prefill_d256_gqa_architecture_policy_is_exact_shape_bounded(monkeypatch):
+    import vllm.envs as envs
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+    query = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
+    key = torch.empty((1, 128000, 1, 256), dtype=torch.float16, device="meta")
+    value = torch.empty_like(key)
+
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        value,
+        max_seqlen_q=8000,
+        max_seqlen_k=128000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    assert flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        value,
+        max_seqlen_q=8000,
+        max_seqlen_k=128000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query[:, :7999],
+        key,
+        value,
+        max_seqlen_q=7999,
+        max_seqlen_k=128000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        key[:, :127999],
+        value[:, :127999],
+        max_seqlen_q=8000,
+        max_seqlen_k=127999,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        value,
+        max_seqlen_q=8000,
+        max_seqlen_k=128000,
+        softmax_scale=1.0,
+        architecture_op=object(),
     )
 
 

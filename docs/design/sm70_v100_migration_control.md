@@ -1896,6 +1896,60 @@ Source behavior:
 - Decode path reads vLLM paged KV cache directly.
 - Prefill has direct and fallback paths, including paged KV gather fallback.
 
+D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
+
+- Frozen single-rank shape is causal FP16 Q/K/V, `Q=8000`, `KV=128000`,
+  `Hq=6`, `Hkv=1`, `D=256` on one V100-SXM2-32GB. The metric is useful
+  causal Attention FLOPs divided by complete Attention elapsed time; it is not
+  model TOPS or prompt throughput.
+- The architecture separates the fully visible 120K prefix from the causal 8K
+  tail. Six GQA heads are packed into GEMM M=48,000. QK writes FP16 logits and
+  row statistics; PV normalizes logits during its global-to-shared operand
+  transform. One reusable FP16 block partial is folded into a FP32 online
+  prefix numerator/state before the next block. The exact causal-tail kernel
+  exports max/sum state and a final kernel merges prefix and tail.
+- The final BN8192 score-cache layout retains only the 750-MiB FP16 score
+  matrix per device. All other approximately 100 MiB of state is packed into
+  one transient aligned byte slab. A per-device event and mutex serialize
+  score reuse across streams. Before its first allocation, the route requires
+  driver-visible free memory for both workspaces plus 128 MiB of downstream
+  headroom; failure raises a typed OOM without touching the caching allocator
+  or launching a kernel, so the Python path can fall back safely.
+- Strict task-local Torch A/B/A measured the existing exact operator at
+  `139.74426 ms / 43.61 TFLOP/s` and the complete architecture at
+  `100.22127 ms / 60.81416 TFLOP/s`: `28.2824%` lower latency and `1.39436x`
+  speedup. All 12,288,000 outputs are finite; versus the exact operator,
+  max absolute difference is `2.2888e-4`, mean absolute difference
+  `2.5430e-5`, and relative L2 `6.8629e-3`. Peak allocated memory is
+  `1.11960 GiB`.
+- Smaller score blocks do not pass the target: BN7168 is
+  `104.32751 ms / 58.42057 TFLOP/s`; BN8000 is
+  `101.70283 ms / 59.92825 TFLOP/s` and must not be rounded to 60. BN8192 is
+  therefore retained while model KV reservation supplies downstream headroom.
+- QK and PV compile at 254 and 119 registers/thread with no spill, stack, or
+  local storage. The complete operator is loadable through `torch.ops`; the
+  initial namespace registration mismatch was caught by a static load test and
+  fixed before timing. Synchronous device-symbol updates were changed to
+  current-stream asynchronous copies so the integrated measurement includes no
+  artificial whole-device fence.
+- Integration is exact-shape bounded and default-off behind
+  `VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1`. It rejects
+  CUDA-graph capture and falls back to the exact dense kernel on workspace OOM.
+  The final external FA2 patch applies cleanly after the existing D256
+  pipeline, split-KV3, and K-ping-pong patches, and a fresh CUDA 12.8 / Torch
+  cu128 SM70 build passes its operator-schema load test. The full Flash-V100
+  policy file passes 111/111 CPU tests; Ruff and `git diff --check` pass.
+- Real-model memory tests at `gpu_memory_utilization=0.88` rejected the fully
+  persistent and score-cache layouts after their first successful route call:
+  the following 80-MiB PYNCCL all-reduce had only 62-74 MiB free. This is a
+  downstream-headroom failure, not an Attention compute failure. A matched
+  `.875` TP4 control/candidate/control validation is queued on GPUs 4-7.
+- This checkpoint passes the 60-TFLOP/s microkernel/Torch gate but is not yet a
+  production model claim. Default enablement requires a clean Nsight timeline,
+  real Qwen3.8-27B-FP8 route-hit and prompt-throughput A/B, and fixed-prompt
+  logits/tokens quality evidence. Evidence and the experiment ledger are under
+  `/data/minimax-h3/task-cache/qwen38-d256-attn-arch60-20260825/`.
+
 Latest target state:
 
 - No `FLASH_ATTN_V100` enum.

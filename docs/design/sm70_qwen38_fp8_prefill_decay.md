@@ -287,6 +287,59 @@ greedy identity fails. Keep Q8000 split-KV3 explicit and default-off until a
 fixed-text logprob/perplexity or dataset-level quality gate establishes that
 the classified Type-B reduction-order drift does not reduce model quality.
 
+## 2026-08-25 Q8000/KV128000 GQA-packed Attention Architecture
+
+This experiment freezes the final long-prefill call at causal FP16
+`Q=8000`, `KV=128000`, `Hq=6`, `Hkv=1`, and `D=256` on one
+V100-SXM2-32GB. Its metric is 6.094872576 useful causal TFLOPs divided by the
+complete Attention elapsed time. It is neither whole-model TOPS nor prompt
+tokens/s; the acceptance gate is at most 101.581 ms, or at least 60.0 useful
+causal TFLOP/s.
+
+Tile and barrier tuning of the fused BM64/BN32 kernel was already exhausted:
+the long-shape NCU record showed one CTA/SM, 12.5% occupancy, 62.14% of cycles
+without an eligible warp, and only 9.06% DRAM throughput. The replacement is a
+different scheduling and dataflow architecture:
+
+- split the fully visible 120K prefix from the exact causal 8K tail;
+- pack all six GQA query heads into GEMM M=48,000;
+- run wide SM70 Tensor-Core QK GEMMs that emit FP16 scores plus row max/sum;
+- transform scores into normalized probabilities during the PV
+  global-to-shared load, avoiding a materialized probability matrix;
+- fold one reusable FP16 PV partial into a FP32 online prefix
+  numerator/max/sum state;
+- export max/sum from the accepted exact 8K tail and merge the two online
+  softmax states.
+
+The retained score block is BN8192. Strict Torch A/B/A for the score-cache
+layout measures `139.74426 -> 100.22127 ms`, or
+`43.61448 -> 60.81416` useful causal TFLOP/s: 28.2824% lower latency and a
+1.39436x speedup. All 12,288,000 outputs are finite; max/mean absolute error
+is `2.2888e-4 / 2.5430e-5` and relative L2 is `6.8629e-3` versus the exact
+FP32-accumulator route. BN7168 reaches only 58.42057 TFLOP/s and BN8000 only
+59.92825 TFLOP/s, so neither is promoted or rounded into a pass.
+
+The architecture trace is compute-dense rather than launch-starved: 49 timed
+kernels occupy 95.630493 ms of a 95.809850-ms GPU span, or 99.81%. Prefix QK
+accounts for 54.22% and prefix PV 39.74%; the exact tail is 4.89%. The next
+compute ceiling is therefore QK/PV instruction efficiency, not additional
+host launch fusion.
+
+Real-model integration exposed a separate memory contract. Retaining all
+partials or the entire workspace passes the operator gate but leaves too
+little memory for the following 80-MiB TP all-reduce. The final layout retains
+only the 750-MiB FP16 score matrix per device and packs about 100 MiB of other
+state into one transient byte slab. Before first use it requires enough
+driver-visible free memory for both allocations plus 128 MiB of downstream
+headroom; otherwise it raises a typed OOM before touching the caching allocator
+and falls back to the exact route.
+
+The route is default-off behind
+`VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1`, rejects CUDA graph
+capture, and admits only the frozen shape and scale. The final `.875` TP4
+control/candidate/control and `.88` fallback-safety runs remain the promotion
+gate; no whole-model speed claim is made before those results complete.
+
 ## Artifacts
 
 - K-stage task root:
