@@ -96,3 +96,26 @@ def test_sm70_dflash2_gemma_fused_add_rms_allows_aot_warmup_shape(monkeypatch):
     weight = torch.empty(5120, dtype=torch.float16, device="cuda")
 
     assert _use_sm70_dflash2_gemma_fused_add_rms(x, residual, weight)
+
+
+def test_sm70_dflash2_gemma_fused_predicate_is_fullgraph_safe(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA device required")
+
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "1")
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+    x = torch.zeros((8, 5120), dtype=torch.float16, device="cuda")
+    residual = torch.empty_like(x, dtype=torch.float32)
+    weight = torch.empty(5120, dtype=torch.float16, device="cuda")
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def apply_predicate(
+        values: torch.Tensor,
+        residual_values: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if _use_sm70_dflash2_gemma_fused_add_rms(values, residual_values, norm_weight):
+            return values + 1
+        return values
+
+    torch.testing.assert_close(apply_predicate(x, residual, weight), x + 1)

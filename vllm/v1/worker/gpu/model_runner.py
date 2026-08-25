@@ -875,6 +875,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         is_prefilling_np = self.req_states.is_prefilling(idx_mapping_np)
+        computed_prefill_lens = self.req_states.num_computed_prefill_tokens[
+            idx_mapping_np
+        ]
+        prefill_lens = self.req_states.prefill_len.np[idx_mapping_np]
+        is_incomplete_prefilling_np = is_prefilling_np & (
+            computed_prefill_lens + num_scheduled_tokens < prefill_lens
+        )
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
@@ -969,6 +976,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prefix_anchor_lens=prefix_anchor_lens,
+            is_incomplete_prefilling_np=is_incomplete_prefilling_np,
         )
 
     def prepare_attn(

@@ -15,6 +15,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
@@ -28,6 +29,15 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _is_context_only_prefill(input_batch: InputBatch) -> bool:
+    incomplete_prefill = input_batch.is_incomplete_prefilling_np
+    return bool(
+        incomplete_prefill is not None
+        and incomplete_prefill.size == input_batch.num_reqs
+        and np.all(incomplete_prefill)
+    )
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -99,6 +109,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._context_only_prefill_logged = False
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -355,12 +366,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            with record_function_or_nullcontext("dflash: concatenate target hidden"):
+                combined_target_hidden = torch.cat(aux_hidden_states, dim=-1)
+            with record_function_or_nullcontext("dflash: project target hidden"):
+                hidden_states = self.model.combine_hidden_states(combined_target_hidden)
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+        with record_function_or_nullcontext("dflash: stage target hidden"):
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -384,37 +399,38 @@ class DFlashSpeculator(DraftModelSpeculator):
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                self.temperature,
-                self.seeds,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
-                self.block_tables.cp_interleave,
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
-            )
+        with record_function_or_nullcontext("dflash: prepare inputs"):
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.block_tables.cp_rank,
+                    self.block_tables.cp_size,
+                    self.block_tables.cp_interleave,
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -429,53 +445,71 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
-
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
-
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
-        num_tokens_padded = batch_desc.num_tokens
-
-        # Rebuild the draft attention metadata even when replaying the FULL
-        # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-            step=self.num_query_per_req,
-            causal=self._group_causal,
-        )
-        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-            self.block_tables.slot_mappings[:, :num_tokens_padded],
-            self.kv_cache_config,
-        )
-
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            self._generate_draft(
-                num_reqs,
-                num_tokens_padded,
-                draft_attn_metadata,
-                draft_slot_mappings_by_layer,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+        with record_function_or_nullcontext("dflash: materialize context kv"):
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
             )
+
+        if not dummy_run and _is_context_only_prefill(input_batch):
+            # Intermediate chunked-prefill steps only need to materialize the
+            # target hidden states into draft KV. Their proposed tokens cannot
+            # be consumed before the final prompt chunk, which will run the
+            # normal query graph and replace this sentinel output.
+            self.draft_tokens[:num_reqs].fill_(-1)
+            if not self._context_only_prefill_logged:
+                logger.info(
+                    "%s context-only path is skipping unused draft queries "
+                    "for intermediate prefill chunks.",
+                    self._speculator_name,
+                )
+                self._context_only_prefill_logged = True
+            return self.draft_tokens[:num_reqs]
+
+        with record_function_or_nullcontext("dflash: query and selector"):
+            # Every DFlash step has exactly num_query_per_req tokens, so we can
+            # use FULL CUDA graphs.
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
+            )
+
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            num_tokens_padded = batch_desc.num_tokens
+
+            # Rebuild the draft attention metadata even when replaying the FULL
+            # graph so that any attention metadata builder state is updated.
+            draft_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=self.num_query_per_req,
+                causal=self._group_causal,
+            )
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
+
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                assert self.query_cudagraph_manager is not None
+                self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                self._generate_draft(
+                    num_reqs,
+                    num_tokens_padded,
+                    draft_attn_metadata,
+                    draft_slot_mappings_by_layer,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                )
 
         return self.draft_tokens[:num_reqs]
 

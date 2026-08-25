@@ -42997,3 +42997,51 @@ Interpretation:
   no E4M3 route trace and must not be cited. The accepted implementation gates
   both metadata and dispatcher creation; capture logs prove eight FULL graphs
   and explicit B8/B16 long-context route hits.
+
+## 2026-08-25 DFlash2 practical-performance closure
+
+- PRs #252, #253, #257, #266, and #284 are already merged. The missing
+  performance closure was twelve post-#284 files that remained only in the
+  measured production worktree, not an open historical PR.
+- A matched single-request coding probe with FP8 E5M2 KV, 256K maximum
+  context, 4096 maximum batched tokens, prefix caching, Mamba align, CUDA
+  Graph, and tool/reasoning parsers measured `18.66--18.83 ms` per complete
+  round (`131.2--139.9 tok/s`) on that production tree. The clean
+  `onecat/main@05d5aa4e57` route hit the same visible QPN8, sharded projection,
+  grouped verifier, and CUDA Graph logs but measured `27.84--27.96 ms`
+  (`90.5--92.6 tok/s`). Route-hit logs alone are therefore not an acceptable
+  performance proof.
+- Draft PR #288 restores the exact missing source closure on latest main. The
+  decode hot path enables fused GDN group metadata for `mamba_cache_mode=align`
+  and makes disabled GDN dump hooks return before CUDA runtime queries. The
+  prefill half skips unused DFlash queries on intermediate 4096-token chunks
+  and keeps the small-M TurboMind projection out of large-M prefill shapes.
+- Focused pre-commit passes. On the latest-main worktree, DFlash2/GDN CPU
+  suites report `110 passed, 32 skipped`; the V100 align-metadata replay and
+  AOT fullgraph predicate tests both pass. The first end-to-end launch produced
+  no timing result because an external TP4 job acquired GPUs 4--7 between API
+  startup and worker memory admission. Wait for the cards and rerun the exact
+  practical contract before merging; do not lower memory utilization or cite
+  that failed launch as implementation evidence.
+- The queued clean rerun on PR #288 used the exact practical contract: TP4 on
+  V100, FP8 E5M2 target KV, FP16 draft KV, 256K maximum context, 4096 maximum
+  batched tokens, prefix caching, Mamba align, probabilistic DFlash2, CUDA
+  Graph, and the Qwen tool/reasoning parsers. Startup logs prove QPN8 exact
+  rerank, the TP4 sharded context projection, the one-pass grouped verifier,
+  target and draft graph capture, and, critically, fused GDN metadata for all
+  10 cache groups.
+- After one explicitly excluded first-request JIT warmup, four 512-token
+  single-request runs of `给我写个自我介绍网页吧` measured `18.465--18.537 ms`
+  per complete round and `133.05--146.63 tok/s`; acceptance length was
+  `2.457--2.718`. Three 1,024-token practical coding runs measured
+  `18.587--18.603 ms`, `132.62--139.93 tok/s`, and acceptance length
+  `2.470--2.606`, reproducing the measured production worktree.
+- The historical high-acceptance MBPP item 28 reproduced `251.60 tok/s`,
+  `18.567 ms` per complete round, acceptance length `4.686`, and a natural-EOS
+  328-token completion. Its complete generated text has the same SHA256 as the
+  previous production result, and EvalPlus reports base `1/1` and plus `1/1`.
+  This closes both the roughly 18 ms and the 220+ token/s restoration gates.
+- A fresh 32K chunked-prefill request logged the context-only DFlash path and
+  measured `10.58--10.65 s` cold; the identical prefix hit measured `1.405 s`.
+  The older public server's nominal cold result may have retained an identical
+  prefix, so only the fresh-server numbers are treated as strict cold evidence.

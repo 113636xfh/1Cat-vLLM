@@ -49,6 +49,24 @@ BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
 
 
+def test_disabled_gdn_core_dump_avoids_cuda_runtime_query(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_DUMP_GDN_CORE_DIR", raising=False)
+    monkeypatch.delenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS", raising=False)
+    monkeypatch.delenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR", raising=False)
+
+    def fail_debug_work(*_args, **_kwargs):
+        raise AssertionError("disabled debug hook performed debug work")
+
+    cuda_module = vars(qwen_gdn.torch)["cuda"]
+    monkeypatch.setattr(cuda_module, "is_current_stream_capturing", fail_debug_work)
+    monkeypatch.setattr(qwen_gdn, "_sm70_gdn_graph_buffer_copy", fail_debug_work)
+    qwen_gdn._sm70_dump_gdn_core_tensor(
+        "input_qkv",
+        "layer.0",
+        torch.zeros(1),
+    )
+
+
 def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
     """Flash-V100 metadata must not lazily copy seq_lens back from the GPU."""
 
@@ -79,6 +97,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
         seq_lens=torch.tensor([123], dtype=torch.int32),
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         dcp_local_seq_lens=None,
+        prefix_anchor_lens=None,
     )
     state.prepare_attn(
         input_batch,
@@ -760,6 +779,148 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     assert single.spec_query_start_loc.tolist() == [0, 8] + [8] * 7
     assert single.num_accepted_tokens is not None
     assert single.num_accepted_tokens.tolist() == [7] + [1] * 7
+
+
+def test_dflash2_fused_gdn_group_metadata_align_replay(
+    monkeypatch,
+    local_gdn_model,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        pytest.skip("the fused GDN metadata kernel is SM70-only")
+
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "1")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            mamba_cache_mode="align",
+            max_cudagraph_capture_size=16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    width = builders[0].num_spec_state_tokens + 1
+    query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([7, 7], dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        num_spec_state_tokens=7,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+
+    table_columns = 32
+    block_tables = (
+        torch.arange(
+            10,
+            10 + 2 * table_columns,
+            dtype=torch.int32,
+            device=device,
+        ).view(2, table_columns),
+        torch.arange(
+            100,
+            100 + 2 * table_columns,
+            dtype=torch.int32,
+            device=device,
+        ).view(2, table_columns),
+    )
+    # Batch rows deliberately map to non-adjacent persistent request slots.
+    req_index_mapping = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    state_start_indices = torch.tensor([3, 12, 7, 18], dtype=torch.int32, device=device)
+    accepted = torch.tensor([3, 5], dtype=torch.int32, device=device)
+
+    # Align metadata is incomplete without both persistent-state inputs.
+    assert (
+        prepare_dflash2_gdn_group_metadata(
+            builders_by_group=[(0, builders[0]), (1, builders[1])],
+            block_tables=block_tables,
+            common_gdn_metadata=common_metadata,
+            num_accepted_tokens=accepted,
+            num_actual_tokens=16,
+            descriptor=None,
+            state_start_indices=state_start_indices,
+        )
+        is None
+    )
+
+    first_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=None,
+        state_start_indices=state_start_indices,
+        req_index_mapping=req_index_mapping,
+    )
+    assert first_result is not None
+    prepared, descriptor = first_result
+    torch.accelerator.synchronize(device)
+
+    starts = [7, 3]
+    for group_id, builder in enumerate(builders):
+        state = prepared[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        expected = torch.stack(
+            [
+                block_tables[group_id][row, start : start + width]
+                for row, start in enumerate(starts)
+            ]
+        )
+        torch.testing.assert_close(state[:2], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
+
+    # Replay with the same persistent pointers but a different request mapping
+    # and state columns. CUDA graph replay must observe the live values.
+    for builder in builders:
+        builder.spec_state_indices_tensor.fill_(888)
+    # The model runner allocates this short mapping per batch. Its pointer is
+    # intentionally allowed to change without rebuilding the group descriptor.
+    req_index_mapping = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    state_start_indices.copy_(
+        torch.tensor([2, 9, 5, 20], dtype=torch.int32, device=device)
+    )
+    second_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=descriptor,
+        state_start_indices=state_start_indices,
+        req_index_mapping=req_index_mapping,
+    )
+    assert second_result is not None
+    replayed, replay_descriptor = second_result
+    assert replay_descriptor is descriptor
+    assert replayed is prepared
+    torch.accelerator.synchronize(device)
+
+    starts = [9, 20]
+    for group_id, builder in enumerate(builders):
+        state = replayed[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        expected = torch.stack(
+            [
+                block_tables[group_id][row, start : start + width]
+                for row, start in enumerate(starts)
+            ]
+        )
+        torch.testing.assert_close(state[:2], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):

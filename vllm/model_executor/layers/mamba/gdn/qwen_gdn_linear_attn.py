@@ -503,11 +503,19 @@ def _sm70_dump_gdn_core_tensor(
     tensor: torch.Tensor,
     source: str = "core",
 ) -> None:
-    _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
-    if torch.cuda.is_current_stream_capturing():
-        return
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR")
-    if not dump_dir:
+    graph_dump = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1" and bool(
+        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
+    )
+    # Keep the production path free of CUDA runtime queries. This hook runs
+    # several times per GDN layer, while core dumps are normally disabled.
+    if not dump_dir and not graph_dump:
+        return
+    if graph_dump:
+        _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
+    if not dump_dir or not tensor.is_cuda:
+        return
+    if torch.cuda.is_current_stream_capturing():
         return
     raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS")
     if raw_layer_ids:

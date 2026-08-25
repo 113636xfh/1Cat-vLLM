@@ -134,7 +134,7 @@ class MambaHybridModelState(DefaultModelState):
         self._use_dflash2_fused_gdn_metadata = bool(
             self._use_dflash2_common_gdn_metadata
             and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
-            and self.cache_config.mamba_cache_mode == "none"
+            and self.cache_config.mamba_cache_mode in ("none", "align")
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
         )
@@ -380,6 +380,12 @@ class MambaHybridModelState(DefaultModelState):
                     num_accepted_tokens=num_accepted_tokens,
                     num_actual_tokens=num_tokens,
                     descriptor=self._dflash2_gdn_group_descriptor,
+                    state_start_indices=(
+                        self._mamba_state_idx_gpu if self._align_mode else None
+                    ),
+                    req_index_mapping=(
+                        input_batch.idx_mapping if self._align_mode else None
+                    ),
                 )
                 if prepared_result is not None:
                     (

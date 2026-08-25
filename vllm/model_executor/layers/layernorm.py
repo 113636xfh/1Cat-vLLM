@@ -86,7 +86,9 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     return bool(
         envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-        and current_platform.is_device_capability(70)
+        # Keep the cached platform query out of the AOT fullgraph. The helper
+        # below is explicitly constant-foldable by Dynamo.
+        and _sm70_gemma_long_prefill_available()
         and residual is not None
         and x.is_cuda
         and x.dtype == torch.float16
