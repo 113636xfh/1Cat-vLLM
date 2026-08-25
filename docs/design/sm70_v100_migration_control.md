@@ -43178,3 +43178,25 @@ Interpretation:
   admission remains limited to device capability, dtype, batch/head geometry,
   cache strides, page size, graph semantics, and partition thresholds; no
   model, checkpoint, `model_type`, or architecture identity is consulted.
+
+## 2026-08-26 generic in-flight KV eviction audit
+
+- PR #293 mixed a valid engine-level cache lifetime repair with
+  architecture-keyed serving recipes, model-specific generation defaults, and
+  OCR prompt/resolution behavior. The architecture/model identity defaults are
+  not admitted to main; they are unrelated to inference-engine route safety.
+- The retained repair tracks tokens scheduled in batches whose outputs have
+  not settled yet. Sliding-window, chunked-local, prefix-anchored SWA, and
+  Mamba eviction now derive their safe freeing boundary from processed tokens,
+  rather than the scheduler's optimistic computed-token boundary. This avoids
+  recycling a KV block while an asynchronous or pipeline-parallel batch can
+  still read it, including when speculative tokens later roll back.
+- Recycling-aware admission reserves for the same executor concurrency bound:
+  pipeline depth for PP, asynchronous queue depth otherwise. The contract uses
+  scheduler concurrency, attention/cache geometry, token state, and block
+  lifetime only; it does not inspect a model, checkpoint, `model_type`, or
+  architecture identity.
+- Final-source validation passes 17 focused cache/accounting cases, all 11
+  async-scheduler unit cases, and a simple CPU-offload store/load round trip.
+  All changed-file pre-commit hooks pass. This is a cache lifetime correctness
+  repair; no throughput claim is attached.
