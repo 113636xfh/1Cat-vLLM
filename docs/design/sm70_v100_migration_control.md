@@ -1963,12 +1963,15 @@ D256 8K-by-40K..128K GQA architecture checkpoint, 2026-08-25:
   and 16 route hits/rank. Its profiler left enough headroom for the route, so
   this validates high-memory route success rather than directly exercising
   the preflight fallback branch.
-- The shape-family operator gate is complete, but the widened real-model TP4
-  gate remains pending. The twelve per-layer split-KV3-to-architecture savings
-  sum to 267.024 ms; across 16 full-attention layers that projects 4.272 s, but
-  this is not a model result. Promotion requires a clean run with 192 expected
-  route hits/rank, bracketed prompt throughput, and identical fixed-prompt
-  tokens. Evidence and the experiment ledger are under
+- The widened TP4 Qwen3.8-27B-FP8 gate uses a `46.11195-s` control before the
+  candidate and a `46.09222-s` control after it. Against their `46.10208-s`
+  mean, the `41.51191-s` candidate lowers prefill latency by `9.9565%` and
+  raises prompt throughput from `2843.08` to `3157.46` token/s (`11.0575%`).
+  Every rank logs exactly 192 family-route hits with no architecture OOM or
+  fallback. Both controls and the candidate emit the same 32 token IDs and
+  SHA256
+  `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+  Evidence and the experiment ledger are under
   `/data/minimax-h3/task-cache/qwen38-d256-attn-arch60-20260825/`.
 
 Latest target state:

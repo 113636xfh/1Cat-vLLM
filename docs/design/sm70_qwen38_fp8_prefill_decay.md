@@ -372,13 +372,17 @@ architecture hits, with no architecture OOM/fallback, and all three runs emit
 the same 32 output token IDs and SHA256
 `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
 
-The endpoint-only `.88` run also succeeds at 45.53427-s prefill with the same hash and 16
-hits/rank. Its memory profiler left enough headroom, so the route passed rather
-than exercising the fallback branch. The family operator now covers up to 12
-long chunks per full-attention layer. Its per-layer measured saving sums to
-267.024 ms, or a projected 4.272 s across 16 full-attention layers; this is not
-a whole-model claim. The remaining promotion gate is a clean TP4 A/B with 192
-expected family-route hits/rank and identical fixed-prompt output tokens.
+The endpoint-only `.88` run also succeeds at 45.53427-s prefill with the same
+hash and 16 hits/rank. Its memory profiler left enough headroom, so the route
+passed rather than exercising the fallback branch.
+
+The widened TP4 Qwen3.8-27B-FP8 gate brackets the candidate with `46.11195-s`
+and `46.09222-s` controls. Relative to their `46.10208-s` mean, the
+`41.51191-s` candidate lowers prefill latency by 9.9565% and raises prompt
+throughput from 2843.08 to 3157.46 token/s (11.0575%). Every rank logs exactly
+192 family-route hits with no architecture OOM/fallback. Both controls and the
+candidate emit the same 32 token IDs and SHA256
+`df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
 
 ## Artifacts
 
@@ -389,6 +393,10 @@ expected family-route hits/rank and identical fixed-prompt output tokens.
   root.
 - Shape-family operator A/B:
   `results/torch-architecture-shapefamily-v1-aba.json` under that task root.
+- Shape-family TP4 model gate:
+  `results/tp4-128k-architecture-shapefamily-{candidate,control-after}-0875.json`,
+  bracketed with the endpoint gate's
+  `results/tp4-128k-architecture-scorecache-final-control-b-0875.json`.
 - Final TP4 `.875` model gate:
   `results/tp4-128k-architecture-scorecache-final-{control-a,candidate,control-b}-0875.json`.
 - Final high-memory `.88` route-success run:
