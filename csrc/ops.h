@@ -490,8 +490,9 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
     torch::Tensor topk_ids, torch::Tensor w13_ptrs_w, torch::Tensor w13_ptrs_s,
     torch::Tensor expert_offsets, torch::Tensor inv_permuted_idx,
-    torch::Tensor sorted_expert_ids, int64_t w13_k, int64_t w13_n,
-    int64_t group_size, int64_t hidden_logical_size);
+    torch::Tensor sorted_expert_ids, torch::Tensor broadcast_input_ptrs,
+    bool broadcast_input, int64_t w13_k, int64_t w13_n, int64_t group_size,
+    int64_t hidden_logical_size);
 
 void fp8_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,

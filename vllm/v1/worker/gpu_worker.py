@@ -220,9 +220,9 @@ class Worker(WorkerBase):
             yield
             return
 
-        set_allocator_settings = getattr(torch._C,
-                                         "_accelerator_setAllocatorSettings",
-                                         None)
+        set_allocator_settings = getattr(
+            torch._C, "_accelerator_setAllocatorSettings", None
+        )
         if set_allocator_settings is None:
             yield
             return
@@ -788,6 +788,74 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
+        """Whether this step has the exact metadata-free PP decode contract."""
+        if not envs.VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER or num_tokens != 1:
+            return False
+        cached = getattr(self, "_sm70_static_pp_hidden_contract", None)
+        if cached is not None:
+            return bool(cached)
+
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        compilation_config = config.compilation_config
+        model_config = config.model_config
+        enabled = not (
+            parallel_config.pipeline_parallel_size != 2
+            or parallel_config.tensor_parallel_size != 4
+            or parallel_config.enable_dbo
+            or parallel_config.ubatch_size > 1
+            or config.scheduler_config.max_num_seqs != 1
+            or getattr(config, "speculative_config", None) is not None
+            or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            or compilation_config.pass_config.enable_sp
+            or model_config.dtype != torch.float16
+        )
+
+        text_config = model_config.hf_text_config
+        enabled = (
+            enabled
+            and model_config.get_hidden_size() == 4096
+            and getattr(text_config, "hc_mult", None) == 4
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(self.device) == (7, 0)
+        )
+        self._sm70_static_pp_hidden_contract = enabled
+        return enabled
+
+    @staticmethod
+    def _is_static_pp_hidden_tensor_dict(
+        tensor_dict: dict[str, torch.Tensor], num_tokens: int
+    ) -> bool:
+        if tuple(tensor_dict) != ("hidden_states",):
+            return False
+        hidden_states = tensor_dict["hidden_states"]
+        return (
+            hidden_states.shape == (num_tokens, 4, 4096)
+            and hidden_states.dtype == torch.float16
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+        )
+
+    def _static_pp_hidden_recv_buffers(
+        self, num_tokens: int
+    ) -> dict[str, torch.Tensor] | None:
+        if not self._use_sm70_static_pp_hidden_transfer(num_tokens):
+            return None
+        buffers = self.model_runner.intermediate_tensors
+        if buffers is None or tuple(buffers.tensors) != ("hidden_states",):
+            raise RuntimeError(
+                "static PP hidden transfer requires one persistent "
+                "hidden_states input buffer"
+            )
+        hidden_states = buffers.tensors["hidden_states"][:num_tokens]
+        tensor_dict = {"hidden_states": hidden_states}
+        if not self._is_static_pp_hidden_tensor_dict(tensor_dict, num_tokens):
+            raise RuntimeError(
+                "static PP hidden transfer input buffer violates its fixed schema"
+            )
+        return tensor_dict
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -835,12 +903,20 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
+            if tensor_dict is not None:
+                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+                comm_postprocess = []
+                logger.info_once(
+                    "SM70 metadata-free static PP hidden transfer enabled."
                 )
-            )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -870,12 +946,24 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        # Launch a non-blocking send. The exact SM70 B1 path omits CPU
+        # metadata and sends the replicated hidden tensor directly into the
+        # next stage's persistent graph-input buffer.
+        if self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
+            if not self._is_static_pp_hidden_tensor_dict(
+                output.tensors, num_scheduled_tokens
+            ):
+                raise RuntimeError(
+                    "static PP hidden transfer output violates its fixed schema"
+                )
+            self._pp_send_work = get_pp_group().isend_tensor_dict_static(output.tensors)
+            logger.info_once("SM70 metadata-free static PP hidden transfer enabled.")
+        else:
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 

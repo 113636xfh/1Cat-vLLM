@@ -514,6 +514,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
         ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
+        layer._mxfp4_sm70_buf_broadcast_input_ptrs = torch.empty(
+            top_k * 16, dtype=torch.uint8, device=device
+        )
         layer._mxfp4_sm70_buf_permuted_idx = torch.empty(
             max_slots, dtype=torch.int32, device=device
         )
@@ -566,6 +569,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "token_expert_indices": (
                 layer._mxfp4_sm70_buf_token_expert_indices[:num_tokens]
             ),
+            "broadcast_input_ptrs": layer._mxfp4_sm70_buf_broadcast_input_ptrs,
             "permuted_idx": layer._mxfp4_sm70_buf_permuted_idx[:total_slots],
             "sort_workspace": layer._mxfp4_sm70_buf_sort_workspace,
             "permuted_experts_id": (
@@ -637,6 +641,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "token_expert_indices": torch.arange(
                 total_slots, dtype=torch.int32, device=device
             ).view(num_tokens, top_k),
+            "broadcast_input_ptrs": torch.empty(
+                top_k * 16, dtype=torch.uint8, device=device
+            ),
             "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
             "sort_workspace": torch.empty(
                 sort_workspace_size, dtype=torch.int8, device=device
@@ -737,6 +744,8 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 buffers["compact_expert_offsets"],
                 buffers["inv_permuted_idx"],
                 buffers["permuted_experts_id"],
+                buffers["broadcast_input_ptrs"],
+                envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_BROADCAST_INPUT,
                 layer.sm70_mxfp4_w13_k_dim,
                 layer.sm70_mxfp4_w13_n_dim,
                 layer.sm70_mxfp4_group_size,

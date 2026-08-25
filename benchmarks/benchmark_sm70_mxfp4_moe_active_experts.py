@@ -384,6 +384,9 @@ def benchmark_full_pipeline(
             "token_expert_indices": torch.arange(
                 top_k, dtype=torch.int32, device=device
             ).view(1, top_k),
+            "broadcast_input_ptrs": torch.empty(
+                top_k * 16, dtype=torch.uint8, device=device
+            ),
             "permuted_idx": torch.empty(top_k, dtype=torch.int32, device=device),
             "workspace": torch.empty(workspace_size, dtype=torch.int8, device=device),
             "permuted_experts_id": torch.empty(top_k, dtype=torch.int32, device=device),
@@ -469,6 +472,8 @@ def benchmark_full_pipeline(
             direct["compact_offsets"],
             direct["inv_permuted_idx"],
             direct["permuted_experts_id"],
+            direct["broadcast_input_ptrs"],
+            False,
             4096,
             512,
             32,

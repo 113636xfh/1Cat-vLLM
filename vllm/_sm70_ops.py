@@ -19,7 +19,10 @@ def _maybe_load_fp8_qpn8_library() -> None:
     path lets source experiments add only the QPN8 operators to an otherwise
     compatible installed build, including in spawned TP workers.
     """
-    if os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1":
+    if (
+        os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1"
+        and os.getenv("VLLM_SM70_DSV4_FP8_QPN8", "0") != "1"
+    ):
         return
     library_path = os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY")
     if library_path:
@@ -1243,6 +1246,8 @@ def mxfp4_moe_single_token_prepare_w13_sm70_out(
     expert_offsets: torch.Tensor,
     inv_permuted_idx: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
+    broadcast_input_ptrs: torch.Tensor,
+    broadcast_input: bool,
     w13_k: int,
     w13_n: int,
     group_size: int,
@@ -1258,6 +1263,8 @@ def mxfp4_moe_single_token_prepare_w13_sm70_out(
         expert_offsets,
         inv_permuted_idx,
         sorted_expert_ids,
+        broadcast_input_ptrs,
+        broadcast_input,
         w13_k,
         w13_n,
         group_size,
@@ -1278,6 +1285,8 @@ if hasattr(torch.ops._C, "mxfp4_moe_single_token_prepare_w13_sm70_out"):
         expert_offsets: torch.Tensor,
         inv_permuted_idx: torch.Tensor,
         sorted_expert_ids: torch.Tensor,
+        broadcast_input_ptrs: torch.Tensor,
+        broadcast_input: bool,
         w13_k: int,
         w13_n: int,
         group_size: int,

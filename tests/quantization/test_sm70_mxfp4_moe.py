@@ -518,6 +518,9 @@ def test_mxfp4_sm70_tp4_compact_shapes_match_per_expert(
         direct_offsets = torch.empty_like(offsets)
         inverse_indices = torch.empty(num_experts, dtype=torch.int32, device="cuda")
         direct_expert_ids = torch.empty_like(expert_ids)
+        broadcast_input_ptrs = torch.empty(
+            num_experts * 16, dtype=torch.uint8, device="cuda"
+        )
         torch.ops._C.mxfp4_moe_single_token_prepare_w13_sm70_out(
             direct,
             direct_input,
@@ -528,6 +531,8 @@ def test_mxfp4_sm70_tp4_compact_shapes_match_per_expert(
             direct_offsets,
             inverse_indices,
             direct_expert_ids,
+            broadcast_input_ptrs,
+            False,
             k,
             n,
             group_size,
@@ -535,6 +540,27 @@ def test_mxfp4_sm70_tp4_compact_shapes_match_per_expert(
         )
         torch.accelerator.synchronize()
         torch.testing.assert_close(direct, reference, rtol=0.0, atol=0.0)
+
+        broadcast = torch.empty_like(actual)
+        torch.ops._C.mxfp4_moe_single_token_prepare_w13_sm70_out(
+            broadcast,
+            direct_input,
+            x,
+            expert_ids.view(1, num_experts),
+            ptrs_w,
+            ptrs_s,
+            direct_offsets,
+            inverse_indices,
+            direct_expert_ids,
+            broadcast_input_ptrs,
+            True,
+            k,
+            n,
+            group_size,
+            k,
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(broadcast, direct, rtol=0.0, atol=0.0)
 
 
 def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):

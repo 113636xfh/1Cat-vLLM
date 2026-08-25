@@ -42875,6 +42875,86 @@ Interpretation:
   removed; measured checkpoint details remain evidence only and never select
   an optimization route.
 
+## 2026-08-25 DeepSeek V4 PP2 x TP4 no-spec 100 token/s campaign
+
+- The active eight-V100 target is PP2 x TP4, one 1,024-token prompt, 256
+  generated tokens, FP16 activations, FP8 E5M2 KV, full decode CUDA Graph,
+  maximum one sequence, and no DSpark/speculation. The accepted number is
+  single-request pure decode, not concurrent aggregate throughput.
+- Current-main plus the admitted TP4 compact MXFP4 shapes measures
+  `59.248 token/s` median and `16.878 ms` mean TPOT across three stable runs.
+  The immediate target is at least `100 token/s`, or at most `10 ms` TPOT.
+- The rank layout is PP0 on GPUs 0-3 and PP1 on GPUs 4-7. Aligned PP pairs use
+  direct NVLink (`NV2`, `NV2`, `NV1`, `NV1`); this endpoint is not explained by
+  a CPU-routed PP boundary. A metadata-free, full-payload PP candidate projected
+  about `0.46 ms/token` in isolation but recovered only `0.034 ms/token` in the
+  combined full-model A/B, so it remains default-off.
+- A corrected real-checkpoint QPN8 screen covers 301 dense FP8 calls per short
+  token and projects `3.439 ms/token` warm and `3.267 ms/token` cold savings.
+  All winners use the existing fast-decoder dispatch and pass repeated graph
+  replay. All 365 relevant scales are finite positive powers of two and survive
+  the QPN8 scale transform exactly; accumulation still requires full-model and
+  dataset gates. The default-off production candidate excludes the C4 indexer
+  because its auxiliary-stream prefill can race the main projection for the
+  shared 16 MiB fallback workspace. This gives up only `0.074-0.077 ms/token`
+  of possible long-context savings. A real-weight source-integration gate
+  passed M=1 CUDA Graph replay, M=9 prefill fallback, numerical checks, grouped
+  `wo_a`, and the single-workspace contract; the GPU was released cleanly.
+- The clean full-model QPN8 candidate measures `64.359 token/s` median and
+  `15.538 ms` mean TPOT across three stable same-contract runs: `+8.63%` and
+  about `1.340 ms/token` saved versus baseline. This invalidates the additive
+  `12.98 ms/token`, `77 token/s` micro projection. Candidate hashes are stable
+  internally but differ from baseline. Its first paired GSM8K-64 gate failed:
+  both routes scored `63/64` with zero invalid answers, but QPN8 regressed row
+  12 from correct 13 to incorrect 12 while improving row 54 from 42 to 40.
+  Equal aggregate accuracy does not pass the per-row no-regression contract;
+  QPN8 stays default-off while projection suffixes are bisected.
+- The first suffix bisections did not find a quality-safe promotion subset.
+  `fused_wqa_wkv` alone measured `59.251 token/s`, `16.877 ms` and regressed
+  targeted GSM8K row 12 from 13 to 10. The complementary five projections
+  measured `62.029 token/s`, `16.121 ms` (`+4.69%` versus baseline), but also
+  answered 10. Both runs were stable, hit their recorded suffix contracts, and
+  released every owned GPU process. This proves both that the quality drift is
+  not attributable to WQA alone and that the full endpoint gain is
+  non-additive. Neither route advances to Nsight or promotion; the next split
+  isolates attention output projections from the shared-expert projections.
+- The remaining QPN8 bisections also failed. `wq_b + wo_a + wo_b` reached
+  `62.203 token/s` but scored `11/13` on the targeted set. `wo_a + wo_b`
+  reached `61.805 token/s` and passed `13/13`, then failed the mandatory paired
+  GSM8K-64 gate at `62/64`: row 37 regressed from baseline-correct 2 to 5.
+  The accepted evidence run is `...qpn8-woab-quality-gsm8k64-20260825-r2`;
+  an earlier run that collided with an unrelated TP4 owner is excluded. All
+  tested QPN8 subsets are therefore closed as approximate/default-off routes
+  and do not advance to Nsight or promotion.
+- An exact MXFP4 B1/top-6 activation-broadcast candidate now passes its
+  one-V100 hard gate. The first indexed-loader version was rejected for 6 of
+  6,144 differing FP16 values (`1.5259e-5` maximum). The replacement writes a
+  96-byte repeated `StridedPtr` table in the existing prepare kernel and keeps
+  TurboMind's blocked loader. W13 and the complete W13/SwiGLU/W2 pipeline are
+  bitwise equal; 1,010 graph replays reduced the per-layer pipeline from
+  `0.116904 ms` to `0.063707 ms` (`-0.053197 ms`, `-45.5%`). It remains
+  default-off pending the same-contract eight-GPU endpoint and token-hash gate.
+- The recovered baseline Nsight trace shows that the apparent 9 ms NCCL rows
+  are PP dependency residence: PP1 waits for hidden state and PP0 waits for the
+  sampled-token feedback. Source-side launches are about `0.010-0.014 ms`.
+  Actual TP4 custom-all-reduce rank-max service is `0.781 ms` on PP0 and
+  `0.695 ms` on PP1, about 43 launches per stage and `15.776 us` per custom
+  reduce. Under profiler overhead the replay interval is `18.939 ms` mean;
+  this is composition evidence only, not the unprofiled endpoint.
+- Static PP plus QPN8 measures `64.502 token/s` median and `15.503 ms` mean
+  TPOT across three stable runs, only `+0.22%` or about `0.034 ms/token` over
+  QPN8 alone. It retained the QPN8 token hash, hit the route on every rank, and
+  released all owned GPU processes. The `0.46 ms/token` protocol-microbench
+  projection did not survive endpoint overlap, so static PP stays default-off
+  and is rejected as a material direction for the 100 token/s target.
+- The quality gate pins deterministic sequential GSM8K-64, HumanEval, and the
+  `hotpotqa`, `multifieldqa_zh`, `gov_report`, and `lcc` LongBench subset.
+  GSM8K comparison now requires identical input hashes and evaluation contract
+  before checking per-row and aggregate no-regression.
+- Detailed contract, measurements, rejected evidence, and retained Nsight/source
+  gates are in `docs/design/sm70_deepseek_v4_pp2_tp4_nospec.md`. GPU work waits
+  through the shared event gate and releases task-owned processes immediately.
+
 ## 2026-08-24 PR #276 cache-block reuse audit
 
 - The reported corruption root cause is valid: a reused full-attention cache

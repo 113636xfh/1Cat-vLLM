@@ -163,11 +163,13 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_DSV4_FP8_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_BROADCAST_INPUT: bool = False
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -182,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
+    VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = False
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
@@ -1674,6 +1677,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Exact DeepSeek V4 PP2 x TP4 no-spec dense shapes use a separate opt-in
+    # until their endpoint and dataset gates are complete.
+    "VLLM_SM70_DSV4_FP8_QPN8": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_FP8_QPN8", "0"))
+    ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
@@ -1753,6 +1761,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES", "1"))
     ),
+    "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_BROADCAST_INPUT": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_BROADCAST_INPUT", "0"))
+    ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))
     ),
@@ -1793,6 +1804,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
+    ),
+    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "0"))
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")

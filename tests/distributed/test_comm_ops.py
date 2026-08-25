@@ -278,6 +278,39 @@ def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
     torch.testing.assert_close(td["b"], torch.ones(4, dtype=torch.int32))
 
 
+def test_static_tensor_dict_transfer_uses_caller_owned_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int, torch.Tensor]] = []
+
+    def fake_isend(tensor: torch.Tensor, *, dst: int, group: Any) -> _DummyWork:
+        del group
+        calls.append(("send", dst, tensor))
+        return _DummyWork()
+
+    def fake_irecv(tensor: torch.Tensor, *, src: int, group: Any) -> _DummyWork:
+        del group
+        tensor.fill_(7)
+        calls.append(("recv", src, tensor))
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+    monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
+
+    sender = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    sent = torch.arange(8, dtype=torch.float32)
+    send_handles = sender.isend_tensor_dict_static({"hidden_states": sent})
+
+    receiver = _make_group_for_unit_test(rank_in_group=1, world_size=2)
+    received = torch.empty_like(sent)
+    recv_handles = receiver.irecv_tensor_dict_static({"hidden_states": received})
+
+    assert len(send_handles) == 1
+    assert len(recv_handles) == 1
+    assert calls == [("send", 1, sent), ("recv", 0, received)]
+    torch.testing.assert_close(received, torch.full_like(received, 7))
+
+
 def test_async_intermediate_tensors_lazy_wait() -> None:
     work = _DummyWork()
     post_calls = {"n": 0}
