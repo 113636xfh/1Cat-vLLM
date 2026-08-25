@@ -636,6 +636,65 @@ reducer did not beat the retained route; paired E4M3 conversion measured
 409.958/683.428 us at 128K/256K and lost to the shared LUT. All three
 experiments are absent from the admitted path.
 
+### Post-acceptance kernel headroom
+
+Three additional changes retain the same admitted route and the real unbound
+interleaved K/V views. First, the long-wave CTA stages its partition page IDs
+once instead of reloading them for every tile. Second, a strict host-side
+stride gate specializes the production `(blocks, 2, 1568, 1, 256).unbind(1)`
+layout: the physical block stride is `2 * 1568 * 256`, while token and head
+strides remain 256. Any other view uses the generic stride path. Third, the
+fixed-layout E4M3 PV loop reads adjacent shared-memory values as `half2` while
+retaining one FP32 FMA per dimension and the original token accumulation
+order. It only changes lane ownership and restores dimensions explicitly at
+the output store.
+
+Each stage was measured as a four-arm control/candidate/candidate/control A/B
+on one otherwise idle V100. Every arm contains five repetitions for each of
+three page-table layouts; the table reports the median of the ten samples per
+layout followed by the median across layouts. The exact partition-boundary
+companions at 131,071 and 262,080 tokens pass as well.
+
+| Exact context | Stage | Control | Candidate | Kernel delta |
+|---:|---|---:|---:|---:|
+| 128K | partition page IDs | 373.076 us | 368.604 us | -1.199% |
+| 256K | partition page IDs | 602.017 us | 594.632 us | -1.227% |
+| 128K | fixed interleaved stride | 370.102 us | 364.585 us | -1.491% |
+| 256K | fixed interleaved stride | 598.257 us | 587.909 us | -1.730% |
+| 128K | shared-V `half2` PV | 362.739 us | 348.265 us | -3.990% |
+| 256K | shared-V `half2` PV | 584.745 us | 558.515 us | -4.486% |
+
+All 12 sequence/layout cases have one output SHA256 across all four arms and
+are bit-exact to their explicit p896/p1664 controls (`max_abs=0`). The final
+partition kernel remains at 168 registers/thread and two CTAs/SM; the PV
+change removes the prior 32-byte stack frame. Relative to the fixed-stride
+binary, its static SASS instruction count falls from 2,424 to 2,248 and shared
+loads fall from 118 to 90, with the same 57 FFMA instructions. These are
+static cubin counts, not NCU throughput counters. The timed binary SHA256 is
+`43f742cc228100dd0a58aed37bf1cb6007447129bcf3f1d28148bee71b6ff2a5`.
+The clang-formatted final build SHA256 is
+`5e66a5331aaf83e5e15080c5122c78047b94d3cb47a721572613bbbba9172d47`;
+its target-kernel SASS is byte-identical to the timed build (normalized SASS
+SHA256 `0684d453072ed630aa68477b618ab4c090eb18c87422a6de90af3fd43740a1ee`)
+and its resource record is unchanged. The final build is bit-exact in eager
+and CUDA Graph replay at 128K/p896 and 256K/p1664 (`max_abs=0`); all eight
+parameterized page-1568 wave-boundary regressions pass.
+
+Applying the three independently matched operator ratios to the measured
+5.921/9.597 ms attention slices, while leaving the measured 10.251/10.253 ms
+non-attention residuals unchanged, projects 15.784 ms (63.354 tok/s) at 128K
+and 19.151 ms (52.216 tok/s) at 256K. These are decomposition-based
+projections, not replacement end-to-end measurements; the accepted measured
+endpoint remains 61.834/50.376 tok/s.
+
+A packed pair-LUT initialization experiment is rejected because it is about
+1.0-1.2% slower at 128K and 0.78% slower at 256K. Replacing constant division
+with compare/subtract address normalization passed 2,801,664 exhaustive host
+address checks and all GPU exactness cases but was statistically neutral. A
+scalar PV-accumulator rewrite removed the stack frame but was neutral or
+slower at 256K. None of these rejected variants is present in the admitted
+path.
+
 Primary retained evidence is:
 
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/e4m3_xqa_auto_single_p12288_long_i16k_64k_128k_256k_o64.json`
@@ -644,4 +703,9 @@ Primary retained evidence is:
 - `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_lut_separate_same_gpu4.json`
 - `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_lut_merged_same_gpu4.json`
 - `.artifacts/qwen38_e4m3_xqa_long_route/results/e4m3_xqa_wave_boundaries_graph_workspace.json`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fixed_stride/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fixed_stride_pv_half2/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_packed_lut/`
+- `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fast_address/`
 - `.artifacts/qwen38_e4m3_xqa_long_route/profiles/e4m3_xqa_final_merged_wave_p1664_l262144_nsys.nsys-rep`

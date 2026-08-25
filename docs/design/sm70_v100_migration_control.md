@@ -43147,6 +43147,22 @@ Interpretation:
   200.7-226.8 W mean per-rank power at 1530/877 MHz SM/memory clocks. Memory
   duty is not HBM throughput. NCU counters are blocked by
   `ERR_NVGPUCTRPERM` and are not inferred.
+- A post-acceptance operator pass retains the same route and arithmetic. It
+  stages partition page IDs once, specializes only the actual page-1568
+  interleaved unbound-view strides, and consumes shared V in adjacent `half2`
+  pairs while preserving per-dimension FP32 FMA order. Four-arm same-GPU A/B
+  gives staged exact-context kernel reductions of 1.20%, 1.49%, and 3.99% at
+  128K, and 1.23%, 1.73%, and 4.49% at 256K. All 12 sequence/layout cases are
+  bit-exact with one hash per case across all arms. The final kernel retains
+  168 registers and two CTAs/SM, removes its 32-byte stack frame, and reduces
+  static SASS from 2,424 to 2,248 instructions versus the fixed-stride stage.
+  The formatted final build is eager- and CUDA-Graph-exact at 128K/256K, and
+  all eight page-1568 wave-boundary GPU regressions pass.
+- Scaling the measured attention slice by those independently matched ratios,
+  while freezing the measured non-attention residual, projects 63.354 tok/s
+  at 128K and 52.216 tok/s at 256K. This is an operator-decomposition
+  projection, not a new endpoint measurement; 61.834/50.376 tok/s remain the
+  accepted measured rates.
 - Reject the contiguous-KV assumption, QK software pipeline, split reducer,
   and paired E4M3 converter. The real unbound K/V views are interleaved;
   violating that layout corrupts model output. The QK pipeline slows the long
