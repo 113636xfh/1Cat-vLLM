@@ -43371,6 +43371,74 @@ Interpretation:
   All changed-file pre-commit hooks pass. This is a cache lifetime correctness
   repair; no throughput claim is attached.
 
+## 2026-08-26 DeepSeek V4 PP2 TP4 no-DSpark decode recovery
+
+- The frozen endpoint contract is DeepSeek V4 Flash on eight V100-SXM2-32GB
+  GPUs, PP2 with TP4 ranks confined to GPUs 0--3 and 4--7, input 1024, output
+  cap 256, model-default sampling, no speculation/DSpark, E5M2 KV, sparse MLA, mHC,
+  TurboMind FP8/MXFP4 projections, and full CUDA Graph replay. Pure decode is
+  reported separately from prefill and TTFT; the target remains 100 tok/s.
+- The latest uninstrumented control reaches 59.160 tok/s, or 16.903 ms/token.
+  A 26-step Nsight Systems trace is perturbed to 18.939 ms/token but localizes
+  the per-stage service leaders to 6.434 ms of FP8 dense work, 2.647 ms of
+  MXFP4 MoE, 2.582 ms of FP16 GEMV, 1.714 ms of mHC, 1.695 ms of sparse MLA,
+  1.694 ms of routing, 1.688 ms of Q/KV work, and 1.476 ms of TP all-reduce.
+  Roughly 9 ms pipeline rows are dependency waits and are not added as PP
+  transfer cost.
+- PR #299 extends the fully connected SM70 TP4
+  push all-reduce to the exact 8-KiB FP16 CUDA Graph payload. Same-binary TP4
+  A/B/B/A operator timing moves 9.286--9.425 us to 3.041--3.174 us. Both paths
+  are bitwise equal to the explicit rank-0-through-rank-3 FP32 accumulation
+  oracle. A stronger changing-input graph test covers 43 collective nodes,
+  eight input patterns, 64 replays, and all four ranks with zero mismatches;
+  every GPU claim is released after the bounded test. The route is default-on
+  only for SM70, fully connected TP4, active CUDA Graph capture, FP16, and the
+  exact 8-KiB or 80-KiB payload; `VLLM_SM70_TP4_PUSH_ALLREDUCE=0` rolls back.
+- Matched full-model control and candidate medians are 59.160 and 61.272
+  tok/s, or 16.903 and 16.321 ms/token. The candidate therefore recovers
+  3.57% and 0.583 ms/token. This is accepted performance and operator evidence,
+  while two independent unchanged controls select different stable token
+  streams because of pre-existing cross-process TurboMind autotuning. Greedy
+  identity is diagnostic rather than an acceptance gate; the exact collective
+  oracle isolates the changed operator.
+- The next arithmetic target is the FP8 dense/WO-A launch family, which is the
+  largest trace category. Each of the 43 layers currently dispatches the two
+  one-row `(K=4096,N=1024)` groups separately. The replacement prepares
+  two persistent TurboMind pointer rows and dispatches both groups through one
+  blocked GEMM only for batch-one decode; all other shapes and token counts
+  retain the existing loop.
+- The accepted arithmetic contract fixes the grouped descriptor to the dense
+  `8x128x64`, split-K 7 schedule. An environment-injected selector screen and
+  a source-built rerun both pass eager and changing-input CUDA Graph checks for
+  exact-small, random-small, and model-like inputs with zero mismatches. The
+  measured source-built extension SHA256 is
+  `133724eb67e70e3b4ff098c5f32c00e3155cd7c5e8f7aeb6dff84934ac294e9e`.
+  The merge audit changes the absent-environment default to the measured
+  explicit `=1` behavior; it does not change the selected tactic or kernel.
+  Median isolated graph time changes from `74.943` to `22.450 us` per layer,
+  projecting `2.257 ms/token` of service reduction before model overlap.
+  Independently tuned flat/grouped schedules differ by up to one FP16 ULP and
+  remain rejected.
+- The matched full-model pair keeps the source, extension, push all-reduce,
+  topology, lengths, and cache contract fixed. The control median is
+  `57.436 tok/s` (`17.411 ms/token`) and the grouped candidate reaches
+  `59.209 tok/s` (`16.889 ms/token`), recovering `0.521 ms/token` or 3.09%.
+  This is the measured endpoint reduction; the larger isolated service
+  projection is not used as a TPOT claim. Both sides are internally stable
+  across three requests. Their different hashes reflect unrelated
+  cross-process FP8 tactic selection and are not treated as a numerical gate.
+- The grouped route is therefore default-on only for the exact engine
+  contract already proven above: SM70 block-FP8 `[128,128]`, two groups,
+  `K=4096`, `N=1024`, batch-one decode, the source-built grouped and pointer
+  operators, and the fixed `8x128x64` split-K-7 tactic. Other shapes, multi-row
+  calls, missing operators, and non-SM70 devices retain the two-launch path.
+  `VLLM_SM70_FP8_GROUPED_BMM_DECODE=0` is the rollback. Admission never reads
+  model name, checkpoint, `model_type`, or architecture identity.
+- A multi-row FP16 GEMV screen is rejected. The only bitwise-exact candidate
+  (`BLOCK_N=2`, `BLOCK_K=1024`) is 0.5--12% slower across the five traced
+  `N=64/256/512/1024/2048` shapes; smaller-K/four-row variants are slower and
+  also change FP32 accumulation. The candidate is not retained.
+
 ## 2026-08-25 DFlash2 n-gram hybrid
 
 - Development is isolated on
