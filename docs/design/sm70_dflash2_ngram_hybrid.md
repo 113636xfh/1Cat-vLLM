@@ -75,4 +75,14 @@ This work is based on `onecat/main` at
 ## Status
 
 - 2026-08-25: isolated worktree created; upstream audit and initial contract
-  recorded. Implementation and validation are in progress.
+  recorded.
+- 2026-08-25: implemented opt-in MRV2 host lookup over the UVA request-token
+  state, full-hit query/selector bypass, mixed-batch row override, and one-hot
+  dense/sparse rejection caches. Structured-output batches bypass the assist.
+- CPU split-history KMP microbenchmark (median/P95): 1K `2.66/2.74 us`, 32K
+  `50.05/53.22 us`, 128K `190.72/201.03 us`, and 256K `369.57/393.17 us`.
+- Tests: 22 DFlash2-ngram tests pass on V100, including exact parity with the
+  standalone KMP policy and dense-vs-compact probabilistic rejection at
+  `top_p=1.0/0.95`; existing DFlash2 CPU suite passes 61 tests with 12 expected
+  CUDA skips, and the MRV2 route suite passes 10 tests. End-to-end model and
+  dataset validation remain in progress.

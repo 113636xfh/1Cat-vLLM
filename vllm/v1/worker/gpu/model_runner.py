@@ -1441,6 +1441,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                output_copy_event=async_output.copy_event,
+                sampled_token_ids_cpu=async_output.sampled_token_ids,
+                num_sampled_tokens_cpu=async_output.num_sampled_tokens_np,
+                all_token_ids_cpu=(
+                    self.req_states.all_token_ids.get_cpu_view().numpy()
+                ),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
