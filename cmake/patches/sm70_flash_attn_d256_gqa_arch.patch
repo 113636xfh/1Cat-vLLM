@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index acf2219..d644e02 100644
+index acf2219..f5e2732 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -84,6 +84,7 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
@@ -20,12 +20,13 @@ index acf2219..d644e02 100644
 
      # custom definitions
      target_compile_definitions(_vllm_fa2_C PRIVATE
-@@ -125,5 +127,15 @@ if (FA2_ENABLED)
+@@ -125,5 +127,16 @@ if (FA2_ENABLED)
          # FLASHATTENTION_DISABLE_UNEVEN_K
          # FLASHATTENTION_DISABLE_LOCAL
          FLASHATTENTION_DISABLE_PYBIND
 +        PREFIX_TORCH_EXTENSION
 +        PREFIX_QK_FULL_STATS
++        PREFIX_QK_SKIP_APPLY
 +        QK_TB_M=128
 +        QK_TB_N=512
 +        QK_WARP_M=64
@@ -1643,39 +1644,22 @@ index 7a0f626..1fd4008 100644
      const at::Tensor &q,
      const at::Tensor &k,
 diff --git a/csrc/cutlass/examples/35_gemm_softmax/gemm_with_softmax.h b/csrc/cutlass/examples/35_gemm_softmax/gemm_with_softmax.h
-index 31b2b769..e5720b20 100644
+index 31b2b769..2cb4ba74 100644
 --- a/csrc/cutlass/examples/35_gemm_softmax/gemm_with_softmax.h
 +++ b/csrc/cutlass/examples/35_gemm_softmax/gemm_with_softmax.h
-@@ -623,29 +623,9 @@ public:
+@@ -623,6 +623,7 @@ public:
        return cutlass::Status::kErrorInternal;
      }
 
--    //
--    // Launch the SoftmaxApplyKernel
--    //
--
--    dim3 apply_block(SoftmaxApplyKernel::ApplyShape::kColumn, SoftmaxApplyKernel::ApplyShape::kRow);
--
--    int threadblock_rows = SoftmaxApplyKernel::ApplyShape::kRow;
--    int threadblock_columns = SoftmaxApplyKernel::ApplyShape::kColumn * SoftmaxApplyKernel::kAlignment;
--
--    dim3 apply_grid(
--      (params_.softmax.args.extent.row() + threadblock_rows - 1) / threadblock_rows,
--      (params_.softmax.args.extent.column() + threadblock_columns - 1) / threadblock_columns,
--      params_.softmax.args.batch_count);
--
--    Kernel<SoftmaxApplyKernel><<<
--      apply_grid, apply_block, sizeof(typename SoftmaxApplyKernel::SharedStorage), stream
--    >>>(params_.softmax);
--
--    result = cudaGetLastError();
--
--    if (result != cudaSuccess) {
--      return cutlass::Status::kErrorInternal;
--    }
-+    // The SM70 GQA architecture consumes logits in the PV mainloop, so it
-+    // intentionally stops after GEMM + final row-stat reduction. Materializing
-+    // a second global probability matrix would erase the bandwidth win.
++#if !defined(PREFIX_QK_SKIP_APPLY)
+     //
+     // Launch the SoftmaxApplyKernel
+     //
+@@ -646,6 +647,7 @@ public:
+     if (result != cudaSuccess) {
+       return cutlass::Status::kErrorInternal;
+     }
++#endif
 
      return cutlass::Status::kSuccess;
    }
