@@ -61,9 +61,9 @@ def test_static_short_indexer_cache_skip_requires_full_context_bound():
         _can_skip_static_short_indexer_cache,
     )
 
-    assert _can_skip_static_short_indexer_cache(2048, 2048)
-    assert _can_skip_static_short_indexer_cache(32, 2048)
-    assert not _can_skip_static_short_indexer_cache(2049, 2048)
+    assert _can_skip_static_short_indexer_cache(512, 512)
+    assert _can_skip_static_short_indexer_cache(32, 512)
+    assert not _can_skip_static_short_indexer_cache(513, 512)
 
 
 def test_static_short_indexer_skip_omits_unreachable_input_gemms():
@@ -74,7 +74,11 @@ def test_static_short_indexer_skip_omits_unreachable_input_gemms():
     wrapper = SimpleNamespace(
         aux_stream_list=[object(), object(), object()],
         compressor=None,
-        indexer=SimpleNamespace(skip_unused_static_short_path=True),
+        indexer=SimpleNamespace(
+            skip_unreachable_static_cache=True,
+            k_cache=SimpleNamespace(prefix="indexer_cache"),
+            topk_tokens=512,
+        ),
         fused_wqa_wkv=MagicMock(return_value=(projected, None)),
         ln_events=[object(), object(), object(), object()],
     )
@@ -89,12 +93,64 @@ def test_static_short_indexer_skip_omits_unreachable_input_gemms():
     method = (
         attention.DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
     )
-    with patch.object(attention, "execute_in_parallel", fake_execute):
+    context = SimpleNamespace(
+        attn_metadata={"indexer_cache": SimpleNamespace(compressed_max_seq_len=32)}
+    )
+    with (
+        patch.object(attention, "execute_in_parallel", fake_execute),
+        patch.object(attention, "get_forward_context", return_value=context),
+        patch.object(attention.envs, "VLLM_SM70_DSV4_SHORT_INDEXER_SKIP", True),
+    ):
         result = method(wrapper, hidden_states)
 
     assert recorded_aux_fns == [None, None, None]
     torch.testing.assert_close(result[0], projected)
     assert result[1:] == (None, None, None)
+
+
+def test_bounded_short_indexer_skip_retains_future_cache_write():
+    from vllm.models.deepseek_v4 import attention
+
+    wrapper = SimpleNamespace(
+        aux_stream_list=[object(), object(), object()],
+        compressor=None,
+        indexer=SimpleNamespace(
+            skip_unreachable_static_cache=False,
+            k_cache=SimpleNamespace(prefix="indexer_cache"),
+            topk_tokens=512,
+            compressor=SimpleNamespace(
+                fused_wkv_wgate=SimpleNamespace(weight=torch.empty((1, 1)))
+            ),
+        ),
+        fused_wqa_wkv=MagicMock(
+            return_value=(torch.ones((1, 1), dtype=torch.float16), None)
+        ),
+        ln_events=[object(), object(), object(), object()],
+    )
+    context = SimpleNamespace(
+        attn_metadata={"indexer_cache": SimpleNamespace(compressed_max_seq_len=512)}
+    )
+    recorded_aux_fns = None
+
+    def fake_execute(main_fn, aux_fns, *args, **kwargs):
+        del args, kwargs
+        nonlocal recorded_aux_fns
+        recorded_aux_fns = aux_fns
+        return main_fn(), (None, None, None)
+
+    method = (
+        attention.DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
+    )
+    with (
+        patch.object(attention, "execute_in_parallel", fake_execute),
+        patch.object(attention, "get_forward_context", return_value=context),
+        patch.object(attention.envs, "VLLM_SM70_DSV4_SHORT_INDEXER_SKIP", True),
+    ):
+        method(wrapper, torch.ones((1, 1), dtype=torch.float16))
+
+    assert recorded_aux_fns is not None
+    assert recorded_aux_fns[1] is None
+    assert callable(recorded_aux_fns[2])
 
 
 def test_static_short_indexer_skip_omits_unreachable_cache_write():
@@ -105,7 +161,7 @@ def test_static_short_indexer_skip_omits_unreachable_cache_write():
         compressor=MagicMock(),
         k_cache=SimpleNamespace(prefix="indexer_cache"),
         topk_tokens=4,
-        skip_unused_static_short_path=True,
+        skip_unreachable_static_cache=True,
         topk_indices_buffer=topk_indices,
         compress_ratio=1,
     )
