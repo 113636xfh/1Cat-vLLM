@@ -43045,3 +43045,39 @@ Interpretation:
   measured `10.58--10.65 s` cold; the identical prefix hit measured `1.405 s`.
   The older public server's nominal cold result may have retained an identical
   prefix, so only the fresh-server numbers are treated as strict cold evidence.
+
+## 2026-08-25 Qwen3.8-27B NVFP4 long-context decode
+
+- The accepted candidate specializes only the SM70 E4M3 G6/D256 dual-CTA
+  decode route whose production K/V views come from an interleaved
+  `[blocks, 2, 800, 1, 256]` allocation. It replaces general page arithmetic
+  with a compile-time page800/physical-stride path and uses aligned shared-V
+  `half2` loads without changing per-output FMA order. Other layouts, dtypes,
+  dimensions, routes, and prefill retain the fallback.
+- `VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH=0` is the rollback. The default-on
+  path also has a once-per-process trace flag and is protected by exact shape
+  and stride checks. Production-layout B8/B16 p64/p128/p256 tests are bitwise
+  equal to rollback; the two focused GPU suites pass 15/15 and 14/14.
+- The matched TP4, no-MTP, E4M3-KV, FULL-graph SPEED-Bench `low_entropy`
+  pure-decode A/B improves 32K B8/B16 by 11.79%/15.04% and 64K B8/B16 by
+  16.47%/19.74%. The four-cell geometric mean is 15.72%, no cell regresses,
+  and 64K B16 scaling efficiency is 48.52%, only 3.76 percentage points below
+  the accepted 16K reference. All 144 candidate requests finish with healthy
+  512-token output.
+- NCU on 64K/B16 p256 attributes the 22.47% kernel reduction to 11.92% fewer
+  instructions, 48.16% fewer shared-bank conflicts, and 95.92% less MIO-
+  throttle stall. Peak-relative DRAM/SM utilization rises 24.49% to 28.11%
+  and 39.11% to 44.79%; occupancy is unchanged. This is copy/addressing and
+  shared-memory relief, not an occupancy-only claim.
+- The official-sampling quality gate uses the same 32 GSM8K main/test prompts
+  at B8/B16 with temperature 1.0, top-k 20, top-p 0.95, natural EOS, and three
+  predeclared sampling seeds. Candidate/control aggregate numeric EM is 74/96
+  versus 71/96 at B8 and 74/96 versus 74/96 at B16; all 384 requests succeed
+  with no candidate empty or replacement-character output. The initial single
+  seed's one-item deficits remain recorded rather than being silently rerun.
+- The measured patch rebases without conflict onto `onecat/main@d62ef5cb20`.
+  The final-source rebuild and measured binary have byte-identical complete
+  SM70 SASS dumps.
+  The server's common D256 prefill fallback warning is outside the pure-decode
+  metric, so this change closes long decode only and must not be cited as a
+  prefill improvement.

@@ -158,6 +158,31 @@ bool xqa_e4m3_batch_optimized_enabled() {
   return value == nullptr || value[0] != '0';
 }
 
+bool xqa_e4m3_page800_fastpath_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_e4m3_page800_fastpath_trace_enabled() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE");
+  return value != nullptr && value[0] == '1';
+}
+
+void trace_xqa_e4m3_page800_fastpath(const int batch_size,
+                                     const int partition_size,
+                                     const bool active) {
+  if (!active || !xqa_e4m3_page800_fastpath_trace_enabled()) {
+    return;
+  }
+  static std::atomic<bool> traced{false};
+  if (!traced.exchange(true, std::memory_order_relaxed)) {
+    TORCH_WARN("Flash-V100 E4M3 page800 fast path active: batch=", batch_size,
+               ", partition_size=", partition_size,
+               ", standard interleaved Hkv=1, PV=half2");
+  }
+}
+
 bool xqa_e5m2_g6_dual_cta_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA");
   return value == nullptr || value[0] != '0';
@@ -637,10 +662,12 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
   static_assert(BLOCK_SIZE == 0 || BLOCK_SIZE == 16 || BLOCK_SIZE == 784 ||
-                    BLOCK_SIZE == 1648 || BLOCK_SIZE == 3296,
+                    BLOCK_SIZE == 800 || BLOCK_SIZE == 1648 ||
+                    BLOCK_SIZE == 3296,
                 "Unsupported paged-KV block-size specialization");
-  static_assert(!CONTIGUOUS_HKV1_LAYOUT || BLOCK_SIZE == 16,
-                "The contiguous Hkv=1 layout requires 16-token pages");
+  static_assert(
+      !CONTIGUOUS_HKV1_LAYOUT || (BLOCK_SIZE == 16 || BLOCK_SIZE == 800),
+      "The contiguous Hkv=1 layout requires a specialized page");
   int logical_block;
   int block_offset;
   if constexpr (BLOCK_SIZE == 16) {
@@ -649,6 +676,9 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   } else if constexpr (BLOCK_SIZE == 784) {
     logical_block = token_offset / 784;
     block_offset = token_offset - logical_block * 784;
+  } else if constexpr (BLOCK_SIZE == 800) {
+    logical_block = token_offset >= 800;
+    block_offset = token_offset - logical_block * 800;
   } else if constexpr (BLOCK_SIZE == 1648) {
     logical_block = token_offset / 1648;
     block_offset = token_offset - logical_block * 1648;
@@ -662,11 +692,12 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   const int physical_block = page_ids[logical_block];
   int64_t physical_offset;
   if constexpr (CONTIGUOUS_HKV1_LAYOUT) {
-    constexpr int kHeadDim = 256;
-    constexpr int kBlockStride = 16 * kHeadDim;
-    physical_offset = static_cast<int64_t>(physical_block) * kBlockStride +
-                      static_cast<int64_t>(block_offset) * kHeadDim +
-                      panel_offset;
+    constexpr int64_t kHeadDim = 256;
+    constexpr int64_t kPhysicalBlockStride =
+        BLOCK_SIZE == 16 ? 16 * kHeadDim : 2 * 800 * kHeadDim;
+    physical_offset =
+        static_cast<int64_t>(physical_block) * kPhysicalBlockStride +
+        static_cast<int64_t>(block_offset) * kHeadDim + panel_offset;
   } else {
     physical_offset = static_cast<int64_t>(physical_block) * block_stride +
                       static_cast<int64_t>(block_offset) * token_stride +
@@ -721,6 +752,9 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       } else if constexpr (BLOCK_SIZE == 784) {
         logical_block = token_offset / 784;
         block_offset = token_offset - logical_block * 784;
+      } else if constexpr (BLOCK_SIZE == 800) {
+        logical_block = token_offset >= 800;
+        block_offset = token_offset - logical_block * 800;
       } else if constexpr (BLOCK_SIZE == 1648) {
         logical_block = token_offset / 1648;
         block_offset = token_offset - logical_block * 1648;
@@ -734,11 +768,12 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const int physical_block = page_ids[logical_block];
       int64_t physical_offset;
       if constexpr (CONTIGUOUS_HKV1_LAYOUT) {
-        constexpr int kHeadDim = 256;
-        constexpr int kBlockStride = 16 * kHeadDim;
-        physical_offset = static_cast<int64_t>(physical_block) * kBlockStride +
-                          static_cast<int64_t>(block_offset) * kHeadDim +
-                          panel_offset;
+        constexpr int64_t kHeadDim = 256;
+        constexpr int64_t kPhysicalBlockStride =
+            BLOCK_SIZE == 16 ? 16 * kHeadDim : 2 * 800 * kHeadDim;
+        physical_offset =
+            static_cast<int64_t>(physical_block) * kPhysicalBlockStride +
+            static_cast<int64_t>(block_offset) * kHeadDim + panel_offset;
       } else {
         physical_offset = static_cast<int64_t>(physical_block) * block_stride +
                           static_cast<int64_t>(block_offset) * token_stride +
@@ -1122,6 +1157,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       QK_SW_PIPELINE ? SmemLayout::kQKStride / 8 : kv_smem_stride_uint4;
   constexpr int qk_panel_d_stride_uint4 = kQKPanelDim / 8;
   constexpr int kAccumsPerThread = D / kWarpSize;
+  constexpr bool kPVHalf2 = CONTIGUOUS_HKV1_LAYOUT && BLOCK_SIZE == 800 &&
+                            KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3;
   static_assert(GROUP_SIZE == 4 || GROUP_SIZE == 6 || GROUP_SIZE == 8,
                 "Wide D=256 TC XQA kernel supports q_per_kv in {4, 6, 8}");
   static_assert(NUM_THREADS >= GROUP_SIZE * kWarpSize,
@@ -1210,10 +1247,18 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   int partition_start_page = 0;
   int partition_page_offset = 0;
   if constexpr (PARTITION_PAGE_IDS) {
-    partition_start_page = start_token_idx / block_size;
-    partition_page_offset = start_token_idx - partition_start_page * block_size;
-    const int partition_page_count =
-        (partition_page_offset + part_tokens + block_size - 1) / block_size;
+    int partition_page_count;
+    if constexpr (BLOCK_SIZE == 800) {
+      partition_start_page = start_token_idx / 800;
+      partition_page_offset = start_token_idx - partition_start_page * 800;
+      partition_page_count = 1 + (partition_page_offset + part_tokens > 800);
+    } else {
+      partition_start_page = start_token_idx / block_size;
+      partition_page_offset =
+          start_token_idx - partition_start_page * block_size;
+      partition_page_count =
+          (partition_page_offset + part_tokens + block_size - 1) / block_size;
+    }
     for (int idx = tid; idx < partition_page_count; idx += NUM_THREADS) {
       smem.page_ids[idx] = __ldg(&block_table_seq[partition_start_page + idx]);
     }
@@ -1237,6 +1282,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       start_page = tile_token_start / 784;
       tile_page_offset = tile_token_start - start_page * 784;
       page_count = (tile_page_offset + valid_k_rows + 783) / 784;
+    } else if constexpr (BLOCK_SIZE == 800) {
+      start_page = tile_token_start / 800;
+      tile_page_offset = tile_token_start - start_page * 800;
+      page_count = 1 + (tile_page_offset + valid_k_rows > 800);
     } else {
       start_page = tile_token_start / block_size;
       tile_page_offset = tile_token_start - start_page * block_size;
@@ -1497,13 +1546,29 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
               prob = __half2float(sP_row[token]);
             }
             const __half* sV_row = sV + token * SmemLayout::kKVStride;
+            if constexpr (kPVHalf2) {
 #pragma unroll
-            for (int d_iter = 0; d_iter < (kPVPanelDim / kWarpSize); ++d_iter) {
-              const int local_d = lane_id + d_iter * kWarpSize;
-              const int acc_idx =
-                  panel_idx * (kPVPanelDim / kWarpSize) + d_iter;
-              out_acc[acc_idx] =
-                  fmaf(prob, __half2float(sV_row[local_d]), out_acc[acc_idx]);
+              for (int d_iter = 0; d_iter < (kPVPanelDim / (2 * kWarpSize));
+                   ++d_iter) {
+                const int local_d2 = lane_id + d_iter * kWarpSize;
+                const float2 value = __half22float2(
+                    reinterpret_cast<const __half2*>(sV_row)[local_d2]);
+                const int acc_idx =
+                    panel_idx * (kPVPanelDim / kWarpSize) + d_iter * 2;
+                out_acc[acc_idx] = fmaf(prob, value.x, out_acc[acc_idx]);
+                out_acc[acc_idx + 1] =
+                    fmaf(prob, value.y, out_acc[acc_idx + 1]);
+              }
+            } else {
+#pragma unroll
+              for (int d_iter = 0; d_iter < (kPVPanelDim / kWarpSize);
+                   ++d_iter) {
+                const int local_d = lane_id + d_iter * kWarpSize;
+                const int acc_idx =
+                    panel_idx * (kPVPanelDim / kWarpSize) + d_iter;
+                out_acc[acc_idx] =
+                    fmaf(prob, __half2float(sV_row[local_d]), out_acc[acc_idx]);
+              }
             }
           }
         }
@@ -1532,11 +1597,25 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
                           static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
                           static_cast<int64_t>(head_idx) * tmp_out_stride1 +
                           static_cast<int64_t>(partition_idx) * tmp_out_stride2;
-    for (int d = thread_in_row; d < D; d += kXQATC256WideThreadsPerRow) {
-      const float output_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
-                                     ? inv_row_sum
-                                     : inv_row_sum * v_scale;
-      tmp_out_ptr[d] = __float2half(out_acc[d / kWarpSize] * output_scale);
+    const float output_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
+                                   ? inv_row_sum
+                                   : inv_row_sum * v_scale;
+    if constexpr (kPVHalf2) {
+#pragma unroll
+      for (int acc_idx = 0; acc_idx < kAccumsPerThread; ++acc_idx) {
+        constexpr int kAccumsPerPanel = kPVPanelDim / kWarpSize;
+        const int panel_idx = acc_idx / kAccumsPerPanel;
+        const int panel_acc_idx = acc_idx % kAccumsPerPanel;
+        const int d_iter = panel_acc_idx / 2;
+        const int component = panel_acc_idx & 1;
+        const int d = panel_idx * kPVPanelDim + d_iter * (2 * kWarpSize) +
+                      thread_in_row * 2 + component;
+        tmp_out_ptr[d] = __float2half(out_acc[acc_idx] * output_scale);
+      }
+    } else {
+      for (int d = thread_in_row; d < D; d += kXQATC256WideThreadsPerRow) {
+        tmp_out_ptr[d] = __float2half(out_acc[d / kWarpSize] * output_scale);
+      }
     }
     if (thread_in_row == 0) {
       const int64_t stats_index =
@@ -3650,22 +3729,40 @@ at::Tensor flash_attention_decode_paged_xqa(
         e4m3_batch_route == XQABatchContextRoute::kDualCtaSplit;
     const bool e4m3_split_reduce =
         e4m3_batch_route == XQABatchContextRoute::kDualCtaSplit;
+    constexpr int64_t kPage800HeadDim256Elements = 800 * 256;
+    const bool e4m3_page800_contiguous =
+        xqa_e4m3_page800_fastpath_enabled() && k_cache.size(1) == 800 &&
+        k_cache.size(2) == 1 && k_cache.size(3) == 256 &&
+        k_cache.stride(0) == 2 * kPage800HeadDim256Elements &&
+        k_cache.stride(1) == 256 && k_cache.stride(2) == 256 &&
+        k_cache.stride(3) == 1 &&
+        v_cache.stride(0) == 2 * kPage800HeadDim256Elements &&
+        v_cache.stride(1) == 256 && v_cache.stride(2) == 256 &&
+        v_cache.stride(3) == 1;
     trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
                                   partition_size, k_cache.size(1),
                                   e4m3_batch_route);
+    trace_xqa_e4m3_page800_fastpath(q.size(0), partition_size,
+                                    e4m3_dual_cta && e4m3_page800_contiguous);
     const int split_reduce_dim_tile = xqa_split_reduce_dim_tile();
+
+#define LAUNCH_E4M3_DUAL_CTA(PARTITION, PAGE_SIZE, CONTIGUOUS)              \
+  launch_flash_attention_decode_paged_xqa_tc_256_wide<                      \
+      PARTITION, 6, true, kXQATCG6DualCtaThreads, 2, PAGE_SIZE, CONTIGUOUS, \
+      false, kXQARouteAllSeqLens, false, true, true,                        \
+      flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(                                 \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits, \
+      exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,     \
+      launch_num_partitions, e4m3_split_reduce, split_reduce_dim_tile, stream)
 
 #define LAUNCH_E4M3_BATCH_XQA(PARTITION)                                       \
   do {                                                                         \
     if (e4m3_dual_cta) {                                                       \
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<                     \
-          PARTITION, 6, true, kXQATCG6DualCtaThreads, 2, 0, false, false,      \
-          kXQARouteAllSeqLens, false, true, true,                              \
-          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(                                \
-          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,            \
-          max_logits, exp_sums, active_num_partitions, softmax_scale, k_scale, \
-          v_scale, launch_num_partitions, e4m3_split_reduce,                   \
-          split_reduce_dim_tile, stream);                                      \
+      if (e4m3_page800_contiguous) {                                           \
+        LAUNCH_E4M3_DUAL_CTA(PARTITION, 800, true);                            \
+      } else {                                                                 \
+        LAUNCH_E4M3_DUAL_CTA(PARTITION, 0, false);                             \
+      }                                                                        \
     } else if (e4m3_batch_optimized) {                                         \
       launch_flash_attention_decode_paged_xqa_tc_256_wide<                     \
           PARTITION, 6, true, kXQATC256WideThreads, 1, 0, false, false,        \
@@ -3694,6 +3791,7 @@ at::Tensor flash_attention_decode_paged_xqa(
       LAUNCH_E4M3_BATCH_XQA(256);
     }
 #undef LAUNCH_E4M3_BATCH_XQA
+#undef LAUNCH_E4M3_DUAL_CTA
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
   }

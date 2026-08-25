@@ -414,3 +414,107 @@ Primary local evidence paths are:
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/gdn_rmsnorm_production_op_bound_48layers.json`
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/qpn8_fused_ba_split_bound_48layers.json`
 - `.artifacts/qwen38_nvfp4_speed_20260823/results/qknorm_mrope_cache_gdn_ba_rms_r3_i1k_o256.json`
+
+## 2026-08-25 Long-context E4M3 page800 decode
+
+### Scope and route
+
+This optimization targets the exact SM70, E4M3, grouped-query decode route
+used when aligned Mamba state makes the attention page 800 tokens. The
+production KV allocation is interleaved as `[blocks, 2, 800, 1, 256]`; its K
+and V views each have strides `[409600, 256, 256, 1]`. Admission additionally
+requires G6/D256 and the existing dual-CTA batch route. Other page sizes,
+layouts, head dimensions, KV dtypes, batch routes, and prefill keep the prior
+implementation.
+
+The specialized kernel uses the compile-time 800-token page and physical
+block stride, replaces repeated general page division with the bounded
+one/two-page comparison for a 256-token partition, and loads adjacent shared
+V values as aligned `half2`. Each output dimension retains the same token and
+FMA order as the fallback. The strict layout predicate is checked before
+dispatch; setting `VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH=0` restores the
+general-stride kernel. The fast path is enabled by default on an admitted
+route. `VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE=1` emits a once-per-process
+route diagnostic.
+
+The measured contract uses Qwen3.8-27B-NVFP4, four V100-SXM2-32GB GPUs with
+TP4, compressed-tensors NVFP4 weights, FP16 activations, E4M3 KV, Flash-V100,
+FlashQLA, prefix caching, aligned Mamba cache, FULL decode graphs, and no MTP.
+The workload is NVIDIA SPEED-Bench revision
+`487aa718444e816458d1a0a52bfce7a454285cf4`: the official 32K `low_entropy`
+JSONL has SHA256
+`c3ee8a3f63b6cce18d063a2ff9992b6b96cb72c2b6408970fa78d2335b542f8e`.
+The explicitly derived 64K workload pairs two official rows and has SHA256
+`0dcc877ecc7ccf66450c1f168ff7493dcf50f52da89d321dba394144a70e9800`.
+Performance sampling is temperature 1.0, top-k 20, top-p 0.95, request seed
+20260822, natural EOS, and a 512-token cap. Pure decode excludes queueing,
+TTFT, and prefill; each cell has one warmup and three measured repeats.
+
+### Long-context result
+
+The matched rollback/candidate A/B was measured on source `05d5aa4e57`. B1
+references are 52.052 token/s at 32K and 40.152 token/s at 64K. The accepted
+16K scaling references are 70.736% at B8 and 52.281% at B16.
+
+| Context | Batch | Rollback token/s | Candidate token/s | Candidate TPOT | Gain | Efficiency vs B1 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32K | 8 | 292.03 | **326.47** | 24.505 ms | **11.79%** | 78.40% |
+| 32K | 16 | 392.84 | **451.92** | 35.405 ms | **15.04%** | 54.26% |
+| 64K | 8 | 209.94 | **244.51** | 32.719 ms | **16.47%** | 76.12% |
+| 64K | 16 | 260.36 | **311.74** | 51.325 ms | **19.74%** | 48.52% |
+
+B8's two-context geometric-mean gain is 14.11%, B16's is 17.36%, and the
+four-cell geometric mean is 15.72%; no cell regresses. Relative to the 16K
+references, 64K loses no efficiency at B8 and 3.76 percentage points at B16,
+within the ten-point budget. Every one of the 144 candidate performance
+requests completed with its full 512 tokens and without empty or replacement-
+character output. Route logs show FULL graphs and the expected long-context
+`dual_cta_split` B8 and `dual_cta` B16 dispatches on all four ranks.
+
+The endpoint reports that the exact D256 prefill extension is unavailable and
+uses its established fallback. That warning is common to rollback and
+candidate and is excluded from the pure-decode metric. This result must not be
+cited as a prefill improvement.
+
+### Counter and correctness evidence
+
+An Nsight Compute rollback/candidate comparison on B16, 64K, p256 attributes
+the endpoint gain to less address/control and shared-memory pressure rather
+than added occupancy. Kernel duration falls 22.47%, executed instructions
+11.92%, shared-bank conflicts 48.16%, MIO-throttle stalls 95.92%, long-
+scoreboard stalls 8.61%, and wait stalls 11.06%. Eligible warps per active
+cycle rise 0.565 to 0.699. Peak-relative DRAM and SM utilization rise from
+24.49% to 28.11% and from 39.11% to 44.79%, respectively; registers rise only
+from 166 to 168 and dynamic shared memory is unchanged. Thus the retained
+change follows the measured copy/addressing bottleneck and does not depend on
+an occupancy increase.
+
+The production-layout operator A/B is bitwise equal to the rollback path for
+B8/B16 and p64/p128/p256. At p256, its direct kernel gains are 22.10% at
+32K/B8, 21.37% at 32K/B16, 22.59% at 64K/B8, and 22.84% at 64K/B16. The two
+focused GPU suites pass 15/15 and 14/14; the production interleaved cases use
+`torch.equal`, not a tolerance. All 55 environment tests, Ruff lint/format,
+the SM70 extension build, and `git diff --check` also pass.
+
+Because the production path uses official stochastic sampling, independent
+server processes are not expected to reproduce every generated text. The
+quality gate therefore pairs rollback and candidate over the same 32 GSM8K
+main/test prompts at B8 and B16, temperature 1.0/top-k 20/top-p 0.95, natural
+EOS, and sampling seeds 20260822, 20260823, and 20260824. This protocol was
+fixed before the two additional seeds ran; both sides were rerun rather than
+repeating only the candidate.
+
+| Batch | Rollback numeric EM | Candidate numeric EM | Delta |
+|---:|---:|---:|---:|
+| 8 | 71/96 | **74/96** | +3 |
+| 16 | 74/96 | **74/96** | 0 |
+
+All 384 quality requests succeed, and the candidate has no empty or Unicode
+replacement output. The first seed alone was one item lower in each batch;
+the predeclared three-seed aggregate is recorded to make that sampling
+variance visible rather than discarding it. The final source patch rebases
+without conflict onto `onecat/main@d62ef5cb20`. Its rebuilt Flash-V100 ELF has
+SHA256 `70816f9655e36fcd04b07d75be1b3abafabc81a30c261d4fd99b06389cbf82a2`.
+The full SM70 SASS dump is byte-identical to the measured binary, with SHA256
+`b30031fa4f29181b8e1c757bc408c608bae97df380893e613b96a2cf7d3e9a51`;
+the differing full-ELF hash is build metadata, not device code.
