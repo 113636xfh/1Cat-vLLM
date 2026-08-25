@@ -26,6 +26,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
@@ -49,6 +50,27 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_unwrap_pipeline_intermediate_hidden_states_uses_semantic_key():
+    hidden_states = torch.zeros((2, 3))
+    residual = torch.ones_like(hidden_states)
+    output = IntermediateTensors({"residual": residual, "hidden_states": hidden_states})
+
+    assert (
+        gpu_model_runner_module._unwrap_pipeline_intermediate_hidden_states(output)
+        is hidden_states
+    )
+    assert (
+        gpu_model_runner_module._unwrap_pipeline_intermediate_hidden_states(
+            hidden_states
+        )
+        is hidden_states
+    )
+    with pytest.raises(RuntimeError, match="must contain a 'hidden_states' tensor"):
+        gpu_model_runner_module._unwrap_pipeline_intermediate_hidden_states(
+            IntermediateTensors({"residual": residual})
+        )
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

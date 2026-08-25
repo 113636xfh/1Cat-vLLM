@@ -43081,3 +43081,27 @@ Interpretation:
   The server's common D256 prefill fallback warning is outside the pure-decode
   metric, so this change closes long decode only and must not be cited as a
   prefill improvement.
+
+## 2026-08-25 generic PP profiling and compact MXFP4 audit
+
+- PR #283 mixed accepted engine work with rejected workload experiments. Its
+  QPN8 candidates had repeated baseline-correct-to-candidate-wrong quality
+  regressions, while the metadata-free PP transfer recovered only about
+  `0.034 ms/token` in the full endpoint. Neither path is promoted to main.
+- The retained PP repair is model-independent. A non-last pipeline stage can
+  return `IntermediateTensors` during a dummy profile/capture; the runner now
+  selects the semantic `hidden_states` entry instead of treating the wrapper
+  as a tensor. A CPU unit test also proves that dictionary insertion order
+  cannot select a residual tensor accidentally.
+- The retained MXFP4 route is admitted only by the existing SM70 operator,
+  group size 32, six one-row groups, and exact `(K,N)` tensor shapes. Runtime
+  code does not inspect checkpoint paths, model names, `model_type`, or
+  architecture identity, and the compact grouped route remains default-off.
+- On a V100, both new shapes are bitwise equal to the per-expert fallback and
+  pass CUDA Graph replay. Median operator time changes from `0.139827` to
+  `0.037478 ms` for `(4096,1024)` and from `0.064696` to `0.021371 ms` for
+  `(512,4096)`, or `3.731x` and `3.027x` respectively. Final-source reruns on
+  latest main measured `0.151521` to `0.040428 ms` (`3.748x`) and `0.065004`
+  to `0.022538 ms` (`2.884x`). The full CUDA 12.8
+  extension builds with target architecture 7.0 only; 28 CPU checks and the
+  changed-file static gate pass.
