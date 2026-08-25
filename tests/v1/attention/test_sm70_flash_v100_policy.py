@@ -868,7 +868,7 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
     )
 
 
-def test_prefill_d256_gqa_architecture_policy_is_exact_shape_bounded(monkeypatch):
+def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatch):
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
@@ -891,15 +891,19 @@ def test_prefill_d256_gqa_architecture_policy_is_exact_shape_bounded(monkeypatch
 
     monkeypatch.setenv(name, "1")
     envs.disable_envs_cache()
-    assert flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key,
-        value,
-        max_seqlen_q=8000,
-        max_seqlen_k=128000,
-        softmax_scale=0.0625,
-        architecture_op=object(),
-    )
+    for kv_len in range(40000, 128001, 8000):
+        family_key = torch.empty(
+            (1, kv_len, 1, 256), dtype=torch.float16, device="meta"
+        )
+        assert flash_v100._should_use_prefill_d256_gqa_architecture(
+            query,
+            family_key,
+            torch.empty_like(family_key),
+            max_seqlen_q=8000,
+            max_seqlen_k=kv_len,
+            softmax_scale=0.0625,
+            architecture_op=object(),
+        )
     assert not flash_v100._should_use_prefill_d256_gqa_architecture(
         query[:, :7999],
         key,
@@ -915,6 +919,15 @@ def test_prefill_d256_gqa_architecture_policy_is_exact_shape_bounded(monkeypatch
         value[:, :127999],
         max_seqlen_q=8000,
         max_seqlen_k=127999,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        key[:, :44000],
+        value[:, :44000],
+        max_seqlen_q=8000,
+        max_seqlen_k=44000,
         softmax_scale=0.0625,
         architecture_op=object(),
     )

@@ -287,7 +287,7 @@ greedy identity fails. Keep Q8000 split-KV3 explicit and default-off until a
 fixed-text logprob/perplexity or dataset-level quality gate establishes that
 the classified Type-B reduction-order drift does not reduce model quality.
 
-## 2026-08-25 Q8000/KV128000 GQA-packed Attention Architecture
+## 2026-08-25 Q8000/KV40K..128K GQA-packed Attention Architecture
 
 This experiment freezes the final long-prefill call at causal FP16
 `Q=8000`, `KV=128000`, `Hq=6`, `Hkv=1`, and `D=256` on one
@@ -301,7 +301,7 @@ the long-shape NCU record showed one CTA/SM, 12.5% occupancy, 62.14% of cycles
 without an eligible warp, and only 9.06% DRAM throughput. The replacement is a
 different scheduling and dataflow architecture:
 
-- split the fully visible 120K prefix from the exact causal 8K tail;
+- split a fully visible 32K..120K prefix from the exact causal 8K tail;
 - pack all six GQA query heads into GEMM M=48,000;
 - run wide SM70 Tensor-Core QK GEMMs that emit FP16 scores plus row max/sum;
 - transform scores into normalized probabilities during the PV
@@ -318,6 +318,31 @@ score-cache layout measures `140.00213 -> 100.76979 ms`, or
 is `2.2888e-4 / 2.5430e-5` and relative L2 is `6.8629e-3` versus the exact
 FP32-accumulator route. BN7168 reaches only 58.42057 TFLOP/s and BN8000 only
 59.92825 TFLOP/s, so neither is promoted or rounded into a pass.
+
+The same bounded workspace was then generalized across the twelve observed
+8K-chunk shapes. Each row is a strict A/B bracket against the active split-KV3
+control:
+
+| KV tokens | split-KV3 ms | architecture ms | latency change | useful TFLOP/s |
+|---:|---:|---:|---:|---:|
+| 40,000 | 38.41638 | 29.81530 | -22.3891% | 59.34862 |
+| 48,000 | 47.25811 | 36.38477 | -23.0084% | 59.44005 |
+| 56,000 | 56.53999 | 42.68715 | -24.5010% | 59.87584 |
+| 64,000 | 65.17897 | 49.14552 | -24.5991% | 60.00842 |
+| 72,000 | 74.00670 | 55.44960 | -25.0749% | 60.27745 |
+| 80,000 | 82.74432 | 61.77792 | -25.3388% | 60.46783 |
+| 88,000 | 91.98507 | 68.37111 | -25.6715% | 60.38797 |
+| 96,000 | 100.88397 | 74.72862 | -25.9262% | 60.51241 |
+| 104,000 | 109.80642 | 81.09448 | -26.1478% | 60.61108 |
+| 112,000 | 118.42901 | 87.71959 | -25.9307% | 60.51602 |
+| 120,000 | 127.35232 | 93.99757 | -26.1909% | 60.65749 |
+| 128,000 | 135.93617 | 100.34193 | -26.1845% | 60.74103 |
+
+All 147,456,000 candidate output elements are finite. Across the family, the
+worst max absolute difference is `5.0354e-4` and worst relative L2 is
+`6.8983e-3` versus the exact FP32-accumulator route. The three shortest points
+remain slightly below 60 because the 43-TFLOP/s exact causal tail is a larger
+fixed fraction, but they are still 1.288x..1.325x faster than split-KV3.
 
 The architecture trace is compute-dense rather than launch-starved: 49 timed
 kernels occupy 95.630493 ms of a 95.809850-ms GPU span, or 99.81%. Prefix QK
@@ -336,7 +361,9 @@ and falls back to the exact route.
 
 The route is default-off behind
 `VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1`, rejects CUDA graph
-capture, and admits only the frozen shape and scale. The final `.875` TP4
+capture, and admits only `Q=8000`, `KV=40000..128000` in 8000-token steps,
+`Hq=6/Hkv=1/D=256`, FP16, causal attention, and scale 1/16. The earlier
+endpoint-only `.875` TP4
 Qwen3.8-27B-FP8 control/candidate/control prefill times are
 `46.45658 / 45.47797 / 46.11195 s`. Relative to the `46.28426-s` bracketed
 control, the candidate lowers latency by 1.7421% and raises prompt throughput
@@ -345,13 +372,13 @@ architecture hits, with no architecture OOM/fallback, and all three runs emit
 the same 32 output token IDs and SHA256
 `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
 
-The `.88` run also succeeds at 45.53427-s prefill with the same hash and 16
+The endpoint-only `.88` run also succeeds at 45.53427-s prefill with the same hash and 16
 hits/rank. Its memory profiler left enough headroom, so the route passed rather
-than exercising the fallback branch. This exact-shape win is not the complete
-128K decay solution: it accelerates only the final `KV=128000` chunk. The next
-architecture gate expands admission across `Q=8000`, `KV=40000..128000`, where
-the same bounded score cache can cover up to 12 long chunks per full-attention
-layer.
+than exercising the fallback branch. The family operator now covers up to 12
+long chunks per full-attention layer. Its per-layer measured saving sums to
+267.024 ms, or a projected 4.272 s across 16 full-attention layers; this is not
+a whole-model claim. The remaining promotion gate is a clean TP4 A/B with 192
+expected family-route hits/rank and identical fixed-prompt output tokens.
 
 ## Artifacts
 
@@ -360,6 +387,8 @@ layer.
 - Final operator A/B/A:
   `results/torch-architecture-scorecache-final-v1-aba.json` under that task
   root.
+- Shape-family operator A/B:
+  `results/torch-architecture-shapefamily-v1-aba.json` under that task root.
 - Final TP4 `.875` model gate:
   `results/tp4-128k-architecture-scorecache-final-{control-a,candidate,control-b}-0875.json`.
 - Final high-memory `.88` route-success run:

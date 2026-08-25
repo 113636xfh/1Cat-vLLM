@@ -89,7 +89,7 @@ new file mode 100644
 index 0000000..197453f
 --- /dev/null
 +++ b/csrc/flash_attn/src/flash_fwd_d256_gqa_arch_sm70.cu
-@@ -0,0 +1,1351 @@
+@@ -0,0 +1,1359 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +
 +/***************************************************************************************************
@@ -1210,11 +1210,11 @@ index 0000000..197453f
 +  constexpr int kHeadDim = 256;
 +  constexpr int kHeadsQ = 6;
 +  constexpr int kHeadsKV = 1;
-+  constexpr int kPrefix = 120000;
 +  constexpr int kTail = 8000;
-+  constexpr int kTotalKV = kPrefix + kTail;
++  constexpr int kMinTotalKV = 40000;
++  constexpr int kMaxTotalKV = 128000;
++  constexpr int kTotalKVStep = 8000;
 +  constexpr int kBlockN = 8192;
-+  constexpr int kBlocks = (kPrefix + kBlockN - 1) / kBlockN;
 +
 +  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(),
 +              "SM70 GQA architecture requires CUDA tensors");
@@ -1224,11 +1224,19 @@ index 0000000..197453f
 +                  && out.scalar_type() == q.scalar_type(),
 +              "SM70 GQA architecture requires FP16 q, k, v, and out");
 +  TORCH_CHECK(q.sizes() == at::IntArrayRef({1, kQuery, kHeadsQ, kHeadDim})
-+                  && k.sizes()
-+                      == at::IntArrayRef({1, kTotalKV, kHeadsKV, kHeadDim})
++                  && k.dim() == 4 && k.size(0) == 1
++                  && k.size(2) == kHeadsKV && k.size(3) == kHeadDim
 +                  && v.sizes() == k.sizes() && out.sizes() == q.sizes(),
 +              "SM70 GQA architecture only accepts the validated "
-+              "Q8000/KV128000/Hq6/Hkv1/D256 shape");
++              "Q8000/Hq6/Hkv1/D256 dense shape family");
++  const int total_kv = static_cast<int>(k.size(1));
++  TORCH_CHECK(total_kv >= kMinTotalKV && total_kv <= kMaxTotalKV
++                  && total_kv % kTotalKVStep == 0,
++              "SM70 GQA architecture requires KV in [40000, 128000] "
++              "with an 8000-token step, got ",
++              total_kv);
++  const int prefix = total_kv - kTail;
++  const int blocks = (prefix + kBlockN - 1) / kBlockN;
 +  TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
 +                  && out.is_contiguous(),
 +              "SM70 GQA architecture requires contiguous tensors");
@@ -1343,8 +1351,8 @@ index 0000000..197453f
 +
 +  C10_CUDA_CHECK(onecat_sm70_d256_dense_state_raw(
 +      query,
-+      key + size_t(kPrefix) * kHeadDim,
-+      value + size_t(kPrefix) * kHeadDim,
++      key + size_t(prefix) * kHeadDim,
++      value + size_t(prefix) * kHeadDim,
 +      tail_max_ptr,
 +      tail_sum_ptr,
 +      tail_output_ptr,
@@ -1378,9 +1386,9 @@ index 0000000..197453f
 +      cudaMemcpyHostToDevice,
 +      stream));
 +
-+  for (int block = 0; block < kBlocks; ++block) {
++  for (int block = 0; block < blocks; ++block) {
 +    int begin = block * kBlockN;
-+    int width = std::min(kBlockN, kPrefix - begin);
++    int width = std::min(kBlockN, prefix - begin);
 +    BlockOperators operation;
 +    operation.width = width;
 +    typename QKGemm::Arguments arguments(

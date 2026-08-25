@@ -1896,14 +1896,14 @@ Source behavior:
 - Decode path reads vLLM paged KV cache directly.
 - Prefill has direct and fallback paths, including paged KV gather fallback.
 
-D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
+D256 8K-by-40K..128K GQA architecture checkpoint, 2026-08-25:
 
 - Frozen single-rank shape is causal FP16 Q/K/V, `Q=8000`, `KV=128000`,
   `Hq=6`, `Hkv=1`, `D=256` on one V100-SXM2-32GB. The metric is useful
   causal Attention FLOPs divided by complete Attention elapsed time; it is not
   model TOPS or prompt throughput.
-- The architecture separates the fully visible 120K prefix from the causal 8K
-  tail. Six GQA heads are packed into GEMM M=48,000. QK writes FP16 logits and
+- The architecture separates a fully visible 32K..120K prefix from the causal
+  8K tail. Six GQA heads are packed into GEMM M=48,000. QK writes FP16 logits and
   row statistics; PV normalizes logits during its global-to-shared operand
   transform. One reusable FP16 block partial is folded into a FP32 online
   prefix numerator/state before the next block. The exact causal-tail kernel
@@ -1922,6 +1922,13 @@ D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
   max absolute difference is `2.2888e-4`, mean absolute difference
   `2.5430e-5`, and relative L2 `6.8629e-3`. Peak allocated memory is
   `1.11960 GiB`.
+- The generalized operator admits all twelve observed `Q=8000` chunk shapes,
+  `KV=40000..128000` in 8000-token steps. Strict per-length A/B measured
+  `59.34862..60.74103` useful causal TFLOP/s. Against the active split-KV3
+  control, every point is faster: latency is `22.3891%..26.1909%` lower and
+  speedup is `1.28848x..1.35485x`. All 147,456,000 candidate elements are
+  finite; the worst max absolute difference is `5.0354e-4` and worst relative
+  L2 is `6.8983e-3` versus the exact FP32-accumulator route.
 - Smaller score blocks do not pass the target: BN7168 is
   `104.32751 ms / 58.42057 TFLOP/s`; BN8000 is
   `101.70283 ms / 59.92825 TFLOP/s` and must not be rounded to 60. BN8192 is
@@ -1932,7 +1939,7 @@ D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
   fixed before timing. Synchronous device-symbol updates were changed to
   current-stream asynchronous copies so the integrated measurement includes no
   artificial whole-device fence.
-- Integration is exact-shape bounded and default-off behind
+- Integration is shape-family bounded and default-off behind
   `VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1`. It rejects
   CUDA-graph capture and falls back to the exact dense kernel on workspace OOM.
   The final external FA2 patch applies cleanly after the existing D256
@@ -1956,11 +1963,12 @@ D256 8K-by-128K GQA architecture checkpoint, 2026-08-25:
   and 16 route hits/rank. Its profiler left enough headroom for the route, so
   this validates high-memory route success rather than directly exercising
   the preflight fallback branch.
-- This checkpoint passes the 60-TFLOP/s operator and real-model quality gates,
-  but remains default-off because the exact `KV=128000` admission covers only
-  the last long-prefill chunk. The next gate generalizes the architecture over
-  the observed `Q=8000`, `KV=40000..128000` shape family and measures the full
-  128K decay curve. Evidence and the experiment ledger are under
+- The shape-family operator gate is complete, but the widened real-model TP4
+  gate remains pending. The twelve per-layer split-KV3-to-architecture savings
+  sum to 267.024 ms; across 16 full-attention layers that projects 4.272 s, but
+  this is not a model result. Promotion requires a clean run with 192 expected
+  route hits/rank, bracketed prompt throughput, and identical fixed-prompt
+  tokens. Evidence and the experiment ledger are under
   `/data/minimax-h3/task-cache/qwen38-d256-attn-arch60-20260825/`.
 
 Latest target state:
