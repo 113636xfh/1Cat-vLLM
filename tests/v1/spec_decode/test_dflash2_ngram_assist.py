@@ -107,6 +107,15 @@ def _host_only_speculator() -> DFlash2Speculator:
     return speculator
 
 
+def test_host_token_state_is_requested_only_for_enabled_assist() -> None:
+    speculator = object.__new__(DFlash2Speculator)
+    speculator._ngram_assist = None
+    assert not speculator.requires_host_token_state
+
+    speculator._ngram_assist = object()  # type: ignore[assignment]
+    assert speculator.requires_host_token_state
+
+
 def test_prepare_assist_uses_request_slots_and_skips_only_all_hit() -> None:
     speculator = _host_only_speculator()
     token_ids = np.zeros((3, 16), dtype=np.int32)

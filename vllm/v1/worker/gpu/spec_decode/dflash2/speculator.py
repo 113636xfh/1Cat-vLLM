@@ -346,6 +346,11 @@ class DFlash2Speculator(DFlashSpeculator):
                 self.num_speculative_steps,
             )
 
+    @property
+    def requires_host_token_state(self) -> bool:
+        """Whether the runner must expose async samples and request history."""
+        return self._ngram_assist is not None
+
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # The selector walk and rejection sampler must consume identical scores.
         # BF16 rounding measurably changes candidate order, so keep this FP32.
