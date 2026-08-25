@@ -271,6 +271,19 @@ _SM70_MTP_STEP_DUMP_COUNTER = 0
 _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = False
 
 
+def _unwrap_pipeline_intermediate_hidden_states(
+    output: torch.Tensor | IntermediateTensors,
+) -> torch.Tensor:
+    if not isinstance(output, IntermediateTensors):
+        return output
+    try:
+        return output.tensors["hidden_states"]
+    except KeyError as exc:
+        raise RuntimeError(
+            "Pipeline intermediate output must contain a 'hidden_states' tensor."
+        ) from exc
+
+
 def _dflash_ddtree_debug_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0") == "1"
 
@@ -10894,7 +10907,9 @@ class GPUModelRunner(
                 # Non-last PP ranks return intermediate tensors instead of
                 # logits-bearing hidden states. Dummy-run callers only need a
                 # tensor to preserve the profiling/capture return contract.
-                hidden_states = next(iter(hidden_states.tensors.values()))
+                hidden_states = _unwrap_pipeline_intermediate_hidden_states(
+                    hidden_states
+                )
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()

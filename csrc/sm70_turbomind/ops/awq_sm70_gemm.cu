@@ -8276,10 +8276,10 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       logged_mxfp4_dense_stage,
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
-  const bool compact_decode_shape =
-      input.size(0) == num_experts && num_experts == 6 &&
-      ((k == 4096 && (n == 512 || n == 1024)) ||
-       (n == 4096 && (k == 256 || k == 512)));
+  const bool compact_decode_shape = input.size(0) == num_experts &&
+                                    num_experts == 6 &&
+                                    ((k == 4096 && (n == 512 || n == 1024)) ||
+                                     (n == 4096 && (k == 256 || k == 512)));
   if (vllm::awq_sm70::mxfp4_moe_compact_grouped_decode_enabled() &&
       compact_decode_shape) {
     mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
@@ -8571,7 +8571,7 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
   TORCH_CHECK(group_size == 32 && w13_k == hidden_logical_size &&
                   (w13_n == 512 || w13_n == 1024),
               "mxfp4_moe_single_token_prepare_w13_sm70_out: unsupported "
-              "DeepSeek V4 W13 shape contract.");
+              "MXFP4 W13 shape contract.");
   TORCH_CHECK(
       compact_input.is_cuda() &&
           compact_input.scalar_type() == torch::kFloat16 &&
