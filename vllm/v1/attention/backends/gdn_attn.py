@@ -176,6 +176,8 @@ def _dflash2_gdn_group_metadata_kernel(
     block_table_ptrs,
     state_output_ptrs,
     block_table_strides,
+    state_start_indices,
+    req_index_mapping,
     spec_query_start_loc_src,
     num_accepted_src,
     state_selector_src,
@@ -188,6 +190,7 @@ def _dflash2_gdn_group_metadata_kernel(
     WIDTH: tl.constexpr,
     PAD_ID: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_STATE_START: tl.constexpr,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -200,8 +203,23 @@ def _dflash2_gdn_group_metadata_kernel(
     columns = offsets % WIDTH
     output_mask = offsets < batch_size * WIDTH
     live_state_mask = output_mask & (rows < num_spec_decodes)
+    state_columns = columns
+    if USE_STATE_START:
+        req_indices = tl.load(
+            req_index_mapping + rows,
+            mask=live_state_mask,
+            other=0,
+        )
+        live_state_mask &= req_indices >= 0
+        state_starts = tl.load(
+            state_start_indices + req_indices,
+            mask=live_state_mask,
+            other=-1,
+        )
+        state_columns = columns + state_starts
+        live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
     state_ids = tl.load(
-        block_table + rows * block_table_stride + columns,
+        block_table + rows * block_table_stride + state_columns,
         mask=live_state_mask,
         other=PAD_ID,
     )
@@ -2168,6 +2186,8 @@ def prepare_dflash2_gdn_group_metadata(
     num_accepted_tokens: torch.Tensor,
     num_actual_tokens: int,
     descriptor: DFlash2GDNGroupDescriptor | None,
+    state_start_indices: torch.Tensor | None = None,
+    req_index_mapping: torch.Tensor | None = None,
 ) -> (
     tuple[
         dict[int, GDNAttentionMetadata],
@@ -2177,12 +2197,12 @@ def prepare_dflash2_gdn_group_metadata(
 ):
     """Prepare all pure-MRV2 DFlash2 GDN graph metadata in one launch.
 
-    The current production target uses ``mamba_cache_mode=none``. Its legacy
-    contract compacts the live speculative rows from every group's block table,
-    then copies them into graph-stable buffers. DFlash2 batches keep those rows
-    at the front and CUDA-graph padding at the back, so the pointer-table kernel
-    can perform the identical copy and tail fill without ten independent
-    advanced-indexing pipelines.
+    ``mamba_cache_mode=none`` reads the first speculative state columns.
+    ``mamba_cache_mode=align`` supplies the authoritative, post-precopy state
+    column for each live request. DFlash2 batches keep live speculative rows at
+    the front and CUDA-graph padding at the back, so one pointer-table kernel can
+    perform the same state selection and tail fill without ten independent
+    gather/copy pipelines.
     """
     if not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
         return None
@@ -2193,6 +2213,22 @@ def prepare_dflash2_gdn_group_metadata(
     if num_accepted_tokens.dtype != torch.int32 or num_accepted_tokens.ndim != 1:
         return None
 
+    use_state_start = state_start_indices is not None
+    if use_state_start != (req_index_mapping is not None):
+        return None
+    if use_state_start:
+        assert state_start_indices is not None
+        assert req_index_mapping is not None
+        if (
+            state_start_indices.device != num_accepted_tokens.device
+            or state_start_indices.dtype != torch.int32
+            or state_start_indices.ndim != 1
+            or req_index_mapping.device != num_accepted_tokens.device
+            or req_index_mapping.dtype != torch.int32
+            or req_index_mapping.ndim != 1
+        ):
+            return None
+
     spec_mask_cpu = common_gdn_metadata.spec_sequence_masks_cpu
     num_spec_decodes = common_gdn_metadata.num_spec_decodes
     if (
@@ -2202,6 +2238,10 @@ def prepare_dflash2_gdn_group_metadata(
         or num_spec_decodes > num_actual_tokens
         or num_spec_decodes > spec_mask_cpu.numel()
         or common_gdn_metadata.num_spec_decode_tokens > num_actual_tokens
+        or (
+            req_index_mapping is not None
+            and req_index_mapping.numel() < num_spec_decodes
+        )
     ):
         return None
     if not bool(torch.all(spec_mask_cpu[:num_spec_decodes]).item()):
@@ -2221,6 +2261,11 @@ def prepare_dflash2_gdn_group_metadata(
         return None
 
     first_builder = builders_by_group[0][1]
+    mamba_cache_mode = first_builder.vllm_config.cache_config.mamba_cache_mode
+    if mamba_cache_mode not in ("none", "align"):
+        return None
+    if use_state_start != (mamba_cache_mode == "align"):
+        return None
     width = first_builder.num_spec_state_tokens + 1
     common_buffers = first_builder._ddtree_fast_common_buffers
     if common_buffers is None:
@@ -2245,7 +2290,7 @@ def prepare_dflash2_gdn_group_metadata(
         if (
             builder.num_spec_state_tokens + 1 != width
             or not builder.use_full_cuda_graph
-            or builder.vllm_config.cache_config.mamba_cache_mode != "none"
+            or builder.vllm_config.cache_config.mamba_cache_mode != mamba_cache_mode
             or builder.decode_cudagraph_max_bs < num_actual_tokens
             or builder._ddtree_fast_common_buffers is not common_buffers
             or group_id < 0
@@ -2295,6 +2340,7 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(table.data_ptr() for table in input_tables),
         tuple(state.data_ptr() for state in output_states),
         tuple(table.stride(0) for table in input_tables),
+        use_state_start,
         common_buffers.spec_sequence_masks.data_ptr(),
         common_buffers.spec_token_indx.data_ptr(),
         common_buffers.non_spec_token_indx.data_ptr(),
@@ -2329,6 +2375,8 @@ def prepare_dflash2_gdn_group_metadata(
         descriptor.block_table_ptrs,
         descriptor.state_output_ptrs,
         descriptor.block_table_strides,
+        num_accepted_tokens if state_start_indices is None else state_start_indices,
+        num_accepted_tokens if req_index_mapping is None else req_index_mapping,
         query_start_loc,
         num_accepted_tokens,
         num_accepted_tokens,
@@ -2341,6 +2389,7 @@ def prepare_dflash2_gdn_group_metadata(
         WIDTH=width,
         PAD_ID=PAD_SLOT_ID,
         BLOCK=block,
+        USE_STATE_START=use_state_start,
         num_warps=1,
     )
     common_buffers.initialized_key = (
@@ -2404,7 +2453,20 @@ def prepare_dflash2_gdn_group_metadata(
             actual = prepared[id(builder)]
             actual_state = actual.spec_state_indices_tensor
             assert actual_state is not None
-            expected_state = block_tables[group_id][spec_mask, :width]
+            source_table = block_tables[group_id][spec_mask]
+            if use_state_start:
+                assert state_start_indices is not None
+                assert req_index_mapping is not None
+                req_indices = req_index_mapping[:num_spec_decodes].to(torch.long)
+                starts = state_start_indices[req_indices].to(torch.long)
+                columns = starts[:, None] + torch.arange(
+                    width,
+                    dtype=torch.long,
+                    device=source_table.device,
+                )
+                expected_state = torch.gather(source_table, 1, columns)
+            else:
+                expected_state = source_table[:, :width]
             torch.testing.assert_close(
                 actual_state[:num_spec_decodes],
                 expected_state,
