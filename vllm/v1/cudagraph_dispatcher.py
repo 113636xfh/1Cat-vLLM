@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 
 _SM70_FP8_KV_BATCH_CONTEXT_SIZES = frozenset((4, 8, 16))
 _SM70_FP8_KV_LONG_CONTEXT_MIN_SEQ_LEN = 16384
+_SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN = 49152
 
 
 def _get_sm70_context_buckets(env_name: str) -> tuple[int, ...]:
@@ -235,6 +236,22 @@ class CudagraphDispatcher:
         self.sm70_fp8_kv_batch_context_routing = (
             _sm70_fp8_kv_batch_context_routing_enabled(vllm_config)
         )
+        cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+        self.sm70_e4m3_b1_wave_context_routing = bool(
+            self.sm70_fp8_kv_batch_context_routing
+            and cache_dtype in ("fp8", "fp8_e4m3")
+            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "0") == "1"
+            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS", "0") == "1"
+        )
+        self.sm70_e4m3_b1_wave_context_min_seq_len = max(
+            1,
+            int(
+                os.getenv(
+                    "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN",
+                    str(_SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN),
+                )
+            ),
+        )
         self._logged_sm70_context_bucket = False
         self._logged_sm70_batch_context_variant = False
 
@@ -390,8 +407,22 @@ class CudagraphDispatcher:
             and batch_descriptor.uniform
             and batch_descriptor.num_reqs is not None
             and batch_descriptor.num_tokens == batch_descriptor.num_reqs
-            and batch_descriptor.num_reqs in _SM70_FP8_KV_BATCH_CONTEXT_SIZES
+            and (
+                batch_descriptor.num_reqs in _SM70_FP8_KV_BATCH_CONTEXT_SIZES
+                or (
+                    self.sm70_e4m3_b1_wave_context_routing
+                    and batch_descriptor.num_reqs == 1
+                )
+            )
         )
+
+    def _batch_context_variant_min_seq_len(
+        self,
+        batch_descriptor: BatchDescriptor,
+    ) -> int:
+        if self.sm70_e4m3_b1_wave_context_routing and batch_descriptor.num_reqs == 1:
+            return self.sm70_e4m3_b1_wave_context_min_seq_len
+        return _SM70_FP8_KV_LONG_CONTEXT_MIN_SEQ_LEN
 
     def _context_buckets_for_descriptor(
         self,
@@ -449,7 +480,8 @@ class CudagraphDispatcher:
         """Return the graph specialization selected by the active context."""
         if (
             attention_context_len is not None
-            and attention_context_len >= _SM70_FP8_KV_LONG_CONTEXT_MIN_SEQ_LEN
+            and attention_context_len
+            >= self._batch_context_variant_min_seq_len(batch_descriptor)
             and self._is_batch_context_variant_descriptor(batch_descriptor)
         ):
             return replace(

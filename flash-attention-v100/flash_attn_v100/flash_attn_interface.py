@@ -18,7 +18,7 @@ except ImportError:
 
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
-E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 1024)
+E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}

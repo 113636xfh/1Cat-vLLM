@@ -43105,3 +43105,51 @@ Interpretation:
   to `0.022538 ms` (`2.884x`). The full CUDA 12.8
   extension builds with target architecture 7.0 only; 28 CPU checks and the
   changed-file static gate pass.
+## 2026-08-25 Qwen3.8-27B-NVFP4 no-MTP long-context decode
+
+- Frozen acceptance is TP4 on four V100-SXM2-32GB GPUs, E4M3 KV,
+  Flash-V100, TurboMind FP8/NVFP4 projections, full CUDA Graph, official
+  temperature-1/top-p-.95/top-k-20 sampling, no MTP, and exact final contexts.
+  Pure decode excludes prefill/TTFT and uses 63 intervals from 64 output
+  tokens. Required rates are 60 tok/s at 128K and 45 tok/s at 256K.
+- The admitted batch-one G6/D256, page-1568 E4M3 route uses an exact shared
+  conversion LUT and device-selected p64/p256/p512/p896/p1664 waves with
+  thresholds 12,288/49,152/98,304/196,608. A merged long partition/reducer pair
+  replaces three inactive long launch pairs during graph replay. Admission is
+  based only on hardware, dtype, batch, head, page-layout, graph, and explicit
+  partition contracts; it does not inspect a model or checkpoint identity.
+- Batch-one full CUDA Graph replay is specialized at 49,152 tokens. The
+  default graph contains only the p64/p256 launch pair; the semantic
+  long-context graph admits the merged wave pair. Selection uses scheduler
+  context metadata and does not synchronize a device sequence length to the
+  host. Eager execution continues to route from the live context.
+- The matched control is 40.561 tok/s (24.654 ms) at 128K and 27.456 tok/s
+  (36.422 ms) at 256K. The candidate reaches **61.834 tok/s (16.172 ms)** and
+  **50.376 tok/s (19.851 ms)** respectively, exceeding both targets. Prefill
+  remains separately reported at 283.127/1085.519 s and TTFT at
+  283.154/1085.568 s.
+- Both candidate requests return all 64 tokens without corruption and exactly
+  preserve their control streams: hashes are `66a130ea9d68...` at 128K and
+  `e1bc9ab8a979...` at 256K. No sampling path or MTP state changes.
+- The disabled-compile-cache post-integration 1K/256-output regression guard
+  reaches 83.184/83.187 tok/s on its two hot repetitions versus
+  83.761/83.721 tok/s for the accepted GDN BA-split control, a 0.66% median
+  delta. All candidate repetitions preserve that control's exact token stream
+  (`c243818da5cc...`). The first cold request remains separately reported, and
+  cache-reload diagnostics are excluded from quality evidence.
+- A final isolated 256K Nsight Systems trace measures 0.576603 ms for the
+  merged long partition kernel and 0.033280 ms for its reducer. Including the
+  inactive device-routed short guard pair gives 0.617979 ms of Flash kernels,
+  down 63.83% from the old p256 trace's 1.708550 ms. This is operator evidence,
+  not a full-model TPOT decomposition.
+- Exact decode windows show 100% NVML GPU-busy duty, about 48.2%/45.5%
+  memory-active duty at 128K/256K, 29.45-29.75 GiB allocation per rank, and
+  200.7-226.8 W mean per-rank power at 1530/877 MHz SM/memory clocks. Memory
+  duty is not HBM throughput. NCU counters are blocked by
+  `ERR_NVGPUCTRPERM` and are not inferred.
+- Reject the contiguous-KV assumption, QK software pipeline, split reducer,
+  and paired E4M3 converter. The real unbound K/V views are interleaved;
+  violating that layout corrupts model output. The QK pipeline slows the long
+  kernels by about 30-38%, and the paired converter loses to the exact shared
+  LUT. Detailed evidence and rollback flags are in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.
