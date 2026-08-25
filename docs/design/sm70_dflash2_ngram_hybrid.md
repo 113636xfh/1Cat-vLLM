@@ -9,7 +9,7 @@ The target verifier and the probabilistic rejection-sampling contract remain
 authoritative, so the optimization cannot change the target distribution.
 
 This work is based on `onecat/main` at
-`05d5aa4e5713b376e0fcc057a0a623c7eae53708` and is isolated on
+`d62ef5cb20b48de93a91562e777ac48985f44b76` and is isolated on
 `agent/v100-dflash2-ngram-hybrid-20260825-050018`.
 
 ## Upstream audit
@@ -74,30 +74,53 @@ This work is based on `onecat/main` at
 
 ## Status
 
-- 2026-08-25: isolated worktree created; upstream audit and initial contract
-  recorded.
-- 2026-08-25: implemented opt-in MRV2 host lookup over the UVA request-token
-  state, full-hit query/selector bypass, mixed-batch row override, and one-hot
-  dense/sparse rejection caches. Structured-output batches bypass the assist.
+- 2026-08-25: Draft PR #287 implements opt-in MRV2 host lookup over the
+  authoritative UVA request-token state, full-hit query/selector bypass,
+  mixed-batch row override, and one-hot dense/sparse rejection caches.
+  Structured-output batches bypass the assistant, and intermediate chunked
+  prefill materializes draft context K/V before returning without lookup.
 - CPU split-history KMP microbenchmark (median/P95): 1K `2.66/2.74 us`, 32K
   `50.05/53.22 us`, 128K `190.72/201.03 us`, and 256K `369.57/393.17 us`.
-- Tests: 22 DFlash2-ngram tests pass on V100, including exact parity with the
-  standalone KMP policy and dense-vs-compact probabilistic rejection at
-  `top_p=1.0/0.95`; existing DFlash2 CPU suite passes 61 tests with 12 expected
-  CUDA skips, and the MRV2 route suite passes 10 tests. End-to-end model and
-  dataset validation remain in progress.
-- The first practical TP4 CUDA Graph run used FP8 E5M2 target KV, FP16 draft
-  KV, 256K maximum context, 4096 maximum batched tokens, prefix caching, Mamba
-  alignment, and the Qwen tool/reasoning parsers. Repeated text reached 92 full
-  hits in 93 eligible rounds and a warmed `328.32 tok/s`; lookup itself averaged
-  about `0.018 ms` on TP0. A natural coding completion reached `148.89 tok/s`
-  with about 15% of rounds skipping the DFlash2 query/selector and average
-  accepted length near 3.9. These are route proofs, not the final paired speed
-  result: the existing public server uses additional uncommitted production
-  optimizations, so its `418.02 tok/s` repeated-text result is not a valid
-  baseline for this clean branch.
-- Existing same-sampling 16K natural-stop quality runs provide the target and
-  DFlash2 control. DFlash2 completed HumanEval32 in `374.08 s`, MBPP32 in
-  `363.19 s`, and LiveCodeBench16 in `885.02 s` (`1622.29 s`, or 27.04 minutes,
-  for 80 cases). A hybrid-only full rerun is therefore budgeted at roughly
-  25--28 minutes after the paired micro-suite passes.
+  Focused validation reports `93 passed, 9 skipped` for the CPU DFlash2/ngram
+  set, `10 passed` for MRV2 routing, and `24 passed` for the V100 ngram/AOT
+  fullgraph set.
+- PR #288 first restored the missing production optimization closure to main.
+  On that restored source, no-assist practical coding measured `18.660 ms` per
+  complete round, `135.70 tok/s`, and acceptance length `2.532`. Repeated runs
+  of the historical MBPP item 28 stabilized at `18.484--18.616 ms`,
+  `224.05--225.66 tok/s`, and acceptance length `4.184`. Older 27--31 ms
+  branch measurements predate this closure and are invalid baselines.
+- With ngram `[5,5]` enabled under the identical TP4 practical contract, the
+  coding request measured `18.980 ms`, `131.14 tok/s`, and acceptance length
+  `2.494`; only about 2.2% of eligible rounds were full hits. The matched MBPP
+  item measured `18.700 ms`, `217.18 tok/s`, and acceptance length `4.071`.
+  Thus low-hit short requests currently pay roughly `0.1--0.3 ms` per round
+  and do not pass the default-enable performance gate.
+- The 32-case MBPP natural-stop run (16K output cap, fixed per-item seeds) gave
+  the pure-DFlash control `65,934` output tokens in `389.542 s`, `19,767`
+  verification rounds, `19.707 ms` wall time per round, and acceptance length
+  `3.336`. Hybrid produced `53,710` tokens in `327.613 s`, `16,700` rounds,
+  `19.618 ms` per round, and acceptance length `3.216`. Cumulative full-hit
+  rate reached about 10.1% and lookup averaged `0.016--0.018 ms`; skipped
+  queries slightly reduced round cost, but the lower sampled acceptance path
+  left raw aggregate output throughput at `163.94` versus `169.26 tok/s`.
+- EvalPlus on the mapped 31 MBPP cases reports pure DFlash Base `30/31` and
+  Plus `28/31`; hybrid reports Base `31/31` and Plus `28/31`. This is no score
+  regression, but it does not override the failed throughput gate. The
+  probabilistic one-hot proposal preserves the target distribution; it is not
+  expected to reproduce the same sample-by-sample random trajectory.
+- A fresh hybrid 32K chunked-prefill request measured `10.688 s` cold and
+  `1.416 s` on an identical-prefix hit, versus the restored no-assist evidence
+  of `10.58--10.65 s` and `1.405 s`. The context-only skip log was present and
+  no cache corruption occurred.
+- Promotion decision: keep `ngram_assist` opt-in. The next candidate must
+  report conditional hit acceptance and use an adaptive/confidence policy that
+  removes the low-hit tax; blindly reducing the ngram length is not justified
+  by the current data.
+- After the paired run was stopped, fresh graph captures on GPUs 4--7 began
+  failing inside the draft paged-attention capture with
+  `cudaErrorStreamCaptureInvalidated`. A clean pre-ngram main worktree failed
+  at the same point, so this is not an ngram source regression. The NVLink
+  topology requires resetting all eight GPUs, which was deliberately not done
+  while the user-facing API remained live on GPUs 0--3. Do not count failed
+  startups as performance samples.

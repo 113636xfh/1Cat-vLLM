@@ -43056,10 +43056,29 @@ Interpretation:
   reverse-KMP policy as standalone vLLM n-gram lookup, skips DFlash2 query and
   selector only on a full seven-token hit, and preserves context-KV
   materialization. Misses remain on the unchanged DFlash2 route.
-- V100 unit coverage is 22/22, including probabilistic one-hot rejection,
+- V100 unit coverage is 24/24, including probabilistic one-hot rejection,
   mixed rows, overlap state, and the CUDA override kernel. Practical TP4 graph
   startup with prefix cache, FP8 E5M2 KV, 256K max context, 4096 batched-token
   limit, and tool/reasoning parsers is proven. The earlier 27--31 ms clean-main
   measurements predate the merged production closure and are invalid as a
   speed baseline; collect `ngram_assist=false/true` numbers from the same
   restored build.
+- The restored paired result is now complete. No-assist practical coding is
+  `18.660 ms` per round, `135.70 tok/s`, acceptance `2.532`; ngram `[5,5]` is
+  `18.980 ms`, `131.14 tok/s`, acceptance `2.494`, with only about 2.2% full
+  hits. The feature therefore remains opt-in for short/low-hit traffic.
+- On the fixed-seed, 16K-cap, natural-stop MBPP32 workload, pure DFlash records
+  `389.542 s`, `19,767` rounds, `19.707 ms/round`, acceptance `3.336`, and
+  EvalPlus Base/Plus `30/31` and `28/31`. Hybrid records `327.613 s`, `16,700`
+  rounds, `19.618 ms/round`, acceptance `3.216`, and Base/Plus `31/31` and
+  `28/31`. Its cumulative full-hit rate is about 10.1%, but lower sampled
+  acceptance leaves aggregate output throughput `163.94` versus
+  `169.26 tok/s`; the quality gate passes and the throughput gate does not.
+- Hybrid 32K prefill is `10.688 s` cold and `1.416 s` on an identical-prefix
+  hit, matching restored no-assist evidence (`10.58--10.65 s`, `1.405 s`)
+  closely enough to rule out a material prefill regression in this probe.
+- Post-run capture failures on GPUs 4--7 reproduce unchanged on the clean
+  pre-ngram main worktree at the same draft paged-attention capture. They are
+  runtime/GPU-state evidence, not an ngram regression or speed sample. A full
+  NVLink-group reset was intentionally deferred because GPUs 0--3 host the
+  live user API.
