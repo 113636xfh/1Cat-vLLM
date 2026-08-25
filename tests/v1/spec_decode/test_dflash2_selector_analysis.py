@@ -79,3 +79,24 @@ def test_future_message_can_prefer_a_better_supported_branch():
 
     assert local[0] == local[1]
     assert global_chain[0] > global_chain[1]
+
+
+def test_greedy_mixture_is_normalized_and_moves_exact_mass():
+    record = _record()
+    baseline = _ANALYZER._proposal_probs(
+        record,
+        _ANALYZER.ProposalConfig(name="baseline", use_cached_logits=True),
+    )[1]
+    mixed = _ANALYZER._proposal_probs(
+        record,
+        _ANALYZER.ProposalConfig(
+            name="mixture",
+            greedy_mix=0.25,
+            use_cached_logits=True,
+        ),
+    )[1]
+
+    expected = baseline * 0.75
+    expected[torch.argmax(baseline)] += 0.25
+    torch.testing.assert_close(mixed, expected)
+    torch.testing.assert_close(mixed.sum(), torch.tensor(1.0, dtype=torch.float64))

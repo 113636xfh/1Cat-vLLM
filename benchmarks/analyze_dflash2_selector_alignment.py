@@ -29,6 +29,7 @@ class ProposalConfig:
     unary_scale: float = 1.0
     edge_scale: float = 1.0
     future_beta: float = 0.0
+    greedy_mix: float = 0.0
     use_cached_logits: bool = False
 
 
@@ -129,20 +130,30 @@ def _proposal_probs(
     config: ProposalConfig,
 ) -> list[torch.Tensor]:
     if config.use_cached_logits:
-        return [
+        rows = [
             _compact_probs(row, config.proposal_top_p) for row in record.realized_logits
         ]
-
-    lattice = _transformed_lattice(record, config)
-    future = _backward_messages(lattice)
-    predecessors = _path_predecessors(record)
-    return [
-        _compact_probs(
-            lattice[step, predecessor] + config.future_beta * future[step],
-            config.proposal_top_p,
-        )
-        for step, predecessor in enumerate(predecessors)
-    ]
+    else:
+        lattice = _transformed_lattice(record, config)
+        future = _backward_messages(lattice)
+        predecessors = _path_predecessors(record)
+        rows = [
+            _compact_probs(
+                lattice[step, predecessor] + config.future_beta * future[step],
+                config.proposal_top_p,
+            )
+            for step, predecessor in enumerate(predecessors)
+        ]
+    if config.greedy_mix == 0.0:
+        return rows
+    if not 0.0 <= config.greedy_mix <= 1.0:
+        raise ValueError("greedy_mix must be in [0, 1]")
+    mixed_rows = []
+    for probs in rows:
+        mixed = probs * (1.0 - config.greedy_mix)
+        mixed[torch.argmax(probs)] += config.greedy_mix
+        mixed_rows.append(mixed)
+    return mixed_rows
 
 
 def _target_rows(record: AlignmentRecord) -> list[torch.Tensor]:
@@ -218,7 +229,7 @@ def _evaluate(records: list[AlignmentRecord], config: ProposalConfig) -> dict[st
 
 def _sweep_configs() -> list[ProposalConfig]:
     configs = [ProposalConfig(name="current", use_cached_logits=True)]
-    seen: set[tuple[float, float, float, float, float]] = set()
+    seen: set[tuple[float, float, float, float, float, float]] = set()
 
     def add(
         family: str,
@@ -227,8 +238,9 @@ def _sweep_configs() -> list[ProposalConfig]:
         unary: float = 1.0,
         edge: float = 1.0,
         beta: float = 0.0,
+        greedy_mix: float = 0.0,
     ) -> None:
-        key = (temperature, top_p, unary, edge, beta)
+        key = (temperature, top_p, unary, edge, beta, greedy_mix)
         if key in seen:
             return
         seen.add(key)
@@ -236,13 +248,14 @@ def _sweep_configs() -> list[ProposalConfig]:
             ProposalConfig(
                 name=(
                     f"{family}:t={temperature:g},p={top_p:g},u={unary:g},"
-                    f"e={edge:g},b={beta:g}"
+                    f"e={edge:g},b={beta:g},g={greedy_mix:g}"
                 ),
                 proposal_temperature_scale=temperature,
                 proposal_top_p=top_p,
                 unary_scale=unary,
                 edge_scale=edge,
                 future_beta=beta,
+                greedy_mix=greedy_mix,
             )
         )
 
@@ -251,6 +264,13 @@ def _sweep_configs() -> list[ProposalConfig]:
     for top_p in (0.9, 0.95, 0.98, 0.99):
         for temperature in (0.8, 0.9, 1.0):
             add("nucleus", temperature=temperature, top_p=top_p)
+    for greedy_mix in (0.1, 0.2, 0.3, 0.4, 0.5):
+        for temperature in (0.8, 0.9, 1.0, 1.1):
+            add(
+                "greedy-mixture",
+                temperature=temperature,
+                greedy_mix=greedy_mix,
+            )
     for unary in (0.75, 1.0, 1.25):
         for edge in (0.5, 0.75, 1.0, 1.25, 1.5):
             for temperature in (0.85, 1.0, 1.15):
