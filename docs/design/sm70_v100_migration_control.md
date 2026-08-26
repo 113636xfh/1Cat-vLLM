@@ -43868,13 +43868,17 @@ Interpretation:
   to the QPN8 projection/reduction path. The `0.084 ms/token` speed reduction
   is therefore not admitted, and the route now defaults off while an exact
   TurboMind-prescaled alternative is screened.
-- The replacement keeps the TurboMind gated-interleaved layout, accumulation
-  path, layout restore and external clamp-SwiGLU unchanged. It only folds the
-  exact E4M3 exponent-bias factor into finite, reversibly prescaled FP16 block
-  scales. On the real layer-0 TP4-rank-0 shared gate/up tensor, all 64 dynamic
-  patterns are bitwise both before and after activation and both CUDA Graphs
-  replay stably. Same-GPU A/B/B/A timing moves `62.298` to `20.562 us/layer`
-  (`3.03x`). Evidence is under
+- The replacement keeps the gated-interleaved layout, layout restore, and
+  external clamp-SwiGLU, and its FP16 block-scale exponent shift is reversible.
+  It does not keep the control accumulation path: C++ dispatch selects the
+  dedicated `Config_E4M3_Prescaled` `8x128x64`, split-K-7, swizzle-1 kernel,
+  changing partial boundaries and reduction order versus the ordinary
+  TurboMind control. The earlier same-accumulation description is withdrawn.
+  On the real layer-0 TP4-rank-0 tensor, the initial 64 dynamic patterns happen
+  to be bitwise before and after activation and both CUDA Graphs replay stably;
+  same-GPU A/B/B/A timing moves `62.298` to `20.562 us/layer` (`3.03x`). This
+  screen is insufficient for inputs near FP16 rounding boundaries. Evidence
+  is under
   `/data/models/v100-dsv4-0731-pp2tp4-shared-gate-prescaled-exact-screen-20260826-r1/`.
   The isolated layer-0 result does not generalize to the model endpoint. In a
   source/topology/request-matched full pair, the control scores GSM8K `64/64`,
