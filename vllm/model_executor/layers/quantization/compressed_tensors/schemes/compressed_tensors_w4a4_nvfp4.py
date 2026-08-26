@@ -362,6 +362,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     if qpn2_prefill_workspace is None
                     else qpn2_prefill_workspace.data_ptr()
                 )
+                if qpn2_prefill_workspace is not None:
+                    # QPN2 and QPN4 use the same physical tile order, but
+                    # expose checkpoint-native [N, K/2] and GEMM-native
+                    # [K, N/2] shapes respectively.  Keep zero-copy views so
+                    # prefill does not retain a third multi-GB weight layout.
+                    layer.sm70_nvfp4_qpn2_prefill_codes = qpn2_codes.view(k, n // 2)
+                    layer.sm70_nvfp4_qpn2_prefill_scales = qpn2_scales.view(k // 16, n)
                 logger.info_once(
                     "SM70 NVFP4 QPN2 M<=8 route enabled for a compatible "
                     "TP4 projection contract."
@@ -453,8 +460,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 out_2d,
                 prefill_dense_weight_ptr,
                 x_2d,
-                layer.sm70_nvfp4_qpn2_codes,
-                layer.sm70_nvfp4_qpn2_scales,
+                layer.sm70_nvfp4_qpn2_prefill_codes,
+                layer.sm70_nvfp4_qpn2_prefill_scales,
                 float(layer.sm70_nvfp4_qpn2_global_scale),
                 True,
                 gated_silu,

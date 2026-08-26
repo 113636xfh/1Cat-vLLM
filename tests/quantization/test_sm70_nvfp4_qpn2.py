@@ -156,6 +156,16 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert layer.sm70_nvfp4_qpn2_gated_silu
         assert layer.sm70_nvfp4_qpn2_global_scale == 0.5
         assert layer.sm70_nvfp4_qpn2_prefill_dense_weight_ptr == workspace.data_ptr()
+        assert layer.sm70_nvfp4_qpn2_prefill_codes.shape == (64, 32)
+        assert layer.sm70_nvfp4_qpn2_prefill_scales.shape == (4, 64)
+        assert (
+            layer.sm70_nvfp4_qpn2_prefill_codes.data_ptr()
+            == layer.sm70_nvfp4_qpn2_codes.data_ptr()
+        )
+        assert (
+            layer.sm70_nvfp4_qpn2_prefill_scales.data_ptr()
+            == layer.sm70_nvfp4_qpn2_scales.data_ptr()
+        )
         assert layer.weight.numel() == 0
         assert layer.weight_scale.numel() == 0
 
@@ -177,5 +187,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert torch.equal(large_fused, torch.full_like(large_fused, 5))
         assert prefill_calls[0][-2:] == (True, False)
         assert prefill_calls[1][-2:] == (True, True)
+        assert prefill_calls[0][3].shape == (64, 32)
+        assert prefill_calls[0][4].shape == (4, 64)
     finally:
         envs.disable_envs_cache()

@@ -20,6 +20,7 @@ The historical short- and long-prefill numbers use different contracts:
 |---|---|---:|---|
 | Public PR #271 | Qwen3.8-27B-FP8, TP4, exact input 8000, target-only | 5121.44 request-wall and 5170.96 pure-prefill tok/s | Exact-8K only |
 | Public PR #324 | Same exact-8K FP8 contract | 5500 tok/s is a campaign target, not a measured implementation result | Documentation-only PR |
+| Public PR #224 | Qwen3.8-27B-FP8, TP4, exact input 65536, target-only | 2798.6 to 3496.4 prompt tok/s after the exact D256 operator | Closest retained 64K target-only reference |
 | Private PR #8/#13 | Qwen3.8-27B-FP8, TP4, input 261888, chunk 8192 with FP16 Mamba/SSM cache and Q8000 aligned chunks, target-only | 2438.89 prompt tok/s | Stable max-aware D256 architecture |
 | Rejected public PR #315 lane | Same 256K FP8 contract | 2971.51 prompt tok/s | Rejected: 32 output token IDs were zero |
 
@@ -145,6 +146,26 @@ weight dequantization on every call:
 
 The candidate reuses the QPN2 code and E4M3 scale-code buffers that are already
 resident for verification, plus the existing shared 85-MiB FP16 workspace. It
-does not retain a third packed weight layout. Admission is default-off and
-requires `VLLM_SM70_NVFP4_QPN2_PREFILL=1`; M below the separately recorded
-crossover threshold keeps TurboMind, and M<=8 verification remains QPN2.
+does not retain a third packed weight layout: QPN2 and QPN4 expose different
+2-D shapes but use the same flattened physical tile order, so the bridge uses
+zero-copy views. Admission is default-off and requires
+`VLLM_SM70_NVFP4_QPN2_PREFILL=1`; M below the separately recorded crossover
+threshold keeps TurboMind, and M<=8 verification remains QPN2. The current
+campaign stops at 64K; no 128K/256K throughput run is required for promotion.
+The single-V100 bridge probe confirms byte-identical flattened code and scale
+storage despite shapes `[N,K/2]` and `[K,N/2]`; both ordinary and fused
+gate-SiLU QPN4-prefill calls are bitwise equal with maximum absolute error
+zero.
+
+## Rejected SWA tail-only shortcut
+
+The DFlash2 draft uses a 2048-token sliding window, but projecting and writing
+only the currently readable tail is not valid with automatic prefix caching.
+Draft-group blocks are registered by content for later requests; a block whose
+target tokens were computed without the matching draft-context KV write can be
+reused later at a sequence length where those tokens are inside the window.
+That produces a cache hit backed by uninitialized draft KV and collapses
+acceptance. Therefore this campaign keeps full coverage of every newly
+computed target token. A future tail-only design would first need to decouple
+draft-group cache registration from target-prefix hits and prove rebuild
+semantics; that is outside this prefill dependency closure.
