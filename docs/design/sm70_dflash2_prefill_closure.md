@@ -72,17 +72,19 @@ contract is Q8000 with KV16K..256K in 8K steps. With seven speculative slots,
 the scheduler first reduces the configured 4096-token budget to 4089. The
 checkpoint's FP32 SSM state makes one aligned attention/Mamba block 1648
 tokens, so the observed steady prefill query is Q3296. A configured 8192-token
-budget retains that FP32 state and yields Q6592, not Q8000. Reaching Q8000 with
-the existing kernel requires the historical FP16 Mamba/SSM cache override;
-that arm must pass the quality audit before promotion. The next paired
-measurements are therefore deliberately separated:
+budget retains that FP32 state and yields Q6592, not Q8000. The historical
+target-only FP16 Mamba/SSM contract used an 800-token block, but DFlash2 grows
+the convolution state by seven speculative slots. Its FP16 block is therefore
+880 tokens and the same budget yields Q7920, so it cannot enter the existing
+Q8000 architecture either. The next paired measurements are therefore
+deliberately separated:
 
 1. chunk 4096 plus the stable sidecar, to measure the dependency-closure gain;
 2. chunk 8192 plus the same sidecar and FP32 SSM state, to measure Q6592;
-3. chunk 8192 plus FP16 Mamba/SSM cache, to test the already validated Q8000
-   architecture with DFlash2 and NVFP4, initially as a quality-gated candidate;
-4. if the FP16 state fails quality, profile a quality-exact Q6592/Q8240
-   architecture generalization instead of weakening attention math.
+3. chunk 8192 plus FP16 Mamba/SSM cache, to measure the actual Q7920 DFlash2
+   geometry rather than crediting the target-only Q8000 route;
+4. profile the remaining NVFP4 projection cost before considering a new
+   Q6592/Q7920 attention architecture.
 
 Each candidate must prove operator-route hits, preserve output validity, fit
 the 256K DFlash2 memory contract, and retain the quality-audit PPL and scored
@@ -105,3 +107,44 @@ at each length retain the control first-token hash
 `54363ddee68f4a5db81c9d37e5fb738d28f5b67dc7f725ad7333172b1ea157da`.
 Artifact:
 `/data/minimax-h3/task-cache/v100-dflash2-prefill-32k64k-20260827/candidate-stable-fa2-q4096-v1/`.
+
+## Chunk and Mamba dtype closure
+
+Increasing the configured budget to 8192 while retaining the checkpoint's
+FP32 SSM state produces Q6592. It is neutral at 32K and slightly slower at 64K:
+
+| Input | Q3296 sidecar | Q6592 sidecar | Change |
+|---:|---:|---:|---:|
+| 32768 | 3476.53 tok/s | 3481.83 tok/s | +0.15% |
+| 65536 | 3103.02 tok/s | 3077.03 tok/s | -0.84% |
+
+The FP16 Mamba/SSM arm produces Q7920, not Q8000, and loses at both lengths:
+
+| Input | Q3296 sidecar | Q7920 FP16 state | Change |
+|---:|---:|---:|---:|
+| 32768 | 3476.53 tok/s | 3271.49 tok/s | -5.90% |
+| 65536 | 3103.02 tok/s | 2827.03 tok/s | -8.90% |
+
+All twelve measured requests retain the same first-token hash. Q6592 is not a
+promotion, and Q7920 is rejected on speed before spending a dataset-quality
+run. Artifacts are `candidate-stable-fa2-q8192-fp32-v4` and
+`candidate-stable-fa2-q8000-mamba-fp16-v1` under the task root above.
+
+## NVFP4 projection candidate
+
+The accepted DFlash2 target keeps M<=8 verification on the existing QPN2
+route, while large-M prefill currently falls through to TurboMind W4A16. A
+single-V100 M3296 microbenchmark shows that the already present bounded FP16
+QPN4 prefill operator is materially faster even though its timing includes
+weight dequantization on every call:
+
+| Projection | TurboMind | bounded QPN4 | Latency reduction |
+|---|---:|---:|---:|
+| fused gate/up, 5120x8704 | 5.351 ms | 3.896 ms | 27.19% |
+| down, 4352x5120 | 2.646 ms | 1.866 ms | 29.47% |
+
+The candidate reuses the QPN2 code and E4M3 scale-code buffers that are already
+resident for verification, plus the existing shared 85-MiB FP16 workspace. It
+does not retain a third packed weight layout. Admission is default-off and
+requires `VLLM_SM70_NVFP4_QPN2_PREFILL=1`; M below the separately recorded
+crossover threshold keeps TurboMind, and M<=8 verification remains QPN2.

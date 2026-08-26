@@ -172,6 +172,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
+    VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
+    VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
@@ -1721,6 +1723,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    # Reuse the already resident QPN2 code/scale layout for bounded-workspace
+    # FP16 large-M prefill. M<=8 decode and speculative verification remain on
+    # QPN2. This stays opt-in until full-model speed and quality gates pass.
+    "VLLM_SM70_NVFP4_QPN2_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": lambda: int(
+        os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")
+    ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
