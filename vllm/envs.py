@@ -166,7 +166,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
-    VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = True
+    VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
@@ -1699,11 +1699,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
     ),
-    # Default non-fused QPN8 route for the exact PP2 x TP4 shared-expert
-    # gate/up tensor. The model-level clamp-SwiGLU remains external. Set to 0
-    # to retain the TurboMind path.
+    # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
+    # gate/up tensor. The model-level clamp-SwiGLU remains external. This
+    # numerically sensitive role requires an explicit opt-in.
     "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1"))
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0"))
     ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.

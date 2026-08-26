@@ -43847,11 +43847,20 @@ Interpretation:
   split-32/two-chain plus the identical clamp moves `62.299` to `11.582 us`
   (`5.38x`) on real weights. Two low-scale patterns are bitwise after clamp;
   the remaining patterns retain at least `99.609%` exact FP16 elements with
-  maximum relative L2 `4.63e-6`. The exact tensor-role route now defaults on,
-  retains the external production activation, and does not inspect model or
-  checkpoint identity. `VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE=0` is the
-  rollback. A matched endpoint remains useful for attribution, but the
-  operator result is not presented as an endpoint-speed measurement.
+  maximum relative L2 `4.63e-6`. The exact tensor-role route retains the
+  external production activation and does not inspect model or checkpoint
+  identity, but the operator bound alone is not sufficient for promotion.
+  `VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE=1` is an experimental opt-in.
+- The matched shared-gate endpoint rejects that opt-in on the quality gate.
+  Control records a median `75.166 token/s` (`13.304 ms/token`) and GSM8K-64
+  `62/64`; the candidate records `75.641 token/s` (`13.220 ms/token`) but
+  scores `61/64`. Only item 37 changes correctness (`2 -> 0`); 35/64 texts
+  and 62/64 extracted numeric predictions are identical, with no candidate
+  win. The A/B changes only the shared-expert gate/up projection while keeping
+  the external clamp-SwiGLU identical, isolating the greedy-trajectory change
+  to the QPN8 projection/reduction path. The `0.084 ms/token` speed reduction
+  is therefore not admitted, and the route now defaults off while an exact
+  TurboMind-prescaled alternative is screened.
 - Sparse-MLA long-context decay is now directly quantified. With the current
   exact `BLOCK_K=16`, one C128 layer measures `12.43 us` at 1K context,
   `18.37 us` at 64K, `26.98 us` at 128K, `42.40 us` at 256K,

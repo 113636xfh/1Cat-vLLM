@@ -90,7 +90,7 @@ def test_pp2_tp4_qpn8_rejects_wrong_tensor_and_concurrency_roles() -> None:
     assert fp8._sm70_fp8_qpn8_pp2_tp4_config(wrong_layout, gated_silu=False) is None
 
 
-def test_pp2_tp4_qpn8_shared_gate_is_default_with_rollback(monkeypatch) -> None:
+def test_pp2_tp4_qpn8_shared_gate_requires_explicit_opt_in(monkeypatch) -> None:
     layer = _layer(
         "gate_up_proj",
         4,
@@ -104,6 +104,10 @@ def test_pp2_tp4_qpn8_shared_gate_is_default_with_rollback(monkeypatch) -> None:
     envs.disable_envs_cache()
     try:
         assert fp8._is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) is None
+
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
+        envs.disable_envs_cache()
         assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) == (
             32,
             2,
@@ -263,7 +267,7 @@ def test_pp2_tp4_qpn8_default_prepares_matching_layer(monkeypatch) -> None:
 
 
 def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4", raising=False)
     envs.disable_envs_cache()
