@@ -43932,3 +43932,33 @@ Interpretation:
   PR for this continuation use the private remote and the isolated branch
   `agent/private-v100-dsv4-pp2tp4-followup-20260826`; public upstream is
   fetch-only for this work.
+
+## 2026-08-27 prescaled M=1 launch-spec root and diagnostic repair
+
+- The rejected shared-gate result remains excluded. A deeper dispatch audit
+  narrows its numerical confound: ordinary FP8 M=1 startup measures and caches
+  a launch specification independently on each rank, while the prescaled path
+  previously discarded that cache entry and forced swizzle 1. The old trace
+  shows the ordinary `1x1024x4096` shape using the same `8x128x64`, split-K-7
+  kernel family but multiple raster layouts across ranks. Split-K completion
+  and reduction order can therefore change even when CTA shape and split count
+  look identical.
+- The scale rewrite itself is not the observed source of error. All shared
+  W1/W3 checkpoint scales use UE8M0 codes 114 through 120. Exhaustive CPU
+  simulation over every E4M3 byte and every observed scale code finds zero
+  FP16 dequantized-value mismatches between ordinary and prescaled transforms.
+  This does not promote the route; it identifies launch-spec matching as the
+  next causal test.
+- Draft private PR #19 changes prescaled M=1 dispatch to inherit the exact
+  ordinary `Measure()` cache entry per rank, including kernel family, CTA,
+  split-K and swizzle. It fails closed when the corresponding prescaled kernel
+  family is unavailable. The shared-gate integration is restored only as a
+  default-off diagnostic opt-in.
+- Host policy tests pass (`93 passed`). The changed CUDA translation unit
+  compiles and links for SM70; all 38 embedded cubins remain `sm_70`. The
+  candidate extension is
+  `/data/models/private-v100-dsv4-prescale-spec-match-build-20260827-r2/_C.abi3.so`
+  with SHA256
+  `dfbec4f8bbebd8f82f9e0a280c15b6bfb4950c7dd96c60e6b35f3b1f18ccec30`.
+  Same-GPU traced bitwise timing and the full PP2 x TP4 dataset gate remain
+  pending, so no speed or quality acceptance is claimed.
