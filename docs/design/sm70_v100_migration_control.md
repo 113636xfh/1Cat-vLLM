@@ -43861,6 +43861,16 @@ Interpretation:
   to the QPN8 projection/reduction path. The `0.084 ms/token` speed reduction
   is therefore not admitted, and the route now defaults off while an exact
   TurboMind-prescaled alternative is screened.
+- The replacement keeps the TurboMind gated-interleaved layout, accumulation
+  path, layout restore and external clamp-SwiGLU unchanged. It only folds the
+  exact E4M3 exponent-bias factor into finite, reversibly prescaled FP16 block
+  scales. On the real layer-0 TP4-rank-0 shared gate/up tensor, all 64 dynamic
+  patterns are bitwise both before and after activation and both CUDA Graphs
+  replay stably. Same-GPU A/B/B/A timing moves `62.298` to `20.562 us/layer`
+  (`3.03x`). Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-shared-gate-prescaled-exact-screen-20260826-r1/`.
+  `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=1` remains an isolated opt-in until
+  its matched full-model speed and dataset-quality pair closes.
 - Sparse-MLA long-context decay is now directly quantified. With the current
   exact `BLOCK_K=16`, one C128 layer measures `12.43 us` at 1K context,
   `18.37 us` at 64K, `26.98 us` at 128K, `42.40 us` at 256K,

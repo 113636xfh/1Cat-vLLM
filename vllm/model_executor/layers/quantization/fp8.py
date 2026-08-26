@@ -169,15 +169,36 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] 
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
-def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
-    """Admit only the measured replicated fused WQA/WKV tensor contract."""
+def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
+    """Match the exact PP2 x TP4 shared-expert gate/up tensor."""
+    prefix = str(getattr(layer, "prefix", ""))
     return bool(
+        prefix.endswith(".shared_experts.gate_up_proj")
+        and int(getattr(layer, "tp_size", 1)) == 4
+        and getattr(layer, "weight_block_size", None) == [128, 128]
+        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
+        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
+        and getattr(layer, "output_partition_sizes", None) == [512, 512]
+        and tuple(layer.weight.shape) == (1024, 4096)
+    )
+
+
+def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
+    """Admit only measured replicated or explicitly enabled TP4 tensors."""
+    fused_wqa_wkv = bool(
         getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "fused_wqa_wkv"
         and int(getattr(layer, "tp_size", 1)) == 1
         and getattr(layer, "weight_block_size", None) == [128, 128]
         and int(getattr(layer, "input_size_per_partition", 0)) == 4096
         and int(getattr(layer, "output_size_per_partition", 0)) == 1536
         and tuple(layer.weight.shape) == (1536, 4096)
+    )
+    return bool(
+        fused_wqa_wkv
+        or (
+            envs.VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE
+            and _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
+        )
     )
 
 
@@ -304,16 +325,7 @@ def _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(
     layer: torch.nn.Module,
 ) -> bool:
     """Match only the measured non-fused shared-expert gate/up tensor."""
-    prefix = str(getattr(layer, "prefix", ""))
-    return bool(
-        prefix.endswith(".shared_experts.gate_up_proj")
-        and int(getattr(layer, "tp_size", 1)) == 4
-        and getattr(layer, "weight_block_size", None) == [128, 128]
-        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
-        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
-        and getattr(layer, "output_partition_sizes", None) == [512, 512]
-        and tuple(layer.weight.shape) == (1024, 4096)
-    )
+    return _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
 
 
 def _sm70_fp8_qpn8_pp2_tp4_config(
@@ -1157,8 +1169,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
             prescaled_decode_requested = envs.VLLM_SM70_FP8_PRESCALED_M1_DECODE
-            prescaled_decode_explicit = (
+            prescaled_shared_gate_layer = _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
+            prescaled_decode_explicit = bool(
                 os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE") == "1"
+                or (
+                    prescaled_shared_gate_layer
+                    and os.getenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE") == "1"
+                )
             )
             prescaled_decode_layer = _is_sm70_fp8_prescaled_m1_decode_layer(layer)
             prescaled_decode_runtime = bool(
@@ -1233,9 +1250,15 @@ class Fp8LinearMethod(LinearMethodBase):
                         prescaled_scales,
                         persistent=False,
                     )
-                    logger.info_once(
-                        "Exact SM70 fused-WQA/WKV prescaled decode path enabled."
-                    )
+                    if prescaled_shared_gate_layer:
+                        logger.info_once(
+                            "Exact SM70 shared-expert gate/up prescaled decode "
+                            "path enabled with external activation retained."
+                        )
+                    else:
+                        logger.info_once(
+                            "Exact SM70 fused-WQA/WKV prescaled decode path enabled."
+                        )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
                 and envs.VLLM_SM70_FP8_PREFILL_PRESCALED
