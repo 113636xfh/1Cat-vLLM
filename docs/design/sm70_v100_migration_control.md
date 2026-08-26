@@ -43452,6 +43452,13 @@ Interpretation:
   This is an operator gate only;
   the opt-in `VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE` route still requires a
   matched PP2/TP4 endpoint and aggregate-quality gate.
+- The first matched endpoint reached `69.949 token/s`, but its quality gate
+  failed with incoherent output. The direct-order branch had reused
+  `compact_expert_offsets` as if it still contained `[0, 1, ..., 6]`; M2--M8
+  warmup and verifier compaction can overwrite that workspace before B1 graph
+  capture. The corrected branch uses the immutable `slot_expert_offsets`
+  buffer. Keep the route opt-in until a post-fix full-model and GSM8K-64 gate
+  pass; the failed endpoint is rejection evidence, not a speed baseline.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
