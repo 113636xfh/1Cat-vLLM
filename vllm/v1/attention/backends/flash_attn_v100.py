@@ -1274,8 +1274,21 @@ def _get_sm70_splitd_d256_ops():
 
     _sm70_splitd_d256_ops_checked = True
     try:
-        # Importing the interface loads the vendored FA2 torch library.
-        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        try:
+            # Importing the interface loads the bundled FA2 torch library.
+            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        except ImportError:
+            # Source-overlay deployments can intentionally keep native
+            # extensions outside the checkout. Match the existing SM70
+            # sidecar convention and load only an explicitly selected binary.
+            library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+            if library_path is None:
+                raise
+            torch.ops.load_library(library_path)
+            logger.info(
+                "Loaded external SM70 D256 prefill library from %s.",
+                library_path,
+            )
 
         dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
         paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
@@ -1285,7 +1298,7 @@ def _get_sm70_splitd_d256_ops():
             None,
         )
         _sm70_splitd_d256_ops = (dense, paged, splitkv3)
-    except (AttributeError, ImportError, RuntimeError) as exc:
+    except (AttributeError, ImportError, OSError, RuntimeError) as exc:
         _sm70_splitd_d256_ops = None
         logger.warning_once(
             "SM70 D256 exact-prefill operators are unavailable (%s: %s). "
@@ -1308,8 +1321,13 @@ def _get_sm70_d256_gqa_architecture_op():
 
     _sm70_d256_gqa_architecture_op_checked = True
     try:
-        # Importing the interface loads the vendored FA2 torch library.
-        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        # The Split-D loader also resolves an explicit source-overlay
+        # sidecar. Calling it here keeps both operator families on one binary.
+        if not hasattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_gqa_architecture_fwd",
+        ):
+            _get_sm70_splitd_d256_ops()
 
         _sm70_d256_gqa_architecture_op = getattr(
             torch.ops._vllm_fa2_C,
