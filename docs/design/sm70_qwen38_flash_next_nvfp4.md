@@ -2,8 +2,9 @@
 
 ## Status and ownership
 
-- Status: source bring-up implemented; CPU/configuration gates pass. Full-model
-  load, output quality, measured memory, and speed are not claimed yet.
+- Status: source bring-up implemented; CPU/configuration gates pass and the
+  local ModelScope snapshot is fully verified. Full-model load, output quality,
+  measured memory, and speed are not claimed yet.
 - Integration line: `private/main`.
 - Base SHA: `d63e9490f65f9e01f6649053c1ab72922034b931`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
@@ -11,7 +12,9 @@
 - Model download: `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`.
 - Download source: ModelScope `master`, verified against the fixed Hugging Face
   revision above: all 419 file sizes match and all 208 comparable LFS SHA-256
-  values match.
+  values match. After download, all 419 local files were independently hashed
+  against the ModelScope manifest with zero missing, size-mismatched, or
+  SHA-256-mismatched files.
 - Upstream references:
   [vLLM PR 53896](https://github.com/vllm-project/vllm/pull/53896) and
   [SGLang PR 36497](https://github.com/sgl-project/sglang/pull/36497).
@@ -135,6 +138,10 @@ only after profiles identify them as measured decode bottlenecks.
 
 ## Source validation snapshot
 
+- The ModelScope download completed successfully at the path above. A full
+  post-download verification checked 419 files and about 125.910 GiB of
+  safetensor payload: zero files were missing and zero size or SHA-256 values
+  differed from the remote manifest.
 - The real downloaded `config.json` resolves without remote model code as
   `Qwen4ExpConfig` / `Qwen4ExpTextConfig`: 48 layers, 36 GDN, 12 QSA, 512
   experts, top-10, HC count four/rank 320, and one trigram PLE layer.
