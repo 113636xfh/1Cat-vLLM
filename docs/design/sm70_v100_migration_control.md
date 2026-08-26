@@ -43816,9 +43816,19 @@ Interpretation:
   1 KiB and 2 KiB shared memory. Worktree-source/new-extension binding and
   the focused MXFP4 plus FP8-QPN compatibility suites pass (`41 passed`).
   The selected operator pipeline is bitwise and graph-stable; no unmatched
-  operator projection is relabeled as a full-model speed result. A matching
-  merged-source AOT build and one-variable full-model A/B remain follow-up
-  evidence rather than merge prerequisites.
+  operator projection is relabeled as a full-model speed result. The merged
+  private source now also has a clean CUDA 12.8 AOT build under
+  `/data/models/private-v100-dsv4-pp2tp4-defaults-build-20260826-r1/`.
+  Its extension SHA256 is
+  `ef6db06d54419029da87bbe159a36b0f5f0b68658797aceab69491b3f4421fa7`;
+  all 38 cubins are `sm_70`, and the split-8/split-16 kernels retain exactly
+  56 registers with 1 KiB/2 KiB shared memory. A fresh interpreter binds the
+  private follow-up worktree to this `_C`, retains the installed `_moe_C`,
+  and sees both the MXFP4-QPN and FP8-QPN operators. With CUDA hidden, the
+  focused MXFP4 plus PP2-TP4 FP8-QPN suites pass (`39 passed, 4 skipped`).
+  This closes the merged-source AOT and host-policy follow-up. A merged-source
+  GPU route-hit and full-model quality endpoint remain follow-up evidence, not
+  a retroactive prerequisite for the already merged change.
 - The exact FP16 auxiliary candidate joins the C4 `N=2048`, `N=512` and
   `N=64` projections into one `N=2624` launch while preserving their original
   FP32 FMA and reduction order. All joined outputs and the concurrent main
