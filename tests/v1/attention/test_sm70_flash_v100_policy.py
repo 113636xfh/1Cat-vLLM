@@ -741,6 +741,16 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
 def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    fake_package = types.ModuleType("vllm.vllm_flash_attn")
+    fake_package.__dict__["flash_attn_interface"] = fake_interface
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        fake_interface,
+    )
+
     namespace = SimpleNamespace()
     loaded: list[str] = []
 
@@ -754,7 +764,6 @@ def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
         load_library=load_library,
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
-    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", None)
     monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", "/tmp/stable-fa2.so")
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)

@@ -20,12 +20,14 @@ The historical short- and long-prefill numbers use different contracts:
 |---|---|---:|---|
 | Public PR #271 | Qwen3.8-27B-FP8, TP4, exact input 8000, target-only | 5121.44 request-wall and 5170.96 pure-prefill tok/s | Exact-8K only |
 | Public PR #324 | Same exact-8K FP8 contract | 5500 tok/s is a campaign target, not a measured implementation result | Documentation-only PR |
-| Private PR #8/#13 | Qwen3.8-27B-FP8, TP4, input 261888, chunk 8192 with Q8000 aligned chunks, target-only | 2438.89 prompt tok/s | Stable max-aware D256 architecture |
+| Private PR #8/#13 | Qwen3.8-27B-FP8, TP4, input 261888, chunk 8192 with FP16 Mamba/SSM cache and Q8000 aligned chunks, target-only | 2438.89 prompt tok/s | Stable max-aware D256 architecture |
 | Rejected public PR #315 lane | Same 256K FP8 contract | 2971.51 prompt tok/s | Rejected: 32 output token IDs were zero |
 
 The 2438.89 tok/s route uses max-shifted exponentiation and max-aware online
-softmax merging. Its output hash exactly matched the exact control. The removed
-raw-logit half2 polynomial must not be restored.
+softmax merging. Its output hash exactly matched the exact control. It also
+explicitly overrides the checkpoint's FP32 SSM-cache contract to FP16; that
+override is a separate quality variable and is not inherited automatically by
+DFlash2. The removed raw-logit half2 polynomial must not be restored.
 
 ## Current DFlash2 baseline
 
@@ -58,18 +60,28 @@ This branch adds an explicit `VLLM_SM70_FA2_D256_LIBRARY` source-overlay
 sidecar. It is opt-in and follows the existing SM70 native-sidecar convention.
 Bundled-wheel behavior remains unchanged, and missing or incompatible
 operators still fail closed to the existing fallback with a warning.
+Both the benchmark preflight and runtime loader validate registered operators,
+not merely a successful Python-interface import. This covers partially cached
+interfaces that otherwise appear importable while exposing no native kernels.
 
 ## Shape boundary and next measurements
 
 The practical chunk-4096 contract can use the exact D256 Split-D operators,
 but it cannot enter the stable long GQA architecture, whose validated kernel
-contract is Q8000 with KV16K..256K in 8K steps. The next paired measurements
-are therefore deliberately separated:
+contract is Q8000 with KV16K..256K in 8K steps. With seven speculative slots,
+the scheduler first reduces the configured 4096-token budget to 4089. The
+checkpoint's FP32 SSM state makes one aligned attention/Mamba block 1648
+tokens, so the observed steady prefill query is Q3296. A configured 8192-token
+budget retains that FP32 state and yields Q6592, not Q8000. Reaching Q8000 with
+the existing kernel requires the historical FP16 Mamba/SSM cache override;
+that arm must pass the quality audit before promotion. The next paired
+measurements are therefore deliberately separated:
 
 1. chunk 4096 plus the stable sidecar, to measure the dependency-closure gain;
-2. chunk 8192 plus the same sidecar, to test the already validated Q8000
-   architecture with DFlash2 and NVFP4;
-3. only if chunk 4096 remains materially slower, profile a quality-exact Q4K
+2. chunk 8192 plus the same sidecar and FP32 SSM state, to measure Q6592;
+3. chunk 8192 plus FP16 Mamba/SSM cache, to test the already validated Q8000
+   architecture with DFlash2 and NVFP4, initially as a quality-gated candidate;
+4. if the FP16 state fails quality, profile a quality-exact Q6592/Q8240
    architecture generalization instead of weakening attention math.
 
 Each candidate must prove operator-route hits, preserve output validity, fit
