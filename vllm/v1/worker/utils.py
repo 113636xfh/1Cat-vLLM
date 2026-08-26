@@ -609,7 +609,7 @@ def bind_kv_cache(
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
 def is_residual_scattered_for_sp(
