@@ -43523,30 +43523,29 @@ Interpretation:
   acceptance. The assistant remains explicit opt-in until matched evidence
   shows that full-query skips repay host lookup overhead for a workload.
 
-## 2026-08-26 PR #283 aggregate-quality acceptance
+## 2026-08-26 PR #283 aggregate-quality decision (superseded)
 
-- The numerical policy does not require greedy or token-stream identity.
-  Candidate outputs must remain finite, satisfy dtype-appropriate operator
-  error bounds, and preserve matched aggregate task quality. Per-example
-  regressions and improvements remain visible diagnostics rather than an
-  automatic identity gate.
+- This section records the historical aggregate-only decision. It is
+  superseded by the no-per-sample-regression policy below: an aggregate tie or
+  improvement cannot compensate for any control-correct sample becoming
+  wrong, and an algebraically exact candidate must preserve the matched output
+  stream.
 - The full serialized-FP8 QPN8 candidate improves the matched PP2 x TP4 B1
   no-spec endpoint from 59.248 to 64.359 token/s (`+8.63%`) and reduces mean
   TPOT from 16.878 to 15.538 ms. Its paired GSM8K-64 result remains 63/64 with
   zero invalid answers: one baseline-correct answer regresses and one
-  baseline-wrong answer improves, so aggregate quality does not decline.
+  baseline-wrong answer improves. Under the current policy, the
+  baseline-correct-to-candidate-wrong transition rejects this result.
 - Operator checks remain finite with relative L2 at most `6.05e-4`, cosine at
   least `0.9999997`, and maximum absolute difference at most `0.00390625` in
   the recorded screen. All 365 audited block scales are finite, positive
   powers of two and survive the layout scale transform exactly. These are
   numerical bounds, not a claim of bitwise equivalence.
-- QPN8 is therefore default-on only for its validated engine contract: exact
-  SM70 block-FP8 operator roles/shapes/layouts, PP2 x TP4, one sequence, no
-  DBO or explicit ubatching, and no speculative decoding. Missing operators
-  or workspace allocation fall back to TurboMind. Either
-  `VLLM_SM70_FP8_QPN8=0` or `VLLM_SM70_FP8_QPN8_PP2_TP4=0` is an explicit
-  rollback. Admission never reads model name, checkpoint, `model_type`, or
-  architecture identity.
+- QPN8 is now default-off for the PP2 x TP4 contract. Explicit
+  `VLLM_SM70_FP8_QPN8_PP2_TP4=1` remains available only for controlled
+  diagnosis and still requires its exact tensor/runtime contract. The matched
+  model-level regressions below override the earlier operator-error and
+  aggregate-score rationale.
 - Metadata-free PP transfer is also default-on for its exact SM70 B1 schema:
   PP2 x TP4, FP16 `[1,4,4096]` contiguous replicated hidden state, CUDA Graph,
   no sequence parallelism, no DBO/ubatching/speculation, and one sequence.
@@ -43555,10 +43554,10 @@ Interpretation:
   original metadata plus TP reconstruction path; an admitted-but-invalid
   runtime tensor fails fast before communication. The rollback is
   `VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER=0`.
-- The paired quality tools now pin dataset hashes and the complete evaluation
-  contract, validate artifact self-consistency, and gate aggregate HumanEval,
-  LongBench, GSM8K, and needle-retrieval quality. They report directional
-  sample flips but do not treat greedy identity as task quality.
+- The paired quality tools pin dataset hashes and the complete evaluation
+  contract, validate artifact self-consistency, and gate HumanEval, LongBench,
+  GSM8K, and needle-retrieval quality per sample. A control-pass to
+  candidate-fail transition is an automatic rejection.
 - A post-merge four-pattern, real-weight matrix separates a single numerical
   outlier from five already-bounded fast schedules. Fused WQA/WKV, attention
   WQ-B/WO-B, grouped WO-A, and shared-expert down retain at least `99.707%`
@@ -43593,11 +43592,9 @@ Interpretation:
   `15.71254 ms/token`; the all-accuracy candidate records `63.9120 tok/s` and
   `15.64652 ms/token`, about `+0.42%` and `-0.066 ms/token`. The paired pinned
   GSM8K64 run is `62/64` versus `61/64`, with zero invalid outputs and one
-  directional difference at item 37. That single sample remains visible, but
-  it is not a greedy-identity gate and does not show that choosing the lowest
-  operator error improves aggregate task quality. The accepted repair
-  therefore preserves every numerically bounded speed winner and falls back
-  only the demonstrated gate/up outlier. Full artifacts are under
+  directional difference at item 37 (`2 -> 0`) and no candidate win. This is
+  a model-level quality regression, so the candidate is rejected and the
+  broader PP2 x TP4 QPN8 route defaults off. Full artifacts are under
   `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-fullmodel-control-20260826-r1/`
   and
   `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-fullmodel-candidate-20260826-r2/`.
@@ -43743,13 +43740,14 @@ Interpretation:
   with 64/64 bitwise main-path results and maximum auxiliary relative L2
   `4.03e-7`. That overlap result is directional after the mainline FP8 M=1 API
   split and is not relabeled as a current-main endpoint result.
-- Production defaults on through `VLLM_SM70_DSV4_FP13_GEMV=1`; explicit `=0`
-  is the rollback. Admission checks SM70, CUDA device equality, dtype, shape,
-  layout, output contract, and the actual weight bits. It never reads a model
-  name or checkpoint identity, and an incompatible tensor retains FP16. Packing
-  occurs once after loading; capture and per-token execution perform no packing.
-  The retained buffers add 549.66 MiB without pipeline parallelism, or at most
-  282.34 MiB per rank for the audited PP2 partition.
+- FP13 now defaults off because these operator and overlap screens do not
+  constitute a matched model-level dataset gate. Explicit
+  `VLLM_SM70_DSV4_FP13_GEMV=1` remains available for an isolated future A/B.
+  Admission still checks SM70, CUDA device equality, dtype, shape, layout,
+  output contract, and the actual weight bits; incompatible tensors retain
+  FP16. Packing occurs once after loading. The retained buffers would add
+  549.66 MiB without pipeline parallelism, or at most 282.34 MiB per rank for
+  the audited PP2 partition.
 
 ## 2026-08-26 DeepSeek V4 PP2 x TP4 100-token/s continuation
 
@@ -43762,6 +43760,15 @@ Interpretation:
   operator may default on after graph, numerical and source gates pass, with
   an explicit rollback; it is not reported as an endpoint gain until a matched
   full-model benchmark exists.
+- The current quality-safe source-`59adf8d89a` control explicitly disables all
+  FP8 QPN8 routes and packed FP13 while retaining the exact fused-WQA prescale,
+  exact MXFP4 QPN M1, static PP transfer, TP4 push all-reduce, fused Q/KV
+  normalization, direct-order MoE, and exponent fold. It scores GSM8K-64
+  `64/64` with zero invalid answers, HumanEval `29/32`, and LongBench `44.740`.
+  Three matched 1024+256 pure-decode runs measure `73.534`, `73.542`, and
+  `73.539 token/s` (median `73.539`, `13.598 ms/token`). This is the accepted
+  no-DSpark baseline for the next trace; evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-private-quality-safe-prescaled-shared-gate-control-fullmodel-20260826-r2/`.
 - The latest usable endpoint before the current queued stack is source
   `089feeae7241daaaf7ccb2a4fb2a821925be5350`: QPN8-off records
   `68.279 token/s`, and QPN8-on records a three-repeat median
@@ -43780,8 +43787,8 @@ Interpretation:
   output-token hashes are identical. The Chinese smoke is coherent and
   GSM8K-64 scores `62/64` with zero invalid answers, matching the preceding
   accepted exact-stack observation and remaining one item below the pinned
-  `63/64` baseline. This is the new accepted speed endpoint, but it misses
-  the 100-token/s target by `27.628 token/s`. Evidence is under
+  `63/64` baseline. Under the current no-regression policy this is historical
+  speed evidence, not a quality-admissible endpoint. Evidence is under
   `/data/models/v100-dsv4-0731-pp2tp4-qpn8-exact-combined-fullmodel-20260826-r1/`.
 - The latest 26-step Nsight Systems trace measures a `16.535 ms` wall replay
   interval. Excluding PP dependency waits, stage-sum service is led by FP8
@@ -43799,8 +43806,8 @@ Interpretation:
   input. Its 40-layer service projection is `0.535 ms/token`. A full-model
   route-hit candidate measures `73.645`, `73.613` and `73.646 token/s`, with
   median TPOT `13.579 ms`, identical output-token hashes, coherent Chinese
-  output and GSM8K-64 `62/64` with zero invalid answers. This is a valid
-  combined endpoint but not an isolated no-copy A/B: relative to the
+  output and GSM8K-64 `62/64` with zero invalid answers. It is not
+  quality-admissible and is also not an isolated no-copy A/B: relative to the
   `72.372 token/s` endpoint it also swaps FP8 QPN8 for the prescaled FP8 path,
   so the observed `0.239 ms/token` difference cannot be assigned to MXFP4.
   Evidence is under
@@ -43869,8 +43876,15 @@ Interpretation:
   replay stably. Same-GPU A/B/B/A timing moves `62.298` to `20.562 us/layer`
   (`3.03x`). Evidence is under
   `/data/models/v100-dsv4-0731-pp2tp4-shared-gate-prescaled-exact-screen-20260826-r1/`.
-  `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=1` remains an isolated opt-in until
-  its matched full-model speed and dataset-quality pair closes.
+  The isolated layer-0 result does not generalize to the model endpoint. In a
+  source/topology/request-matched full pair, the control scores GSM8K `64/64`,
+  HumanEval `29/32`, LongBench `44.740`, and `73.539 token/s`; the candidate
+  scores `62/64`, `28/32`, and has LongBench row regressions while slowing to
+  `73.302 token/s`. GSM items 37 and 54 regress with no wins, HumanEval/16
+  regresses, and all three performance streams change. The route is rejected
+  and its runtime integration is removed rather than retained as an opt-in.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-private-quality-safe-prescaled-shared-gate-{control,candidate}-fullmodel-20260826-r2/`.
 - Sparse-MLA long-context decay is now directly quantified. With the current
   exact `BLOCK_K=16`, one C128 layer measures `12.43 us` at 1K context,
   `18.37 us` at 64K, `26.98 us` at 128K, `42.40 us` at 256K,

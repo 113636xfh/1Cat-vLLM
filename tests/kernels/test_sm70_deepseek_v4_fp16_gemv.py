@@ -23,15 +23,15 @@ def reset_env_cache() -> Iterator[None]:
     envs.disable_envs_cache()
 
 
-def test_sm70_dsv4_fp13_gemv_is_default_on_with_rollback(monkeypatch) -> None:
+def test_sm70_dsv4_fp13_gemv_is_default_off_with_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SM70_DSV4_FP16_GEMV", raising=False)
     monkeypatch.delenv("VLLM_SM70_DSV4_FP13_GEMV", raising=False)
     assert not envs.VLLM_SM70_DSV4_FP16_GEMV
-    assert envs.VLLM_SM70_DSV4_FP13_GEMV
-
-    monkeypatch.setenv("VLLM_SM70_DSV4_FP13_GEMV", "0")
-    envs.disable_envs_cache()
     assert not envs.VLLM_SM70_DSV4_FP13_GEMV
+
+    monkeypatch.setenv("VLLM_SM70_DSV4_FP13_GEMV", "1")
+    envs.disable_envs_cache()
+    assert envs.VLLM_SM70_DSV4_FP13_GEMV
 
 
 def test_sm70_dsv4_fp13_enables_fp16_fallback(monkeypatch) -> None:

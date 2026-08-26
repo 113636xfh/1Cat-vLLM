@@ -160,13 +160,12 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
     VLLM_SM70_FP8_PRESCALED_M1_DECODE: bool = True
-    VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE: bool = False
     VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
+    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
@@ -186,7 +185,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
-    VLLM_SM70_DSV4_FP13_GEMV: bool = True
+    VLLM_SM70_DSV4_FP13_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
     VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4: bool = True
     VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
@@ -1693,12 +1692,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
-    # Default-on QPN8 route for the validated serialized PP2 x TP4 contract.
-    # Admission additionally requires exact operator shapes/layouts, B1,
-    # no speculative decoding, no DBO, and no explicit ubatching. Set this to
-    # 0 (or the generic QPN8 flag to 0) to retain TurboMind everywhere.
+    # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
+    # default-off after matched model-level quality regressions. An explicit
+    # opt-in still requires exact operator shapes/layouts, B1, no speculative
+    # decoding, no DBO, and no explicit ubatching.
     "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "0"))
     ),
     # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
     # gate/up tensor. The model-level clamp-SwiGLU remains external. This
@@ -1782,11 +1781,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PRESCALED_M1_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))
     ),
-    # Exact TurboMind-prescaled M=1 route for the PP2 x TP4 shared-expert
-    # gate/up tensor. This remains opt-in until its full-model quality gate.
-    "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "0"))
-    ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))
     ),
@@ -1835,7 +1829,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
     ),
     "VLLM_SM70_DSV4_FP13_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))
+        int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "0"))
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
