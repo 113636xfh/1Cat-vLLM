@@ -431,6 +431,15 @@ class OffloadingSpec(ABC):
             assert offloaded_block_size_int % gpu_block_size == 0
             self.block_size_factor = offloaded_block_size_int // gpu_block_size
 
+        # Per-group coarsening factor for mamba-align groups. The stored mamba
+        # boundary state is fixed-size regardless of block length, so coarser
+        # keys reduce the number of states (and pool blocks) without any
+        # quantization or compute loss.
+        self.mamba_offload_factor: int = 1
+        _mof = self.extra_config.get("mamba_offload_factor")
+        if _mof is not None:
+            self.mamba_offload_factor = int(_mof)
+
     @abstractmethod
     def get_manager(self) -> OffloadingManager:
         """

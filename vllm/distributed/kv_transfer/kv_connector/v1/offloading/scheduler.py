@@ -106,7 +106,9 @@ def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
     for idx, gpu_block_size in enumerate(spec.gpu_block_size):
         kv_spec = spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec
         if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align":
-            offload_block_size = gpu_block_size * spec.block_size_factor
+            offload_block_size = gpu_block_size * getattr(
+                spec, "mamba_offload_factor", 1
+            )
             assert mamba_align_size is None or mamba_align_size == offload_block_size
             mamba_align_size = offload_block_size
     return mamba_align_size
@@ -161,30 +163,46 @@ class SchedulerOffloadConfig(NamedTuple):
                 isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align"
             )
 
+        def _offloaded_block_size(
+            gpu_block_size: int, requires_exact_boundary: bool
+        ) -> int:
+            # Mamba-align groups store a fixed-size boundary state per offloaded
+            # block, so we coarsen their key granularity (fewer, larger blocks)
+            # without scaling the CPU page size (transfer block_size_factor stays
+            # 1). This cuts mamba boundary-state count ~factor and lets the pool
+            # cover far more prefix.
+            factor = (
+                getattr(spec, "mamba_offload_factor", 1)
+                if requires_exact_boundary
+                else spec.block_size_factor
+            )
+            return gpu_block_size * factor
+
+        def _group_config(idx: int, gpu_block_size: int) -> GroupOffloadConfig:
+            requires_exact_boundary = _requires_exact_boundary_source(idx)
+            offloaded_block_size = _offloaded_block_size(
+                gpu_block_size, requires_exact_boundary
+            )
+            sw = get_sliding_window_size_in_blocks(
+                spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
+                offloaded_block_size,
+            )
+            return GroupOffloadConfig(
+                group_idx=idx,
+                gpu_block_size=gpu_block_size,
+                offloaded_block_size=offloaded_block_size,
+                hash_block_size_factor=offloaded_block_size // spec.hash_block_size,
+                sliding_window_size_in_blocks=sw,
+                alignment_block_count=_alignment_block_count(
+                    offloaded_block_size, sw
+                ),
+                requires_exact_boundary_source=requires_exact_boundary,
+            )
+
         return cls(
             num_workers=spec.vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
-                GroupOffloadConfig(
-                    group_idx=idx,
-                    gpu_block_size=gpu_block_size,
-                    offloaded_block_size=gpu_block_size * spec.block_size_factor,
-                    hash_block_size_factor=(
-                        (gpu_block_size * spec.block_size_factor)
-                        // spec.hash_block_size
-                    ),
-                    sliding_window_size_in_blocks=(
-                        sw := get_sliding_window_size_in_blocks(
-                            spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec,
-                            gpu_block_size * spec.block_size_factor,
-                        )
-                    ),
-                    alignment_block_count=_alignment_block_count(
-                        gpu_block_size * spec.block_size_factor, sw
-                    ),
-                    requires_exact_boundary_source=(
-                        _requires_exact_boundary_source(idx)
-                    ),
-                )
+                _group_config(idx, gpu_block_size)
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
             ),
             block_size_factor=spec.block_size_factor,
@@ -648,7 +666,10 @@ class OffloadingConnectorScheduler:
             )
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
-            if group_config.sliding_window_size_in_blocks is not None:
+            if (
+                group_config.sliding_window_size_in_blocks is not None
+                and not group_config.requires_exact_boundary_source
+            ):
                 assert (
                     num_pending_gpu_blocks
                     <= group_config.sliding_window_size_in_blocks
@@ -657,20 +678,42 @@ class OffloadingConnectorScheduler:
 
             num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
             assert len(offload_keys) >= num_blocks
-            if num_pending_gpu_blocks:
-                start_block_idx = (
-                    num_locally_computed_gpu_blocks // self.config.block_size_factor
-                )
-                keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
-            dst_block_ids.extend(
-                block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
-            )
-            group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(num_locally_computed_gpu_blocks)
+            if group_config.requires_exact_boundary_source:
+                # Mamba-align groups: the CPU pool stores one fixed-size
+                # boundary state per coarse offloaded block. On a load hit we
+                # only need the states whose boundary falls inside the pending
+                # window; write each into its exact GPU block (the block ending
+                # at that boundary). The transfer handler maps src[i] -> dst[i]
+                # 1:1 because block_size_factor is 1 for these groups.
+                offload_factor = offloaded_block_size // gpu_block_size
+                start_key = (
+                    num_locally_computed_gpu_blocks // offload_factor
+                )
+                keys_to_load.extend(offload_keys[start_key:num_blocks])
+                for k in range(start_key, num_blocks):
+                    gpu_blk_idx = (
+                        (k + 1) * offloaded_block_size
+                    ) // gpu_block_size - 1
+                    dst_block_ids.append(group_blocks[gpu_blk_idx].block_id)
+                group_sizes.append(num_blocks - start_key)
+                block_indices.append(num_locally_computed_gpu_blocks)
+            else:
+                if num_pending_gpu_blocks:
+                    start_block_idx = (
+                        num_locally_computed_gpu_blocks
+                        // self.config.block_size_factor
+                    )
+                    keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
+
+                dst_block_ids.extend(
+                    block.block_id
+                    for block in group_blocks[
+                        num_locally_computed_gpu_blocks:num_gpu_blocks
+                    ]
+                )
+                group_sizes.append(num_pending_gpu_blocks)
+                block_indices.append(num_locally_computed_gpu_blocks)
 
             # Skip prefix-hit blocks for block-level policy; for
             # request-level, next_stored_block_idx stays at 0 so all

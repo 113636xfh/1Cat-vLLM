@@ -406,7 +406,7 @@ class CpuGpuOffloadingHandlers:
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for kv_cache_tensor in kv_caches.tensors:
+        for gi, kv_cache_tensor in enumerate(kv_caches.tensors):
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                 (-1, gpu_page_size_bytes)

@@ -49,6 +49,15 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_bytes_per_offloaded_block // world_size if world_size > 0 else 0
         )
 
+        import logging as _lg
+        _lg.basicConfig()
+        _lg.getLogger("kv_offload_spec").warning(
+            "KV_OFFLOAD_SPEC diag: block_size_factor=%s num_blocks=%s "
+            "kv_bytes_per_offloaded_block=%s gpu_block_size=%s",
+            self.block_size_factor, self.num_blocks,
+            kv_bytes_per_offloaded_block, self.gpu_block_size,
+        )
+
         # scheduler-side
         self._manager: OffloadingManager | None = None
 
