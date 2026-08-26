@@ -43949,16 +43949,23 @@ Interpretation:
   FP16 dequantized-value mismatches between ordinary and prescaled transforms.
   This does not promote the route; it identifies launch-spec matching as the
   next causal test.
-- Draft private PR #19 changes prescaled M=1 dispatch to inherit the exact
-  ordinary `Measure()` cache entry per rank, including kernel family, CTA,
-  split-K and swizzle. It fails closed when the corresponding prescaled kernel
-  family is unavailable. The shared-gate integration is restored only as a
-  default-off diagnostic opt-in.
+- Draft private PR #19 changes only the exact shared-gate
+  `M1/N1024/K4096` prescaled dispatch to inherit the ordinary `Measure()`
+  cache entry per rank, including kernel family, CTA, split-K and swizzle. It
+  fails closed when the corresponding prescaled kernel family is unavailable.
+  Other M1 roles, including fused WQA/WKV, retain their existing launch
+  semantics. The shared-gate integration is restored only as a default-off
+  diagnostic opt-in.
 - Host policy tests pass (`93 passed`). The changed CUDA translation unit
   compiles and links for SM70; all 38 embedded cubins remain `sm_70`. The
   candidate extension is
   `/data/models/private-v100-dsv4-prescale-spec-match-build-20260827-r2/_C.abi3.so`
   with SHA256
   `dfbec4f8bbebd8f82f9e0a280c15b6bfb4950c7dd96c60e6b35f3b1f18ccec30`.
-  Same-GPU traced bitwise timing and the full PP2 x TP4 dataset gate remain
-  pending, so no speed or quality acceptance is claimed.
+  The first same-GPU screen on that extension selects the same ordinary and
+  prescaled `8x128x64`, split-K-7, swizzle-0 specifications. Raw GEMM and
+  external clamp-SwiGLU outputs are bitwise for all `64` changing inputs;
+  CUDA Graph replay is stable and A/B/B/A timing moves `62.229` to
+  `20.793 us/layer`. The subsequent source restriction above requires a new
+  build and repeated operator screen. The full PP2 x TP4 dataset gate also
+  remains pending, so no speed or quality acceptance is claimed.
