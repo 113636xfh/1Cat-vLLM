@@ -2,12 +2,16 @@
 
 ## Status and ownership
 
-- Status: bring-up in progress; no route, quality, memory, or speed claim yet.
+- Status: source bring-up implemented; CPU/configuration gates pass. Full-model
+  load, output quality, measured memory, and speed are not claimed yet.
 - Integration line: `private/main`.
 - Base SHA: `d63e9490f65f9e01f6649053c1ab72922034b931`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
   `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Model download: `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`.
+- Download source: ModelScope `master`, verified against the fixed Hugging Face
+  revision above: all 419 file sizes match and all 208 comparable LFS SHA-256
+  values match.
 - Upstream references:
   [vLLM PR 53896](https://github.com/vllm-project/vllm/pull/53896) and
   [SGLang PR 36497](https://github.com/sgl-project/sglang/pull/36497).
@@ -22,6 +26,10 @@ The first correctness route deliberately excludes speculative decoding.
 
 - Hardware: four NVIDIA V100-SXM2-32GB GPUs (SM70).
 - Parallelism: TP4, PP1, no expert parallelism.
+- Model mode: `--language-model-only`. The initial SM70 route deliberately
+  excludes the vision tower from its memory, quality, and performance gates;
+  omitting the flag fails during configuration instead of reaching a private
+  Qwen3.5 multimodal API mismatch at model construction.
 - Compute dtype: FP16; no BF16 or native FP8/NVFP4 tensor-core assumptions.
 - Checkpoint: ModelOpt NVFP4 routed-expert weights, consumed as an SM70
   weight-only W4A16 route. Ignored dense, attention, GDN, shared-expert, GR,
@@ -33,6 +41,12 @@ The first correctness route deliberately excludes speculative decoding.
 - Initial KV cache: FP16. FP8 KV cache is a separate, quality-gated follow-up.
 - Initial decoding: MTP disabled. MTP may be enabled only after the no-MTP
   route is correct and its emitted-token baseline is recorded.
+- Model runner: V2 is the default initial route. Its Qwen4Exp model state keeps
+  raw token IDs and builds the PLE context from committed tokens, so rejected
+  speculative candidates cannot leak into the next trigram. V1 remains a
+  correctness control, not the primary performance route.
+- Prefix caching: disabled for the first route. The fixed QSA ring manager does
+  not yet implement reusable prefix blocks.
 
 ## Architecture facts that affect the port
 
@@ -60,11 +74,41 @@ pinned memory, per-rank device peak, post-load device residency, and whether a
 loader creates duplicate staging buffers. A 262144-token context is admitted
 only after the measured peak leaves a safe margin on every 32GB GPU.
 
+The SM70 TurboMind repack changes routed-expert FP4 scales from FP8 to FP16.
+For TP4, routed experts are estimated at about 15.82 GiB/rank in the source
+checkpoint and 17.57 GiB/rank after repack. This puts the idealized final
+device weights near 21.3 GiB/rank. Because layers are repacked sequentially,
+the estimated transient weight peak is about 22.1 GiB/rank before runtime
+buffers, KV/index caches, NCCL, and CUDA graphs. These are storage calculations,
+not `torch.cuda.max_memory_allocated` measurements.
+
+The loader marks the PLE parameter as permanently host-resident so generic
+quantization post-processing cannot stage the entire 11.921 GiB TP shard on a
+GPU. Only its small scale parameter resides on device; lookup reads selected
+FP8 rows through a stable UVA view and converts the gathered output to FP16.
+
+With the real SM70 platform alignment and the QSA attention backend selected,
+the V2 scheduler block is 784 tokens, the recurrent-state block is 32768
+tokens at a 32768-token initial maximum length, and each padded recurrent page
+is 802816 bytes. The exact synthetic model layout has one 24-layer uniform QSA
+main/compressed group, one 12-layer fixed circular QSA ring group, three
+12-layer GDN state groups, and one PLE short-convolution state group. It
+allocates 24 physical cache tensors. The aligned pool cost is 10235904 bytes
+(9.762 MiB) per shared block per TP rank.
+
+For one request, the resulting cache-pool planning estimates are about 0.448
+GiB/rank at 32K (47 shared blocks), 1.649 GiB/rank at 128K (173 blocks), and
+3.241 GiB/rank at 262144 tokens (340 blocks). Combining the last figure with
+the estimated 21.3 GiB final weights gives about 24.54 GiB/rank before CUDA
+graphs, workspaces, NCCL, allocator fragmentation, and loader transients. This
+explains why TP4 is plausible, but it is not evidence that the maximum context
+will load safely.
+
 ## Acceptance gates
 
-1. Static route: Transformers config, model registry, multimodal processor,
+1. Static route: Transformers config, model registry/processor registration,
    QSA/GDN/GR/PLE modules, and ModelOpt NVFP4 mapping load without importing an
-   Ampere-only backend.
+   Ampere-only backend. Multimodal execution is outside this first route.
 2. Loader route: TP4 expert shards select TurboMind SM70 W4A16; PLE shards are
    born on pinned CPU memory and do not consume persistent device memory.
 3. Numerical route: focused operator comparisons against FP32/FP16 references,
@@ -88,3 +132,50 @@ The first SM70-specific changes are limited to genericizing the existing
 TurboMind NVFP4 MoE shape contract, adding the QSA/indexer route, and adding a
 pinned-host PLE loader/gather path. Optimize GDN, GR, sparse attention, and MTP
 only after profiles identify them as measured decode bottlenecks.
+
+## Source validation snapshot
+
+- The real downloaded `config.json` resolves without remote model code as
+  `Qwen4ExpConfig` / `Qwen4ExpTextConfig`: 48 layers, 36 GDN, 12 QSA, 512
+  experts, top-10, HC count four/rank 320, and one trigram PLE layer.
+- Exact-SM70 configuration construction with FP16, TP4, prefix caching off,
+  language-model-only mode, and V2 selects `ModelOptNvFp4Config`, the
+  pinned-host PLE default, and the Qwen4Exp PLE/QSA compilation split
+  operators. The same real configuration rejects the unvalidated multimodal
+  route with an actionable `--language-model-only` error.
+- Full 48-layer meta construction from the real checkpoint config succeeds in
+  language-model-only mode. It instantiates QSA, GDN, HC, PLE, and all 512
+  experts without materializing weights; the routed experts select
+  `ModelOptNvFp4SM70MoEMethod(use_a16=True)` and the PLE table has shape
+  `(320001536, 160)` with FP8 E4M3 storage. This constructor probe used TP1;
+  TP4 selection and expert geometry are covered separately and full TP4 load
+  remains pending.
+- Focused CPU tests cover PLE shard loading and hashing, `seed=None`, permanent
+  host residency during post-load processing, QSA cache grouping, V1 and V2
+  n-gram inputs, V2 circular block-table sizing, scheduler-manager conversion,
+  official checkpoint weight mappings, and Qwen3.6/Qwen3.8 NVFP4 route
+  selection. The current CPU-only focused run is 76 passed and 7 CUDA skips;
+  all 55 changed Python files pass Ruff, format, and compileall checks.
+- In the pre-final real V100-SXM2-32GB snapshot, 63 focused tests pass. They
+  include the Triton V2 slot-mapping kernel with its QSA circular group
+  disabled, pinned-host FP8 lookup through a CUDA UVA view, the compressed QSA
+  storage-page reshape, V2 committed-token PLE state, and the SM70 ModelOpt
+  NVFP4 selection gates. A final V100 rerun is still required after the current
+  GPU owners release a device.
+- The upstream QSA fused pre-indexer executes on SM70 for both ordinary RoPE
+  and MRoPE inputs and matches a PyTorch normalization reference. This also
+  exposed and fixed two private-tree API differences: QKV projection is local
+  because the branch's `Qwen3NextAttention` has no `_project_qkv_gate`, and its
+  `triton_mrope` accepts eight rather than nine arguments.
+- Actual SM70 platform alignment produces a 784-token attention block and an
+  802816-byte padded recurrent page; the exact synthetic 48-layer cache layout
+  validates successfully after that alignment.
+- The HC grouped norm/gate/combine kernels pass FP16 reference checks on a real
+  V100. A captured pinned-host FP8 embedding probe (228.9 MiB synthetic table,
+  16 rows by 160 elements per replay) measured 95.81 microseconds/replay,
+  including the input-ID copy. This only demonstrates that the isolated UVA
+  lookup can be captured and is not by itself an end-to-end throughput result
+  or a measurement of the full 11.921 GiB TP shard.
+- The existing general KV-cache utility/manager suites pass 69 tests; one
+  unrelated DeepSeek-v4 fixture failure is unchanged from the integration
+  base because its `SimpleNamespace` omits `max_in_flight_tokens`.

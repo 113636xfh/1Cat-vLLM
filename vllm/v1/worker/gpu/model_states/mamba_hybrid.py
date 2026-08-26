@@ -31,6 +31,9 @@ from vllm.v1.attention.backends.gdn_attn import (
     prepare_dflash2_gdn_group_metadata,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -90,7 +93,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             }
         if not isinstance(
             attn_metadata_builder,
-            (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+            (
+                Mamba2AttentionMetadataBuilder,
+                GDNAttentionMetadataBuilder,
+                PleShortConvAttentionMetadataBuilder,
+            ),
         ):
             return {}
         kwargs = {

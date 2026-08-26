@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native SM70 TurboMind NVFP4 MoE for Qwen3.6-35B-A3B.
+"""Native SM70 TurboMind NVFP4 MoE for validated Qwen expert shapes.
 
 The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the
 checkpoint's FP8 block scales with its explicit ModelOpt global scales once at
@@ -38,13 +38,15 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_QWEN36_HIDDEN_SIZE: Final = 2048
-_QWEN36_INTERMEDIATE_SIZE: Final = 512
-_QWEN36_NUM_EXPERTS: Final = 256
-_QWEN36_TOP_K: Final = 8
-_QWEN36_SUPPORTED_TP_SIZES: Final = (1, 2, 4)
+_SUPPORTED_CONTRACTS: Final = {
+    # (hidden size, global expert intermediate size, experts, top-k)
+    (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
+    (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
+}
+_SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_TOKENS: Final = 10
+_MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
 
 
 @triton.jit
@@ -80,7 +82,7 @@ def _prepare_compact_slot_groups(
     active_expert_ids: torch.Tensor,
 ) -> None:
     total_slots = sorted_expert_ids.numel()
-    max_slots = _COMPACT_GROUPED_MAX_TOKENS * _QWEN36_TOP_K
+    max_slots = _COMPACT_GROUPED_MAX_TOKENS * _MAX_SUPPORTED_TOP_K
     if not (0 < total_slots <= max_slots):
         raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
     block = triton.next_power_of_2(total_slots + 1)
@@ -100,25 +102,10 @@ def _prepare_compact_slot_groups(
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
     """Reject every topology outside the validated SM70 NVFP4 contract."""
-    if moe.num_experts != _QWEN36_NUM_EXPERTS:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports Qwen3.6-35B-A3B "
-            f"with {_QWEN36_NUM_EXPERTS} experts, got {moe.num_experts}."
-        )
-    if moe.experts_per_token != _QWEN36_TOP_K:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports top-k="
-            f"{_QWEN36_TOP_K}, got {moe.experts_per_token}."
-        )
-    if moe.hidden_dim != _QWEN36_HIDDEN_SIZE:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports hidden size "
-            f"{_QWEN36_HIDDEN_SIZE}, got {moe.hidden_dim}."
-        )
-    if moe.tp_size not in _QWEN36_SUPPORTED_TP_SIZES:
+    if moe.tp_size not in _SUPPORTED_TP_SIZES:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
-            f"sizes {_QWEN36_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
+            f"sizes {_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
         )
     local_intermediate = moe.intermediate_size_per_partition
     if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
@@ -126,11 +113,19 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
             "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
             f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
         )
-    if local_intermediate * max(moe.tp_size, 1) != _QWEN36_INTERMEDIATE_SIZE:
+    global_intermediate = local_intermediate * max(moe.tp_size, 1)
+    contract = (
+        moe.hidden_dim,
+        global_intermediate,
+        moe.num_experts,
+        moe.experts_per_token,
+    )
+    if contract not in _SUPPORTED_CONTRACTS:
         raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports Qwen3.6 expert "
-            f"intermediate size {_QWEN36_INTERMEDIATE_SIZE}; got local="
-            f"{local_intermediate}, tp_size={moe.tp_size}."
+            "SM70 TurboMind NVFP4 MoE shape is not validated: "
+            f"hidden={moe.hidden_dim}, intermediate={global_intermediate}, "
+            f"experts={moe.num_experts}, top_k={moe.experts_per_token}. "
+            f"Validated contracts: {sorted(_SUPPORTED_CONTRACTS)}."
         )
     if moe.moe_parallel_config.use_all2all_kernels:
         raise NotImplementedError(
@@ -175,7 +170,7 @@ def _validate_weight_layout(layer: RoutedExperts) -> None:
 
 
 class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
-    """Qwen3.6 ModelOpt W4A16_NVFP4 experts on native TurboMind SM70."""
+    """ModelOpt NVFP4 experts with FP16 activations on native SM70."""
 
     def __init__(
         self,
@@ -183,10 +178,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         moe_config: FusedMoEConfig,
     ) -> None:
         FusedMoEMethodBase.__init__(self, moe_config)
-        if quant_config.quant_method != "W4A16_NVFP4":
+        if quant_config.quant_method not in {"NVFP4", "W4A16_NVFP4"}:
             raise NotImplementedError(
-                "SM70 TurboMind ModelOpt NVFP4 MoE currently requires "
-                "W4A16_NVFP4 checkpoint weights."
+                "SM70 TurboMind ModelOpt NVFP4 MoE requires NVFP4-family "
+                f"checkpoint weights, got {quant_config.quant_method}."
             )
         self.quant_config = quant_config
         self.use_a16 = True
@@ -215,13 +210,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing:
             raise RuntimeError(
-                "Qwen3.6 NVFP4 MoE on SM70 requires the TurboMind extension "
+                "SM70 NVFP4 MoE requires the TurboMind extension "
                 "with " + ", ".join(missing) + "."
             )
         if not hasattr(torch.ops._moe_C, "moe_permute_with_scratch"):
-            raise RuntimeError(
-                "Qwen3.6 NVFP4 MoE on SM70 requires graph-safe MoE permute ops."
-            )
+            raise RuntimeError("SM70 NVFP4 MoE requires graph-safe MoE permute ops.")
         if self.moe.has_bias:
             raise NotImplementedError("SM70 NVFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
@@ -316,6 +309,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_num_experts = num_experts
         layer.sm70_nvfp4_hidden_size = hidden
         layer.sm70_nvfp4_intermediate_size = intermediate
+        layer.sm70_nvfp4_top_k = int(layer.moe_config.experts_per_token)
         layer.sm70_nvfp4_w13_k_dim = hidden
         layer.sm70_nvfp4_w13_n_dim = 2 * intermediate
         layer.sm70_nvfp4_w2_k_dim = intermediate
@@ -334,17 +328,21 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer.w2_weight_scale_2
         del layer.w2_input_scale
         logger.info_once(
-            "SM70 ModelOpt NVFP4 TurboMind MoE path enabled for "
-            "Qwen3.6-35B-A3B (local_experts=%d, graph_safe_decode=B1-B%d, "
-            "compact_grouped_decode=B1-B%d).",
+            "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
+            "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
+            "graph_safe_decode=B1-B%d, compact_grouped_decode=B1-B%d).",
+            hidden,
+            intermediate,
             num_experts,
+            layer.sm70_nvfp4_top_k,
             _GRAPH_SAFE_MAX_TOKENS,
             _COMPACT_GROUPED_MAX_TOKENS,
         )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
-        max_slots = _GRAPH_SAFE_MAX_TOKENS * _QWEN36_TOP_K
+        top_k = int(layer.sm70_nvfp4_top_k)
+        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
@@ -372,19 +370,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer._nvfp4_sm70_inv_permuted_idx = torch.empty(
             _GRAPH_SAFE_MAX_TOKENS,
-            _QWEN36_TOP_K,
+            top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_topk_ids = torch.empty(
             _GRAPH_SAFE_MAX_TOKENS,
-            _QWEN36_TOP_K,
+            top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
-        ).view(_GRAPH_SAFE_MAX_TOKENS, _QWEN36_TOP_K)
+        ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
         layer._nvfp4_sm70_permuted_idx = torch.empty(
             max_slots, dtype=torch.int32, device=device
         )
@@ -417,7 +415,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     def _persistent_buffers(
         layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
-        slots = num_tokens * _QWEN36_TOP_K
+        slots = num_tokens * int(layer.sm70_nvfp4_top_k)
         return {
             "output": layer._nvfp4_sm70_output[:num_tokens],
             "permuted_input": layer._nvfp4_sm70_permuted_input[:slots],
@@ -446,7 +444,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
         device = layer.w13_tm_weight.device
-        slots = num_tokens * _QWEN36_TOP_K
+        top_k = int(layer.sm70_nvfp4_top_k)
+        slots = num_tokens * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
@@ -476,14 +475,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 experts + 1, dtype=torch.int64, device=device
             ),
             "inv_permuted_idx": torch.empty(
-                num_tokens, _QWEN36_TOP_K, dtype=torch.int32, device=device
+                num_tokens, top_k, dtype=torch.int32, device=device
             ),
             "topk_ids": torch.empty(
-                num_tokens, _QWEN36_TOP_K, dtype=torch.int32, device=device
+                num_tokens, top_k, dtype=torch.int32, device=device
             ),
             "token_expert_indices": torch.arange(
                 slots, dtype=torch.int32, device=device
-            ).view(num_tokens, _QWEN36_TOP_K),
+            ).view(num_tokens, top_k),
             "permuted_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "sort_workspace": torch.empty(
                 workspace_size, dtype=torch.int8, device=device
@@ -528,13 +527,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise TypeError("SM70 NVFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
             raise RuntimeError("SM70 NVFP4 MoE dispatch is restricted to CUDA SM70.")
-        if x.shape[1] != _QWEN36_HIDDEN_SIZE:
+        hidden = int(layer.sm70_nvfp4_hidden_size)
+        top_k = int(layer.sm70_nvfp4_top_k)
+        if x.shape[1] != hidden:
             raise ValueError(
                 "SM70 NVFP4 MoE activation hidden size mismatch: expected "
-                f"{_QWEN36_HIDDEN_SIZE}, got {x.shape[1]}."
+                f"{hidden}, got {x.shape[1]}."
             )
-        if tuple(topk_ids.shape) != (x.shape[0], _QWEN36_TOP_K):
-            raise ValueError("SM70 NVFP4 MoE requires top-k IDs with shape [M, 8].")
+        if tuple(topk_ids.shape) != (x.shape[0], top_k):
+            raise ValueError(
+                "SM70 NVFP4 MoE top-k ID shape mismatch: expected "
+                f"{(x.shape[0], top_k)}, got {tuple(topk_ids.shape)}."
+            )
         if tuple(topk_weights.shape) != tuple(topk_ids.shape):
             raise ValueError("SM70 NVFP4 MoE top-k weights and IDs must share shape.")
         if topk_weights.dtype != torch.float32:
@@ -542,11 +546,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         num_tokens = x.shape[0]
         if num_tokens == 0:
-            return x.new_empty((0, _QWEN36_HIDDEN_SIZE))
+            return x.new_empty((0, hidden))
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
         output.zero_()
-        slots = num_tokens * _QWEN36_TOP_K
+        slots = num_tokens * top_k
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         buffers["permuted_idx"].fill_(slots)
@@ -557,7 +561,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer.expert_map,
             layer.global_num_experts,
             layer.local_num_experts,
-            _QWEN36_TOP_K,
+            top_k,
             buffers["permuted_input"],
             buffers["expert_offsets64"],
             buffers["inv_permuted_idx"],
@@ -613,7 +617,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             topk_weights,
             buffers["inv_permuted_idx"],
             buffers["expert_offsets64"],
-            _QWEN36_TOP_K,
+            top_k,
             output,
         )
         return output

@@ -57,6 +57,19 @@ def _moe_contract(**overrides):
     return SimpleNamespace(**values)
 
 
+def _qwen4_moe_contract(**overrides):
+    values = {
+        "num_experts": 512,
+        "experts_per_token": 10,
+        "hidden_dim": 2560,
+        "intermediate_size_per_partition": 160,
+        "tp_size": 4,
+        "moe_parallel_config": SimpleNamespace(use_all2all_kernels=False),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_mixed_min_capability_requires_exact_sm70_and_both_turbomind_routes():
     with (
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
@@ -92,10 +105,14 @@ def test_nvfp4_grouped_prefill_defaults_on_and_can_be_disabled(monkeypatch):
         ("tp_size", 2),
     ],
 )
-def test_nvfp4_moe_contract_rejects_non_qwen36_shapes(field, value):
+def test_nvfp4_moe_contract_rejects_unvalidated_shapes(field, value):
     validate_nvfp4_sm70_moe_contract(_moe_contract())
     with pytest.raises(NotImplementedError):
         validate_nvfp4_sm70_moe_contract(_moe_contract(**{field: value}))
+
+
+def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4():
+    validate_nvfp4_sm70_moe_contract(_qwen4_moe_contract())
 
 
 def test_nvfp4_moe_contract_rejects_shape_consistent_unvalidated_tp8():
@@ -160,7 +177,7 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
 )
-@pytest.mark.parametrize("total_slots", (8, 72, 80))
+@pytest.mark.parametrize("total_slots", (8, 72, 80, 100))
 def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slots):
     sorted_expert_ids = (
         torch.arange(total_slots, dtype=torch.int32, device="cuda") // 3
@@ -190,3 +207,25 @@ def test_mixed_w4a16_moe_requires_turbomind_on_sm70():
         pytest.raises(NotImplementedError, match="TurboMind"),
     ):
         config.get_quant_method(FakeRoutedExperts(), "model.layers.0.mlp.experts")
+
+
+def test_pure_nvfp4_qwen4_moe_uses_turbomind_w4a16_on_sm70():
+    config = ModelOptNvFp4Config(
+        quant_method="NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+    )
+
+    class FakeRoutedExperts:
+        moe_config = _qwen4_moe_contract()
+
+    with (
+        patch.object(modelopt, "RoutedExperts", FakeRoutedExperts),
+        patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
+        patch.object(sm70_tm, "should_use_nvfp4_moe_turbomind", return_value=True),
+    ):
+        method = config.get_quant_method(
+            FakeRoutedExperts(), "model.layers.0.mlp.experts"
+        )
+
+    assert isinstance(method, ModelOptNvFp4SM70MoEMethod)
+    assert method.use_a16
