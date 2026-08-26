@@ -43796,9 +43796,14 @@ Interpretation:
   pack directly. On real layer-0 TP4-rank-0 weights, W13 split-16/one-chain
   plus W2 split-8/one-chain moves the W13--SwiGLU--W2 pipeline from
   `51.299` to `37.934 us`, is CUDA-Graph stable, and is bitwise for the timing
-  input. Its 40-layer service projection is `0.535 ms/token`, not endpoint
-  TPOT. Full endpoint, three-repeat pure decode and GSM8K-64 remain pidfd
-  queued under
+  input. Its 40-layer service projection is `0.535 ms/token`. A full-model
+  route-hit candidate measures `73.645`, `73.613` and `73.646 token/s`, with
+  median TPOT `13.579 ms`, identical output-token hashes, coherent Chinese
+  output and GSM8K-64 `62/64` with zero invalid answers. This is a valid
+  combined endpoint but not an isolated no-copy A/B: relative to the
+  `72.372 token/s` endpoint it also swaps FP8 QPN8 for the prescaled FP8 path,
+  so the observed `0.239 ms/token` difference cannot be assigned to MXFP4.
+  Evidence is under
   `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-tm-qpn-exact-combined-fullmodel-20260826-r1/`.
 - The same no-copy kernel now defaults on under the exact B1 direct-order TP4
   six-route W13/W2 tensor contract; all other calls keep the existing
@@ -43811,7 +43816,9 @@ Interpretation:
   1 KiB and 2 KiB shared memory. Worktree-source/new-extension binding and
   the focused MXFP4 plus FP8-QPN compatibility suites pass (`41 passed`).
   The selected operator pipeline is bitwise and graph-stable; no unmatched
-  operator projection is relabeled as a full-model speed result.
+  operator projection is relabeled as a full-model speed result. A matching
+  merged-source AOT build and one-variable full-model A/B remain follow-up
+  evidence rather than merge prerequisites.
 - The exact FP16 auxiliary candidate joins the C4 `N=2048`, `N=512` and
   `N=64` projections into one `N=2624` launch while preserving their original
   FP32 FMA and reduction order. All joined outputs and the concurrent main
@@ -43876,5 +43883,5 @@ Interpretation:
   claim only genuinely idle cards, never terminate unrelated processes, and
   release claims immediately after bounded tests. Development and any Draft
   PR for this continuation use the private remote and the isolated branch
-  `agent/private-v100-dsv4-pp2tp4-100tps-20260826`; public upstream is
+  `agent/private-v100-dsv4-pp2tp4-followup-20260826`; public upstream is
   fetch-only for this work.
