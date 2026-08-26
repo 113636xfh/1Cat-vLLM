@@ -63,7 +63,6 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
-        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY",
         "VLLM_SM70_DFLASH2_QPN8_RERANK",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
@@ -83,6 +82,19 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     envs.disable_envs_cache()
     try:
         assert not any(getattr(envs, name) for name in names)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_dflash2_grouped_verify_is_default_on_with_rollback(monkeypatch):
+    name = "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
     finally:
         envs.disable_envs_cache()
 
