@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = True
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
+    VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
@@ -1710,6 +1711,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
     "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
+    "VLLM_SM70_FA2_D256_LIBRARY": lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
     "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
     ),
