@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -349,7 +350,26 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
         if self.layer_type == "linear_attention":
-            attn_out = self.linear_attn(hidden_states=block_input)
+            use_direct_attention_output = (
+                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                and torch.compiler.is_compiling()
+            )
+            attn_buffer = (
+                None if use_direct_attention_output else torch.empty_like(block_input)
+            )
+            projected_attn_out = self.linear_attn(
+                hidden_states=block_input,
+                output=attn_buffer,
+            )
+            if use_direct_attention_output:
+                if projected_attn_out is None:
+                    raise RuntimeError(
+                        "SM70 TP4 fused prefill requires a direct GDN output"
+                    )
+                attn_out = projected_attn_out
+            else:
+                assert attn_buffer is not None
+                attn_out = attn_buffer
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
                 hidden_states=block_input,
