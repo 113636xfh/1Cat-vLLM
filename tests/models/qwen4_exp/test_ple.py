@@ -58,6 +58,7 @@ def test_pinned_host_ple_allocates_tp_shard_without_device_table(
     assert layer.weight._vllm_keep_on_cpu
     assert not layer.weight.is_meta
     assert not layer.weight_scale.is_meta
+    assert layer.weight_scale.dtype == torch.float16
     assert layer._accelerator_weight_views == {}
 
 
@@ -286,6 +287,7 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
 
 def _make_fp8_embedding_layer(
     monkeypatch: pytest.MonkeyPatch,
+    params_dtype: torch.dtype = torch.bfloat16,
 ) -> embedding_module.VocabParallelEmbedding:
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -304,14 +306,20 @@ def _make_fp8_embedding_layer(
     layer = embedding_module.VocabParallelEmbedding(
         3,
         2,
-        params_dtype=torch.bfloat16,
+        params_dtype=params_dtype,
         padding_size=1,
         quant_method=method,
     )
     weight = torch.tensor([[1.0, 2.0], [4.0, 8.0], [16.0, 32.0]])
     layer.weight.data.copy_(weight.to(torch.float8_e4m3fn))
-    layer.weight_scale.data.copy_(torch.tensor([0.25], dtype=torch.bfloat16))
+    layer.weight_scale.data.copy_(torch.tensor([0.25], dtype=params_dtype))
     return layer
+
+
+def test_ple_fp8_embedding_scale_matches_model_dtype(monkeypatch) -> None:
+    layer = _make_fp8_embedding_layer(monkeypatch, params_dtype=torch.float16)
+
+    assert layer.weight_scale.dtype == torch.float16
 
 
 def test_ple_fp8_embedding_dequantizes_in_ple_layer(monkeypatch) -> None:

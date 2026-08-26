@@ -162,7 +162,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        del input_size, output_size, params_dtype
+        del input_size, output_size
         weight_loader = extra_weight_attrs.get("weight_loader")
         weight = create_fp8_weight_parameter(
             sum(output_partition_sizes), input_size_per_partition, weight_loader
@@ -175,7 +175,10 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
             input_size_per_partition,
             None,
             weight_loader,
-            scale_dtype=torch.bfloat16,
+            # Keep graph inputs in the requested model dtype. In particular,
+            # an otherwise-FP16 graph cannot retain a BF16 scale parameter on
+            # SM70 because Inductor rejects BF16 graph inputs there.
+            scale_dtype=params_dtype,
         )
         layer.register_parameter("weight_scale", weight_scale)
 
@@ -293,7 +296,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self.embedding_dim,
             None,
             self.weight_loader,
-            scale_dtype=torch.bfloat16,
+            scale_dtype=params_dtype,
         )
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
         logger.info(
