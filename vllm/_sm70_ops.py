@@ -1222,6 +1222,33 @@ if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+def mxfp4_moe_qpn_m1_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+) -> None:
+    _op("mxfp4_moe_qpn_m1_sm70_out")(
+        out, input, weights, scales, expert_ids, broadcast_input
+    )
+
+
+if hasattr(torch.ops._C, "mxfp4_moe_qpn_m1_sm70_out"):
+
+    @register_fake("_C::mxfp4_moe_qpn_m1_sm70_out")
+    def _mxfp4_moe_qpn_m1_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+    ) -> None:
+        return None
+
+
 def nvfp4_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,

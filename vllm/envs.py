@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
+    VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = True
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
@@ -255,6 +256,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
@@ -1697,6 +1699,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
     ),
+    # Default non-fused QPN8 route for the exact PP2 x TP4 shared-expert
+    # gate/up tensor. The model-level clamp-SwiGLU remains external. Set to 0
+    # to retain the TurboMind path.
+    "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1"))
+    ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
@@ -2221,6 +2229,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # restores the stable-sort path.
     "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
+    ),
+    # Consume the existing TurboMind E2M1/UE8M0 pack directly for the exact
+    # six-route B1 W13/W2 tensors. Set to 0 to retain the dense-stage path.
+    "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1"))
     ),
     "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))

@@ -645,6 +645,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &mxfp4_moe_dense_stage_sm70_out);
 
   ops.def(
+      "mxfp4_moe_qpn_m1_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input) -> ()");
+  ops.impl("mxfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
+           &mxfp4_moe_qpn_m1_sm70_out);
+
+  ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
