@@ -3,7 +3,10 @@
 
 import torch
 
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+)
 from vllm.model_executor.models.utils import WeightsMapper
 
 
@@ -73,4 +76,41 @@ def test_merged_column_load_weights_forwards_stacked_shards() -> None:
     assert calls == [
         (weight, down, 0),
         (weight, injection, 1),
+    ]
+
+
+def test_qkv_load_weights_forwards_stacked_shards() -> None:
+    layer = object.__new__(QKVParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "attn.qkv_proj"
+    weight = torch.nn.Parameter(torch.zeros(7, 4))
+    calls = []
+
+    def weight_loader(param, loaded_weight, shard_id) -> None:
+        calls.append((param, loaded_weight, shard_id))
+
+    weight.weight_loader = weight_loader
+    layer.register_parameter("weight", weight)
+    query = torch.ones(3, 4)
+    query.shard_id = "q"
+    key = torch.full((2, 4), 2.0)
+    key.shard_id = "k"
+    value = torch.full((2, 4), 3.0)
+    value.shard_id = "v"
+
+    loaded = list(
+        layer.load_weights(
+            [
+                ("weight", query),
+                ("weight", key),
+                ("weight", value),
+            ]
+        )
+    )
+
+    assert loaded == ["weight", "weight", "weight"]
+    assert calls == [
+        (weight, query, "q"),
+        (weight, key, "k"),
+        (weight, value, "v"),
     ]
