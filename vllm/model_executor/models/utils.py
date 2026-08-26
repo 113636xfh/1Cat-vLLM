@@ -243,7 +243,14 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            try:
+                weight_loader(param, weight_data)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Error loading weight {weight_qualname!r} "
+                    f"with checkpoint shape {tuple(weight_data.shape)} into "
+                    f"parameter shape {tuple(param.shape)}"
+                ) from exc
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 
