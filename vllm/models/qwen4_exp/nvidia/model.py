@@ -11,6 +11,9 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.fused_moe import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -194,6 +197,17 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+        # Qwen3Next loads expert tensors manually in this private tree, so its
+        # FusedMoE does not receive the mapping required by AutoWeightsLoader.
+        # Qwen4Exp uses recursive loading and must attach that mapping here.
+        self.experts.expert_mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.n_routed_experts,
+            num_redundant_experts=self.n_redundant_experts,
+        )
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

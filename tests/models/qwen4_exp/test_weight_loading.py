@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+from torch import nn
 
+from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
+    Qwen4ExpSparseMoeBlock,
     _remap_qsa_cache_scale_name,
 )
 
@@ -97,6 +100,57 @@ def test_outer_checkpoint_mapper_selects_language_model_only_paths() -> None:
     assert mapper._map_name("model.visual.blocks.0.attn.qkv.weight") == (
         "visual.blocks.0.attn.qkv.weight"
     )
+
+
+def test_sparse_moe_attaches_private_recursive_loader_mapping(monkeypatch) -> None:
+    class FakeExperts(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.expert_mapping = None
+
+    def fake_qwen3_next_init(self, vllm_config, prefix="") -> None:
+        del vllm_config, prefix
+        nn.Module.__init__(self)
+        self.n_routed_experts = 2
+        self.n_redundant_experts = 0
+        self.experts = FakeExperts()
+
+    monkeypatch.setattr(
+        Qwen3NextSparseMoeBlock,
+        "__init__",
+        fake_qwen3_next_init,
+    )
+    vllm_config = type(
+        "VllmConfigStub",
+        (),
+        {
+            "parallel_config": type(
+                "ParallelConfigStub", (), {"use_sequence_parallel_moe": False}
+            )(),
+            "model_config": type(
+                "ModelConfigStub",
+                (),
+                {
+                    "hf_text_config": type(
+                        "TextConfigStub",
+                        (),
+                        {"shared_expert_intermediate_size": 640},
+                    )()
+                },
+            )(),
+        },
+    )()
+
+    block = Qwen4ExpSparseMoeBlock(vllm_config, prefix="model.layers.0.mlp")
+
+    assert block.experts.expert_mapping == [
+        ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
+        ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
+        ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
+        ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
+        ("experts.w2_", "experts.1.down_proj.", 1, "w2"),
+        ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
+    ]
 
 
 @pytest.mark.parametrize(
