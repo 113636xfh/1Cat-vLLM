@@ -571,18 +571,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
-        num_reqs = query_start_loc.numel() - 1
+        num_reqs = ngram_context.shape[0]
         num_tokens = input_ids.shape[0]
-        if num_tokens > self.positions_buffer.numel():
-            raise ValueError(
-                f"PLE received {num_tokens} tokens, but its workspace supports "
-                f"at most {self.positions_buffer.numel()}"
-            )
-        if num_reqs > self.padded_buffer.shape[0]:
-            raise ValueError(
-                f"PLE received {num_reqs} requests, but its workspace supports "
-                f"at most {self.padded_buffer.shape[0]}"
-            )
+        # The scheduler already enforces max_num_batched_tokens and max_num_seqs.
+        # Python comparisons here would specialize these symbolic dimensions and
+        # violate V2's dynamic-shape contract during AOT compilation.
 
         positions = self.positions_buffer[:num_tokens]
         packed = self.padded_buffer[:num_reqs]
@@ -593,9 +586,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             0, packed.shape[1] - 1
         )
         packed[request_indices, columns] = input_ids
-        ngram_context = ngram_context[:num_reqs].to(
-            device=input_ids.device, dtype=torch.long
-        )
+        ngram_context = ngram_context.to(device=input_ids.device, dtype=torch.long)
 
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
