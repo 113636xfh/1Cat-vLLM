@@ -4,6 +4,10 @@ from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from typing import Literal
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingEvent,
@@ -17,6 +21,9 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -161,15 +168,15 @@ class CPUOffloadingManager(OffloadingManager):
 
         to_evict: list[OffloadKey] = []
         if num_blocks_to_evict > 0:
-            # Blocks from the original input are excluded from eviction candidates:
-            # a block that was already stored must remain in the cache after this call.
-            protected = set(keys)
-            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                return None
-            for key, block in evicted:
-                self._free_block(block)
-                to_evict.append(key)
+            # KEEP-FIRST policy: pool is full. Do NOT evict the oldest blocks --
+            # the earliest blocks are the shared prompt prefix and are the only
+            # ones that can produce contiguous external-prefix-cache hits.
+            # Skipping the overflow keeps the prefix resident for reuse.
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=self._get_load_store_spec([], []),
+                evicted_keys=[],
+            )
 
         if to_evict and self.events is not None:
             self.events.append(

@@ -27,10 +27,10 @@ exec /home/xfh/1cat-vllm/venv/bin/python -u -m vllm.entrypoints.openai.api_serve
   --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 2 \
   --gpu-memory-utilization 0.97 \
-  --max-model-len 151296 \
+  --max-model-len 145824 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 2048 \
-  --mamba-block-size 1024 \
+  --mamba-block-size 512 \
   --cpu-offload-gb 0.8 \
   --cpu-offload-params visual \
   --kv-offloading-size 12 \
