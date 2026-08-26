@@ -891,7 +891,7 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
 
     monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
-    for kv_len in range(40000, 128001, 8000):
+    for kv_len in range(8000, 256001, 8000):
         family_key = torch.empty(
             (1, kv_len, 1, 256), dtype=torch.float16, device="meta"
         )
@@ -924,10 +924,10 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
     )
     assert not flash_v100._should_use_prefill_d256_gqa_architecture(
         query,
-        key[:, :44000],
-        value[:, :44000],
+        key[:, :12000],
+        value[:, :12000],
         max_seqlen_q=8000,
-        max_seqlen_k=44000,
+        max_seqlen_k=12000,
         softmax_scale=0.0625,
         architecture_op=object(),
     )

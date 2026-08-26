@@ -1451,7 +1451,7 @@ def _should_use_prefill_d256_gqa_architecture(
     softmax_scale: float,
     architecture_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
-    """Gate the measured Q8000/KV40K..128K/Hq6/Hkv1/D256 family."""
+    """Gate the measured Q8000/KV8K..256K/Hq6/Hkv1/D256 family."""
     return (
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
         and architecture_op is not None
@@ -1462,7 +1462,7 @@ def _should_use_prefill_d256_gqa_architecture(
         and value.shape == key.shape
         and max_seqlen_q == 8000
         and max_seqlen_k == key.shape[1]
-        and 40000 <= max_seqlen_k <= 128000
+        and 8000 <= max_seqlen_k <= 256000
         and max_seqlen_k % 8000 == 0
         and query.dtype == torch.float16
         and key.dtype == query.dtype
@@ -1632,7 +1632,7 @@ def _try_sm70_fa2_d256_prefill(
                         if not _logged_prefill_d256_gqa_architecture:
                             logger.info(
                                 "FLASH_ATTN_V100 SM70 D256 GQA "
-                                "8K-by-40K..128K architecture route active."
+                                "8K-by-8K..256K architecture route active."
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
