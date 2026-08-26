@@ -1074,7 +1074,12 @@ bool mxfp4_tune_small_shapes_enabled() {
 
 bool mxfp4_moe_compact_grouped_decode_enabled() {
   const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
-  return raw != nullptr && std::atoi(raw) != 0;
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
+bool mxfp4_moe_broadcast_input_decode_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE");
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_enabled() {
@@ -6633,17 +6638,29 @@ void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
   const int hidden_logical_size_i = static_cast<int>(hidden_logical_size);
   const int sorted_output_row_stride =
       static_cast<int>(sorted_output.stride(0));
-  if (top_k == 8 && (hidden_logical_size_i % 2) == 0 &&
+  if ((top_k == 6 || top_k == 8) && (hidden_logical_size_i % 2) == 0 &&
       (sorted_output_row_stride % 2) == 0) {
     const int blocks = std::max<int>(
         1, ((hidden_logical_size_i >> 1) + kThreads - 1) / kThreads);
-    awq_moe_single_token_weighted_reduce_half2_kernel<8>
-        <<<blocks, kThreads, 0, stream>>>(
-            reinterpret_cast<const __half*>(sorted_output.data_ptr<at::Half>()),
-            topk_weights.data_ptr<float>(),
-            inv_permuted_idx.data_ptr<int32_t>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
-            hidden_logical_size_i, sorted_output_row_stride);
+    if (top_k == 6) {
+      awq_moe_single_token_weighted_reduce_half2_kernel<6>
+          <<<blocks, kThreads, 0, stream>>>(
+              reinterpret_cast<const __half*>(
+                  sorted_output.data_ptr<at::Half>()),
+              topk_weights.data_ptr<float>(),
+              inv_permuted_idx.data_ptr<int32_t>(),
+              reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+              hidden_logical_size_i, sorted_output_row_stride);
+    } else {
+      awq_moe_single_token_weighted_reduce_half2_kernel<8>
+          <<<blocks, kThreads, 0, stream>>>(
+              reinterpret_cast<const __half*>(
+                  sorted_output.data_ptr<at::Half>()),
+              topk_weights.data_ptr<float>(),
+              inv_permuted_idx.data_ptr<int32_t>(),
+              reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+              hidden_logical_size_i, sorted_output_row_stride);
+    }
   } else {
     const int blocks =
         std::max<int>(1, (hidden_logical_size_i + kThreads - 1) / kThreads);
@@ -8090,7 +8107,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    torch::Tensor b_group_indices, bool compact_grouped_rows = false) {
+    torch::Tensor b_group_indices, bool compact_grouped_rows = false,
+    bool broadcast_input_rows = false) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "mxfp4_moe_gemm_sm70: input must be CUDA float16.");
@@ -8111,9 +8129,16 @@ void mxfp4_moe_gemm_sm70_out_impl(
               "mxfp4_moe_gemm_sm70: k must be divisible by group_size.");
   TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
               "mxfp4_moe_gemm_sm70: input shape mismatch.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == sorted_input.size(0) &&
+  const int64_t total_tokens =
+      broadcast_input_rows ? out.size(0) : sorted_input.size(0);
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == total_tokens &&
                   out.size(1) == n && out.stride(1) == 1,
               "mxfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
+  TORCH_CHECK(!broadcast_input_rows ||
+                  (sorted_input.size(0) == 1 && total_tokens == num_experts &&
+                   compact_grouped_rows),
+              "mxfp4_moe_gemm_sm70: broadcast input requires one physical "
+              "row and one logical row per compact group.");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "mxfp4_moe_gemm_sm70: expert_offsets too small.");
   TORCH_CHECK(b_group_indices.is_cuda() &&
@@ -8123,7 +8148,6 @@ void mxfp4_moe_gemm_sm70_out_impl(
               "mxfp4_moe_gemm_sm70: B group indices must be contiguous CUDA "
               "int32.");
 
-  const int64_t total_tokens = sorted_input.size(0);
   if (total_tokens == 0) {
     return;
   }
@@ -8147,7 +8171,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
       static_cast<int>(sorted_input.stride(0)),
   };
   desc_A.num = static_cast<int>(num_experts);
-  desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.offsets =
+      broadcast_input_rows ? nullptr : expert_offsets.data_ptr<int>();
   turbomind::gemm::MatrixLayout desc_U{};
 
   const auto order_w = conv_w->order;
@@ -8273,8 +8298,12 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "supported.");
   TORCH_CHECK(input.dim() == 2 && input.size(1) == k,
               "mxfp4_moe_dense_stage_sm70_out: input shape mismatch.");
+  const bool broadcast_compact_decode_shape =
+      input.size(0) == 1 && out.dim() == 2 && out.size(0) == num_experts &&
+      num_experts == 6 && k == 4096 && (n == 512 || n == 1024);
   TORCH_CHECK(
-      out.dim() == 2 && out.size(0) == input.size(0) && out.size(1) == n,
+      out.dim() == 2 && out.size(1) == n &&
+          (out.size(0) == input.size(0) || broadcast_compact_decode_shape),
       "mxfp4_moe_dense_stage_sm70_out: out shape mismatch.");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "mxfp4_moe_dense_stage_sm70_out: expert_offsets too small.");
@@ -8291,11 +8320,12 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     num_experts == 6 &&
                                     ((k == 4096 && (n == 512 || n == 1024)) ||
                                      (n == 4096 && (k == 256 || k == 512)));
-  if (vllm::awq_sm70::mxfp4_moe_compact_grouped_decode_enabled() &&
-      compact_decode_shape) {
-    mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
-                                 num_experts, k, n, group_size,
-                                 dense_expert_ids, true);
+  if (broadcast_compact_decode_shape ||
+      (vllm::awq_sm70::mxfp4_moe_compact_grouped_decode_enabled() &&
+       compact_decode_shape)) {
+    mxfp4_moe_gemm_sm70_out_impl(
+        out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n,
+        group_size, dense_expert_ids, true, broadcast_compact_decode_shape);
     return;
   }
   const bool grouped_m8_shape =
@@ -8629,6 +8659,9 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
       x.size(0), kTopK);
 
   constexpr int kThreads = 256;
+  const bool broadcast_input =
+      w13_n == 512 &&
+      vllm::awq_sm70::mxfp4_moe_broadcast_input_decode_enabled();
   const int src_row_stride = kPtrRowBytes;
   const int row_bytes = kPtrRowBytes;
   if (topk_ids.scalar_type() == torch::kInt32) {
@@ -8639,8 +8672,10 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
-        reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()), nullptr,
-        expert_offsets.data_ptr<int32_t>(), nullptr,
+        broadcast_input
+            ? nullptr
+            : reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
+        nullptr, expert_offsets.data_ptr<int32_t>(), nullptr,
         inv_permuted_idx.data_ptr<int32_t>(),
         sorted_expert_ids.data_ptr<int32_t>(), kTopK,
         static_cast<int>(hidden_logical_size), src_row_stride, src_row_stride,
@@ -8653,8 +8688,10 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
         w13_ptrs_w.data_ptr<uint8_t>(), w13_ptrs_s.data_ptr<uint8_t>(),
-        reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()), nullptr,
-        expert_offsets.data_ptr<int32_t>(), nullptr,
+        broadcast_input
+            ? nullptr
+            : reinterpret_cast<__half*>(compact_input.data_ptr<at::Half>()),
+        nullptr, expert_offsets.data_ptr<int32_t>(), nullptr,
         inv_permuted_idx.data_ptr<int32_t>(),
         sorted_expert_ids.data_ptr<int32_t>(), kTopK,
         static_cast<int>(hidden_logical_size), src_row_stride, src_row_stride,
@@ -8662,9 +8699,10 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  mxfp4_moe_gemm_sm70_out_impl(gate_up, compact_input, expert_offsets,
-                               w13_ptrs_w, w13_ptrs_s, kTopK, w13_k, w13_n,
-                               group_size, sorted_expert_ids, true);
+  mxfp4_moe_gemm_sm70_out_impl(gate_up, broadcast_input ? x : compact_input,
+                               expert_offsets, w13_ptrs_w, w13_ptrs_s, kTopK,
+                               w13_k, w13_n, group_size, sorted_expert_ids,
+                               true, broadcast_input);
 }
 
 void fp8_moe_single_token_dense_stage_sm70_out(

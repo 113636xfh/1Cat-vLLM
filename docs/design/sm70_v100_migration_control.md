@@ -43438,6 +43438,38 @@ Interpretation:
   (`BLOCK_N=2`, `BLOCK_K=1024`) is 0.5--12% slower across the five traced
   `N=64/256/512/1024/2048` shapes; smaller-K/four-row variants are slower and
   also change FP32 accumulation. The candidate is not retained.
+- The next MXFP4 B1 screen removes redundant route sorting without changing
+  model arithmetic. The six unique top-k IDs become the compact TurboMind
+  group IDs directly, fixed offsets remain `[0, 1, ..., 6]`, W13 reads the
+  single physical input row through the accepted broadcast contract, and W2
+  stays in original top-k order. The final weighted reduction therefore keeps
+  the same route-order FP32 FMA sequence without an inverse permutation.
+  Initial and changed-route CUDA Graph replays are bitwise at W13, clamped
+  SwiGLU, W2, and final output. Adding the exact top-k-6 `half2` reducer moves
+  the current direct-top6 pipeline from `54.414` to `46.519 us/layer`, a
+  `0.339 ms/token` 43-layer service projection. The reproducible JSON is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-direct-order-screen-20260826-r1/`.
+  The exact B1, replicated-expert, top-k-6 route is therefore default-on after
+  source audit. `VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE=0`,
+  `VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE=0`, and
+  `VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE=0` remain explicit rollbacks; other
+  token counts, expert mappings, top-k shapes, dtypes, and devices retain the
+  existing path. This is operator performance evidence, not a full endpoint
+  throughput claim.
+- The exact TP4 QNorm/RoPE plus FP8-KV insertion route combines the existing
+  16 Q-head programs and eight packed-KV writers into one graph node without
+  changing their arithmetic. Across 64 changing-input CUDA Graph patterns,
+  both transformed Q and the complete cache storage are bitwise equal. Median
+  operator time falls from `9.974` to `4.076 us` (`2.45x`), projecting
+  `0.254 ms/token` across 43 layers. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-qnorm-kv-fusion-screen-20260826-r1/`;
+  `VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4=0` is the rollback.
+- Sparse MLA QK d-split now uses one 16-head group for the exact TP4 shape.
+  V100 medians improve by about 43% at C4 and 30--31% at C128/SWA. C128 and
+  SWA are bitwise equal; the C4 and changing-input comparisons remain finite
+  with at most one changed FP16 element per pattern, `1.526e-5` max absolute
+  difference, and `1.807e-5` max relative L2. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-sparse-head16-screen-20260826-r1/`.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
