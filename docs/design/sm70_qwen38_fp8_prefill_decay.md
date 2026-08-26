@@ -398,10 +398,62 @@ at most `1e-3` and relative L2 at most `1e-2`; greedy or bitwise identity is
 not required. The complete Flash-V100 policy suite passes 112 tests on a real
 V100, including a direct architecture-OOM-to-dense-fallback test.
 
+## 2026-08-26 isolated TP4 256K boundary gate
+
+The first retained 261,888-token attempt did not establish a kernel or
+sampling deadlock. A second TP4 job had started on the same GPUs without an
+atomic claim. Its rank 2 worker, PID 827324, occupied 14.19 GiB on GPU 2 while
+the prefill worker occupied 17.52 GiB. The prefill worker then failed a
+134-MiB gate/up allocation with only 6.19 MiB free. Peer ranks waited for the
+failed worker and the engine eventually reported `sample_tokens` RPC timeout.
+The worker OOM is the primary failure; the RPC timeout is only the delayed
+symptom.
+
+The corrected launcher refuses a direct unclaimed start, takes an atomic TP4
+GPU claim, and uses a case-local vLLM, TorchInductor, and Triton cache. During
+the first corrected launch it rejected a real concurrent starter holding 368
+MiB on GPU 0, released the provisional claim, and retried only after all four
+GPUs were idle. The measured contract is Qwen3.8-27B-FP8, TP4 V100-SXM2-32GB,
+261,888 prompt tokens plus 32 output tokens, 262,144 maximum model length,
+8,192 maximum batched tokens, one sequence, FP8 E5M2 KV, chunked prefill,
+Mamba align mode, Flash-Attention-V100, CUDA graphs, and the model's official
+thinking sampling (`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed
+20260825). The isolated profile exposes 18.64 GiB for KV and the single-request
+CUDA graph occupies 0.20 GiB; the overlapped failure exposed only 7.11 GiB for
+KV and captured 1.50 GiB of graphs under its old 16-sequence benchmark
+contract.
+
+| Route | Pure prefill | Prompt throughput | Request wall | Output gate |
+|---|---:|---:|---:|---|
+| architecture disabled | 128.406976 s | 2039.52 tok/s | 129.342123 s | coherent 32-token text |
+| 8K..256K architecture | 88.133023 s | 2971.51 tok/s | 89.063283 s | reject: 32 token IDs are zero |
+
+The architecture performance lane is 1.45697x faster, saves 40.273953 seconds,
+and lowers pure-prefill time by 31.3643%. It is not an accepted model result:
+the matched control emits coherent text with hash
+`c3d3db079d1611c0462b3cf6cb55e83438123b3f607492b68ab2d6c32e114872`,
+whereas the candidate emits 32 zero IDs with hash
+`8a86dd30276a7f38fb6cf14439c812e4446227c5a48c7373fd5a9a7c07c4f97f`.
+Until this model-level quality regression is fixed, 2039.52 prompt tok/s is
+the usable 256K result and 2971.51 prompt tok/s is performance-only evidence.
+The Draft remains blocked from promotion and the architecture rollback stays
+`VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=0`.
+
+Route evidence confirms that the candidate is not a final-chunk-only speedup.
+Each rank reports 496 long-architecture hits: 31 full prefix-bearing chunks
+times 16 full-attention layers. The first no-prefix chunk uses 16 exact
+Split-D calls and the final partial chunk uses 16 tail-pad calls. The matched
+control reports zero long-architecture hits.
+
 ## Artifacts
 
 - D256 GQA architecture artifacts are retained outside Git; their private
   filesystem location is intentionally not committed.
+- Isolated 256K candidate/control JSON:
+  `model/results/tp4-256k-owned-official-sampling-{m080,control-m080}.json`
+  under the 80-TFLOP task root, with matching `.log` and `.claim.log` files.
+- Claim-enforcing 256K runner:
+  `model/run_tp4_prefill_256k_owned.sh` under the same task root.
 - Final operator A/B/A:
   `results/torch-architecture-scorecache-final-v1-aba.json` under that task
   root.
