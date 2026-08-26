@@ -55,28 +55,6 @@ def test_pp2_tp4_qpn8_is_default_on_with_explicit_rollback(monkeypatch) -> None:
         (_layer("fused_wqa_wkv", 1, 4096, 1536), False, (32, 2, False)),
         (_layer("wq_b", 4, 1024, 8192), False, (8, 2, False)),
         (_layer("wo_b", 4, 2048, 4096), False, (16, 2, False)),
-        (
-            _layer(
-                "gate_up_proj",
-                4,
-                4096,
-                1024,
-                output_partition_sizes=[512, 512],
-            ),
-            False,
-            (32, 2, False),
-        ),
-        (
-            _layer(
-                "gate_up_proj",
-                4,
-                4096,
-                1024,
-                output_partition_sizes=[512, 512],
-            ),
-            True,
-            (16, 2, False),
-        ),
         (_layer("down_proj", 4, 512, 4096), False, (16, 2, False)),
     ],
 )
@@ -97,14 +75,15 @@ def test_pp2_tp4_qpn8_rejects_wrong_tensor_and_concurrency_roles() -> None:
         fp8._sm70_fp8_qpn8_pp2_tp4_config(concurrent_indexer, gated_silu=False) is None
     )
 
-    wrong_gate = _layer(
+    excluded_gate = _layer(
         "gate_up_proj",
         4,
         4096,
         1024,
-        output_partition_sizes=[256, 768],
+        output_partition_sizes=[512, 512],
     )
-    assert fp8._sm70_fp8_qpn8_pp2_tp4_config(wrong_gate, gated_silu=True) is None
+    assert fp8._sm70_fp8_qpn8_pp2_tp4_config(excluded_gate, gated_silu=False) is None
+    assert fp8._sm70_fp8_qpn8_pp2_tp4_config(excluded_gate, gated_silu=True) is None
 
     wrong_layout = _layer("wo_b", 4, 2048, 4096)
     wrong_layout.weight_block_size = [64, 128]
