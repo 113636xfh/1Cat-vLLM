@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl
 from vllm.v1.worker.utils import bind_kv_cache
 
 
@@ -36,3 +37,61 @@ def test_bind_qsa_key_cache_builds_key_and_mrope_views() -> None:
     assert layer.rope_position_cache.shape == (2, 8, 1, 3)
     assert layer.rope_position_cache.dtype == torch.int64
     assert runner_kv_caches == [cache]
+
+
+def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    num_blocks, block_size, head_size = 2, 16, 8
+    kv_cache = torch.arange(
+        num_blocks * 2 * block_size * head_size,
+        dtype=torch.float16,
+    ).view(num_blocks, 2, block_size, 1, head_size)
+    query = torch.zeros(1, 2, head_size, dtype=torch.float16)
+    output = torch.empty_like(query)
+    logical_indices = torch.zeros(1, 4, dtype=torch.int32)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+    token_to_req = torch.zeros(1, dtype=torch.int32)
+    captured = {}
+
+    def fake_sparse_attention(
+        query_arg,
+        key_cache_arg,
+        value_cache_arg,
+        logical_indices_arg,
+        block_table_arg,
+        token_to_req_arg,
+        output_arg,
+    ):
+        captured["key_cache"] = key_cache_arg
+        captured["value_cache"] = value_cache_arg
+        assert torch.equal(query_arg, query)
+        assert torch.equal(logical_indices_arg, logical_indices)
+        assert torch.equal(block_table_arg, block_table)
+        assert torch.equal(token_to_req_arg, token_to_req)
+        output_arg.fill_(1)
+        return output_arg
+
+    monkeypatch.setattr(qsa_ops, "qsa_sparse_paged_attention", fake_sparse_attention)
+    impl = object.__new__(Qwen4ExpQSAFlashAttentionImpl)
+    impl.head_size = head_size
+    impl.alibi_slopes = None
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+
+    result = impl.forward_qsa(
+        SimpleNamespace(topk_indices_buffer=logical_indices),
+        query,
+        query[:, :1],
+        query[:, :1],
+        kv_cache,
+        SimpleNamespace(num_actual_tokens=1, block_table=block_table),
+        output,
+        token_to_req,
+    )
+
+    expected_key, expected_value = kv_cache.unbind(1)
+    assert torch.equal(captured["key_cache"], expected_key)
+    assert torch.equal(captured["value_cache"], expected_value)
+    assert result is output
+    assert torch.equal(output, torch.ones_like(output))

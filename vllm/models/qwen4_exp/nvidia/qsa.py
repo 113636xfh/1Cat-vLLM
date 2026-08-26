@@ -147,7 +147,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
+        # [num_blocks, 2, block_size, num_kv_heads, head_size].
+        key_cache, value_cache = kv_cache.unbind(1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if key_cache.dtype != query.dtype or query.dtype not in (
