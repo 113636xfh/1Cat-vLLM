@@ -78,6 +78,9 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_on_sm70(
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
+    monkeypatch.setattr(
+        embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+    )
     layer = Qwen4ExpPinnedHostEmbedding(
         num_embeddings=8,
         embedding_dim=8,
@@ -86,16 +89,22 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_on_sm70(
         prefix="model.layers.2.ple.ngram_embedding",
         quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
     )
-    expected = torch.arange(64, dtype=torch.float32).reshape(8, 8) % 16
-    layer.weight.data.copy_(expected.to(torch.float8_e4m3fn))
-
-    accelerator_weight = layer.get_accelerator_weight(torch.device("cuda"))
-    output = F.embedding(
-        torch.tensor([0, 7], dtype=torch.int64, device="cuda"), accelerator_weight
+    raw = torch.tensor(
+        [0x00, 0x01, 0x08, 0x38, 0x7E, 0x80, 0xB8, 0xFE],
+        dtype=torch.uint8,
+    ).repeat(8, 1)
+    layer.weight.data.copy_(raw.view(torch.float8_e4m3fn))
+    layer.weight_scale = nn.Parameter(
+        torch.tensor([0.25], dtype=torch.float16, device="cuda"),
+        requires_grad=False,
     )
+    layer.prepare_accelerator_weight()
+
+    output = layer(torch.tensor([0, 7], dtype=torch.int64, device="cuda"))
     torch.cuda.synchronize()
 
-    assert output.dtype == torch.float8_e4m3fn
+    assert output.dtype == torch.float16
+    expected = raw.view(torch.float8_e4m3fn).float() * 0.25
     torch.testing.assert_close(output.float().cpu(), expected[[0, 7]])
 
 

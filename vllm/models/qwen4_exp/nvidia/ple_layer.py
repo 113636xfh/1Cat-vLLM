@@ -44,6 +44,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
@@ -66,6 +67,59 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _apply_float32_sign_bit(value, sign_bit):
+    """Apply an FP8 sign bit without canonicalizing negative zero."""
+
+    value_bits = tl.cast(value, tl.uint32, bitcast=True)
+    signed_bits = value_bits | (sign_bit.to(tl.uint32) << 31)
+    return tl.cast(signed_bits, tl.float32, bitcast=True)
+
+
+@triton.jit
+def _e4m3fn_byte_to_float(raw):
+    """Decode E4M3FN bytes without requiring native FP8 on SM70."""
+
+    raw_i32 = raw.to(tl.int32)
+    sign_bit = (raw_i32 >> 7) & 1
+    exponent = (raw_i32 >> 3) & 0x0F
+    mantissa = raw_i32 & 0x07
+    mantissa_f32 = mantissa.to(tl.float32)
+    normal = (1.0 + mantissa_f32 * 0.125) * tl.exp2(exponent.to(tl.float32) - 7.0)
+    subnormal = mantissa_f32 * 0.001953125  # 2**-9
+    value = _apply_float32_sign_bit(
+        tl.where(exponent == 0, subnormal, normal), sign_bit
+    )
+    is_nan = (exponent == 0x0F) & (mantissa == 0x07)
+    return tl.where(is_nan, float("nan"), value)
+
+
+@triton.jit
+def _gather_ple_fp8_from_pinned_kernel(
+    weight_ptr,
+    ids_ptr,
+    scale_ptr,
+    output_ptr,
+    embedding_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather and dequantize one PLE row per program from pinned host memory."""
+
+    row_idx = tl.program_id(0)
+    local_idx = tl.load(ids_ptr + row_idx)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    raw = tl.load(
+        byte_ptr + local_idx * embedding_dim + offsets,
+        mask=mask,
+        other=0,
+    )
+    scale = tl.load(scale_ptr).to(tl.float32)
+    values = _e4m3fn_byte_to_float(raw) * scale
+    tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
 
 
 def _splitmix64(value: int) -> int:
@@ -191,6 +245,9 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("PLE FP8 weights only support embedding lookup")
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        pinned_lookup = getattr(layer, "embedding_lookup", None)
+        if pinned_lookup is not None:
+            return pinned_lookup(input_)
         get_accelerator_weight = getattr(layer, "get_accelerator_weight", None)
         weight = (
             get_accelerator_weight(input_.device)
@@ -299,6 +356,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             scale_dtype=params_dtype,
         )
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
+        self._accelerator_weight_ptrs: dict[int, int] = {}
+        self._output_dtype = self.weight_scale.dtype
         logger.info(
             "Qwen4Exp PLE shard allocated in pinned host memory: %s",
             format_gib(self.weight.numel() * self.weight.element_size()),
@@ -321,10 +380,37 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             with torch.cuda.device(device_index):
                 view = get_accelerator_view_from_cpu_tensor(self.weight)
             self._accelerator_weight_views[device_index] = view
+            self._accelerator_weight_ptrs[device_index] = view.data_ptr()
         return view
 
     def prepare_accelerator_weight(self) -> None:
         self.get_accelerator_weight(torch.device("cuda", torch.cuda.current_device()))
+
+    def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
+        """Gather FP8 UVA rows and emit scaled model-dtype values."""
+
+        device_index = (
+            torch.cuda.current_device()
+            if input_.device.index is None
+            else input_.device.index
+        )
+        weight_ptr = self._accelerator_weight_ptrs.get(device_index)
+        if weight_ptr is None:
+            self.get_accelerator_weight(input_.device)
+            weight_ptr = self._accelerator_weight_ptrs[device_index]
+        output = torch.empty(
+            (*input_.shape, self.embedding_dim),
+            dtype=self._output_dtype,
+            device=input_.device,
+        )
+        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+            input_.reshape(-1),
+            output.reshape(-1, self.embedding_dim),
+            self.weight_scale,
+            weight_ptr,
+            self.embedding_dim,
+        )
+        return output
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -1296,6 +1382,45 @@ def qwen4_exp_ple_short_conv_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+def qwen4_exp_ple_pinned_gather(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_ptr: int,
+    embedding_dim: int,
+) -> None:
+    if input_ids.numel() == 0:
+        return
+    block_d = triton.next_power_of_2(embedding_dim)
+    _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
+        weight_ptr,
+        input_ids,
+        weight_scale,
+        output,
+        embedding_dim=embedding_dim,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+
+
+def qwen4_exp_ple_pinned_gather_fake(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_ptr: int,
+    embedding_dim: int,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_pinned_gather",
+    op_func=qwen4_exp_ple_pinned_gather,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_pinned_gather_fake,
+)
 
 
 direct_register_custom_op(
