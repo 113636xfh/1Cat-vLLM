@@ -62,7 +62,7 @@ backoff==2.2.1
     #   schemathesis
 bitsandbytes==0.49.2
     # via -r requirements/test/cuda.in
-black==24.10.0
+black==26.5.1
     # via datamodel-code-generator
 blobfile==3.0.0
     # via -r requirements/test/cuda.in
@@ -488,6 +488,7 @@ numpy==2.2.6
     #   scikit-learn
     #   scipy
     #   segmentation-models-pytorch
+    #   sentence-transformers
     #   soxr
     #   statsmodels
     #   tensorizer
@@ -616,7 +617,7 @@ perceptron==0.1.4
     # via -r requirements/test/cuda.in
 perf-analyzer==0.1.0
     # via genai-perf
-pillow==10.4.0
+pillow==12.3.0
     # via
     #   genai-perf
     #   imagehash
@@ -762,6 +763,8 @@ python-dateutil==2.9.0.post0
     #   typepy
 python-rapidjson==1.20
     # via tritonclient
+pytokens==0.4.1
+    # via black
 pytrec-eval-terrier==0.5.7
     # via mteb
 pytz==2024.2
@@ -890,7 +893,7 @@ scipy==1.13.1
     #   vocos
 segmentation-models-pytorch==0.5.0
     # via -r requirements/test/cuda.in
-sentence-transformers==5.2.0
+sentence-transformers==6.0.0
     # via
     #   -r requirements/test/cuda.in
     #   mteb
@@ -986,6 +989,7 @@ tokenizers==0.22.2
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/cuda.in
+    #   sentence-transformers
     #   transformers
 tomli==2.2.1
     # via schemathesis
