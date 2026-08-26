@@ -52,9 +52,6 @@ def test_sm70_fa2_d256_prefill_status_accepts_explicit_sidecar(monkeypatch):
     namespace = types.SimpleNamespace()
     loaded: list[str] = []
 
-    def fail_import(_name):
-        raise ImportError("source overlay shadows extension")
-
     def load_library(path: str) -> None:
         loaded.append(path)
         namespace.sm70_d256_splitd_n32_dense_fwd = object()
@@ -65,7 +62,11 @@ def test_sm70_fa2_d256_prefill_status_accepts_explicit_sidecar(monkeypatch):
         load_library=load_library,
     )
     fake_torch = types.SimpleNamespace(ops=fake_ops)
-    monkeypatch.setattr(benchmark_sm70_decode.importlib, "import_module", fail_import)
+    monkeypatch.setattr(
+        benchmark_sm70_decode.importlib,
+        "import_module",
+        lambda _name: types.SimpleNamespace(),
+    )
     monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", "/tmp/stable-fa2.so")
 
     status = benchmark_sm70_decode._sm70_fa2_d256_prefill_status(fake_torch)

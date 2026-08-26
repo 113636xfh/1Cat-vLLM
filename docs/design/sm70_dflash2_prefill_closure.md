@@ -77,3 +77,19 @@ the 256K DFlash2 memory contract, and retain the quality-audit PPL and scored
 coding gates. Prefix-hit time is reported separately and never counted as cold
 prefill throughput.
 
+## Dependency-closure A/B
+
+The first candidate changes only native-extension resolution and keeps chunk
+4096. All six measured requests are cold. The stable sidecar loads on all four
+ranks and the benchmark reports both required D256 operators as available.
+
+| Input | Missing-extension control | Stable-sidecar candidate | Throughput gain |
+|---:|---:|---:|---:|
+| 32768 | 3125.12 tok/s | 3476.53 tok/s | +11.24% |
+| 65536 | 2588.54 tok/s | 3103.02 tok/s | +19.87% |
+
+Candidate pure-prefill means are 9.425490 s and 21.120102 s. The three repeats
+at each length retain the control first-token hash
+`54363ddee68f4a5db81c9d37e5fb738d28f5b67dc7f725ad7333172b1ea157da`.
+Artifact:
+`/data/minimax-h3/task-cache/v100-dflash2-prefill-32k64k-20260827/candidate-stable-fa2-q4096-v1/`.
