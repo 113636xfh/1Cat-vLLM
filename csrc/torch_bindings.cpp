@@ -421,6 +421,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
 
   ops.def(
+      "sm70_glm_mhc_pre_norm_out("
+      "Tensor gemm_mul, Tensor gemm_sqrsum, Tensor hc_scale, Tensor hc_base, "
+      "Tensor residual, Tensor(a!) post_mix, Tensor(b!) comb_mix, "
+      "Tensor(c!) layer_input, Tensor norm_weight, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, "
+      "int sinkhorn_repeat, float norm_eps) -> ()");
+  ops.impl("sm70_glm_mhc_pre_norm_out", torch::kCUDA,
+           &sm70_glm_mhc_pre_norm_out);
+
+  ops.def(
+      "sm70_glm_kda_fg_b_out(Tensor(a!) f_out, Tensor(b!) g_out, "
+      "Tensor f_input, Tensor g_input, Tensor f_weight, Tensor g_weight) -> "
+      "()");
+  ops.impl("sm70_glm_kda_fg_b_out", torch::kCUDA, &sm70_glm_kda_fg_b_out);
+
+  ops.def(
       "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor candidate_ids, Tensor(b!) selected_raw, "
       "Tensor(c!) selected_packed, Tensor(d!) expanded, Tensor(e!) partials, "
