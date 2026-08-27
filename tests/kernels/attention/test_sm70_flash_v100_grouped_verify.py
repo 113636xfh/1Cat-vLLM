@@ -127,10 +127,13 @@ def _reference(
         (16, 5, 507, False),
         (16, 6, 506, False),
         (16, 8, 1016, False),
+        (16, 16, 1008, True),
         (16, 3, 1025, True),
         (784, 5, 2049, True),
         (1648, 8, 4097, True),
+        (1648, 16, 4089, True),
         (3296, 8, 8193, True),
+        (3296, 16, 8185, True),
     ],
 )
 @torch.inference_mode()
@@ -217,13 +220,16 @@ def test_grouped_verify_matches_fp32_reference_with_random_pages(
     torch.testing.assert_close(one_pass, two_pass, atol=6.2e-5, rtol=2.0e-3)
 
 
+@pytest.mark.parametrize("query_len", [8, 16])
 @torch.inference_mode()
-def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
+def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len(
+    query_len: int,
+) -> None:
     flash_attn_v100 = _require_grouped_verify()
     torch.manual_seed(20260825)
     query, key_cache, value_cache, block_table, seq_lens = _make_case(
         page_size=1648,
-        query_len=8,
+        query_len=query_len,
         prefix_len=4097,
     )
     output = torch.empty_like(query)
@@ -269,15 +275,16 @@ def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
 
 
 @pytest.mark.parametrize("page_size", [1648, 3296])
+@pytest.mark.parametrize("query_len", [8, 16])
 @torch.inference_mode()
 def test_grouped_verify_fixed_interleaved_is_bitwise(
-    page_size: int, monkeypatch: pytest.MonkeyPatch
+    page_size: int, query_len: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flash_attn_v100 = _require_grouped_verify()
     torch.manual_seed(20260826 + page_size)
     query, key_cache, value_cache, block_table, seq_lens = _make_interleaved_case(
         page_size=page_size,
-        query_len=8,
+        query_len=query_len,
         prefix_len=8193,
     )
 

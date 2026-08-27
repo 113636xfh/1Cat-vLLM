@@ -5178,8 +5178,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens == 8
-            and tuple(query.shape) == (8, 6, 256)
+            and num_query_tokens in (8, 16)
+            and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
             and key_cache.ndim == 4
@@ -5254,7 +5254,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q8/H6/Hkv1/D256, FP8 E5M2 KV, one-pass)."
+                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                query.shape[0],
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(

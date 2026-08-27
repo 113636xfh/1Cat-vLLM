@@ -183,6 +183,36 @@ def new_mamba_spec(
     )
 
 
+def test_small_draft_sliding_window_bucket_absorbs_hybrid_padding():
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    full_spec = new_kv_cache_spec()
+    mamba_spec = new_mamba_spec(page_size_padded=full_spec.page_size_bytes)
+    sliding_spec = new_sliding_window_spec(sliding_window=2048)
+    kv_cache_specs.update({f"full.{i}": full_spec for i in range(16)})
+    kv_cache_specs.update({f"mamba.{i}": mamba_spec for i in range(48)})
+    kv_cache_specs.update({f"draft.{i}": sliding_spec for i in range(5)})
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_specs)
+
+    assert len(groups) == 9
+    assert [len(group.layer_names) for group in groups] == [8] * 8 + [5]
+
+
+def test_sliding_window_padding_preserves_generic_singleton_grouping():
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    full_spec = new_kv_cache_spec()
+    mamba_spec = new_mamba_spec(page_size_padded=full_spec.page_size_bytes)
+    sliding_spec = new_sliding_window_spec(sliding_window=2048)
+    kv_cache_specs.update({f"full.{i}": full_spec for i in range(15)})
+    kv_cache_specs.update({f"mamba.{i}": mamba_spec for i in range(45)})
+    kv_cache_specs.update({"draft.0": sliding_spec})
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_specs)
+
+    assert len(groups) == 13
+    assert [len(group.layer_names) for group in groups] == [5] * 12 + [1]
+
+
 def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
     """Aligned Mamba keeps fine-grained hashes after page-size unification."""
     kv_cache_config = KVCacheConfig(

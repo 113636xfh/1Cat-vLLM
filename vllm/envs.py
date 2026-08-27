@@ -4234,6 +4234,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
     ),
+    # Explicit CUDA graph memory reservation for the V2 GPU model runner,
+    # which does not profile graph memory yet. The default preserves upstream
+    # behavior. Set this from a measured capture result when sizing a tight KV
+    # cache pool.
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": lambda: float(
+        os.getenv("VLLM_V2_CUDAGRAPH_MEM_MIB", "0") or 0
+    ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")

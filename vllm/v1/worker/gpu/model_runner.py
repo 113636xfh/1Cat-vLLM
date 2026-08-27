@@ -72,6 +72,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    get_explicit_cudagraph_memory_reserve,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -690,7 +691,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def profile_cudagraph_memory(self) -> int:
         # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        return get_explicit_cudagraph_memory_reserve(
+            self.compilation_config.cudagraph_mode
+        )
 
     @torch.inference_mode()
     def capture_model(self) -> int:

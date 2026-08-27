@@ -1108,6 +1108,49 @@ def _select_hybrid_kv_cache_group_size(layer_counts: Sequence[int]) -> int:
     return min_num_layers
 
 
+def _prefer_padding_sliding_window_layers(
+    same_type_layers: dict[KVCacheSpec, list[str]], group_size: int
+) -> int:
+    """Prefer cheap sliding-window padding over full-context padding.
+
+    A DFlash2 target can have 16 full-attention layers, 48 Mamba layers, and
+    only 5 draft sliding-window layers. Using the smallest bucket as the group
+    size pads the full-context buckets. Sliding-window state is bounded by its
+    window, so choose a common divisor of the other buckets when that moves no
+    more than one bucket's worth of padding onto each sliding-window bucket.
+    """
+    sliding_window_counts = [
+        len(layers)
+        for spec, layers in same_type_layers.items()
+        if isinstance(spec, (SlidingWindowSpec, SlidingWindowMLASpec))
+    ]
+    other_counts = [
+        len(layers)
+        for spec, layers in same_type_layers.items()
+        if not isinstance(spec, (SlidingWindowSpec, SlidingWindowMLASpec))
+    ]
+    if (
+        group_size <= 1
+        or not sliding_window_counts
+        or not other_counts
+        or min(sliding_window_counts) != group_size
+    ):
+        return group_size
+
+    common_divisor = math.gcd(*other_counts)
+    for candidate in range(common_divisor, group_size, -1):
+        if common_divisor % candidate != 0:
+            continue
+        if all((-count) % candidate <= count for count in sliding_window_counts):
+            logger.info(
+                "Using KV cache group size %d so bounded sliding-window "
+                "layers absorb padding instead of full-context layers",
+                candidate,
+            )
+            return candidate
+    return group_size
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1194,6 +1237,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # sw, where the group size should be 10).
     layer_counts = [len(layers) for layers in same_type_layers.values()]
     group_size = _select_hybrid_kv_cache_group_size(layer_counts)
+    group_size = _prefer_padding_sliding_window_layers(same_type_layers, group_size)
     if group_size != min(layer_counts):
         logger.info(
             "Using hybrid KV cache group size %d for layer counts %s",
