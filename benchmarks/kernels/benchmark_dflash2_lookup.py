@@ -15,7 +15,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import fuse_draft, suffix_loo
 def _time_ms(fn: Callable[[], None], repeats: int, warmup: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -114,7 +114,7 @@ def _benchmark_case(
         for _ in range(3):
             lookup_and_fuse()
     torch.cuda.current_stream().wait_stream(capture_stream)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     with torch.cuda.graph(graph):
         lookup_and_fuse()
     graph_ms = _time_ms(graph.replay, repeats, warmup)
