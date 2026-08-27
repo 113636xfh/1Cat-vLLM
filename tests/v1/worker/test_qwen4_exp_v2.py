@@ -55,6 +55,63 @@ def test_qwen4_exp_mtp_v2_unpacks_logits_and_feedback_hidden_states(
     assert actual_feedback_hidden is feedback_hidden
 
 
+def test_qwen4_exp_mtp_v2_uses_local_argmax_without_full_logits() -> None:
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    speculator.use_local_argmax_reduction = True
+
+    class DraftModel:
+        def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            assert hidden_states.shape == (2, 4)
+            return torch.tensor([7, 11])
+
+        def compute_logits(self, _hidden_states: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("local argmax must not materialize full logits")
+
+    speculator.model = DraftModel()
+    top_tokens = speculator._sample_draft(
+        hidden_states=torch.zeros(2, 4),
+        idx_mapping=torch.arange(2, dtype=torch.int32),
+        pos=torch.arange(2),
+        draft_step=torch.tensor(0),
+        draft_logits=None,
+    )
+
+    torch.testing.assert_close(top_tokens, torch.tensor([7, 11]))
+
+
+def test_qwen4_exp_mtp_v2_reuses_step_zero_qsa_indices() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class MTPBackbone:
+        def set_skip_topk(self, skip: bool) -> None:
+            calls.append(("skip", skip))
+
+        def compact_topk_indices(self, row_indices: torch.Tensor) -> None:
+            calls.append(("compact", row_indices.tolist()))
+
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    speculator.share_mtp_topk_indices = True
+    speculator.num_speculative_steps = 3
+    speculator.last_token_indices = torch.tensor([4, 9, 12])
+    speculator.model = SimpleNamespace(model=MTPBackbone())
+
+    speculator._mtp_prefill_begin()
+    speculator._mtp_prefill_end(num_reqs=2)
+    speculator._mtp_decode_begin()
+    speculator._mtp_decode_end()
+
+    assert calls == [
+        ("skip", False),
+        ("compact", [4, 9]),
+        ("skip", True),
+        ("skip", False),
+    ]
+
+
 def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
