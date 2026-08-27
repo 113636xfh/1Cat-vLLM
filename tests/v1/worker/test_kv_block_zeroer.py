@@ -159,3 +159,50 @@ def test_zero_block_ids_multiple_interleaved_pools() -> None:
             index for index in range(cells.shape[0]) if bool((cells[index] == 0).all())
         }
         assert zeroed == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_nonuniform_page_sizes() -> None:
+    device = torch.device("cuda")
+    page_sizes = [8, 16]
+    buffers = [
+        torch.ones(N_BLOCKS * page_size, dtype=torch.int32, device=device)
+        for page_size in page_sizes
+    ]
+    groups = []
+    static_forward_context = {}
+    for index, (page_size, buffer) in enumerate(zip(page_sizes, buffers)):
+        spec = MambaSpec(
+            block_size=16,
+            shapes=((1,),),
+            dtypes=(torch.int32,),
+            page_size_padded=page_size * 4,
+        )
+        layer_name = f"mamba.nonuniform.{index}"
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=spec,
+                kv_cache_group_id=index,
+                layer_names=[layer_name],
+                backend=None,
+            )
+        )
+        static_forward_context[layer_name] = SimpleNamespace(kv_cache=[buffer])
+
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        groups,
+        kernel_block_sizes=[16, 16],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=static_forward_context,
+    )
+
+    target = 2
+    zeroer.zero_block_ids([target])
+    torch.accelerator.synchronize()
+
+    for page_size, buffer in zip(page_sizes, buffers):
+        pages = buffer.view(N_BLOCKS, page_size)
+        zeroed = {index for index in range(N_BLOCKS) if bool((pages[index] == 0).all())}
+        assert zeroed == {target}

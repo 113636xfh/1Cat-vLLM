@@ -101,6 +101,10 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return True
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -539,6 +543,30 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One fixed block per request for QSA's uncompressed key ring."""
+
+    head_size_v: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        del vllm_config
+        return self.page_size_bytes
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
@@ -606,11 +634,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
-    dtypes: tuple[torch.dtype]
+    dtypes: tuple[torch.dtype, ...]
     page_size_padded: int | None = None
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # PLE short-conv state is replicated; GDN state is TP-sharded.
+    tp_replicated: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -719,6 +749,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -748,6 +782,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 isinstance(spec, SlidingWindowMLASpec)
                 and spec.sliding_window == one_spec.sliding_window
                 for spec in kv_cache_specs.values()
+            )
+        elif isinstance(one_spec, CircularBufferSpec):
+            return all(
+                isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
             )
         elif isinstance(one_spec, FullAttentionSpec):
             return all(

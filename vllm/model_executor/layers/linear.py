@@ -3,6 +3,7 @@
 
 import itertools
 from abc import abstractmethod
+from collections.abc import Iterable
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -1215,6 +1216,31 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_rank=self.tp_rank,
         )
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, None)
+            else:
+                param = getattr(self, name, None)
+            if param is None and name == "bias":
+                continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -1312,6 +1338,32 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
             return
         raise ValueError("This line should not be reached")
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Load separately serialized Q/K/V shards through AutoWeightsLoader."""
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, None)
+            else:
+                param = getattr(self, name, None)
+            if param is None and name == "bias":
+                continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
