@@ -165,8 +165,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
-    VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = True
+    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
+    VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
@@ -1696,18 +1696,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
-    # Default-on QPN8 route for the validated serialized PP2 x TP4 contract.
-    # Admission additionally requires exact operator shapes/layouts, B1,
-    # no speculative decoding, no DBO, and no explicit ubatching. Set this to
-    # 0 (or the generic QPN8 flag to 0) to retain TurboMind everywhere.
+    # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
+    # default-off after matched model-level quality regressions. An explicit
+    # opt-in still requires exact operator shapes/layouts, B1, no speculative
+    # decoding, no DBO, and no explicit ubatching.
     "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "0"))
     ),
-    # Default non-fused QPN8 route for the exact PP2 x TP4 shared-expert
-    # gate/up tensor. The model-level clamp-SwiGLU remains external. Set to 0
-    # to retain the TurboMind path.
+    # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
+    # gate/up tensor. The model-level clamp-SwiGLU remains external. This
+    # numerically sensitive role requires an explicit opt-in.
     "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1"))
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0"))
     ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
