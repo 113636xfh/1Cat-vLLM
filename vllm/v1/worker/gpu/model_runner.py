@@ -504,9 +504,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""
         self._kv_block_zeroer = KVBlockZeroer(
-            self.device,
-            pin_memory=is_pin_memory_available(),
-            max_concurrency=self.vllm_config.max_concurrent_batches,
+            self.device, pin_memory=is_pin_memory_available()
         )
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=(group for groups in self.attn_groups for group in groups),

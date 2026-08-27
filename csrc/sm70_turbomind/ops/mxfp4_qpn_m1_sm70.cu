@@ -194,8 +194,8 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
     // offset so that every E2M1 value can be formed with integer bit ops.
     // MXFP4 folds the matching 2^14 correction into its exponent scale;
     // NVFP4's prepared FP16 group scale needs the same correction here.
-    const half2 scale = __hmul2(__halves2half2(scalar, scalar),
-                                __float2half2_rn(16384.0f));
+    const half2 scale =
+        __hmul2(__halves2half2(scalar, scalar), __float2half2_rn(16384.0f));
 
     half2 decoded[8];
     dequant_e2m1x8(packed0, scale, decoded);
@@ -262,8 +262,7 @@ void launch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
   const int n = static_cast<int>(out.size(1));
   const int k = static_cast<int>(input.size(1));
   nvfp4_qpn_m1_sm70_kernel<kSplitK>
-      <<<dim3(n / 32, 10), 32 * kSplitK, 0,
-         at::cuda::getCurrentCUDAStream()>>>(
+      <<<dim3(n / 32, 10), 32 * kSplitK, 0, at::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
           reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
           reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
@@ -276,10 +275,10 @@ void dispatch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
                            torch::Tensor weights, torch::Tensor scales,
                            torch::Tensor expert_ids, bool broadcast_input,
                            int64_t split_k) {
-#define VLLM_NVFP4_QPN_M1_CASE(SPLIT)                                      \
-  case SPLIT:                                                              \
-    launch_nvfp4_qpn_m1<SPLIT>(out, input, weights, scales, expert_ids,     \
-                               broadcast_input);                           \
+#define VLLM_NVFP4_QPN_M1_CASE(SPLIT)                                   \
+  case SPLIT:                                                           \
+    launch_nvfp4_qpn_m1<SPLIT>(out, input, weights, scales, expert_ids, \
+                               broadcast_input);                        \
     break
   switch (split_k) {
     VLLM_NVFP4_QPN_M1_CASE(1);
@@ -292,8 +291,7 @@ void dispatch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
     VLLM_NVFP4_QPN_M1_CASE(20);
     VLLM_NVFP4_QPN_M1_CASE(32);
     default:
-      TORCH_CHECK(false,
-                  "nvfp4_moe_qpn_m1_sm70_out: unsupported split_k ",
+      TORCH_CHECK(false, "nvfp4_moe_qpn_m1_sm70_out: unsupported split_k ",
                   split_k);
   }
 #undef VLLM_NVFP4_QPN_M1_CASE
