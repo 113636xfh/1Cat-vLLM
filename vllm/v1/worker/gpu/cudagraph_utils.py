@@ -13,6 +13,10 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.speculative import (
+    get_dflash_model_draft_tokens,
+    uses_adaptive_dflash_lookup,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -32,6 +36,23 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
+    """Return an operator-provided V2 CUDA graph memory reserve in bytes."""
+    reserve_mib = envs.VLLM_V2_CUDAGRAPH_MEM_MIB
+    if reserve_mib < 0:
+        raise ValueError("VLLM_V2_CUDAGRAPH_MEM_MIB must be non-negative")
+    if reserve_mib == 0 or cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+
+    reserve_bytes = int(reserve_mib * 1024 * 1024)
+    logger.info(
+        "Reserving %.2f GiB for V2 CUDA graphs before sizing the KV cache "
+        "(VLLM_V2_CUDAGRAPH_MEM_MIB)",
+        reserve_bytes / 2**30,
+    )
+    return reserve_bytes
 
 
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
@@ -129,6 +150,19 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        self.decode_query_lens: tuple[int, ...] = (decode_query_len,)
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and uses_adaptive_dflash_lookup(
+            speculative_config
+        ):
+            model_query_len = 1 + get_dflash_model_draft_tokens(speculative_config)
+            if 1 < model_query_len < decode_query_len:
+                self.decode_query_lens = (model_query_len, decode_query_len)
+                logger.info_once(
+                    "Capturing target decode graphs for adaptive DFlash2 "
+                    "query lengths %s.",
+                    self.decode_query_lens,
+                )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -162,6 +196,15 @@ class CudaGraphManager:
             self._capture_sizes = list(
                 self.compilation_config.cudagraph_capture_sizes or []
             )
+            # The sizes above are normalized around the widest target query
+            # (q16 for LABD). Preserve the checkpoint-native q8 shape so a
+            # B1 short verification can still replay a graph when
+            # max_num_seqs=1.
+            if len(self.decode_query_lens) > 1:
+                short_query_len = min(self.decode_query_lens)
+                if short_query_len not in self._capture_sizes:
+                    self._capture_sizes.append(short_query_len)
+                    self._capture_sizes.sort()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -171,7 +214,6 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
-        max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
@@ -182,19 +224,20 @@ class CudaGraphManager:
         for num_tokens in capture_sizes:
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
-            if (
-                separate_decode_routine
-                and decode_mode
-                and self.decode_query_len <= num_tokens <= max_decode_tokens
-            ):
-                desc = BatchExecutionDescriptor(
-                    cg_mode=decode_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=num_tokens // self.decode_query_len,
-                    uniform_token_count=self.decode_query_len,
-                )
-                descs_by_mode[decode_mode].append(desc)
-                descs_by_token_count[num_tokens].append(desc)
+            if separate_decode_routine and decode_mode:
+                for query_len in self.decode_query_lens:
+                    if (
+                        query_len <= num_tokens <= self.max_num_reqs * query_len
+                        and num_tokens % query_len == 0
+                    ):
+                        desc = BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_tokens // query_len,
+                            uniform_token_count=query_len,
+                        )
+                        descs_by_mode[decode_mode].append(desc)
+                        descs_by_token_count[num_tokens].append(desc)
 
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying

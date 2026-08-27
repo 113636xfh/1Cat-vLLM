@@ -282,20 +282,20 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1536x4096_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 5, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x8192x1024_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x2048_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 3, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1024x4096_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 7, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x512_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   return std::nullopt;
 }
@@ -366,15 +366,13 @@ const char* ToString(DispatchPolicy policy) {
   if ((policy & DispatchPolicy::kPreserveDefaultSplits) ||
       (policy & DispatchPolicy::kPreserveDefaultSplitCount) ||
       (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) ||
-      (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) ||
-      (policy & DispatchPolicy::kSm70Mxfp4ExponentFolded)) {
+      (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled)) {
     static thread_local std::string text;
     auto base = static_cast<DispatchPolicy>(
         (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits &
         ~(int)DispatchPolicy::kPreserveDefaultSplitCount &
         ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast &
-        ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled &
-        ~(int)DispatchPolicy::kSm70Mxfp4ExponentFolded);
+        ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled);
     text = std::string(ToString(base));
     if (policy & DispatchPolicy::kPreserveDefaultSplits) {
       text += "|preserve_default_splits";
@@ -387,9 +385,6 @@ const char* ToString(DispatchPolicy policy) {
     }
     if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
       text += "|sm70_fp8_prefill_prescaled";
-    }
-    if (policy & DispatchPolicy::kSm70Mxfp4ExponentFolded) {
-      text += "|sm70_mxfp4_exponent_folded";
     }
     return text.c_str();
   }
@@ -449,8 +444,7 @@ struct Gemm::Impl {
         arch_{props_->major * 100 + props_->minor * 10},
         registry_{props_},
         cache_{registry_.kernels()},
-        sm70_fp8_prefill_cache_{registry_.kernels()},
-        sm70_mxfp4_exponent_folded_cache_{registry_.kernels()} {
+        sm70_fp8_prefill_cache_{registry_.kernels()} {
     if (arch_ == 700) {
       // V100 decode is dominated by many tiny GEMM/GEMV problems. A
       // broader search space consistently finds better launch specs than
@@ -484,19 +478,13 @@ struct Gemm::Impl {
   LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
                       size_t partials_size) {
     const auto& desc = ctx.desc();
-    const bool allow_fp8_prescaled =
+    const bool allow_prescaled =
         policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
-    const bool allow_mxfp4_exponent_folded =
-        policy & DispatchPolicy::kSm70Mxfp4ExponentFolded;
     const auto is_feasible = [&](const LaunchSpec& spec) {
-      if (!spec.kernel) {
-        return false;
-      }
-      const auto& name = spec.kernel->name();
-      return (allow_fp8_prescaled ||
-              name.find("_sm70_fp8_pscale") == std::string::npos) &&
-             (allow_mxfp4_exponent_folded ||
-              name.find("_sm70_mxfp4_efold") == std::string::npos) &&
+      return spec.kernel &&
+             (allow_prescaled ||
+              spec.kernel->name().find("_sm70_fp8_pscale") ==
+                  std::string::npos) &&
              spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
     };
     if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
@@ -510,34 +498,6 @@ struct Gemm::Impl {
                 ctx, specs, *fast_target, barriers_size, partials_size)) {
           sm70_fp8_prefill_cache_.Insert(desc, *fast_spec);
           return *fast_spec;
-        }
-      }
-      return {};
-    }
-    if (policy & DispatchPolicy::kSm70Mxfp4ExponentFolded) {
-      if (auto spec = sm70_mxfp4_exponent_folded_cache_.Find(desc);
-          spec && is_feasible(*spec)) {
-        return *spec;
-      }
-      // The exponent fold is bitwise exact only when the reduction order is
-      // unchanged. Reuse the already measured ordinary launch geometry and
-      // replace only its input transform; do not independently retune splits,
-      // swizzle, or CTA shape.
-      if (auto baseline = cache_.Find(desc); baseline && baseline->kernel) {
-        const std::string folded_name =
-            baseline->kernel->name() + "_sm70_mxfp4_efold_dsv4_m6";
-        auto kernels = ctx.Filter(registry_.kernels());
-        auto match = std::find_if(
-            kernels.begin(), kernels.end(), [&](const Kernel* kernel) {
-              return kernel->name() == folded_name;
-            });
-        if (match != kernels.end()) {
-          auto folded = *baseline;
-          folded.kernel = *match;
-          if (is_feasible(folded)) {
-            sm70_mxfp4_exponent_folded_cache_.Insert(desc, folded);
-            return folded;
-          }
         }
       }
       return {};
@@ -586,20 +546,15 @@ struct Gemm::Impl {
 
   std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size,
                                size_t partials_size, int top_k,
-                               bool include_fp8_prescaled) {
+                               bool include_prescaled) {
     std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
-    if (!include_fp8_prescaled) {
+    if (!include_prescaled) {
       feasible.erase(
           std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
             return k->name().find("_sm70_fp8_pscale") != std::string::npos;
           }),
           feasible.end());
     }
-    feasible.erase(
-        std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
-          return k->name().find("_sm70_mxfp4_efold") != std::string::npos;
-        }),
-        feasible.end());
 
     std::vector<std::vector<LaunchSpec>> clusters;
     {
@@ -749,8 +704,6 @@ struct Gemm::Impl {
 
   DispatchCache sm70_fp8_prefill_cache_;
 
-  DispatchCache sm70_mxfp4_exponent_folded_cache_;
-
   std::mutex dispatch_mutex_;
 };
 
@@ -808,8 +761,7 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
 
 #if 0
     if (operation.reserved) {
-        auto specs = impl_->Find(context, workspace.barriers_size,
-                                 workspace.partials_size, 0, false);
+        auto specs = impl_->Find(context, workspace.barriers_size, workspace.partials_size, 0);
         auto cases = (std::vector<std::function<LaunchSpec()>>*)operation.reserved;
         for (const auto& spec : specs) {
             cases->push_back([=] {
@@ -827,8 +779,6 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
   {
     std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
     if (measured) {
-      // Measure the accepted ordinary MXFP4 tactic even for exponent-folded
-      // execution. Dispatch then swaps only the transform implementation.
       impl_->Measure(*dispatch_context, workspace.barriers_size,
                      workspace.partials_size, 1, launch, stream);
     }

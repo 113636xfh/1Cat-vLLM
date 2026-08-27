@@ -221,6 +221,16 @@ def _pack_sm70_dsv4_fp13_weight(weight: torch.Tensor) -> torch.Tensor:
     return words.contiguous()
 
 
+@torch.no_grad()
+def _has_sm70_dsv4_fp13_weight_contract(weight: torch.Tensor) -> bool:
+    """Accept exact BF16-derived normals and bounded FP16 subnormal tails."""
+    bits = weight.view(torch.int16).to(torch.int32) & 0xFFFF
+    exponent = (bits >> 10) & 0x1F
+    discarded = bits & 0x7
+    incompatible = (exponent == 0x1F) | ((discarded != 0) & (exponent != 0))
+    return not bool(torch.any(incompatible).item())
+
+
 def prepare_sm70_dsv4_fp13_gemv(layer: torch.nn.Module) -> torch.Tensor | None:
     if not envs.VLLM_SM70_DSV4_FP13_GEMV or not getattr(
         layer, "_sm70_dsv4_fp13_gemv", False
@@ -240,6 +250,12 @@ def prepare_sm70_dsv4_fp13_gemv(layer: torch.nn.Module) -> torch.Tensor | None:
         or not weight.is_contiguous()
     ):
         return None
+    if not _has_sm70_dsv4_fp13_weight_contract(weight):
+        logger.warning_once(
+            "SM70 packed-FP13 GEMV rejected a weight outside its tensor-value "
+            "contract; retaining the FP16 GEMV fallback."
+        )
+        return None
     packed = _pack_sm70_dsv4_fp13_weight(weight)
     if _FP13_BUFFER in layer._buffers:
         layer._buffers[_FP13_BUFFER] = packed
@@ -256,6 +272,9 @@ def _has_sm70_dsv4_gemv_contract(
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability((7, 0))
+        and x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
         and x.dtype == torch.float16
         and weight.dtype == torch.float16
         and output_dtype in (torch.float16, torch.float32)

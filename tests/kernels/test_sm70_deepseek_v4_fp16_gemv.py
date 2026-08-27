@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.models.deepseek_v4.sm70.gemv import (
+    _has_sm70_dsv4_fp13_weight_contract,
     _pack_sm70_dsv4_fp13_weight,
     can_use_sm70_dsv4_fp13_gemv,
     can_use_sm70_dsv4_fp16_gemv,
@@ -22,16 +23,30 @@ def reset_env_cache() -> Iterator[None]:
     envs.disable_envs_cache()
 
 
-def test_sm70_dsv4_fp16_gemv_is_default_off(monkeypatch) -> None:
+def test_sm70_dsv4_fp13_gemv_is_default_on_with_rollback(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SM70_DSV4_FP16_GEMV", raising=False)
     monkeypatch.delenv("VLLM_SM70_DSV4_FP13_GEMV", raising=False)
-    x = torch.empty((1, 4096), dtype=torch.float16)
-    weight = torch.empty((256, 4096), dtype=torch.float16)
-    assert not can_use_sm70_dsv4_fp16_gemv(x, weight, torch.float32)
+    assert not envs.VLLM_SM70_DSV4_FP16_GEMV
+    assert envs.VLLM_SM70_DSV4_FP13_GEMV
+
+    monkeypatch.setenv("VLLM_SM70_DSV4_FP13_GEMV", "0")
+    envs.disable_envs_cache()
+    assert not envs.VLLM_SM70_DSV4_FP13_GEMV
 
 
 def test_sm70_dsv4_fp13_enables_fp16_fallback(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_SM70_DSV4_FP16_GEMV", "0")
+    monkeypatch.setenv("VLLM_SM70_DSV4_FP13_GEMV", "1")
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.sm70.gemv._has_sm70_dsv4_gemv_contract",
+        lambda *args: True,
+    )
+    x = torch.empty((1, 4096), dtype=torch.float16)
+    weight = torch.empty((256, 4096), dtype=torch.float16)
+    assert can_use_sm70_dsv4_fp16_gemv(x, weight, torch.float32)
+
+
+def test_sm70_dsv4_gemv_rejects_cpu_tensors(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_SM70_DSV4_FP13_GEMV", "1")
     monkeypatch.setattr(
         "vllm.models.deepseek_v4.sm70.gemv.current_platform.is_cuda",
@@ -43,7 +58,19 @@ def test_sm70_dsv4_fp13_enables_fp16_fallback(monkeypatch) -> None:
     )
     x = torch.empty((1, 4096), dtype=torch.float16)
     weight = torch.empty((256, 4096), dtype=torch.float16)
-    assert can_use_sm70_dsv4_fp16_gemv(x, weight, torch.float32)
+    assert not can_use_sm70_dsv4_fp16_gemv(x, weight, torch.float32)
+
+
+def test_sm70_dsv4_fp13_weight_contract_is_tensor_based() -> None:
+    compatible_bits = torch.tensor([0x0000, 0x0007, 0x3C00, -0x4400], dtype=torch.int16)
+    assert _has_sm70_dsv4_fp13_weight_contract(compatible_bits.view(torch.float16))
+
+    normal_with_discarded_bit = torch.tensor([0x3C01], dtype=torch.int16)
+    assert not _has_sm70_dsv4_fp13_weight_contract(
+        normal_with_discarded_bit.view(torch.float16)
+    )
+    nonfinite = torch.tensor([0x7C00], dtype=torch.int16)
+    assert not _has_sm70_dsv4_fp13_weight_contract(nonfinite.view(torch.float16))
 
 
 def test_sm70_dsv4_fp13_pack_preserves_upper_13_bits() -> None:
