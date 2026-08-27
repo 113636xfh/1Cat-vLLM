@@ -349,9 +349,9 @@ python -m pip install -e . --no-build-isolation
 
 请使用微信扫描下方二维码加入群组：
 
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-7.png)
+<img width="966" height="1518" alt="e52eca541f6c191928963c97ac1b38e5" src="https://github.com/user-attachments/assets/73be9e1e-41c3-49d7-9d4e-db4ce97cce9b" />
 
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
+> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请微信搜索微信号添加：YM_isi。
 
 ## Repository Notes
 
