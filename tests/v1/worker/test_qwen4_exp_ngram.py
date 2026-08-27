@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
@@ -58,7 +59,7 @@ def test_v1_runner_prepares_committed_ngram_context() -> None:
 
 def test_v1_runner_uses_stable_dummy_ngram_buffers() -> None:
     runner = _runner()
-    model_kwargs = {}
+    model_kwargs: dict[str, Any] = {}
 
     runner._maybe_add_ngram_kwargs(
         model_kwargs,

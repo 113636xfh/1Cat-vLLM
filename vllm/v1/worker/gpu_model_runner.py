@@ -1557,9 +1557,7 @@ class GPUModelRunner(
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_qwen4_exp_mtp():
-                self.drafter = Qwen4ExpMTPProposer(
-                    self.vllm_config, self.device, self
-                )
+                self.drafter = Qwen4ExpMTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dspark():
                 self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True

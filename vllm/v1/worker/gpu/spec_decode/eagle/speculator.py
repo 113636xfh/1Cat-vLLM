@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -43,8 +43,9 @@ class EagleSpeculator:
         self.vllm_config = vllm_config
         self.device = device
 
-        self.speculative_config = vllm_config.speculative_config
-        assert self.speculative_config is not None
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.speculative_config: SpeculativeConfig = speculative_config
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config

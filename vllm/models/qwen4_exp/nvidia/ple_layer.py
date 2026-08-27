@@ -334,10 +334,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 quant_method=quant_method,
             )
 
+        meta_weight = self._parameters.get("weight")
+        if not isinstance(meta_weight, torch.Tensor):
+            raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
         host_weight = ModelWeightParameter(
             data=torch.empty(
-                tuple(self.weight.shape),
-                dtype=self.weight.dtype,
+                tuple(meta_weight.shape),
+                dtype=meta_weight.dtype,
                 device="cpu",
                 pin_memory=True,
             ),
@@ -369,7 +372,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"Qwen4Exp pinned-host PLE requires a CUDA input, got {device}"
             )
         device_index = (
-            torch.cuda.current_device() if device.index is None else device.index
+            torch.accelerator.current_device_index()
+            if device.index is None
+            else device.index
         )
         view = self._accelerator_weight_views.get(device_index)
         if view is None:
@@ -377,20 +382,22 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 raise RuntimeError(
                     "Qwen4Exp PLE UVA view must be prepared before CUDA graph capture"
                 )
-            with torch.cuda.device(device_index):
+            with torch.accelerator.device_index(device_index):
                 view = get_accelerator_view_from_cpu_tensor(self.weight)
             self._accelerator_weight_views[device_index] = view
             self._accelerator_weight_ptrs[device_index] = view.data_ptr()
         return view
 
     def prepare_accelerator_weight(self) -> None:
-        self.get_accelerator_weight(torch.device("cuda", torch.cuda.current_device()))
+        self.get_accelerator_weight(
+            torch.device("cuda", torch.accelerator.current_device_index())
+        )
 
     def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
         """Gather FP8 UVA rows and emit scaled model-dtype values."""
 
         device_index = (
-            torch.cuda.current_device()
+            torch.accelerator.current_device_index()
             if input_.device.index is None
             else input_.device.index
         )
