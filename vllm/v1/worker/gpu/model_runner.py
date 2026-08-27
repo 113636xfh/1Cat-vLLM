@@ -214,6 +214,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -519,6 +521,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _warmup_sm70_aux_kernels(self) -> None:
+        """Warm SM70 kernels whose production cache exists only in MRV2."""
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _warmup_sm70_qwen_gdn_causal_conv1d,
+        )
+
+        if _warmup_sm70_qwen_gdn_causal_conv1d(
+            self.compilation_config.static_forward_context
+        ):
+            logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -1510,7 +1523,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
+            num_draft_tokens = None
+            if hasattr(self.speculator, "next_num_draft_tokens"):
+                num_draft_tokens = self.speculator.next_num_draft_tokens()
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                draft_tokens,
+                num_draft_tokens=num_draft_tokens,
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
