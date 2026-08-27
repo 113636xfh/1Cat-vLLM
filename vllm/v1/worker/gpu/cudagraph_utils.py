@@ -34,6 +34,23 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
+    """Return an operator-provided V2 CUDA graph memory reserve in bytes."""
+    reserve_mib = envs.VLLM_V2_CUDAGRAPH_MEM_MIB
+    if reserve_mib < 0:
+        raise ValueError("VLLM_V2_CUDAGRAPH_MEM_MIB must be non-negative")
+    if reserve_mib == 0 or cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+
+    reserve_bytes = int(reserve_mib * 1024 * 1024)
+    logger.info(
+        "Reserving %.2f GiB for V2 CUDA graphs before sizing the KV cache "
+        "(VLLM_V2_CUDAGRAPH_MEM_MIB)",
+        reserve_bytes / 2**30,
+    )
+    return reserve_bytes
+
+
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
