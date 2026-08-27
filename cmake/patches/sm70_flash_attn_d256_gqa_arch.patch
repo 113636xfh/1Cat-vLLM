@@ -20,54 +20,22 @@ index acf2219..f5e2732 100644
 
      # custom definitions
      target_compile_definitions(_vllm_fa2_C PRIVATE
-@@ -125,5 +127,48 @@ if (FA2_ENABLED)
+@@ -125,5 +127,16 @@ if (FA2_ENABLED)
          # FLASHATTENTION_DISABLE_UNEVEN_K
          # FLASHATTENTION_DISABLE_LOCAL
          FLASHATTENTION_DISABLE_PYBIND
 +        PREFIX_TORCH_EXTENSION
-+        PREFIX_FULL_ENDPOINT
-+        PREFIX_QK_CUBLAS_RAW
++        PREFIX_QK_FULL_STATS
 +        PREFIX_QK_SKIP_APPLY
-+        PREFIX_QK_SKIP_FINAL_REDUCTION
-+        PREFIX_QK_FIXED_PROB
-+        PREFIX_QK_FIXED_PROB_SKIP_SUM
-+        PREFIX_QK_SKIP_STATS_STORE
-+        PREFIX_FIXED_SOFTMAX_SHIFT=0.0f
-+        PREFIX_TRANSPOSED_SCORE_WORKSPACE
-+        PREFIX_QK_PRETRANSPOSE_INPUTS
-+        PREFIX_PV_COMPUTE_SUM
-+        PREFIX_PV_UNNORMALIZED
-+        PREFIX_PV_DIRECT_FP16_ACCUMULATE
-+        PREFIX_PV_FP32_MMA_ACCUMULATE
-+        PREFIX_PV_HALF2_TAYLOR_EXP
-+        PREFIX_PV_HALF2_TAYLOR_DEGREE=5
-+        PREFIX_PV_HALF2_RANGE_REDUCTION=4
-+        PREFIX_BATCHED_TRI_TAIL
-+        PREFIX_BATCHED_TAIL_TILE_TOKENS=320
-+        PREFIX_BATCHED_TAIL_QK_ALGO=CUBLAS_GEMM_ALGO10_TENSOR_OP
-+        PREFIX_BATCHED_TRI_REVERSE_PV_TASKS
-+        PREFIX_TAIL_IDLE_SM_OVERLAP
-+        PREFIX_TAIL_IDLE_SM_FINE_PV
-+        PREFIX_TAIL_FINE_PV_GROUP_TILES=4
-+        PREFIX_TAIL_FINE_PV_DIRECT_ACCUMULATE
-+        PREFIX_BATCHED_TRI_REPAIR_FIRST_TILE
-+        PREFIX_BATCHED_TRI_REPAIR_TOKENS=64
-+        PREFIX_UPSTREAM_TRANSPOSED_QK
-+        PREFIX_FIXED_STATE_NO_RESET
-+        PREFIX_PV_FUSED_PREFIX_SUM
 +        QK_TB_M=128
-+        QK_TB_N=256
++        QK_TB_N=512
 +        QK_WARP_M=64
-+        QK_WARP_N=64
-+        QK_STAGES=2
-+        PV_TB_M=128
++        QK_WARP_N=128
++        PV_TB_M=64
 +        PV_TB_N=256
-+        PV_TB_K=32
-+        PV_WARP_M=64
++        PV_WARP_M=32
 +        PV_WARP_N=64
-+        PV_WARP_K=32
      )
-+    target_link_libraries(_vllm_fa2_C PRIVATE CUDA::cublas)
  endif ()
 diff --git a/csrc/flash_attn/flash_api_torch_lib.cpp b/csrc/flash_attn/flash_api_torch_lib.cpp
 index 4b7601a..f5b71a2 100644
@@ -1243,8 +1211,8 @@ index 0000000..197453f
 +  constexpr int kHeadsQ = 6;
 +  constexpr int kHeadsKV = 1;
 +  constexpr int kTail = 8000;
-+  constexpr int kMinTotalKV = 40000;
-+  constexpr int kMaxTotalKV = 128000;
++  constexpr int kMinTotalKV = 16000;
++  constexpr int kMaxTotalKV = 256000;
 +  constexpr int kTotalKVStep = 8000;
 +  constexpr int kBlockN = 8192;
 +
@@ -1264,7 +1232,7 @@ index 0000000..197453f
 +  const int total_kv = static_cast<int>(k.size(1));
 +  TORCH_CHECK(total_kv >= kMinTotalKV && total_kv <= kMaxTotalKV
 +                  && total_kv % kTotalKVStep == 0,
-+              "SM70 GQA architecture requires KV in [40000, 128000] "
++              "SM70 GQA architecture requires KV in [16000, 256000] "
 +              "with an 8000-token step, got ",
 +              total_kv);
 +  const int prefix = total_kv - kTail;
