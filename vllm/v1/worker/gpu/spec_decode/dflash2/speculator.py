@@ -402,7 +402,11 @@ class DFlash2Speculator(DFlashSpeculator):
             speculative_config is not None
             and getattr(speculative_config, "ngram_assist", False)
         )
-        if ngram_assist and self.draft_block == self.num_speculative_steps:
+        if (
+            speculative_config is not None
+            and ngram_assist
+            and self.draft_block == self.num_speculative_steps
+        ):
             min_ngram = speculative_config.prompt_lookup_min
             max_ngram = speculative_config.prompt_lookup_max
             assert min_ngram is not None and max_ngram is not None

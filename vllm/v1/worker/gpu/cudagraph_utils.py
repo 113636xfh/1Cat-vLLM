@@ -150,7 +150,7 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
-        self.decode_query_lens = (decode_query_len,)
+        self.decode_query_lens: tuple[int, ...] = (decode_query_len,)
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None and uses_adaptive_dflash_lookup(
             speculative_config
