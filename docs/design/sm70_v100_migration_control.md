@@ -24,6 +24,55 @@ Goal:
   sampling, and normal MoE architecture wherever possible.
 - Do not carry unsafe quality-regressing routes into the main path.
 
+## Qwen3.8 Flash Next NVFP4 prefill acceptance, 2026-08-27
+
+- Review scope: Draft PR #23 on
+  `codex/v100-qwen38-flash-next-prefill-20260827-000848`, stacked on the
+  Qwen3.8 Flash Next bring-up branch. This scope is prefill-only; decode and
+  MTP acceptance remain separate work.
+- Frozen route: four V100-SXM2-32GB GPUs, TP4/PP1, V2 engine, ModelOpt NVFP4,
+  FP16 activations and KV cache, MTP off, `FLASH_ATTN_V100`, FlashQLA-SM70 GDN
+  prefill, pinned-host PLE, prefix caching off, chunked prefill on, and
+  `VLLM_COMPILE` with PIECEWISE CUDA graphs.
+- The matched 8192-token candidate has mean pure prefill time `2.315786s`, or
+  `3537.46 tok/s`, and mean TTFT `2.322317s`. The earlier same-route baseline
+  has mean pure prefill time `21.339760s`, or `383.88 tok/s`: a `9.2149x`
+  speedup and `89.15%` latency reduction. The baseline generated 512 tokens
+  and used FULL_AND_PIECEWISE while the candidate generated 16 tokens and used
+  PIECEWISE; only request-metric prefill time is compared, and prefill uses the
+  PIECEWISE dispatch in both runs.
+- The accepted change admits the two real 512-expert Flash Next prefill GEMM
+  contracts to grouped TurboMind NVFP4 execution, uses four QSA sparse-kernel
+  warps for exact SM70 prefill shapes, and permits an absolute prebuilt
+  FlashQLA-SM70 extension path so all TP ranks avoid redundant JIT builds.
+  Focused validation is `15 passed, 5 skipped`; exact QSA probes are bitwise
+  equal and improve the 8192-token kernel profile from `1320.204ms` to
+  `85.261ms`.
+- Long-context pure-prefill results from one guarded model startup are:
+  32768 tokens `10.740389s` / `3050.91 tok/s`, 65536 tokens `25.020538s` /
+  `2619.29 tok/s`, and 131000 tokens `63.960919s` / `2048.13 tok/s`. The 32K
+  and 64K repeat token hashes are stable, and the arithmetic and Chinese
+  quality outputs match the accepted 8K run exactly.
+- At `gpu_memory_utilization=0.85` and `max_model_len=140000`, vLLM reports
+  `3.09 GiB` available KV cache, `250028` token capacity, and `1.79x` 140K
+  concurrency. Measured peak device use is `29090 MiB` (`28.408 GiB`) per
+  rank; minimum host `MemAvailable` is `47.912 GiB`, with `247.921 GiB` swap
+  still free.
+- Do not repeat the rejected `gpu_memory_utilization=0.82` 140K startup. It
+  fails cleanly before requests because `1.08 GiB` KV cache is below the
+  required `1.73 GiB`, with an estimated maximum length of 86800 tokens. The
+  single `0.85` retry passed the capacity gate and all planned 32K/64K/131K
+  cases, so no third startup is needed.
+- Retained local evidence is under
+  `.artifacts/qwen38_flash_next_prefill_20260827/results/`, notably
+  `grouped-v1-piecewise-8192x16.json` and
+  `grouped-v1-piecewise-longctx-u085.json`. The corresponding PR evidence is
+  recorded in the
+  [8K result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5436515073)
+  and
+  [long-context result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5437096030)
+  comments.
+
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
 - Integration base: `onecat/main@7aede2cf010d92815c9d7bff25867b4fa009b6cb`.
