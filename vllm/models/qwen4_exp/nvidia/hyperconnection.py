@@ -29,6 +29,9 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
+from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+    maybe_apply_fused_hc,
+)
 from vllm.model_executor.models.utils import maybe_prefix
 
 from ..common.hyperconnection import (
@@ -124,6 +127,27 @@ class GatedResidual(nn.Module):
             return_bias=False,
         )
 
+    def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.use_combine:
+            fused = maybe_apply_fused_hc(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                xn,
+            )
+            if fused is not None:
+                return fused
+
+            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            down_and_injection = self.input_mix_weight_down_block_inject(xn)
+            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+        else:
+            lora = self.input_mix_weight_down(xn)
+            injection = None
+
+        lora = hc_silu(lora, self.hc_count)
+        gate = self.input_mix_weight_up(lora)
+        return hc_gate_mix(xn, gate, self.hc_count), injection
+
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -134,18 +158,7 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
-
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input, injection = self._project(xn)
 
         return hidden_states, block_input, injection
 
@@ -170,18 +183,7 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
-
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input, injection = self._project(xn)
 
         return hidden_states, block_input, injection
 

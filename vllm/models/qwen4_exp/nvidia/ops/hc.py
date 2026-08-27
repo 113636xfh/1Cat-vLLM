@@ -352,7 +352,10 @@ def _hc_combine_norm(
 
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
-    BLOCK_SIZE = 512
+    # The M=1 SM70 path is register-bound with the generic 512-wide tile.
+    # A 1024-wide tile keeps identical reduction/rounding results and is
+    # measurably faster on V100; retain the generic tile for larger batches.
+    BLOCK_SIZE = 1024 if N == 1 and current_platform.is_device_capability(70) else 512
     _hc_combine_norm_kernel[(N, hc_count)](
         block_output,
         residual,
@@ -371,6 +374,7 @@ def _hc_combine_norm(
         EPS=eps,
         BLOCK_SIZE=BLOCK_SIZE,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        num_warps=4,
     )
     return out, y
 

@@ -193,6 +193,13 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
                                   int64_t accumulator_chains, bool fast_decoder,
                                   bool prefetch_codes);
 
+void fp8_qpn8_hc_dispatch_sm70_out(
+    torch::Tensor block_out, torch::Tensor injection_out,
+    torch::Tensor down_staging, torch::Tensor lora_staging,
+    torch::Tensor gate_staging, torch::Tensor partials,
+    int64_t dense_weight_ptr, torch::Tensor xn, torch::Tensor down_codes,
+    torch::Tensor down_scales, torch::Tensor up_codes, torch::Tensor up_scales);
+
 std::vector<torch::Tensor> nvfp4_qpn4_prepare_sm70(torch::Tensor qweight,
                                                    torch::Tensor scales);
 
@@ -488,6 +495,11 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
 void mxfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor weights, torch::Tensor scales,
                                torch::Tensor expert_ids, bool broadcast_input);
+
+void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weights, torch::Tensor scales,
+                               torch::Tensor expert_ids, bool broadcast_input,
+                               int64_t split_k);
 
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,

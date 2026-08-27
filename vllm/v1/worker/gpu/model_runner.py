@@ -43,6 +43,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -503,7 +504,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""
         self._kv_block_zeroer = KVBlockZeroer(
-            self.device, pin_memory=is_pin_memory_available()
+            self.device,
+            pin_memory=is_pin_memory_available(),
+            max_concurrency=self.vllm_config.max_concurrent_batches,
         )
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=(group for groups in self.attn_groups for group in groups),
@@ -1044,6 +1047,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output,
             )
+        sm70_greedy_decode = (
+            sampler_output is None
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_reqs == 1
+            and input_batch.num_tokens == 1
+            and not input_batch.is_prefilling_np[0]
+            and grammar_output is None
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and hasattr(self.model, "get_top_tokens")
+            and self.sampler is not None
+            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        )
+        if sm70_greedy_decode:
+            sampled = self.model.get_top_tokens(sample_hidden_states)
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled.view(-1, 1),
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            )
+            logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = self.model.compute_logits(sample_hidden_states)
             if grammar_output is not None:

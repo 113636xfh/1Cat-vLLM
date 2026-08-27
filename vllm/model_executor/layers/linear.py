@@ -370,6 +370,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not current_platform.is_cuda_alike():
             return
 
+        from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+            maybe_prepare_online_qpn8,
+        )
+
+        if maybe_prepare_online_qpn8(layer):
+            return
+
         if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
             layer, "_sm70_dsv4_fp13_gemv", False
         ):
@@ -435,6 +442,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+            maybe_apply_online_qpn8,
+        )
+
+        online_qpn8_out = maybe_apply_online_qpn8(layer, x, bias)
+        if online_qpn8_out is not None:
+            return online_qpn8_out
         sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out
