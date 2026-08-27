@@ -237,6 +237,29 @@ void sm70_f16_gemm_out(torch::Tensor out,
                        int64_t k_ld,
                        bool gated_silu);
 
+void sm70_glm_mhc_pre_norm_out(torch::Tensor gemm_mul,
+                               torch::Tensor gemm_sqrsum,
+                               torch::Tensor hc_scale,
+                               torch::Tensor hc_base,
+                               torch::Tensor residual,
+                               torch::Tensor post_mix,
+                               torch::Tensor comb_mix,
+                               torch::Tensor layer_input,
+                               torch::Tensor norm_weight,
+                               double rms_eps,
+                               double hc_pre_eps,
+                               double hc_sinkhorn_eps,
+                               double hc_post_mult,
+                               int64_t sinkhorn_repeat,
+                               double norm_eps);
+
+void sm70_glm_kda_fg_b_out(torch::Tensor f_out,
+                           torch::Tensor g_out,
+                           torch::Tensor f_input,
+                           torch::Tensor g_input,
+                           torch::Tensor f_weight,
+                           torch::Tensor g_weight);
+
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,
                                torch::Tensor indices_out,
                                torch::Tensor _in_feats,
@@ -503,15 +526,18 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out,
                                   int64_t n,
                                   int64_t group_size);
 
-void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out,
-                                    torch::Tensor input,
+void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,
                                     torch::Tensor dense_expert_ids,
-                                    torch::Tensor ptrs_w,
-                                    torch::Tensor ptrs_s,
-                                    int64_t num_experts,
-                                    int64_t k,
-                                    int64_t n,
+                                    torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+                                    int64_t num_experts, int64_t k, int64_t n,
+                                    int64_t group_size);
+
+void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor expert_offsets,
+                                    torch::Tensor dense_expert_ids,
+                                    torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+                                    int64_t num_experts, int64_t k, int64_t n,
                                     int64_t group_size);
 
 void mxfp4_moe_single_token_prepare_w13_sm70_out(

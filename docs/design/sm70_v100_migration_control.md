@@ -41671,3 +41671,71 @@ Interpretation:
   formatter changes from current main and keep large C/CUDA formatter work
   separate from accepted kernel repairs. Small policy substitutions still need
   their own current-source static/argument-equivalence checks before merge.
+
+## 2026-08-27 GLM-5.3-Flash NVFP4 SM70 bring-up
+
+- Pinned `LibertAIDAI/GLM-5.3-Flash-NVFP4` at revision
+  `9e0d74e3cef17f634e84fb8e2223707e02616290`. The acceptance topology is eight
+  V100s arranged as TP4/PP2, FP16 activations, no MTP, batch one, exact
+  1024-input/256-output measurement, and at least 70 steady pure-decode tok/s.
+- Audited vLLM PR 53906 and SGLang PRs 36507/36513. Their GLM architecture and
+  scheduler semantics were used as references, but their Hopper/Blackwell FP8
+  validation is not an SM70 performance baseline. The conflicting broad vLLM
+  PR was ported by required surface instead of merged wholesale.
+- Added `glm5_next`, KDA bounded-gate support, mHC PP state, sparse MLA/DSA
+  indexer and KPool ownership, hybrid-cache grouping, GLM processor/config,
+  stacked weight mapping, and exact-SM70 ModelOpt NVFP4 MoE admission.
+- V100 cannot perform the KPool writer's native FP8 conversion. Exact SM70 now
+  emits software E4M3 bytes through `uint8` pointers and performs FWHT query
+  rotation plus sparse scoring in FP16 through the established SM70 HMMA
+  indexer. The 28-test GPU KPool suite is byte-exact against the reference.
+- A full local source build completed and registered the NVFP4 SM70 and MoE
+  custom operators. Focused CPU integration reports 64 passing tests. An exact
+  eight-rank TP4/PP2 `meta` construction smoke reports stage sizes 23/22,
+  selects `ModelOptNvFp4SM70MoEMethod` on all ranks, and preserves all four mHC
+  PP tensors.
+- These are route and construction results, not an accepted model result. Keep
+  the real checkpoint load, three-request output identity, sampling quality,
+  CUDA Graph route hit, and matched pure-decode benchmark open until an
+  uncontended eight-GPU run supplies retained logs and JSON.
+- The checkpoint download is now complete: all 120 shards are present at the
+  pinned revision (about 181 GiB). Exact eight-V100 TP4/PP2 dummy-weight eager
+  requests pass with both FP16 KV and `fp8_e4m3` KV. The FP16 run reports
+  66,355 cache tokens; packed E4M3FN reports 111,957 tokens (about 1.69x).
+- Added a GLM-specific 520-byte latent-KV format: 512 software-E4M3FN data
+  bytes plus eight UE8M0 scales per token. `_sm70_glm5_fp8_kv_insert_kernel`
+  writes it. B1 decode keeps the cache packed, gathers/dequantizes the selected
+  rows into a fixed-width FP16 workspace, then uses two Tensor Core GEMMs. This
+  replaced the direct scalar sparse kernel on the accepted decode route.
+- Fixed the upstream GLM KDA state contract to match its merged Q/K/V
+  convolution implementation. Each layer now exposes two states and two copy
+  functions: merged FP16 convolution plus FP32 recurrent state. The original
+  four-state declaration failed at the first real model call after cache
+  allocation.
+- Replaced the exact GLM mHC SM70 PyTorch fallbacks. M=1 fused decode uses the
+  existing DeepSeek-V4-style FP32 staging path plus a native CUDA
+  Sinkhorn/residual-mix/RMSNorm final stage;
+  standalone pre/post and M>16 fused prefill use dedicated SM70 Triton
+  reductions/post mapping. A direct M=17 probe reproduces the rejected generic
+  TileLang path's 33 SM70 BF16-header compile errors. The replacement passes
+  17 focused V100 tests and a full input-17/output-2 TP4/PP2 FP8-KV request.
+  Retained route log:
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/dummy_fp8_tp4pp2_i17_o2_fast_mhc.log`.
+- Layer-zero mHC now pre-sums the four identical initial-stream weights. A
+  V100 M=1 microbenchmark including the required residual expansion measures
+  about 0.155 ms for the expanded path and 0.140 ms for the broadcast path.
+  This is a local kernel result, not an end-to-end speed claim.
+- The first real no-compile CUDA Graph baseline measured 5.35 steady decode
+  tok/s. Replacing scalar packed-FP8 sparse attention with bounded gather/
+  dequant plus Tensor Core GEMMs raised the retained short benchmark to
+  45.83 tok/s (21.82 ms TPOT), with the same 16-token hash
+  `70007811d61c68bb6ec6b4ac5758744f2d4c6b64b51b6b1352f380091c990902`.
+  Nsight Systems reports 95.09% graph-node coverage and no remaining sparse
+  attention hotspot. This 16-input/16-output result is an optimization
+  checkpoint, not the required 1024/256 acceptance result.
+- Added a graph-safe exact-SM70 TP4/B1 CUDA kernel that fuses KDA's two local
+  `128 -> 2048` f/g projections. It measures 6.28 us versus 23.02 us for two
+  cuBLAS launches (3.66x) and preserves FP32 accumulation with FP16 output.
+  Focused mHC/KDA graph and numerical coverage passes 20 tests with one skipped;
+  the next real checkpoint run must confirm its end-to-end gain and unchanged
+  greedy token hash.

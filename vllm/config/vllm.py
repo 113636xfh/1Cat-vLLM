@@ -66,7 +66,13 @@ else:
 
 logger = init_logger(__name__)
 
-DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+    {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Qwen3ForCausalLM",
+    }
+)
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 
 

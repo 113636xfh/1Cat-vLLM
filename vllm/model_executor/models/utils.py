@@ -46,6 +46,9 @@ class WeightsMapper:
 
     orig_to_new_regex: Mapping[re.Pattern, str | None] = field(default_factory=dict)
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_stacked: Mapping[str, tuple[str, str | int | tuple[int, ...]]] = field(
+        default_factory=dict
+    )
     orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
 
@@ -53,11 +56,21 @@ class WeightsMapper:
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
+            orig_to_new_stacked={
+                **self.orig_to_new_stacked,
+                **other.orig_to_new_stacked,
+            },
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
         )
 
     def _map_name(self, key: str) -> str | None:
+        result = self._map_name_with_shard(key)
+        return result[0] if result is not None else None
+
+    def _map_name_with_shard(
+        self, key: str
+    ) -> tuple[str, str | int | tuple[int, ...] | None] | None:
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
@@ -71,6 +84,12 @@ class WeightsMapper:
                     return None
 
                 key = key.replace(substr, new_key, 1)
+
+        shard_id: str | int | tuple[int, ...] | None = None
+        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
+            if substr in key:
+                key = key.replace(substr, new_key, 1)
+                shard_id = new_shard_id
 
         for prefix, new_key in self.orig_to_new_prefix.items():
             if key.startswith(prefix):
@@ -86,16 +105,19 @@ class WeightsMapper:
 
                 key = new_key.join(key.rsplit(suffix, 1))
 
-        return key
+        return key, shard_id
 
     def apply(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return (
-            (out_name, data)
-            for name, data in weights
-            if (out_name := self._map_name(name)) is not None
-        )
+        for name, data in weights:
+            result = self._map_name_with_shard(name)
+            if result is None:
+                continue
+            out_name, shard_id = result
+            if shard_id is not None:
+                data.shard_id = shard_id
+            yield out_name, data
 
     def apply_list(self, values: list[str]) -> list[str]:
         return [

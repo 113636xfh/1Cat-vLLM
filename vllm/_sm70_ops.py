@@ -541,6 +541,50 @@ if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+def nvfp4_moe_dense_stage_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("nvfp4_moe_dense_stage_sm70_out")(
+        out,
+        input,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_dense_stage_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_dense_stage_sm70_out")
+    def _nvfp4_moe_dense_stage_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
 def mxfp4_moe_single_token_prepare_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -763,6 +807,90 @@ if hasattr(torch.ops._C, "sm70_f16_gemm_out"):
         weight: torch.Tensor,
         k_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def sm70_glm_mhc_pre_norm_out(
+    gemm_mul: torch.Tensor,
+    gemm_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+) -> None:
+    _op("sm70_glm_mhc_pre_norm_out")(
+        gemm_mul,
+        gemm_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult,
+        sinkhorn_repeat,
+        norm_eps,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
+
+    @register_fake("_C::sm70_glm_mhc_pre_norm_out")
+    def _sm70_glm_mhc_pre_norm_out_fake(
+        gemm_mul: torch.Tensor,
+        gemm_sqrsum: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        layer_input: torch.Tensor,
+        norm_weight: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+    ) -> None:
+        return None
+
+
+def sm70_glm_kda_fg_b_out(
+    f_out: torch.Tensor,
+    g_out: torch.Tensor,
+    f_input: torch.Tensor,
+    g_input: torch.Tensor,
+    f_weight: torch.Tensor,
+    g_weight: torch.Tensor,
+) -> None:
+    _op("sm70_glm_kda_fg_b_out")(f_out, g_out, f_input, g_input, f_weight, g_weight)
+
+
+if hasattr(torch.ops._C, "sm70_glm_kda_fg_b_out"):
+
+    @register_fake("_C::sm70_glm_kda_fg_b_out")
+    def _sm70_glm_kda_fg_b_out_fake(
+        f_out: torch.Tensor,
+        g_out: torch.Tensor,
+        f_input: torch.Tensor,
+        g_input: torch.Tensor,
+        f_weight: torch.Tensor,
+        g_weight: torch.Tensor,
     ) -> None:
         return None
 

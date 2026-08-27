@@ -296,6 +296,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
 
   ops.def(
+      "sm70_glm_mhc_pre_norm_out("
+      "Tensor gemm_mul, Tensor gemm_sqrsum, Tensor hc_scale, Tensor hc_base, "
+      "Tensor residual, Tensor(a!) post_mix, Tensor(b!) comb_mix, "
+      "Tensor(c!) layer_input, Tensor norm_weight, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, "
+      "int sinkhorn_repeat, float norm_eps) -> ()");
+  ops.impl("sm70_glm_mhc_pre_norm_out", torch::kCUDA,
+           &sm70_glm_mhc_pre_norm_out);
+
+  ops.def(
+      "sm70_glm_kda_fg_b_out(Tensor(a!) f_out, Tensor(b!) g_out, "
+      "Tensor f_input, Tensor g_input, Tensor f_weight, Tensor g_weight) -> ()");
+  ops.impl("sm70_glm_kda_fg_b_out", torch::kCUDA,
+           &sm70_glm_kda_fg_b_out);
+
+  ops.def(
       "sm70_f16_lm_head_top1_out(Tensor(a!) values_out, "
       "Tensor(b!) indices_out, Tensor _in_feats, Tensor _kernel, int k_ld, "
       "int vocab_start_index, int num_vocab_padding) -> ()");
@@ -499,6 +515,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size) -> ()");
   ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
            &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("nvfp4_moe_dense_stage_sm70_out", torch::kCUDA,
+           &nvfp4_moe_dense_stage_sm70_out);
 
   ops.def(
       "mxfp4_moe_single_token_prepare_w13_sm70_out("

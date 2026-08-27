@@ -101,6 +101,11 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def participates_in_prefix_caching(self) -> bool:
+        """Whether blocks owned by this spec can be shared by a prefix."""
+        return True
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -122,6 +127,10 @@ class KVCacheSpec:
             The KV cache size in bytes
         """
         raise NotImplementedError
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        del vllm_config
+        return cdiv(max_len, self.block_size)
 
     def copy_with_new_block_size(self, block_size: int) -> Self:
         """
@@ -352,6 +361,12 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.model_version == "glm5_next" and self.cache_dtype_str in {
+            "fp8",
+            "fp8_e4m3",
+        }:
+            # GLM-5.3 NoPE MLA: 512 E4M3 bytes + eight UE8M0 group scales.
+            return self.storage_block_size * 520
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -559,6 +574,29 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """Per-request circular cache for an incomplete GLM KPool group."""
+
+    def max_admission_blocks_per_request(
+        self, max_num_batched_tokens: int, max_model_len: int
+    ) -> int:
+        del max_num_batched_tokens, max_model_len
+        return 1
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -569,11 +607,15 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
 
     @property
-    def page_size_bytes(self) -> int:
-        page_size = sum(
+    def real_page_size_bytes(self) -> int:
+        return sum(
             prod(shape) * get_dtype_size(dtype)
             for (shape, dtype) in zip(self.shapes, self.dtypes)
         )
+
+    @property
+    def page_size_bytes(self) -> int:
+        page_size = self.real_page_size_bytes
         if self.page_size_padded is not None:
             assert self.page_size_padded >= page_size
             return self.page_size_padded
@@ -673,6 +715,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def page_size_bytes(self) -> int:

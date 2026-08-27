@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -48,6 +49,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -1048,8 +1050,37 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
 
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if (
+            isinstance(layer, RoutedExperts)
+            and not self.is_layer_excluded(prefix)
+            and sm70_tm.is_exact_sm70_cuda_platform()
+        ):
+            if not sm70_tm.should_use_nvfp4_moe_turbomind():
+                raise NotImplementedError(
+                    "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
+                )
+            from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                ModelOptNvFp4SM70MoEMethod,
+            )
+
+            return ModelOptNvFp4SM70MoEMethod(
+                quant_config=self,
+                moe_config=layer.moe_config,
+            )
+        return super().get_quant_method(layer, prefix)
+
     @classmethod
     def get_min_capability(cls) -> int:
+        # SM70 is admitted only when a software backend is selected. Exact
+        # device and MoE-contract checks happen during quant-method dispatch.
+        if (
+            sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
+            or sm70_tm.forces_marlin()
+        ):
+            return 70
         return 75
 
     @classmethod
