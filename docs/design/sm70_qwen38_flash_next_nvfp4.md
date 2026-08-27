@@ -2,9 +2,12 @@
 
 ## Status and ownership
 
-- Status: source bring-up implemented; CPU/configuration gates pass and the
-  local ModelScope snapshot is fully verified. Full-model load, output quality,
-  measured memory, and speed are not claimed yet.
+- Status: source bring-up, native Qwen4Exp MTP, and prefix-cache configuration
+  are implemented; focused CPU/configuration gates pass and the local
+  ModelScope snapshot is fully verified. Native MTP4 now completes TP4 model
+  load, graph capture, warmup, and two 1024x256 requests. Acceptance, repeated
+  token equality, memory, and steady decode are measured below; matched no-MTP
+  token equality and verifier cost remain pending.
 - Integration line: `private/main`.
 - Base SHA: `d63e9490f65f9e01f6649053c1ab72922034b931`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
@@ -48,8 +51,18 @@ The first correctness route deliberately excludes speculative decoding.
   raw token IDs and builds the PLE context from committed tokens, so rejected
   speculative candidates cannot leak into the next trigram. V1 remains a
   correctness control, not the primary performance route.
-- Prefix caching: disabled for the first route. The fixed QSA ring manager does
-  not yet implement reusable prefix blocks.
+- Prefix caching: enabled for the MTP validation route. Hybrid recurrent state
+  uses `mamba_cache_mode=align` with chunked prefill. The fixed QSA compressor
+  ring is explicitly non-cacheable and is excluded from prefix-hit
+  reconciliation; a clean ring block is allocated after a hit. Main QSA KV,
+  compressed QSA KV, and aligned GDN/Mamba state remain cacheable.
+
+The native-MTP validation route keeps the same TP4/PP1, FP16 activation,
+ModelOpt NVFP4, language-model-only, and FlashAttention-V100 contract. It uses
+four speculative tokens, V2, CUDA graphs, prefix caching, a deterministic
+greedy prompt, and two identical requests. The second request is both the hot
+speed sample and the prefix-cache reuse check. A matched no-MTP run is still
+required for exact token-ID quality comparison and incremental verifier cost.
 
 ## Architecture facts that affect the port
 
@@ -107,6 +120,39 @@ graphs, workspaces, NCCL, allocator fragmentation, and loader transients. This
 explains why TP4 is plausible, but it is not evidence that the maximum context
 will load safely.
 
+## Native MTP4 TP4 validation snapshot
+
+The first complete native-MTP run uses V2, TP4, FP16 activations, ModelOpt
+NVFP4 weights, `FLASH_ATTN_V100` for target and draft attention, four draft
+tokens, `mamba_cache_mode=align`, prefix caching, chunked prefill, and
+FULL+PIECEWISE CUDA graphs. It runs two identical deterministic 1024-token
+prompts with 256 forced output tokens each. The artifact is
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_prefix_graph_i1024_o256_r2_hetero_v2.json`.
+
+- Source HEAD is `d9a39ea434` on the Qwen3.8 worktree branch. The measurement
+  also sees the worktree's separately owned, uncommitted SM70 kernel changes;
+  it is bring-up evidence and must be repeated from a clean, pinned source
+  before becoming release-baseline evidence.
+- Target plus MTP weights use 23.16 GiB/rank. The aligned MTP attention block
+  is 816 tokens with 1.62% recurrent-page padding. Available KV-cache memory
+  is 4.77 GiB/rank, or 219,942 tokens. Observed peak device memory is
+  32,330 MiB on every 32,768-MiB V100; the run therefore has only 438 MiB of
+  peak device headroom at `gpu_memory_utilization=0.90`.
+- PLE remains host-resident at 11.92 GiB/rank. The sampled minimum host
+  `MemAvailable` is 48.107 GiB and minimum free swap is 247.994 GiB.
+- Both repeats emit 256 tokens and are exactly equal token-for-token. The first
+  request has 9.750-second TTFT and 53.125 steady decode tokens/s. The repeated
+  prefix has 2.667-second TTFT and 52.187 steady decode tokens/s. Mean steady
+  decode is 52.656 tokens/s; the first end-to-end request includes prefill and
+  JIT and is not a decode baseline.
+- Across 256 speculative steps, the MTP head proposes 1,024 draft tokens and
+  254 are accepted. Mean acceptance length including the target bonus is
+  1.9921875. Draft acceptance is 24.8047%; per-position acceptance is
+  54.6875%, 26.5625%, 13.28125%, and 4.6875%.
+- A strictly matched no-MTP run is required before claiming target-token
+  equality or a verifier-cost ratio. Older 1024x256 artifacts use the distinct
+  Qwen3.8-27B checkpoint and are not valid controls for Flash Next.
+
 ## Acceptance gates
 
 1. Static route: Transformers config, model registry/processor registration,
@@ -150,13 +196,28 @@ only after profiles identify them as measured decode bottlenecks.
   pinned-host PLE default, and the Qwen4Exp PLE/QSA compilation split
   operators. The same real configuration rejects the unvalidated multimodal
   route with an actionable `--language-model-only` error.
+- Exact real-checkpoint construction with native MTP4 and prefix caching on
+  resolves the target as `Qwen4ExpForConditionalGeneration`, the draft as
+  `Qwen4ExpMTP`, target and draft attention as `FLASH_ATTN_V100`, and recurrent
+  caching as `align` with 16-token configured blocks and chunked prefill.
+  Focused prefix-cache/QSA coordinator and model-config tests pass. The
+  non-cacheable QSA compressor ring is skipped during prefix-hit matching,
+  matching the current upstream Qwen4Exp contract.
+- TP4 loaded all 206 checkpoint shards in 109.27 seconds and then correctly
+  rejected an incomplete runtime extension set: `_C` and
+  `_C_stable_libtorch` were present, but `_moe_C` was omitted. A complete
+  runtime must carry all three. The matching `_moe_C` artifact has SHA-256
+  `a14eeb4fa06947e335cf69ee188e23509fc294da61cada786df09888ca5b4469`;
+  its graph-safe permute, workspace-size, unpermute schemas, and SM70 support
+  probe all pass before the next full-model attempt.
 - Full 48-layer meta construction from the real checkpoint config succeeds in
   language-model-only mode. It instantiates QSA, GDN, HC, PLE, and all 512
   experts without materializing weights; the routed experts select
   `ModelOptNvFp4SM70MoEMethod(use_a16=True)` and the PLE table has shape
   `(320001536, 160)` with FP8 E4M3 storage. This constructor probe used TP1;
-  TP4 selection and expert geometry are covered separately and full TP4 load
-  remains pending.
+  TP4 selection and expert geometry are covered separately. Full TP4 target
+  plus native-MTP loading now completes with 23.16 GiB/rank of loaded model
+  state before cache and graph allocation.
 - Focused CPU tests cover PLE shard loading and hashing, `seed=None`, permanent
   host residency during post-load processing, QSA cache grouping, V1 and V2
   n-gram inputs, V2 circular block-table sizing, scheduler-manager conversion,

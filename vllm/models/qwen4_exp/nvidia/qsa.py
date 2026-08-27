@@ -429,6 +429,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def forward(
         self,
         positions: torch.Tensor,
+        output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -462,8 +463,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
             flat_output = flat_output * torch.sigmoid(gate)
-        output, _ = self.o_proj(flat_output)
-        return output
+        projected_output, _ = self.o_proj(flat_output)
+        if output is not None:
+            output.copy_(projected_output)
+        return projected_output
 
 
 def qwen4_exp_qsa_with_output(

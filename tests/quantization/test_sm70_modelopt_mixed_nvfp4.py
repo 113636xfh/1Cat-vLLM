@@ -222,7 +222,7 @@ def test_nvfp4_single_token_direct_routing_is_exact_and_graph_dynamic():
     torch.ops._moe_C.moe_unpermute(
         expert_output, weights, identity, None, top_k, reference
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(expanded, x.expand(top_k, -1))
     assert torch.equal(active_ids, topk_ids[0].int())
     assert torch.equal(output, reference)
@@ -240,7 +240,7 @@ def test_nvfp4_single_token_direct_routing_is_exact_and_graph_dynamic():
     torch.ops._moe_C.moe_unpermute(
         expert_output, weights, identity, None, top_k, reference
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(expanded, x.expand(top_k, -1))
     assert torch.equal(active_ids, topk_ids[0].int())
     assert torch.equal(output, reference)

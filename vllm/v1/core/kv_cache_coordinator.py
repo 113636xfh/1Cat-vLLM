@@ -451,6 +451,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ] = []
 
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not g.kv_cache_spec.prefix_cacheable:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
 
@@ -465,8 +467,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             else:
                 attention_groups.append((spec, [i], manager_cls))
 
-        assert len(attention_groups) > 1, (
-            "HybridKVCacheCoordinator requires at least two attention groups."
+        assert attention_groups, (
+            "HybridKVCacheCoordinator requires at least one cacheable group."
         )
 
         # Put full attention first: its efficient left-to-right scan provides

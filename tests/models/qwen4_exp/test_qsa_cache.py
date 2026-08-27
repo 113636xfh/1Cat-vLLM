@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
@@ -12,7 +13,7 @@ from vllm.v1.worker.utils import bind_kv_cache
 
 def test_bind_qsa_key_cache_builds_key_and_mrope_views() -> None:
     prefix = "model.layers.0.self_attn.raw_key_cache"
-    static_forward_context = {}
+    static_forward_context: dict[str, Any] = {}
     layer = QSAKeyStateCache(
         head_size=128,
         dtype=torch.float16,
@@ -27,7 +28,7 @@ def test_bind_qsa_key_cache_builds_key_and_mrope_views() -> None:
         ),
     )
     cache = torch.empty(2, 8, 1, layer.head_size, dtype=torch.float16)
-    runner_kv_caches = []
+    runner_kv_caches: list[torch.Tensor] = []
 
     bind_kv_cache({prefix: cache}, static_forward_context, runner_kv_caches)
 

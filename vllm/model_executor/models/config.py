@@ -594,12 +594,6 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if text_config.hc_count <= 1:
             raise ValueError("Qwen4Exp requires hc_count > 1")
 
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise NotImplementedError(
-                "Qwen4Exp prefix caching is not enabled in the initial SM70 "
-                "route; disable it while the QSA ring cache is in use"
-            )
-
         parallel_config = vllm_config.parallel_config
         uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
             getattr(text_config, "indexer_n_heads", None) is not None
@@ -623,12 +617,14 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             _strip_qwen4_exp_mrope(model_config)
 
         spec_config = vllm_config.speculative_config
-        if spec_config is not None:
+        if spec_config is not None and spec_config.method not in {
+            "mtp",
+            "ngram",
+            "ngram_gpu",
+        }:
             raise NotImplementedError(
-                "Qwen4Exp speculative decoding is disabled for the initial "
-                "SM70 V2 route. The checkpoint's PLE n-gram embedding remains "
-                "enabled; disable --speculative-config until the native MTP "
-                "follow-up is quality-gated."
+                "Qwen4Exp speculative decoding supports only its native MTP "
+                "checkpoint and linear n-gram proposers"
             )
 
 
@@ -636,6 +632,17 @@ class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        _strip_qwen4_exp_mrope(vllm_config.model_config)
+
+
+class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
+    """Preserve MRoPE for a VL target and use 1D RoPE for a text target."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        if hasattr(vllm_config.model_config.hf_config, "vision_config"):
+            return
         _strip_qwen4_exp_mrope(vllm_config.model_config)
 
 
@@ -701,6 +708,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGenerationConfig,
+    "Qwen4ExpMTP": Qwen4ExpMTPConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }

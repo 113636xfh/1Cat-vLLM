@@ -1224,11 +1224,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             self.validate_shard_id(shard_id)
             if "." in name:
                 submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
+                param = getattr(self.get_submodule(submodule), attr, None)
             else:
-                param = getattr(self, name, self)
+                param = getattr(self, name, None)
             if param is None and name == "bias":
                 continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
@@ -1346,11 +1348,13 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.validate_shard_id(shard_id)
             if "." in name:
                 submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
+                param = getattr(self.get_submodule(submodule), attr, None)
             else:
-                param = getattr(self, name, self)
+                param = getattr(self, name, None)
             if param is None and name == "bias":
                 continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
