@@ -448,11 +448,11 @@ respectively; 103/128 and 24/32 requests terminate naturally before the cap.
 The 32K/128K trace attribution is closed: target grouped attention is the
 long-context verification bottleneck. Pack-GQA48 is the retained candidate;
 its 1K/32K/128K full-graph endpoints, 1K-256K operator sweep, task scores, PPL,
-and dataset-level acceptance gates are recorded above. The route remains
-explicitly opt-in through `VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY`, so this
-change does not silently alter other attention or speculation paths. Two
-bounded follow-ups (tail compaction and page-address broadcast) are rejected
-and must not be resurrected without new evidence.
+and dataset-level acceptance gates are recorded above. At the initial public
+merge, the route remained explicitly opt-in through
+`VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY`. Two bounded follow-ups (tail
+compaction and page-address broadcast) are rejected and must not be resurrected
+without new evidence.
 
 The final source audit rebased all five patches without semantic change onto
 `main@acc0f6fb92`, after the generic prefix-anchored and E4M3 batch-XQA merges.
@@ -463,3 +463,237 @@ alignment attribute preserves the packed verifier layout while restoring all
 or missing. All thirteen grouped-verifier cases pass on a V100 against this
 current-main build. No new full-model or 256K production-configuration claim
 is made by the current-main source audit.
+
+## 2026-08-26 current-main long-context follow-up
+
+This follow-up starts from `main@b06f54cee3` and keeps the practical production
+contract fixed: Qwen3.8-27B NVFP4 target, E5M2 target KV, FP16 draft KV, TP4,
+seven probabilistic draft tokens, prefix cache enabled, 256K maximum context,
+4,096 maximum batched tokens, and FULL CUDA Graph. The frozen unprofiled
+complete-round baseline is 18.477/21.583/30.641/42.300 ms at
+1K/32K/128K/256K. The corresponding Nsight diagnostic values are
+21.323/24.430/33.400/45.307 ms; the approximately 2.8-3.0 ms tracing overhead
+is kept separate from service-wall results.
+
+The trace attribution remains consistent with the earlier audit. Sixteen target
+full-attention layers dominate the context-dependent slope, while five draft
+sliding-window attention layers contribute a smaller avoidable tail. The target
+grouped partial kernel is launched once per full-attention layer with grid
+`(1, 80)`, 512 threads, 128 registers per thread, and 50,944 bytes of dynamic
+shared memory. Its retained single-layer baseline is approximately
+0.048/0.206/0.746/1.451 ms at 1K/32K/128K/256K.
+
+### Draft sliding-window history skip
+
+The non-anchored draft paged-prefill kernel previously started from key tile
+zero even though a 2,048-token sliding window masked all older tiles. Clamping
+the first visited tile to `min_key_pos / BLOCK_N` removes that masked history;
+the anchored/prefix path is deliberately unchanged. Exact DFlash2 shape
+microbenchmarks report the following five-layer totals:
+
+| Context | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| 1K | 0.737280 ms | 0.757760 ms | +0.020480 ms |
+| 32K | 1.367040 ms | 1.264640 ms | -0.102400 ms |
+| 128K | 1.730560 ms | 1.218560 ms | -0.512000 ms |
+| 256K | 2.114560 ms | 1.233920 ms | -0.880640 ms |
+
+Baseline and candidate tensors are bitwise equal at all four lengths. The
+targeted non-causal DFlash2 SWA and anchored-SWA suites pass all 21 cases. The
+small 1K operator movement is 0.02048 ms per complete round and remains subject
+to the full-model one-percent promotion gate.
+
+### Volta shared-row bank-conflict removal
+
+The packed grouped verifier used power-of-two shared row strides for Q/K/V
+(`256` halves), scores (`32` floats), and probabilities (`32` halves). Those
+strides repeatedly present the same bank pattern to Volta WMMA shared loads.
+The initial candidate padded Q/K/V rows by eight halves and both score and
+probability rows by eight elements. This changes only shared-memory addressing:
+
+- Q and K/V row stride: `256 -> 264`;
+- score and probability row stride: `32 -> 40`;
+- softmax arithmetic, FP32 reductions, visibility masks, split count, launch
+  geometry, output workspace, and sampling remain unchanged.
+
+The candidate uses 54,528 bytes of opt-in dynamic shared memory and retains one
+CTA per SM and 128 registers per thread. Q-only and K/V-only ablations improved
+the 32K/128K/256K one-pass kernel to
+0.168/0.592/1.147 ms and 0.184/0.618/1.200 ms, respectively. Padding both sides
+reached 0.136/0.469/0.900 ms; padding the score/probability rows as well produced
+the retained result below.
+
+The production-page-size CUDA-Graph A/B/A medians use 40 warmups and 200 timed
+rounds on the same V100:
+
+| Context | Baseline A1 | Padded candidate | Baseline A2 | Delta vs. A mean |
+| --- | ---: | ---: | ---: | ---: |
+| 1K | 0.051200 ms | 0.031744 ms | 0.044032 ms | -33.33% |
+| 32K | 0.206848 ms | 0.124928 ms | 0.204800 ms | -39.30% |
+| 128K | 0.745472 ms | 0.419840 ms | 0.746496 ms | -43.72% |
+| 256K | 1.451008 ms | 0.807936 ms | 1.451008 ms | -44.32% |
+
+Candidate outputs are bitwise identical to the retained baseline at all four
+lengths, and all thirteen grouped-verifier GPU cases pass. The raw A/B/A records
+are `grouped-sp40-aba-a1.json`, `grouped-sp40-aba-b.json`, and
+`grouped-sp40-aba-a2.json` under the task microbenchmark directory.
+
+Two bounded alternatives were rejected and fully reverted. A 192-thread,
+160-split layout intended to admit two CTAs per SM slowed the four points to
+0.063/0.279/0.889/1.703 ms. An in-CTA QK-next/PV-current software pipeline used
+97,280 bytes of shared memory and slowed them to
+0.058/0.264/0.972/1.900 ms. Both were numerically correct, but neither improved
+the measured critical path; they must not be revived without new hardware
+evidence.
+
+The combined candidate was then run with the frozen TP4 production contract.
+The four-request unprofiled diagnostic improves steady decode from
+147.5/259.0/176.6 to 170.3/317.7/240.0 token/s at 32K/128K/256K. The 1K request
+is excluded from this throughput comparison because both runs include first-use
+JIT. These rates remain acceptance-sensitive and are not used as the verifier
+latency proof.
+
+Independent Nsight Systems traces provide that proof. Each result drops the
+first graph round and averages all four ranks; tracing overhead is therefore
+kept separate from unprofiled service wall. Values are milliseconds per
+complete verification cycle:
+
+| Context | Phase | Baseline | Candidate | Delta |
+| --- | --- | ---: | ---: | ---: |
+| 1K | Draft | 3.774 | 3.933 | +0.159 |
+| 1K | Draft to target | 0.251 | 0.297 | +0.046 |
+| 1K | Target verify | 16.003 | 15.881 | -0.122 |
+| 1K | Target to draft | 1.295 | 1.304 | +0.009 |
+| 1K | Complete | 21.323 | 21.415 | +0.092 (+0.43%) |
+| 32K | Draft | 4.248 | 4.215 | -0.033 |
+| 32K | Draft to target | 0.255 | 0.285 | +0.030 |
+| 32K | Target verify | 18.623 | 17.403 | -1.220 |
+| 32K | Target to draft | 1.303 | 1.307 | +0.003 |
+| 32K | Complete | 24.430 | 23.210 | -1.219 (-4.99%) |
+| 128K | Draft | 4.598 | 4.342 | -0.256 |
+| 128K | Draft to target | 0.256 | 0.332 | +0.076 |
+| 128K | Target verify | 27.239 | 22.179 | -5.060 |
+| 128K | Target to draft | 1.307 | 1.318 | +0.012 |
+| 128K | Complete | 33.400 | 28.171 | -5.229 (-15.65%) |
+| 256K | Draft | 5.091 | 4.443 | -0.648 |
+| 256K | Draft to target | 0.254 | 0.256 | +0.002 |
+| 256K | Target verify | 38.651 | 28.377 | -10.274 |
+| 256K | Target to draft | 1.311 | 1.308 | -0.004 |
+| 256K | Complete | 45.307 | 34.384 | -10.923 (-24.11%) |
+
+The complete-round medians are 21.216/23.125/27.910/34.090 ms, versus
+21.320/24.435/33.399/45.219 ms for the baseline. The mean 32K-to-256K growth
+falls from 20.877 to 11.173 ms (-46.48%), while the 1K point stays within the
+one-percent non-regression gate. This closes the speed and long-context-decay
+gates for the kernel change.
+
+The unprofiled four-request run has exactly the same aggregate mean acceptance
+length (`4.932692`), accepted count (`409`), and drafted count (`728`) as the
+frozen baseline. One 1K probabilistic trace differs by -0.058824 in mean
+acceptance, narrowly outside the single-sample 0.05 boundary; the source
+operator outputs are nevertheless bitwise equal at all four audited lengths.
+Consequently no quality-promotion claim is made from the synthetic traces. The
+frozen dataset-level acceptance, task-score, and WikiText PPL gates remain
+required before default promotion.
+
+### PR 285 fixed-layout follow-up
+
+The operator reference identified for this follow-up is
+[PR 285](https://github.com/1CatAI/1Cat-vLLM/pull/285), not PR 206. PR 285
+improves the independent batch-one E4M3 XQA route from 40.561 to 61.834 token/s
+at 128K and from 27.456 to 50.376 token/s at 256K. Its relevant retained
+mechanisms are a compile-time interleaved physical stride and split-local page
+ID staging. The DFlash2 verifier already combines QK, online softmax, and WMMA
+P@V in one 80-CTA kernel, so PR 285's merged long-wave launch is already the
+local topology. Its scalar shared-V `half2` P@V loop is not copied because that
+would replace the verifier's tensor-core P@V arithmetic rather than merely
+specialize addressing.
+
+The new dispatch admits a fixed layout only for the exact production unbound
+views from `[blocks, 2, page, 1, 256]`, page size 1,648 or 3,296, and matching
+physical strides. All other layouts retain the generic stride path. The fixed
+kernel removes runtime 64-bit block-stride products, and stages the few page
+IDs used by each context split into shared memory. The page IDs share the
+existing Q-publication barrier, so this adds no CTA barrier. Both changes have
+independent default-on rollback flags:
+
+- `VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED=0` disables fixed addressing;
+- `VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS=0` disables page-ID staging.
+
+The same audit found and fixed a generic paired-load defect: its physical
+interleaved block stride was hard-coded to page 800. It is now
+`2 * page_size * head_dim`. This protects page-1,568 E4M3 XQA while admitting
+the new page-1,648/3,296 DFlash2 layouts. The existing page-1,568 E4M3 scalar
+and wave-partition CUDA tests pass all fourteen parametrized cases after the
+change.
+
+A same-process CUDA-Graph comparison on the production page-3,296 layout keeps
+the initial score/probability-padding binary fixed and toggles only fixed
+addressing plus page staging:
+
+| Context | Generic | Fixed plus staged | Delta |
+| --- | ---: | ---: | ---: |
+| 1K | 0.035840 ms | 0.035840 ms | 0.00% |
+| 32K | 0.142336 ms | 0.140288 ms | -1.44% |
+| 128K | 0.447488 ms | 0.440320 ms | -1.60% |
+| 256K | 0.801792 ms | 0.789504 ms | -1.53% |
+
+Every output is bitwise equal. Separate ablations attribute approximately
+0.7-1.3% to the fixed physical stride and a further 0.4-0.7% to page staging.
+This is deliberately a small address-path improvement, not a claim that the
+full PR 285 throughput ratio transfers to the different DFlash2 WMMA kernel.
+
+An A/B/A shared-row follow-up then removed score padding while retaining
+probability padding. On the same physical GPU, the selected
+Q/K/V-264, score-32, probability-40 layout compares with the earlier
+Q/K/V-264, score-40, probability-40 layout as follows:
+
+| Context | Selected score-32 | Earlier score-40 | Delta |
+| --- | ---: | ---: | ---: |
+| 1K | 0.030720 ms | 0.030720 ms | 0.00% |
+| 32K | 0.120832 ms | 0.121856 ms | -0.84% |
+| 128K | 0.407552 ms | 0.410624 ms | -0.75% |
+| 256K | 0.784384 ms | 0.789504 ms | -0.65% |
+
+The output SHA256 is identical across the two separately built extensions at
+every length. The final extension SHA256 is
+`b6952509ffb117c16ba43720c1affd5024f350ccd2ca4324d89022953692bc96`.
+Its production fixed/staged one-pass specialization uses 127 registers per
+thread, zero stack, and 52,992 bytes of dynamic shared memory; launch geometry
+and one-CTA-per-SM occupancy are unchanged. All fifteen grouped-verifier GPU
+cases, all fourteen page-1,568 E4M3 regression cases, and all 56 environment
+tests pass.
+
+The bounded probabilistic mixed-quality A/B uses 32 shuffled requests, a
+2,048-token cap, natural EOS, and the production sampling contract. The first
+control and candidate both score 19/32, with identical per-suite pass counts:
+GSM8K 7/9, HumanEval 7/9, MATH500 5/7, and the known-invalid embedded MBPP
+subset 0/7. The embedded MBPP result is useful only as a relative regression
+check; the valid independent MBPP quality gate is recorded earlier. Candidate
+natural termination improves from 25/32 to 26/32. Request-mean acceptance
+changes from 4.809806 to 4.841060 (+0.031254), while length-weighted pooled
+acceptance changes from 4.226907 to 4.154068 (-0.072839).
+
+An identical-control replay proves that separate probabilistic engine starts
+are not token-stream reproducible: only 4/32 streams match the first control,
+despite no implementation or configuration change. Its task score is 18/32,
+pooled acceptance is 4.190773, and request-mean acceptance is 4.834261. Against
+this adjacent replay, the fixed/staged candidate is one task higher, changes
+pooled acceptance by -0.036705, changes request-mean acceptance by +0.006799,
+and stays inside the frozen 0.05 acceptance gate. This evidence rejects a
+quality-regression attribution; it does not claim that address specialization
+improves model quality. Operator outputs remain bitwise equal and the earlier
+valid 128-request, independent-MBPP, and WikiText gates continue to define the
+absolute production-quality envelope.
+
+### Default promotion
+
+The private current-main audit promotes the grouped verifier to default-on for
+its existing exact runtime contract. Admission remains shape- and route-based:
+SM70, DFlash selector verification, Q8/H6/Hkv1/D256, E5M2 KV, page 1,648 or
+3,296, one request, causal full attention, and a model length of at least 32K.
+It does not inspect a model or checkpoint identity. The retained operator is
+bitwise equal to the prior route, the inherited dataset/PPL gates remain valid,
+and the 1K complete-round movement stays inside the one-percent guard. Set
+`VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY=0` to restore the independent-row
+fallback.
