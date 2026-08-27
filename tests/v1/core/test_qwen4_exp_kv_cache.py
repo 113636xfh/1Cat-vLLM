@@ -127,6 +127,22 @@ def test_qwen4_exp_csa_linear_cache_layout() -> None:
     )
     assert isinstance(coordinator.single_type_managers[1], CircularBufferManager)
 
+    prefix_coordinator = get_kv_cache_coordinator(
+        scheduler_config,
+        max_model_len=8192,
+        max_in_flight_tokens=128,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=4,
+    )
+    assert all(
+        not isinstance(spec, CircularBufferSpec)
+        for spec, _, _ in prefix_coordinator.attention_groups
+    )
+
 
 def test_qwen4_exp_circular_cache_stores_keys_without_unused_values() -> None:
     spec = CircularBufferSpec(

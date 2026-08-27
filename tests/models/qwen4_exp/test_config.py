@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 )
 
 
-def test_initial_sm70_route_accepts_v2_runner(
+def test_sm70_v2_route_accepts_prefix_caching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -42,7 +42,7 @@ def test_initial_sm70_route_accepts_v2_runner(
             hf_text_config=text_config,
             multimodal_config=SimpleNamespace(language_model_only=True),
         ),
-        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
         parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
         speculative_config=None,
         use_v2_model_runner=True,

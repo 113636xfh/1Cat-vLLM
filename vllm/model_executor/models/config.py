@@ -594,12 +594,6 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if text_config.hc_count <= 1:
             raise ValueError("Qwen4Exp requires hc_count > 1")
 
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise NotImplementedError(
-                "Qwen4Exp prefix caching is not enabled in the initial SM70 "
-                "route; disable it while the QSA ring cache is in use"
-            )
-
         parallel_config = vllm_config.parallel_config
         uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
             getattr(text_config, "indexer_n_heads", None) is not None
