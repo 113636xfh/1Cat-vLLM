@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
     _compact_mxfp4_active_experts,
+    _mxfp4_qpn_m1_decode_contract,
     _select_mxfp4_direct_order_offsets,
     _select_mxfp4_stage_dispatch,
     validate_mxfp4_sm70_moe_contract,
@@ -213,8 +214,7 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
 
 def test_mxfp4_sm70_direct_order_ignores_compacted_offsets():
     buffers = {
-        # Reproduce the state left by an M8 active-expert compaction before
-        # the B1 graph is captured.
+        # Reproduce M8 compaction state left before the B1 graph is captured.
         "compact_expert_offsets": torch.tensor(
             [0, 8, 9, 16, 24, 32, 48], dtype=torch.int32
         ),
@@ -225,6 +225,61 @@ def test_mxfp4_sm70_direct_order_ignores_compacted_offsets():
 
     assert offsets is buffers["slot_expert_offsets"]
     torch.testing.assert_close(offsets, torch.arange(7, dtype=torch.int32))
+
+
+def test_mxfp4_sm70_qpn_m1_is_default_with_rollback(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+
+        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_mxfp4_sm70_qpn_m1_missing_default_op_falls_back(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", raising=False)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_qpn_m1_op_available", lambda: False)
+    envs.disable_envs_cache()
+    try:
+        assert not mxfp4_moe._mxfp4_qpn_m1_extension_enabled()
+
+        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1")
+        envs.disable_envs_cache()
+        with pytest.raises(RuntimeError, match="explicitly enabled"):
+            mxfp4_moe._mxfp4_qpn_m1_extension_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_mxfp4_sm70_qpn_m1_requires_exact_tp4_tensor_contract(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", True)
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(tp_size=4),
+        local_num_experts=256,
+        global_num_experts=256,
+        sm70_mxfp4_qpn_m1_available=True,
+        sm70_mxfp4_w13_k_dim=4096,
+        sm70_mxfp4_w13_n_dim=1024,
+        sm70_mxfp4_w2_k_dim=512,
+        sm70_mxfp4_w2_n_dim=4096,
+        sm70_mxfp4_group_size=32,
+        w13_tm_weight=torch.empty((256, 4096, 128), device="meta"),
+        w13_tm_scales=torch.empty((256, 128, 1024), device="meta"),
+        w2_tm_weight=torch.empty((256, 512, 512), device="meta"),
+        w2_tm_scales=torch.empty((256, 16, 4096), device="meta"),
+    )
+
+    assert _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=False)
+    layer.sm70_mxfp4_qpn_m1_available = False
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    layer.sm70_mxfp4_qpn_m1_available = True
+    layer.moe_config.tp_size = 8
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
 
 
 def test_mxfp4_sm70_b1_dispatch_rejects_incompatible_permute_fastpath(
