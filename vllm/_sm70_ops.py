@@ -24,9 +24,11 @@ def _maybe_load_fp8_qpn8_library() -> None:
         return
     generic_override = os.getenv("VLLM_SM70_FP8_QPN8")
     specific_override = os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4")
+    online_override = os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8")
     generic_enabled = generic_override == "1"
     specific_enabled = generic_override != "0" and specific_override == "1"
-    if generic_enabled or specific_enabled:
+    online_enabled = online_override != "0"
+    if generic_enabled or specific_enabled or online_enabled:
         torch.ops.load_library(library_path)
 
 
@@ -36,7 +38,7 @@ _maybe_load_fp8_qpn8_library()
 def _maybe_load_nvfp4_qpn_m1_library() -> None:
     """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
     library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
-    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE") == "1"
+    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
     if library_path is not None and route_enabled:
         torch.ops.load_library(library_path)
 

@@ -70,10 +70,18 @@ def _exact_runtime_contract() -> bool:
     return bool(
         tp_size == 4
         and config.speculative_config is None
-        and getattr(text_config, "model_type", None) == "qwen4_exp_text"
         and int(getattr(text_config, "hidden_size", 0)) == 2560
         and int(getattr(text_config, "num_hidden_layers", 0)) == 48
         and int(getattr(text_config, "num_experts", 0)) == 512
+        and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
+        and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
+        and int(getattr(text_config, "hc_count", 0)) == 4
+        and int(getattr(text_config, "hc_lowrank", 0)) == 320
+        and int(getattr(text_config, "num_attention_heads", 0)) == 24
+        and int(getattr(text_config, "num_key_value_heads", 0)) == 2
+        and int(getattr(text_config, "indexer_head_dim", 0)) == 128
+        and int(getattr(text_config, "indexer_budget", 0)) == 2048
+        and int(getattr(text_config, "indexer_compress_ratio", 0)) == 4
     )
 
 

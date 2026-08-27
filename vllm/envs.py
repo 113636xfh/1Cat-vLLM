@@ -165,8 +165,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
-    VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = False
+    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = True
+    VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
@@ -1703,13 +1703,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
+        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
     # retaining the checkpoint's FP16 accumulation and output rounding.
     "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "0"))
+        int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "1"))
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
