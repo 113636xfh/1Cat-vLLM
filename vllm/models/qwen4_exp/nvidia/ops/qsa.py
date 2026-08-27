@@ -966,9 +966,12 @@ def _qsa_sparse_launch_profile(
         block_n, target_splits, partial_warps = 64, 1, 2
     if is_sm70 and block_n == 64:
         # Two warps serialize the D=256 tensor-core work on V100. Four warps
-        # preserve the exact reduction order while restoring warp-level
-        # parallelism for both split and non-split prefill profiles.
+        # restore warp-level parallelism for split and non-split prefill.
         partial_warps = 4
+        if base_programs >= 512:
+            # A 32-column tile improves the exact 512-row and 8192-row Qwen4Exp
+            # prefill shapes without changing small-batch or non-SM70 routes.
+            block_n = 32
     return block_n, target_splits, partial_warps
 
 

@@ -53,6 +53,21 @@ Goal:
   `2619.29 tok/s`, and 131000 tokens `63.960919s` / `2048.13 tok/s`. The 32K
   and 64K repeat token hashes are stable, and the arithmetic and Chinese
   quality outputs match the accepted 8K run exactly.
+- A follow-up SM70-only QSA tile reduction from 64 to 32 columns passed the
+  matched long-context gate. Pure-prefill time is `9.044346s` at 32K,
+  `21.517608s` at 64K, and `56.609353s` at 131K, corresponding to
+  `3623.04`, `3045.69`, and `2314.11 tok/s`. Relative to the preceding
+  candidate this is a `1.1875x`, `1.1628x`, and `1.1299x` speedup, with
+  latency reductions of `15.79%`, `14.00%`, and `11.49%` respectively. All
+  five quality/performance case token hashes remain exactly equal to the
+  matched baseline.
+- Exact-shape QSA microbenchmarks explain the end-to-end change. At 8192 rows,
+  the 32-column tile measures `56.723ms` versus `92.730ms` for 64 columns
+  (`1.6348x`); at 512 rows with four splits it measures `4.397ms` versus
+  `6.385ms` (`1.4520x`). Both have maximum FP16 difference `0.0001220703125`
+  and no non-finite values. A 128-column tile is rejected before execution
+  because its `139264`-byte shared-memory requirement exceeds V100's
+  `98304`-byte limit.
 - At `gpu_memory_utilization=0.85` and `max_model_len=140000`, vLLM reports
   `3.09 GiB` available KV cache, `250028` token capacity, and `1.79x` 140K
   concurrency. Measured peak device use is `29090 MiB` (`28.408 GiB`) per
@@ -66,7 +81,9 @@ Goal:
 - Retained local evidence is under
   `.artifacts/qwen38_flash_next_prefill_20260827/results/`, notably
   `grouped-v1-piecewise-8192x16.json` and
-  `grouped-v1-piecewise-longctx-u085.json`. The corresponding PR evidence is
+  `grouped-v1-piecewise-longctx-u085.json`. The QSA follow-up is retained as
+  `grouped-v2-qsa-bn32-longctx-u085.json`, with microbenchmarks in
+  `qsa-blockn-sweep-{8192,512-split4}.json`. The corresponding PR evidence is
   recorded in the
   [8K result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5436515073)
   and
