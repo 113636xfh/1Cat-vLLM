@@ -218,6 +218,19 @@ def test_flash_v100_e4m3_page800_fastpath_envs(
         assert environment_variables[name]() is not expected_bool
 
 
+def test_flash_v100_dflash2_grouped_layout_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED",
+        "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 

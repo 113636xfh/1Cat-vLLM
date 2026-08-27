@@ -16,6 +16,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import cast
@@ -1274,8 +1275,30 @@ def _get_sm70_splitd_d256_ops():
 
     _sm70_splitd_d256_ops_checked = True
     try:
-        # Importing the interface loads the vendored FA2 torch library.
-        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        required_ops = (
+            "sm70_d256_splitd_n32_dense_fwd",
+            "sm70_d256_splitd_n32_paged_fwd",
+        )
+        with suppress(ImportError):
+            # Importing the interface loads the bundled FA2 torch library.
+            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+        if namespace is None or not all(
+            hasattr(namespace, op_name) for op_name in required_ops
+        ):
+            # A partially cached Python interface can import successfully
+            # without registering its native operators. Source-overlay
+            # deployments can also intentionally keep the extension outside
+            # the checkout. In both cases, load only an explicitly selected
+            # sidecar and then validate the actual operator capability below.
+            library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+            if library_path is not None:
+                torch.ops.load_library(library_path)
+                logger.info(
+                    "Loaded external SM70 D256 prefill library from %s.",
+                    library_path,
+                )
 
         dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
         paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
@@ -1285,7 +1308,7 @@ def _get_sm70_splitd_d256_ops():
             None,
         )
         _sm70_splitd_d256_ops = (dense, paged, splitkv3)
-    except (AttributeError, ImportError, RuntimeError) as exc:
+    except (AttributeError, ImportError, OSError, RuntimeError) as exc:
         _sm70_splitd_d256_ops = None
         logger.warning_once(
             "SM70 D256 exact-prefill operators are unavailable (%s: %s). "
@@ -1308,8 +1331,13 @@ def _get_sm70_d256_gqa_architecture_op():
 
     _sm70_d256_gqa_architecture_op_checked = True
     try:
-        # Importing the interface loads the vendored FA2 torch library.
-        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        # The Split-D loader also resolves an explicit source-overlay
+        # sidecar. Calling it here keeps both operator families on one binary.
+        if not hasattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_gqa_architecture_fwd",
+        ):
+            _get_sm70_splitd_d256_ops()
 
         _sm70_d256_gqa_architecture_op = getattr(
             torch.ops._vllm_fa2_C,
@@ -1451,7 +1479,7 @@ def _should_use_prefill_d256_gqa_architecture(
     softmax_scale: float,
     architecture_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
-    """Gate the measured Q8000/KV40K..128K/Hq6/Hkv1/D256 family."""
+    """Gate the stable Q8000/KV16K..256K/Hq6/Hkv1/D256 family."""
     return (
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
         and architecture_op is not None
@@ -1462,7 +1490,7 @@ def _should_use_prefill_d256_gqa_architecture(
         and value.shape == key.shape
         and max_seqlen_q == 8000
         and max_seqlen_k == key.shape[1]
-        and 40000 <= max_seqlen_k <= 128000
+        and 16000 <= max_seqlen_k <= 256000
         and max_seqlen_k % 8000 == 0
         and query.dtype == torch.float16
         and key.dtype == query.dtype
@@ -1632,7 +1660,7 @@ def _try_sm70_fa2_d256_prefill(
                         if not _logged_prefill_d256_gqa_architecture:
                             logger.info(
                                 "FLASH_ATTN_V100 SM70 D256 GQA "
-                                "8K-by-40K..128K architecture route active."
+                                "8K-by-16K..256K architecture route active."
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
@@ -5150,8 +5178,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens == 8
-            and tuple(query.shape) == (8, 6, 256)
+            and num_query_tokens in (8, 16)
+            and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
             and key_cache.ndim == 4
@@ -5226,7 +5254,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q8/H6/Hkv1/D256, FP8 E5M2 KV, one-pass)."
+                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                query.shape[0],
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(

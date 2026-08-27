@@ -30,11 +30,15 @@ def _layer(
     )
 
 
-def test_pp2_tp4_qpn8_is_default_on_with_explicit_rollback(monkeypatch) -> None:
+def test_pp2_tp4_qpn8_is_default_off_with_explicit_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4", raising=False)
     envs.disable_envs_cache()
     try:
+        assert not fp8._sm70_fp8_qpn8_pp2_tp4_enabled()
+
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
+        envs.disable_envs_cache()
         assert fp8._sm70_fp8_qpn8_pp2_tp4_enabled()
 
         monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
@@ -47,6 +51,24 @@ def test_pp2_tp4_qpn8_is_default_on_with_explicit_rollback(monkeypatch) -> None:
         assert not fp8._sm70_fp8_qpn8_pp2_tp4_enabled()
     finally:
         envs.disable_envs_cache()
+
+
+def test_qpn8_extension_load_requires_explicit_route(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_LIBRARY", "/tmp/qpn8-test.so")
+    monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
+    monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4", raising=False)
+    with patch.object(torch.ops, "load_library") as load_library:
+        fp8.sm70_ops._maybe_load_fp8_qpn8_library()
+        load_library.assert_not_called()
+
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
+        fp8.sm70_ops._maybe_load_fp8_qpn8_library()
+        load_library.assert_called_once_with("/tmp/qpn8-test.so")
+
+        load_library.reset_mock()
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "0")
+        fp8.sm70_ops._maybe_load_fp8_qpn8_library()
+        load_library.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -88,6 +110,43 @@ def test_pp2_tp4_qpn8_rejects_wrong_tensor_and_concurrency_roles() -> None:
     wrong_layout = _layer("wo_b", 4, 2048, 4096)
     wrong_layout.weight_block_size = [64, 128]
     assert fp8._sm70_fp8_qpn8_pp2_tp4_config(wrong_layout, gated_silu=False) is None
+
+
+def test_pp2_tp4_qpn8_shared_gate_requires_explicit_opt_in(monkeypatch) -> None:
+    layer = _layer(
+        "gate_up_proj",
+        4,
+        4096,
+        1024,
+        output_partition_sizes=[512, 512],
+    )
+    layer.prefix = "arbitrary.layers.7.mlp.shared_experts.gate_up_proj"
+
+    monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert fp8._is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) is None
+
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
+        envs.disable_envs_cache()
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) == (
+            32,
+            2,
+            False,
+        )
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=True) is None
+
+        layer.prefix = "arbitrary.layers.7.mlp.gate_up_proj"
+        assert not fp8._is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) is None
+
+        layer.prefix = "arbitrary.layers.7.mlp.shared_experts.gate_up_proj"
+        monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0")
+        envs.disable_envs_cache()
+        assert fp8._sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False) is None
+    finally:
+        envs.disable_envs_cache()
 
 
 def test_pp2_tp4_qpn8_runtime_and_workspace_contract() -> None:
@@ -172,9 +231,9 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
     torch.testing.assert_close(out[:, 1], torch.full_like(out[:, 1], 2))
 
 
-def test_pp2_tp4_qpn8_default_prepares_matching_layer(monkeypatch) -> None:
+def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
-    monkeypatch.delenv("VLLM_SM70_FP8_QPN8_PP2_TP4", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
     envs.disable_envs_cache()
     layer = _layer("fused_wqa_wkv", 1, 4096, 1536)
     layer.orig_dtype = torch.float16
@@ -227,3 +286,69 @@ def test_pp2_tp4_qpn8_default_prepares_matching_layer(monkeypatch) -> None:
     assert layer.sm70_fp8_qpn8_split_k == 32
     assert layer.sm70_fp8_qpn8_nacc == 2
     assert not layer.sm70_fp8_qpn8_prefetch
+
+
+def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
+    monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
+    envs.disable_envs_cache()
+    layer = _layer(
+        "gate_up_proj",
+        4,
+        4096,
+        1024,
+        output_partition_sizes=[512, 512],
+    )
+    layer.prefix = "arbitrary.layers.7.mlp.shared_experts.gate_up_proj"
+    layer.orig_dtype = torch.float16
+    layer.is_bmm = False
+    layer.weight_scale_inv = torch.empty((8, 32), device="meta")
+    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method.use_marlin = False
+    method.use_sm70_fp8_turbomind = True
+    method.weight_block_size = [128, 128]
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=None,
+    )
+
+    try:
+        with (
+            patch.object(fp8, "get_current_vllm_config", return_value=config),
+            patch.object(fp8, "_missing_sm70_fp8_qpn8_ops", return_value=[]),
+            patch.object(
+                fp8,
+                "_get_sm70_fp8_qpn8_pp2_tp4_workspace",
+                return_value=torch.empty(1),
+            ),
+            patch.object(
+                fp8,
+                "process_fp8_weight_block_strategy",
+                side_effect=lambda weight, scales: (weight, scales),
+            ),
+            patch.object(
+                fp8.sm70_ops,
+                "fp8_qpn8_prepare_sm70",
+                return_value=(
+                    torch.empty((4096, 1024), dtype=torch.uint8, device="meta"),
+                    torch.empty((256, 32), dtype=torch.float16, device="meta"),
+                ),
+            ),
+            patch.object(fp8, "replace_parameter"),
+        ):
+            method.process_weights_after_loading(layer)
+    finally:
+        envs.disable_envs_cache()
+
+    assert layer.sm70_fp8_qpn8
+    assert layer.sm70_fp8_qpn8_split_k == 32
+    assert layer.sm70_fp8_qpn8_nacc == 2
+    assert not layer.sm70_fp8_qpn8_prefetch
+    assert not getattr(layer, "sm70_fp8_gated_silu", False)

@@ -11,7 +11,6 @@ import statistics
 from pathlib import Path
 
 import torch
-
 from flash_attn_v100 import flash_attn_prefill_paged
 
 
@@ -92,7 +91,10 @@ def main() -> None:
         block_table = full_block_table[:, :active_blocks]
         seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
 
-        def run() -> None:
+        def run(
+            block_table: torch.Tensor = block_table,
+            seq_lens: torch.Tensor = seq_lens,
+        ) -> None:
             flash_attn_prefill_paged(
                 query,
                 key_cache,

@@ -43,9 +43,9 @@ def test_sm70_dflash2_noncausal_swa_matches_reference(seq_len: int) -> None:
         dtype=torch.float16,
     )
     value_cache = torch.randn_like(key_cache)
-    block_table = torch.arange(
-        num_blocks, device="cuda", dtype=torch.int32
-    ).unsqueeze(0)
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32).unsqueeze(
+        0
+    )
     seq_lens = torch.tensor([seq_len], device="cuda", dtype=torch.int32)
 
     actual = flash_attn_v100.flash_attn_prefill_paged(
@@ -73,6 +73,4 @@ def test_sm70_dflash2_noncausal_swa_matches_reference(seq_len: int) -> None:
     probs = torch.softmax(scores, dim=-1)
     reference = torch.einsum("hqk,khd->qhd", probs, value.float())
 
-    torch.testing.assert_close(
-        actual[0].float(), reference, atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(actual[0].float(), reference, atol=2e-2, rtol=2e-2)
