@@ -147,11 +147,27 @@ def test_sm70_concurrency_tuning_envs(
     monkeypatch.setenv(name, "0")
     assert environment_variables[name]() is False
 
+    name = "VLLM_SM70_FP8_PRESCALED_M1_DECODE"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
     name = "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE"
     monkeypatch.delenv(name, raising=False)
     assert environment_variables[name]() is True
     monkeypatch.setenv(name, "0")
     assert environment_variables[name]() is False
+
+    for name in (
+        "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE",
+        "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE",
+        "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
 
     monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", raising=False)
     assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 128
@@ -200,6 +216,19 @@ def test_flash_v100_e4m3_page800_fastpath_envs(
         assert environment_variables[name]() is expected_bool
         monkeypatch.setenv(name, "0" if expected_bool else "1")
         assert environment_variables[name]() is not expected_bool
+
+
+def test_flash_v100_dflash2_grouped_layout_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED",
+        "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
 
 
 class TestEnvWithChoices:

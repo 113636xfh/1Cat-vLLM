@@ -287,6 +287,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_qpn8_gated_pair_sm70_out", torch::kCUDA,
            &fp8_qpn8_gated_pair_sm70_out);
 
+  ops.def(
+      "fp8_qpn8_hc_dispatch_sm70_out(Tensor(a!) block_out, Tensor(b!) "
+      "injection_out, Tensor(c!) down_staging, Tensor(d!) lora_staging, "
+      "Tensor(e!) gate_staging, Tensor(f!) partials, int dense_weight_ptr, "
+      "Tensor xn, Tensor down_codes, Tensor down_scales, Tensor up_codes, "
+      "Tensor up_scales) -> ()");
+  ops.impl("fp8_qpn8_hc_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_hc_dispatch_sm70_out);
+
   ops.def("nvfp4_qpn4_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("nvfp4_qpn4_prepare_sm70", torch::kCUDA, &nvfp4_qpn4_prepare_sm70);
 
@@ -322,6 +331,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int q_ld) -> ()");
   ops.impl("fp8_gemm_sm70_prefill_prescaled_out", torch::kCUDA,
            &fp8_gemm_sm70_prefill_prescaled_out);
+
+  // A distinct schema is also a capability marker: older extensions expose
+  // only the 8K-prefill contract and must not receive the new M=1 shapes.
+  ops.def(
+      "fp8_gemm_sm70_prescaled_m1_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _prescaled_factors, int group_size, int k_ld, "
+      "int q_ld) -> ()");
+  ops.impl("fp8_gemm_sm70_prescaled_m1_out", torch::kCUDA,
+           &fp8_gemm_sm70_prescaled_m1_out);
 
   ops.def(
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
@@ -401,6 +419,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "int k_ld, bool gated_silu) -> ()");
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
+
+  ops.def(
+      "sm70_glm_mhc_pre_norm_out("
+      "Tensor gemm_mul, Tensor gemm_sqrsum, Tensor hc_scale, Tensor hc_base, "
+      "Tensor residual, Tensor(a!) post_mix, Tensor(b!) comb_mix, "
+      "Tensor(c!) layer_input, Tensor norm_weight, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, "
+      "int sinkhorn_repeat, float norm_eps) -> ()");
+  ops.impl("sm70_glm_mhc_pre_norm_out", torch::kCUDA,
+           &sm70_glm_mhc_pre_norm_out);
+
+  ops.def(
+      "sm70_glm_kda_fg_b_out(Tensor(a!) f_out, Tensor(b!) g_out, "
+      "Tensor f_input, Tensor g_input, Tensor f_weight, Tensor g_weight) -> "
+      "()");
+  ops.impl("sm70_glm_kda_fg_b_out", torch::kCUDA, &sm70_glm_kda_fg_b_out);
 
   ops.def(
       "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
@@ -634,6 +668,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size) -> ()");
   ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
            &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "mxfp4_moe_qpn_m1_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input) -> ()");
+  ops.impl("mxfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
+           &mxfp4_moe_qpn_m1_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_m1_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_m1_sm70_out);
 
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("

@@ -56,6 +56,29 @@ def _make_case(
     return query, key_cache, value_cache, block_table, seq_lens
 
 
+def _make_interleaved_case(
+    *,
+    page_size: int,
+    query_len: int,
+    prefix_len: int,
+) -> tuple[torch.Tensor, ...]:
+    total_len = prefix_len + query_len
+    logical_pages = math.ceil(total_len / page_size)
+    physical_pages = logical_pages + 3
+    source_shape = (physical_pages, 2, page_size, 1, 256)
+    source = torch.randn(source_shape, dtype=torch.float16, device="cuda").mul_(0.25)
+    cache = source.to(torch.float8_e5m2).view(torch.uint8)
+    key_cache, value_cache = cache.unbind(1)
+    block_table = torch.randperm(physical_pages, dtype=torch.int32, device="cuda")[
+        :logical_pages
+    ].view(1, -1)
+    query = torch.randn((query_len, 6, 256), dtype=torch.float16, device="cuda").mul_(
+        0.25
+    )
+    seq_lens = torch.tensor([total_len], dtype=torch.int32, device="cuda")
+    return query, key_cache, value_cache, block_table, seq_lens
+
+
 def _reference(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -104,10 +127,17 @@ def _reference(
         (16, 5, 507, False),
         (16, 6, 506, False),
         (16, 8, 1016, False),
+        (16, 16, 1008, True),
         (16, 3, 1025, True),
         (784, 5, 2049, True),
         (1648, 8, 4097, True),
+        (1648, 16, 4089, True),
+        (1728, 8, 4097, True),
+        (1728, 16, 4089, True),
         (3296, 8, 8193, True),
+        (3296, 16, 8185, True),
+        (3456, 8, 8193, True),
+        (3456, 16, 8185, True),
     ],
 )
 @torch.inference_mode()
@@ -194,13 +224,16 @@ def test_grouped_verify_matches_fp32_reference_with_random_pages(
     torch.testing.assert_close(one_pass, two_pass, atol=6.2e-5, rtol=2.0e-3)
 
 
+@pytest.mark.parametrize("query_len", [8, 16])
 @torch.inference_mode()
-def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
+def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len(
+    query_len: int,
+) -> None:
     flash_attn_v100 = _require_grouped_verify()
     torch.manual_seed(20260825)
     query, key_cache, value_cache, block_table, seq_lens = _make_case(
         page_size=1648,
-        query_len=8,
+        query_len=query_len,
         prefix_len=4097,
     )
     output = torch.empty_like(query)
@@ -243,3 +276,53 @@ def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len() -> None:
         difference = output.float().sub(expected.float()).abs()
         assert difference.max().item() <= 6.2e-5
         assert difference.mean().item() <= 6.0e-6
+
+
+@pytest.mark.parametrize("page_size", [1648, 3296])
+@pytest.mark.parametrize("query_len", [8, 16])
+@torch.inference_mode()
+def test_grouped_verify_fixed_interleaved_is_bitwise(
+    page_size: int, query_len: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flash_attn_v100 = _require_grouped_verify()
+    torch.manual_seed(20260826 + page_size)
+    query, key_cache, value_cache, block_table, seq_lens = _make_interleaved_case(
+        page_size=page_size,
+        query_len=query_len,
+        prefix_len=8193,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "0")
+    control = flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        one_pass=True,
+    ).clone()
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS", "0")
+    fixed = flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        one_pass=True,
+    ).clone()
+
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS", "1")
+    staged = flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        one_pass=True,
+    ).clone()
+    torch.accelerator.synchronize()
+
+    assert torch.equal(fixed, control)
+    assert torch.equal(staged, control)
