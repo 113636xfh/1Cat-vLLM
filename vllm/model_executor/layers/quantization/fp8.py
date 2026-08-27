@@ -133,8 +133,8 @@ _SM70_FP8_QPN8_EXTRA_SHAPES = {
 }
 _SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
     # Real-weight speed winners remain numerically bounded for every admitted
-    # projection. The shared-expert gate/up role is deliberately absent below
-    # after its fused activation matched only 53.5% of TurboMind FP16 elements.
+    # projection. Shared-expert gate/up may use K4096/N1024 only through its
+    # separately gated non-fused contract; its fused activation remains unsafe.
     (4096, 1536, False): (32, 2, False),
     (1024, 8192, False): (8, 2, False),
     (2048, 4096, False): (16, 2, False),
@@ -142,14 +142,15 @@ _SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
     (512, 4096, False): (16, 2, False),
 }
 _SM70_FP8_QPN8_PP2_TP4_SHAPES = {
-    # Operator role: accepted (layer TP size, K, N) tuples. The shared-expert
-    # gate/up projection is excluded by numerical evidence. The replicated
-    # indexer wq_b is excluded by TP size: its long-prefill work may overlap
-    # the main wq_b and cannot share one dense fallback workspace.
+    # Operator role: accepted (layer TP size, K, N) tuples. Gate/up has an
+    # additional exact shared-expert and explicit opt-in check below. The
+    # replicated indexer wq_b is excluded by TP size: its long-prefill work
+    # may overlap the main wq_b and cannot share one dense fallback workspace.
     "fused_wqa_wkv": {(1, 4096, 1536)},
     "wq_b": {(4, 1024, 8192)},
     "wo_b": {(4, 2048, 4096)},
     "down_proj": {(4, 512, 4096)},
+    "gate_up_proj": {(4, 4096, 1024)},
 }
 _SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS = max(
     k * n for k, n, _ in _SM70_FP8_QPN8_PP2_TP4_CONFIGS
@@ -166,6 +167,20 @@ _SM70_FP8_QPN8_MAX_NUM_SEQS = 8
 # Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
 _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
+    """Match the exact PP2 x TP4 shared-expert gate/up tensor."""
+    prefix = str(getattr(layer, "prefix", ""))
+    return bool(
+        prefix.endswith(".shared_experts.gate_up_proj")
+        and int(getattr(layer, "tp_size", 1)) == 4
+        and getattr(layer, "weight_block_size", None) == [128, 128]
+        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
+        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
+        and getattr(layer, "output_partition_sizes", None) == [512, 512]
+        and tuple(layer.weight.shape) == (1024, 4096)
+    )
 
 
 def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
@@ -299,6 +314,13 @@ def _is_sm70_fp8_qpn8_pp2_tp4_runtime_contract() -> bool:
     )
 
 
+def _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(
+    layer: torch.nn.Module,
+) -> bool:
+    """Match only the measured non-fused shared-expert gate/up tensor."""
+    return _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
+
+
 def _sm70_fp8_qpn8_pp2_tp4_config(
     layer: torch.nn.Module, *, gated_silu: bool
 ) -> tuple[int, int, bool] | None:
@@ -306,6 +328,12 @@ def _sm70_fp8_qpn8_pp2_tp4_config(
     if getattr(layer, "weight_block_size", None) != [128, 128]:
         return None
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    if suffix == "gate_up_proj" and (
+        gated_silu
+        or not envs.VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE
+        or not _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+    ):
+        return None
     accepted = _SM70_FP8_QPN8_PP2_TP4_SHAPES.get(suffix)
     if accepted is None:
         return None
@@ -879,7 +907,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         )
                     if missing_ops:
                         logger.warning_once(
-                            "The default SM70 PP2 x TP4 QPN8 route is unavailable "
+                            "The requested SM70 PP2 x TP4 QPN8 route is unavailable "
                             "in the loaded vllm._C; retaining TurboMind FP8."
                         )
                     workspace = (
@@ -1027,6 +1055,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 or (generic_qpn8_candidate and _is_sm70_fp8_qpn8_runtime_contract())
             )
+            nonfused_shared_gate = bool(
+                pp2_tp4_qpn8_candidate
+                and qpn8_runtime
+                and _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+            )
+            if nonfused_shared_gate:
+                use_gated_silu = False
             if qpn8_candidate_layer and not qpn8_runtime:
                 logger.info_once(
                     "The SM70 FP8 QPN8 route retains TurboMind unless its "
@@ -1048,6 +1083,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     explicitly_enabled = (
                         os.getenv("VLLM_SM70_FP8_QPN8") == "1"
                         or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4") == "1"
+                        or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE") == "1"
                     )
                     if explicitly_enabled:
                         raise RuntimeError(
@@ -1055,7 +1091,7 @@ class Fp8LinearMethod(LinearMethodBase):
                             f"source-built operators; missing: {missing_ops}."
                         )
                     logger.warning_once(
-                        "The default SM70 FP8 QPN8 route is unavailable in "
+                        "The requested SM70 FP8 QPN8 route is unavailable in "
                         "the loaded vllm._C; retaining the TurboMind layout."
                     )
 
@@ -1108,6 +1144,11 @@ class Fp8LinearMethod(LinearMethodBase):
                             "Default SM70 QPN8 enabled for the validated "
                             "serialized PP2 x TP4 operator contract."
                         )
+                        if nonfused_shared_gate:
+                            logger.info_once(
+                                "Default SM70 QPN8 shared-expert gate/up route "
+                                "enabled with its external activation retained."
+                            )
                     else:
                         logger.info_once(
                             "Memory-neutral SM70 FP8 QPN8 path enabled for "
