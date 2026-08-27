@@ -284,7 +284,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             spec_sequence_masks = spec_sequence_masks_cpu
         else:
             spec_sequence_masks = async_tensor_h2d(
-                spec_sequence_masks_cpu,
+                spec_sequence_masks_cpu.tolist(),
                 dtype=torch.bool,
                 device=query_start_loc.device,
             )
