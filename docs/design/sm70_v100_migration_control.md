@@ -68,6 +68,12 @@ Goal:
   and no non-finite values. A 128-column tile is rejected before execution
   because its `139264`-byte shared-memory requirement exceeds V100's
   `98304`-byte limit.
+- No new GDN candidate is claimed by this follow-up. A cold standalone 8192
+  token original-TileLang probe under `/usr` CUDA attempted to rebuild the
+  TileLang cumsum kernel and failed in the installed TileLang BF16 fallback
+  headers. The guarded full-model run reused the accepted production cache and
+  route successfully. Do not treat the standalone failure as a GDN runtime
+  regression or repeat it without the source-matched TileLang toolchain/cache.
 - At `gpu_memory_utilization=0.85` and `max_model_len=140000`, vLLM reports
   `3.09 GiB` available KV cache, `250028` token capacity, and `1.79x` 140K
   concurrency. Measured peak device use is `29090 MiB` (`28.408 GiB`) per
