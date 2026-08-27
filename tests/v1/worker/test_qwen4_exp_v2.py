@@ -219,7 +219,7 @@ def test_qsa_circular_group_emits_no_generic_slots_on_sm70() -> None:
         positions=torch.tensor([153797, 165757], dtype=torch.int64, device=device),
         num_tokens_padded=2,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert slot_mappings[0].tolist() == [-1, -1]
     assert slot_mappings[1].tolist() == [

@@ -101,7 +101,7 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_on_sm70(
     layer.prepare_accelerator_weight()
 
     output = layer(torch.tensor([0, 7], dtype=torch.int64, device="cuda"))
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert output.dtype == torch.float16
     expected = raw.view(torch.float8_e4m3fn).float() * 0.25

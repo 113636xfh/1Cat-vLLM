@@ -375,6 +375,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             attn_out = self.self_attn(
                 hidden_states=block_input,
                 positions=positions,
+                output=None,
             )
         else:
             raise ValueError("Invalid layer_type")
@@ -691,7 +692,7 @@ class Qwen4ExpForCausalLM(
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
@@ -769,7 +770,7 @@ class Qwen4ExpForCausalLM(
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -798,7 +799,7 @@ class Qwen4ExpForCausalLM(
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
@@ -967,7 +968,7 @@ class Qwen4ExpForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "language_model"),
             )
 
-        self.make_empty_intermediate_tensors = (
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
         if not get_pp_group().is_first_rank and self.use_deepstack:
@@ -1069,10 +1070,10 @@ class Qwen4ExpForConditionalGeneration(
         return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
-    def get_mamba_state_shape_from_config(
+    def get_mamba_state_shape_from_config(  # type: ignore[override]
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod

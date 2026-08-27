@@ -10,7 +10,7 @@ from vllm.v1.worker.gpu.model_states import init_model_state
 
 
 def test_model_can_select_custom_model_state() -> None:
-    captured = {}
+    captured: dict[str, object] = {}
 
     class CustomModelState:
         def __init__(self, vllm_config, model, encoder_cache, device) -> None:
