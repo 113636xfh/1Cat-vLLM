@@ -206,3 +206,34 @@ def test_zero_block_ids_nonuniform_page_sizes() -> None:
         pages = buffer.view(N_BLOCKS, page_size)
         zeroed = {index for index in range(N_BLOCKS) if bool((pages[index] == 0).all())}
         assert zeroed == {target}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zeroer_supports_heterogeneous_page_sizes() -> None:
+    device = torch.device("cuda")
+    small = torch.ones((3, 8), dtype=torch.int32, device=device)
+    large = torch.ones((3, 20), dtype=torch.int32, device=device)
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer._id_cap = 8
+    zeroer._ids_pinned = torch.empty(8, dtype=torch.int64)
+    zeroer._ids_gpu = torch.empty(8, dtype=torch.int64, device=device)
+    zeroer._meta = (
+        torch.tensor(
+            [small.data_ptr(), large.data_ptr()], dtype=torch.uint64, device=device
+        ),
+        torch.tensor([8, 20], dtype=torch.int64, device=device),
+        torch.tensor([8, 20], dtype=torch.int64, device=device),
+        3,
+        8,
+        2,
+    )
+
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(small[0], torch.ones_like(small[0]))
+    torch.testing.assert_close(small[1], torch.zeros_like(small[1]))
+    torch.testing.assert_close(small[2], torch.ones_like(small[2]))
+    torch.testing.assert_close(large[0], torch.ones_like(large[0]))
+    torch.testing.assert_close(large[1], torch.zeros_like(large[1]))
+    torch.testing.assert_close(large[2], torch.ones_like(large[2]))

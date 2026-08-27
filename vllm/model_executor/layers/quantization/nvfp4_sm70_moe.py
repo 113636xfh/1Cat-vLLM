@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native SM70 TurboMind NVFP4 MoE for validated Qwen expert shapes.
+"""Native SM70 TurboMind NVFP4 MoE for validated expert shapes.
 
 The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the
 checkpoint's FP8 block scales with its explicit ModelOpt global scales once at
@@ -42,6 +42,7 @@ _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
     (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
+    (4096, 2048, 288, 8),  # GLM-5.3-Flash
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18

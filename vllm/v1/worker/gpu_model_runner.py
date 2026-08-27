@@ -256,6 +256,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    compressed_kernel_block_size,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -688,6 +689,18 @@ def _sync_sm70_before_compile_graph_capture(
             "Synchronizing before SM70 Flash-V100 compile CUDA graph capture."
         )
         torch.accelerator.synchronize()
+
+
+def _select_dummy_sample_hidden_states(
+    hidden_states: torch.Tensor | IntermediateTensors,
+    num_scheduled_tokens: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if isinstance(hidden_states, IntermediateTensors):
+        return None
+    logit_indices = np.cumsum(num_scheduled_tokens) - 1
+    logit_indices_device = torch.from_numpy(logit_indices).to(device, non_blocking=True)
+    return hidden_states[logit_indices_device]
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
@@ -10639,7 +10652,10 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         batch_descriptor_override: BatchDescriptor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor | IntermediateTensors,
+        torch.Tensor | None,
+    ]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
         CUDA graph for the model.
@@ -11137,16 +11153,19 @@ class GPUModelRunner(
             self.eplb_step(is_dummy=True, is_profile=is_profile)
             _sm70_profile_trace("_dummy_run eplb exit")
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            self.device, non_blocking=True
+        sample_hidden_states = _select_dummy_sample_hidden_states(
+            hidden_states, num_scheduled_tokens, self.device
         )
         _sm70_profile_trace(
-            "_dummy_run return hidden_shape=%s sampled_count=%s",
-            tuple(hidden_states.shape),
-            len(logit_indices),
+            "_dummy_run return hidden_type=%s sampled_shape=%s",
+            type(hidden_states).__name__,
+            (
+                tuple(sample_hidden_states.shape)
+                if sample_hidden_states is not None
+                else None
+            ),
         )
-        return hidden_states, hidden_states[logit_indices_device]
+        return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -11430,11 +11449,17 @@ class GPUModelRunner(
             self.max_num_tokens, is_profile=True
         )
         _sm70_profile_trace(
-            "profile_run dummy_run exit hidden_shape=%s last_hidden_shape=%s",
-            tuple(hidden_states.shape),
-            tuple(last_hidden_states.shape),
+            "profile_run dummy_run exit hidden_type=%s last_hidden_shape=%s",
+            type(hidden_states).__name__,
+            (
+                tuple(last_hidden_states.shape)
+                if last_hidden_states is not None
+                else None
+            ),
         )
         if get_pp_group().is_last_rank:
+            assert isinstance(hidden_states, torch.Tensor)
+            assert last_hidden_states is not None
             if self.is_pooling_model:
                 _sm70_profile_trace("profile_run pooler enter")
                 output = self._dummy_pooler_run(hidden_states)
@@ -12322,15 +12347,18 @@ class GPUModelRunner(
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
-                    )
-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    # For MLA with compression, storage_block_size != block_size
+                    # Compressed MLA is split into physical pool pages instead
+                    # of the scheduler's attention-kernel blocks.
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                        shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+                        kernel_num_blocks = num_blocks * (
+                            kv_cache_spec.storage_block_size // shape_block_size
+                        )
                     else:
+                        num_blocks_per_kv_block = (
+                            kv_cache_spec.block_size // kernel_block_size
+                        )
+                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
                         shape_block_size = kernel_block_size
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(

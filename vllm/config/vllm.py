@@ -68,6 +68,8 @@ logger = init_logger(__name__)
 
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",

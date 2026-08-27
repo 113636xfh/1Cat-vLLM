@@ -314,6 +314,18 @@ void sm70_f16_rerank_topk_out(torch::Tensor values_out, torch::Tensor ids_out,
                               torch::Tensor logits, torch::Tensor candidate_ids,
                               int64_t vocab_start_index);
 
+void sm70_glm_mhc_pre_norm_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps);
+
+void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
+                           torch::Tensor f_input, torch::Tensor g_input,
+                           torch::Tensor f_weight, torch::Tensor g_weight);
+
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,
                                torch::Tensor indices_out,
                                torch::Tensor _in_feats, torch::Tensor _kernel,
