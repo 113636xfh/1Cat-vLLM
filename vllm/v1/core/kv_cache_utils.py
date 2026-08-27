@@ -7,10 +7,10 @@ import hashlib
 import math
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NewType, TypeAlias, cast, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -21,6 +21,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -612,12 +613,12 @@ def resolve_kv_cache_block_sizes(
     if not (cache_config.enable_prefix_caching or connector_enabled):
         return scheduler_block_size, scheduler_block_size
 
-    # Mamba groups with block_size != cache_config.block_size
-    # (mamba_cache_mode != "align") break divisibility; back off to the
-    # scheduler block size.
+    # Mamba groups outside align mode break divisibility; back off to the
+    # scheduler block size. Read the mode from the resolved group spec because
+    # its block size may have been updated independently of cache_config.
     if any(
         isinstance(g.kv_cache_spec, MambaSpec)
-        and g.kv_cache_spec.block_size != cache_config.block_size
+        and g.kv_cache_spec.mamba_cache_mode != "align"
         for g in groups
     ):
         return scheduler_block_size, scheduler_block_size
@@ -881,18 +882,14 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    num_blocks_per_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_config.kv_cache_groups
     )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
 
@@ -920,6 +917,8 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
         return len(mla_names) * mla_page + len(idx_names) * idx_page
+    if layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        return layout.bytes_per_block
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
@@ -1047,8 +1046,23 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
+            replace_args = {"block_size": new_block_size}
+            # A padded page does not grow when only block_size changes. This
+            # happens for hybrid Mamba targets when a higher-precision draft
+            # cache has a larger page than the target cache. Keep the logical
+            # block-size adjustment and grow the physical padding with it.
+            if (
+                isinstance(layer_spec, MambaSpec)
+                or getattr(layer_spec, "page_size_padded", None) is not None
+            ):
+                replace_args["page_size_padded"] = max_page_size
+            new_spec = replace(layer_spec, **replace_args)
+            assert new_spec.page_size_bytes == max_page_size, (
+                f"Failed to unify KV page for {layer_name}: "
+                f"spec={layer_spec!r}, old_page={layer_page_size}, "
+                f"target_page={max_page_size}, replacement={replace_args!r}, "
+                f"new_page={new_spec.page_size_bytes}"
+            )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
@@ -1056,6 +1070,42 @@ def unify_kv_cache_spec_page_size(
 def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     # kv_cache_spec is an empty dict for attention free models
     return not kv_cache_spec
+
+
+def _select_hybrid_kv_cache_group_size(layer_counts: Sequence[int]) -> int:
+    """Select a group size without letting a singleton dominate the layout."""
+    min_num_layers = min(layer_counts)
+    max_num_layers = max(layer_counts)
+    if max_num_layers < min_num_layers * 1.5:
+        # If the number of layers is not much larger than the minimum number of
+        # layers, use the maximum number of layers as the group size to avoid
+        # too many padding layers. A typical example is gpt-oss-20b + eagle,
+        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
+        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
+        # layers while accommodating speculative decoding drafters that add
+        # extra layers to one attention type.
+        return max_num_layers
+
+    # A singleton auxiliary state cache can otherwise force group_size=1 and
+    # multiply metadata preparation for every repeated cache type. Find the
+    # largest divisor shared by the repeated types that keeps total padding at
+    # or below 20%. Restrict this optimization to singleton outliers so existing
+    # hybrid layouts retain their current behavior.
+    if min_num_layers == 1:
+        repeated_counts = [count for count in layer_counts if count > 1]
+        if repeated_counts:
+            common_divisor = math.gcd(*repeated_counts)
+            total_layers = sum(layer_counts)
+            for candidate in range(common_divisor, 1, -1):
+                if common_divisor % candidate != 0:
+                    continue
+                padded_layers = candidate * sum(
+                    cdiv(count, candidate) for count in layer_counts
+                )
+                if (padded_layers - total_layers) * 5 <= total_layers:
+                    return candidate
+
+    return min_num_layers
 
 
 def _get_kv_cache_groups_uniform_page_size(
@@ -1142,18 +1192,14 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
-    group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
-    if max_num_layers < min_num_layers * 1.5:
-        # If the number of layers is not much larger than the minimum number of
-        # layers, use the maximum number of layers as the group size to avoid
-        # too many padding layers. A typical example is gpt-oss-20b + eagle,
-        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
-        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
-        # layers while accommodating speculative decoding drafters that add
-        # extra layers to one attention type.
-        group_size = max_num_layers
+    layer_counts = [len(layers) for layers in same_type_layers.values()]
+    group_size = _select_hybrid_kv_cache_group_size(layer_counts)
+    if group_size != min(layer_counts):
+        logger.info(
+            "Using hybrid KV cache group size %d for layer counts %s",
+            group_size,
+            sorted(layer_counts),
+        )
     grouped_layers = []
     for layers in same_type_layers.values():
         num_padding_layers = group_size - len(layers) % group_size
@@ -1442,6 +1488,39 @@ def _glm5_next_tensor_layout(
     )
 
 
+def _get_kv_cache_config_csa_linear(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]] | None:
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    if layout is None:
+        return None
+
+    num_blocks = available_memory // layout.bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=layout.main_kv_page_size * num_blocks,
+            shared_by=[main_kv_name]
+            + [
+                group.layer_names[index]
+                for group in layout.mamba_groups
+                if index < len(group.layer_names)
+            ],
+        )
+        for index, main_kv_name in enumerate(layout.main_kv_names)
+    ]
+    kv_cache_tensors.extend(
+        KVCacheTensor(
+            size=layout.compressed_page_size * num_blocks,
+            shared_by=[compressed_name, layout.compressor_state_names[index]],
+        )
+        for index, compressed_name in enumerate(layout.compressed_names)
+    )
+    return num_blocks, kv_cache_tensors
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1519,6 +1598,10 @@ def get_kv_cache_config_from_groups(
             )
             for i, idx_name in enumerate(idx_names)
         ]
+    elif csa_config := _get_kv_cache_config_csa_linear(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        num_blocks, kv_cache_tensors = csa_config
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -1697,42 +1780,333 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
-def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
-    """Pick a chunk size that minimizes total upward padding.
+class _CSALinearCacheTuple(NamedTuple):
+    """Three cache owners attached to one compressed-sparse layer."""
 
-    Each x is rounded up to a multiple of d:
+    layer_index: int
+    main_kv: tuple[str, FullAttentionSpec]
+    compressed: tuple[str, MLAAttentionSpec]
+    compressor_state: tuple[str, CircularBufferSpec]
 
-      x -> ceil(x / d) * d
 
-    Total padding is:
+@dataclass(frozen=True)
+class _CSALinearTensorLayout:
+    main_kv_names: list[str]
+    compressed_names: list[str]
+    compressor_state_names: list[str]
+    mamba_groups: list[KVCacheGroupSpec]
+    main_kv_page_size: int
+    compressed_page_size: int
 
-      pad(d) = sum_i (ceil(x_i / d) * d - x_i)
+    @property
+    def bytes_per_block(self) -> int:
+        return len(self.main_kv_names) * (
+            self.main_kv_page_size + self.compressed_page_size
+        )
 
-    We brute-force d in [lower_bound, max(values)] (fine for small lists / small
-    maxima) and return the d with minimum padding. Ties prefer larger d.
+
+class _CSALinearRoles(NamedTuple):
+    main_kv: dict[str, FullAttentionSpec]
+    compressed: dict[str, MLAAttentionSpec]
+    compressor_state: dict[str, CircularBufferSpec]
+    mamba: dict[str, MambaSpec]
+
+
+def _classify_csa_linear_specs(
+    kv_cache_spec: Mapping[str, KVCacheSpec],
+) -> _CSALinearRoles | None:
+    if not any(type(spec) is CircularBufferSpec for spec in kv_cache_spec.values()):
+        return None
+
+    roles = _CSALinearRoles(main_kv={}, compressed={}, compressor_state={}, mamba={})
+    unsupported: list[str] = []
+    for name, spec in kv_cache_spec.items():
+        if type(spec) is FullAttentionSpec:
+            roles.main_kv[name] = spec
+        elif type(spec) is MLAAttentionSpec and spec.compress_ratio > 1:
+            roles.compressed[name] = spec
+        elif type(spec) is CircularBufferSpec:
+            roles.compressor_state[name] = spec
+        elif type(spec) is MambaSpec:
+            roles.mamba[name] = spec
+        else:
+            unsupported.append(name)
+    if unsupported:
+        raise ValueError(f"CSA+linear unsupported cache owners: {unsupported}.")
+    if not roles.main_kv or not roles.compressed or not roles.mamba:
+        raise ValueError(
+            "CSA+linear requires main KV, compressed, compressor-state, and "
+            "Mamba cache owners."
+        )
+    return roles
+
+
+def _get_csa_linear_cache_tuples(
+    roles: _CSALinearRoles,
+) -> list[_CSALinearCacheTuple]:
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    def by_layer_index(
+        specs: Mapping[str, KVCacheSpec], role: str
+    ) -> dict[int, tuple[str, KVCacheSpec]]:
+        indexed: dict[int, tuple[str, KVCacheSpec]] = {}
+        for name, spec in specs.items():
+            try:
+                layer_index = extract_layer_index(name)
+            except (AssertionError, ValueError) as exc:
+                raise ValueError(
+                    f"CSA+linear {role} owner {name!r} does not identify "
+                    "exactly one transformer layer."
+                ) from exc
+            if layer_index in indexed:
+                other_name = indexed[layer_index][0]
+                raise ValueError(
+                    f"CSA+linear layer {layer_index} has duplicate {role} "
+                    f"owners: {other_name!r} and {name!r}."
+                )
+            indexed[layer_index] = (name, spec)
+        return indexed
+
+    main_kv = by_layer_index(roles.main_kv, "main-KV")
+    compressed = by_layer_index(roles.compressed, "compressed")
+    compressor_state = by_layer_index(roles.compressor_state, "compressor-state")
+    layer_indices = set(main_kv)
+    if set(compressed) != layer_indices or set(compressor_state) != layer_indices:
+        raise ValueError(
+            "CSA+linear main-KV, compressed, and compressor-state owners must "
+            "have matching transformer-layer indices."
+        )
+
+    return [
+        _CSALinearCacheTuple(
+            layer_index,
+            cast(tuple[str, FullAttentionSpec], main_kv[layer_index]),
+            cast(tuple[str, MLAAttentionSpec], compressed[layer_index]),
+            cast(tuple[str, CircularBufferSpec], compressor_state[layer_index]),
+        )
+        for layer_index in sorted(layer_indices)
+    ]
+
+
+def _get_csa_linear_mamba_group_count(
+    vllm_config: VllmConfig,
+    mamba_names: list[str],
+    main_kv_names: list[str],
+) -> int | None:
+    num_groups = cdiv(len(mamba_names), len(main_kv_names))
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    if pp_size == 1:
+        return num_groups
+
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    mamba_indices = [extract_layer_index(name) for name in mamba_names]
+    main_kv_indices = [extract_layer_index(name) for name in main_kv_names]
+    for rank in range(pp_size):
+        start, end = get_pp_indices(total_layers, rank, pp_size)
+        num_mamba = sum(start <= index < end for index in mamba_indices)
+        num_main_kv = sum(start <= index < end for index in main_kv_indices)
+        if not num_mamba:
+            continue
+        if not num_main_kv:
+            return None
+        num_groups = max(num_groups, cdiv(num_mamba, num_main_kv))
+    return num_groups
+
+
+def _get_kv_cache_groups_csa_linear(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build Qwen4Exp's main/compressed/ring/recurrent cache groups."""
+
+    roles = _classify_csa_linear_specs(kv_cache_spec)
+    if roles is None:
+        return None
+    tuples = _get_csa_linear_cache_tuples(roles)
+
+    expected_local_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    if any(
+        cache.main_kv[1].num_kv_heads != expected_local_kv_heads for cache in tuples
+    ):
+        raise ValueError(
+            "CSA+linear main-KV specs do not match the TP-local KV-head geometry."
+        )
+
+    for cache in tuples:
+        _, main_kv = cache.main_kv
+        _, compressed = cache.compressed
+        _, compressor_state = cache.compressor_state
+        if not (
+            main_kv.block_size == compressed.block_size
+            and compressor_state.real_page_size_bytes <= compressed.page_size_bytes
+            and all(
+                spec.page_size_padded is None
+                for spec in (main_kv, compressed, compressor_state)
+            )
+        ):
+            raise ValueError(
+                f"CSA+linear layer {cache.layer_index} violates cache geometry."
+            )
+
+    shapes = {
+        (
+            cache.compressed[1].compress_ratio,
+            cache.main_kv[1].block_size,
+            cache.main_kv[1].page_size_bytes,
+            cache.compressed[1].page_size_bytes,
+        )
+        for cache in tuples
+    }
+    if len(shapes) != 1:
+        raise ValueError(
+            "CSA+linear layers must share one block size, compression ratio, "
+            "and main/compressed page geometry."
+        )
+    _, _, main_kv_page, compressed_page = next(iter(shapes))
+
+    padded_compressor_specs: dict[str, KVCacheSpec] = {
+        cache.compressor_state[0]: replace(
+            cache.compressor_state[1], page_size_padded=compressed_page
+        )
+        for cache in tuples
+    }
+    compressed_sparse_specs: dict[str, KVCacheSpec] = {
+        name: spec
+        for cache in tuples
+        for name, spec in (cache.main_kv, cache.compressed)
+    }
+    compressed_sparse_uniform = UniformTypeKVCacheSpecs.from_specs(
+        compressed_sparse_specs
+    )
+    compressor_uniform = UniformTypeKVCacheSpecs.from_specs(padded_compressor_specs)
+    if compressed_sparse_uniform is None or compressor_uniform is None:
+        raise ValueError("CSA+linear cache owners have incompatible lifetimes.")
+
+    groups = [
+        KVCacheGroupSpec(list(compressed_sparse_specs), compressed_sparse_uniform),
+        KVCacheGroupSpec(list(padded_compressor_specs), compressor_uniform),
+    ]
+    main_kv_names = [cache.main_kv[0] for cache in tuples]
+    for tp_replicated in (False, True):
+        names = [
+            name
+            for name, spec in roles.mamba.items()
+            if spec.tp_replicated is tp_replicated
+        ]
+        if not names:
+            continue
+        representative = roles.mamba[names[0]]
+        if any(roles.mamba[name] != representative for name in names[1:]):
+            policy = "replicated" if tp_replicated else "sharded"
+            raise ValueError(
+                f"CSA+linear {policy} Mamba owners must use one cache spec."
+            )
+        unpadded_page = replace(representative, page_size_padded=None).page_size_bytes
+        if unpadded_page > main_kv_page:
+            raise ValueError(
+                f"CSA+linear Mamba owner {names[0]!r} needs {unpadded_page} "
+                f"bytes, but a main-KV page has {main_kv_page} bytes."
+            )
+        num_groups = _get_csa_linear_mamba_group_count(
+            vllm_config, names, main_kv_names
+        )
+        if num_groups is None:
+            raise ValueError(
+                "CSA+linear pipeline stage has Mamba owners but no main-KV slots."
+            )
+        padded_spec = replace(representative, page_size_padded=main_kv_page)
+        grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+        for index, name in enumerate(names):
+            grouped_names[index % num_groups].append(name)
+        groups.extend(
+            KVCacheGroupSpec(group_names, padded_spec) for group_names in grouped_names
+        )
+    return groups
+
+
+def _get_csa_linear_tensor_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> _CSALinearTensorLayout | None:
+    compressed_sparse: Mapping[str, KVCacheSpec] | None = None
+    compressor_state: Mapping[str, KVCacheSpec] | None = None
+    mamba_groups: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            mamba_groups.append(group)
+            continue
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            return None
+        member = next(iter(spec.kv_cache_specs.values()))
+        if type(member) is CircularBufferSpec:
+            compressor_state = spec.kv_cache_specs
+        elif type(member) is FullAttentionSpec:
+            compressed_sparse = spec.kv_cache_specs
+        else:
+            return None
+    if compressed_sparse is None or compressor_state is None:
+        return None
+
+    main_kv_names = [
+        name
+        for name, spec in compressed_sparse.items()
+        if type(spec) is FullAttentionSpec
+    ]
+    compressed_names = [
+        name
+        for name, spec in compressed_sparse.items()
+        if type(spec) is MLAAttentionSpec
+    ]
+    if not main_kv_names or not compressed_names:
+        return None
+
+    return _CSALinearTensorLayout(
+        main_kv_names=main_kv_names,
+        compressed_names=compressed_names,
+        compressor_state_names=list(compressor_state),
+        mamba_groups=mamba_groups,
+        main_kv_page_size=compressed_sparse[main_kv_names[0]].page_size_bytes,
+        compressed_page_size=compressed_sparse[compressed_names[0]].page_size_bytes,
+    )
+
+
+def _select_deepseek_v4_tuple_width(
+    vllm_config: VllmConfig,
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+) -> int:
+    """Pick the DeepSeek V4 tuple width with the smallest physical pool.
+
+    Padding layer counts alone is insufficient: full/compressed MLA may need
+    thousands more pages than a short sliding-window group at long context.
+    Widening every physical block to save one SWA subgroup can therefore cost
+    substantially more memory than it saves.
     """
-    if not values:
-        raise ValueError("values must be non-empty")
-    if any(x <= 0 for x in values):
-        raise ValueError(f"values must be positive, got: {list(values)!r}")
+    tuple_counts = [spec.get_num_layer_tuples() for spec in grouped_specs]
+    page_counts = [spec.max_memory_usage_pages(vllm_config) for spec in grouped_specs]
+    min_width = tuple_counts[0]
+    max_width = max(tuple_counts)
 
-    min_d = max(1, lower_bound if lower_bound is not None else 1)
-    max_d = max(values)
-    if min_d > max_d:
-        return min_d
+    def pool_pages(width: int) -> int:
+        return width * sum(
+            cdiv(tuple_count, width) * page_count
+            for tuple_count, page_count in zip(tuple_counts, page_counts)
+        )
 
-    best_d = min_d
-    best_pad: int | None = None
-    for d in range(min_d, max_d + 1):
-        pad = sum((d - (x % d)) % d for x in values)
-        if best_pad is None or pad < best_pad or (pad == best_pad and d > best_d):
-            best_pad = pad
-            best_d = d
-
-    return best_d
+    return min(
+        range(min_width, max_width + 1),
+        key=lambda width: (pool_pages(width), width),
+    )
 
 
 def _get_kv_cache_groups_uniform_groups(
+    vllm_config: VllmConfig,
     grouped_specs: list[UniformTypeKVCacheSpecs],
 ) -> list[KVCacheGroupSpec]:
     """
@@ -1763,10 +2137,8 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group: list[int] = [
         g_spec.get_num_layer_tuples() for g_spec in grouped_specs
     ]
-    # Choose `num_layer_tuples` to minimize total padding across groups.
-    num_layer_tuples = _approximate_gcd(
-        num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
-    )
+    # Choose `num_layer_tuples` by physical bytes, not layer-count padding.
+    num_layer_tuples = _select_deepseek_v4_tuple_width(vllm_config, grouped_specs)
     # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
@@ -1893,13 +2265,17 @@ def get_kv_cache_groups(
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        kv_cache_groups = _get_kv_cache_groups_uniform_groups(
+            vllm_config, grouped_specs
+        )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
     elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
         # GLM-5.3-Flash case: one uniform MLA(+kpool indexer) attention group
         # plus mamba groups whose layers share the MLA layers' slot tensors.
         return glm5_groups
+    elif csa_groups := _get_kv_cache_groups_csa_linear(vllm_config, kv_cache_spec):
+        return csa_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
@@ -2007,6 +2383,16 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        blocks_needed = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        return layout.bytes_per_block * blocks_needed
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups

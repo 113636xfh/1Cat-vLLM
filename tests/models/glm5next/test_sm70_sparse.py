@@ -15,6 +15,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     _hadamard128_torch,
     fwht128,
 )
+from vllm.models.glm5next.sm70 import sparse as sparse_module
 from vllm.models.glm5next.sm70.fp8_kv import (
     sm70_glm5_fp8_kv_insert,
     sm70_glm5_sparse_attention_paged_fp8,
@@ -60,6 +61,50 @@ def test_glm53_sm70_sparse_backend_contract():
         attn_type="decoder",
     )
     assert invalid == []
+
+
+def test_glm53_sm70_sparse_backend_uses_structural_gates(monkeypatch):
+    text_config = SimpleNamespace(
+        model_type="generic_sparse_mla",
+        qk_rope_head_dim=0,
+        kv_lora_rank=512,
+    )
+    monkeypatch.setattr(
+        sparse_module,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=text_config)
+        ),
+    )
+
+    assert (
+        Glm5NextSM70SparseBackend.supports_combination(
+            head_size=512,
+            dtype=torch.float16,
+            kv_cache_dtype="auto",
+            block_size=1152,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            device_capability=DeviceCapability(major=7, minor=0),
+        )
+        is None
+    )
+
+    text_config.qk_rope_head_dim = 64
+    assert "requires NoPE" in (
+        Glm5NextSM70SparseBackend.supports_combination(
+            head_size=512,
+            dtype=torch.float16,
+            kv_cache_dtype="auto",
+            block_size=1152,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            device_capability=DeviceCapability(major=7, minor=0),
+        )
+        or ""
+    )
 
 
 def test_glm53_sm70_fp8_kv_layout_contract():
@@ -135,7 +180,7 @@ def test_glm53_sm70_sparse_attention_matches_reference():
 
     sm70_sparse_attention_gathered(q, kv, indices, lengths, scale, None, out)
     sm70_sparse_attention_gathered(q, kv, indices, lengths, scale, None, repeat)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     refs = []
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -177,7 +222,7 @@ def test_glm53_sm70_fp8_kv_sparse_attention_matches_reference():
     scale = 512**-0.5
     sm70_glm5_sparse_attention_paged_fp8(q, cache, indices, lengths, scale, out)
     sm70_glm5_sparse_attention_paged_fp8(q, cache, indices, lengths, scale, repeat)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     refs = []
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -243,7 +288,7 @@ def test_glm53_sm70_fp8_kv_gemm_decode_matches_reference():
         scores,
         probs,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     selected = kv[indices[0, : len(selected_ids)].long()].float()
     ref_probs = torch.softmax(q[0].float() @ selected.T * scale, dim=-1)
@@ -263,7 +308,7 @@ def test_glm53_sm70_fp16_fwht_matches_reference():
     actual = fwht128(q)
     repeat = fwht128(q)
     reference = _hadamard128_torch(q.float()).half()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.testing.assert_close(actual, reference, rtol=1e-2, atol=2e-3)
     assert torch.equal(actual, repeat)

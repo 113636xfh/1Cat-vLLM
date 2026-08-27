@@ -13,6 +13,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.worker import mamba_utils as worker_mamba_utils
@@ -469,10 +470,101 @@ def _make_gpu_ctx(
     return MambaSpecDecodeGPUContext.create(
         max_num_reqs=cfg.max_num_reqs,
         kv_cache_config=kv_cache_config,
-        num_state_types=2,
+        mamba_state_copy_funcs=_COPY_FUNCS,
         device=device,
         make_buffer=make_buffer,
     )
+
+
+def test_mamba_context_supports_heterogeneous_state_groups():
+    device = torch.device("cpu")
+    block_size = 16
+    num_speculative_blocks = 4
+    gdn_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((4, 8), (16,)),
+        dtypes=(torch.float16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_speculative_blocks,
+    )
+    ple_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((3, 8),),
+        dtypes=(torch.float16,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_speculative_blocks,
+        tp_replicated=True,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["gdn_0", "gdn_1"], kv_cache_spec=gdn_spec),
+            KVCacheGroupSpec(layer_names=["ple"], kv_cache_spec=ple_spec),
+        ],
+    )
+    copy_funcs_by_type = {
+        MambaAttentionBackendEnum.GDN_ATTN: (
+            get_conv_copy_spec,
+            get_temporal_copy_spec,
+        ),
+        MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
+    }
+
+    def make_buffer(n, dtype):
+        return _MockCpuGpuBuffer(n, dtype, device)
+
+    ctx = MambaSpecDecodeGPUContext.create(
+        max_num_reqs=2,
+        kv_cache_config=kv_cache_config,
+        mamba_state_copy_funcs=copy_funcs_by_type,
+        device=device,
+        make_buffer=make_buffer,
+    )
+    copy_bufs = MambaCopyBuffers.create(
+        max_num_reqs=2,
+        kv_cache_config=kv_cache_config,
+        copy_funcs=copy_funcs_by_type,
+        make_buffer=make_buffer,
+    )
+
+    assert ctx.num_layers == 3
+    assert ctx.num_states == 5
+    assert ctx.state_base_addrs.numel() == 5
+    assert copy_bufs.src_ptrs.cpu.numel() == 10
+
+    def attention(*states: torch.Tensor) -> MagicMock:
+        mock = MagicMock()
+        mock.kv_cache = list(states)
+        return mock
+
+    forward_context = {
+        "gdn_0": attention(
+            torch.zeros(4, 4, 8, dtype=torch.float16),
+            torch.zeros(4, 16, dtype=torch.float32),
+        ),
+        "gdn_1": attention(
+            torch.zeros(4, 4, 8, dtype=torch.float16),
+            torch.zeros(4, 16, dtype=torch.float32),
+        ),
+        "ple": attention(torch.zeros(4, 3, 8, dtype=torch.float16)),
+    }
+    block_tables = [
+        torch.zeros(2, 8, dtype=torch.int32),
+        torch.zeros(2, 8, dtype=torch.int32),
+    ]
+    ctx.initialize_from_forward_context(
+        kv_cache_config,
+        forward_context,
+        copy_funcs_by_type,
+        block_tables,
+    )
+
+    assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 1]
+    assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 3]
+    assert ctx.state_inner_sizes.tolist() == [8, 16, 8, 16, 8]
 
 
 def _run_gpu_postprocess(
@@ -541,6 +633,32 @@ def test_batch_memcpy_kernel(size_dtype: torch.dtype, num_bytes: int):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_warmup_batch_memcpy_kernel():
     assert worker_mamba_utils.warmup_batch_memcpy_kernel(torch.device("cuda:0"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_warmup_fused_postprocess_does_not_modify_state():
+    device = torch.device("cuda:0")
+    cfg = _TestConfig()
+    layer_names = ["layer_0"]
+    kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
+    _, _, conv_state, temporal_state, _, forward_context = _make_dual_layer_state(
+        cfg, device
+    )
+    block_table = torch.arange(
+        cfg.max_num_reqs * cfg.num_blocks,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(cfg.max_num_reqs, cfg.num_blocks)
+    gpu_ctx.initialize_from_forward_context(
+        kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
+    )
+    conv_before = conv_state.clone()
+    temporal_before = temporal_state.clone()
+
+    assert gpu_ctx.warmup_fused_postprocess()
+    assert torch.equal(conv_state, conv_before)
+    assert torch.equal(temporal_state, temporal_before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -689,9 +807,7 @@ class TestPostprocessMambaFusedKernel:
         torch.manual_seed(20260617)
 
         accepted = [1, 2, 3, 4, 5]
-        req_ids = [f"same_{i}" for i in accepted] + [
-            f"cross_{i}" for i in accepted
-        ]
+        req_ids = [f"same_{i}" for i in accepted] + [f"cross_{i}" for i in accepted]
         num_accepted_tokens = accepted + accepted
         # scheduled=5 and draft=4 gives running_state = computed + 1.
         num_scheduled_tokens = {req_id: 5 for req_id in req_ids}
@@ -742,9 +858,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
-        block_table_gpu = torch.zeros(
-            len(req_ids), 8, dtype=torch.int32, device=device
-        )
+        block_table_gpu = torch.zeros(len(req_ids), 8, dtype=torch.int32, device=device)
         for i, block_ids in enumerate(block_ids_per_req):
             block_table_gpu[i, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32, device=device

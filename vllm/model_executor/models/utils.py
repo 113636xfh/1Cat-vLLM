@@ -55,6 +55,7 @@ class WeightsMapper:
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
+            orig_to_new_regex={**self.orig_to_new_regex, **other.orig_to_new_regex},
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_stacked={
                 **self.orig_to_new_stacked,
@@ -242,7 +243,14 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            try:
+                weight_loader(param, weight_data)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Error loading weight {weight_qualname!r} "
+                    f"with checkpoint shape {tuple(weight_data.shape)} into "
+                    f"parameter shape {tuple(param.shape)}"
+                ) from exc
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 
@@ -374,6 +382,62 @@ class AutoWeightsLoader:
 
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
+
+
+def maybe_fuse_shared_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    n_routed_experts: int,
+    n_shared_experts: int,
+    ckpt_prefix: str = "mlp.shared_experts",
+    enabled: bool | None = None,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Route AITER fused-shared-expert weights into routed-expert slots.
+
+    CUDA leaves the input stream unchanged.  On ROCm, AITER can fuse shared
+    experts into the routed expert tensor; in that case split the checkpoint
+    tensor into the extra expert slots expected by ``RoutedExperts``.
+    """
+    if enabled is None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+    if not enabled:
+        yield from weights
+        return
+
+    prefix = f"{ckpt_prefix}."
+    for name, loaded_weight in weights:
+        if prefix not in name:
+            yield name, loaded_weight
+            continue
+
+        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
+        total = loaded_weight.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise ValueError(
+                f"FSE shared-expert weight {name!r} has size {total} along axis "
+                f"{split_dim}, not divisible by "
+                f"n_shared_experts={n_shared_experts}."
+            )
+        chunk = total // n_shared_experts
+        for shared_expert_idx in range(n_shared_experts):
+            chunk_slice = slice(
+                shared_expert_idx * chunk, (shared_expert_idx + 1) * chunk
+            )
+            if loaded_weight.ndim == 1:
+                chunk_weight = loaded_weight[chunk_slice]
+            elif split_dim == 0:
+                chunk_weight = loaded_weight[chunk_slice, :]
+            else:
+                chunk_weight = loaded_weight[:, chunk_slice]
+            yield (
+                name.replace(
+                    prefix,
+                    f"mlp.experts.{n_routed_experts + shared_expert_idx}.",
+                ),
+                chunk_weight,
+            )
 
 
 def init_vllm_registered_model(

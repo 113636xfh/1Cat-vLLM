@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native SM70 TurboMind NVFP4 MoE for validated expert shapes.
 
-The route keeps ModelOpt NVFP4 expert weights packed. It combines the
+The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the
 checkpoint's FP8 block scales with its explicit ModelOpt global scales once at
 load time, repacks both tensors for TurboMind, and never materializes an FP16
 expert-weight copy.
@@ -48,6 +48,92 @@ _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_TOKENS: Final = 10
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
+
+
+@triton.jit
+def _prepare_single_token_slots_kernel(
+    input_ptr,
+    topk_ids_ptr,
+    expanded_input_ptr,
+    active_expert_ids_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    slot = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < HIDDEN
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    tl.store(expanded_input_ptr + slot * HIDDEN + offsets, values, mask=mask)
+    expert_id = tl.load(topk_ids_ptr + slot)
+    tl.store(active_expert_ids_ptr + slot, expert_id.to(tl.int32))
+
+
+def _prepare_single_token_slots(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expanded_input: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    top_k = topk_ids.numel()
+    hidden = x.shape[1]
+    if x.shape[0] != 1 or tuple(topk_ids.shape) != (1, top_k):
+        raise ValueError("SM70 NVFP4 direct routing requires one input token.")
+    if tuple(expanded_input.shape) != (top_k, hidden):
+        raise ValueError("SM70 NVFP4 direct routing buffer shape mismatch.")
+    if active_expert_ids.numel() != top_k:
+        raise ValueError("SM70 NVFP4 direct expert-ID buffer shape mismatch.")
+    _prepare_single_token_slots_kernel[(top_k,)](
+        x,
+        topk_ids,
+        expanded_input,
+        active_expert_ids,
+        HIDDEN=hidden,
+        BLOCK=triton.next_power_of_2(hidden),
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _single_token_weighted_reduce_kernel(
+    expert_output_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < HIDDEN
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for slot in tl.static_range(0, TOP_K):
+        values = tl.load(
+            expert_output_ptr + slot * HIDDEN + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        weight = tl.load(topk_weights_ptr + slot)
+        acc += values.to(tl.float32) * weight
+    tl.store(output_ptr + offsets, acc, mask=mask)
+
+
+def _single_token_weighted_reduce(
+    expert_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    top_k, hidden = expert_output.shape
+    if tuple(topk_weights.shape) != (1, top_k) or tuple(output.shape) != (1, hidden):
+        raise ValueError("SM70 NVFP4 direct weighted-reduce shape mismatch.")
+    block = 256
+    _single_token_weighted_reduce_kernel[(triton.cdiv(hidden, block),)](
+        expert_output,
+        topk_weights,
+        output,
+        HIDDEN=hidden,
+        TOP_K=top_k,
+        BLOCK=block,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -405,7 +491,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer._nvfp4_sm70_dense_expert_ids = torch.arange(
             experts, dtype=torch.int32, device=device
         )
-        layer._nvfp4_sm70_compact_offsets = torch.empty(
+        layer._nvfp4_sm70_compact_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
         layer._nvfp4_sm70_active_expert_ids = torch.empty(
@@ -492,7 +578,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "sorted_row_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "topk_ids_for_sort": torch.empty(slots, dtype=torch.int32, device=device),
             "dense_expert_ids": layer._nvfp4_sm70_dense_expert_ids,
-            "compact_offsets": torch.empty(slots + 1, dtype=torch.int32, device=device),
+            "compact_offsets": torch.arange(
+                slots + 1, dtype=torch.int32, device=device
+            ),
             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
         }
 
@@ -550,31 +638,45 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             return x.new_empty((0, hidden))
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
-        output.zero_()
         slots = num_tokens * top_k
-        topk_ids_i32 = buffers["topk_ids"]
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
-        buffers["permuted_idx"].fill_(slots)
-        torch.ops._moe_C.moe_permute_with_scratch(
-            x,
-            topk_ids_i32,
-            buffers["token_expert_indices"],
-            layer.expert_map,
-            layer.global_num_experts,
-            layer.local_num_experts,
-            top_k,
-            buffers["permuted_input"],
-            buffers["expert_offsets64"],
-            buffers["inv_permuted_idx"],
-            buffers["permuted_idx"],
-            buffers["sort_workspace"],
-            buffers["permuted_experts_id"],
-            buffers["sorted_row_idx"],
-            buffers["topk_ids_for_sort"],
-        )
-        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+        direct_single_token = num_tokens == 1
+        if direct_single_token:
+            _prepare_single_token_slots(
+                x,
+                topk_ids,
+                buffers["permuted_input"],
+                buffers["active_expert_ids"],
+            )
+            stage_offsets = buffers["compact_offsets"]
+            stage_expert_ids = buffers["active_expert_ids"]
+            stage_experts = top_k
+        else:
+            output.zero_()
+            topk_ids_i32 = buffers["topk_ids"]
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
+            buffers["permuted_idx"].fill_(slots)
+            torch.ops._moe_C.moe_permute_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                top_k,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
+            buffers["expert_offsets"].copy_(
+                buffers["expert_offsets64"], non_blocking=True
+            )
 
-        if num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
+        if not direct_single_token and num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
             _prepare_compact_slot_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],
@@ -583,7 +685,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
-        else:
+        elif not direct_single_token:
             stage_offsets = buffers["expert_offsets"]
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
@@ -613,14 +715,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer.sm70_nvfp4_w2_n_dim,
             layer.sm70_nvfp4_group_size,
         )
-        torch.ops._moe_C.moe_unpermute(
-            buffers["sorted_output"],
-            topk_weights,
-            buffers["inv_permuted_idx"],
-            buffers["expert_offsets64"],
-            top_k,
-            output,
-        )
+        if direct_single_token:
+            _single_token_weighted_reduce(
+                buffers["sorted_output"], topk_weights, output
+            )
+        else:
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                buffers["expert_offsets64"],
+                top_k,
+                output,
+            )
         return output
 
     def apply_monolithic(

@@ -4,9 +4,7 @@
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm() or current_platform.is_xpu():
-    raise NotImplementedError(
-        "GLM-5.3-Flash currently supports NVIDIA SM90 and above only."
-    )
+    raise NotImplementedError("GLM-5.3-Flash currently supports NVIDIA CUDA only.")
 
 from .nvidia.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
 from .nvidia.mtp import Glm5NextMTP
