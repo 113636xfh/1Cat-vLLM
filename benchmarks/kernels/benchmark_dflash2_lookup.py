@@ -36,8 +36,7 @@ def _make_history(batch_size: int, context_len: int) -> UvaBuffer:
         history.cpu[row, match_start : match_start + suffix.numel()].copy_(suffix)
         history.cpu[
             row,
-            match_start
-            + suffix.numel() : match_start
+            match_start + suffix.numel() : match_start
             + suffix.numel()
             + continuation.numel(),
         ].copy_(continuation)
@@ -54,9 +53,7 @@ def _benchmark_case(
     device = torch.device("cuda")
     k, draft_block = 15, 7
     history = _make_history(batch_size, context_len)
-    total_len = torch.full(
-        (batch_size,), context_len, dtype=torch.int32, device=device
-    )
+    total_len = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
     idx_mapping = torch.arange(
         batch_size, dtype=torch.int32, device=device
     ).repeat_interleave(

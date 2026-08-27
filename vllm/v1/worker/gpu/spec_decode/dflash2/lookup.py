@@ -86,8 +86,7 @@ def _suffix_lookup_kernel(
                 match_len = tl.where(longer, match_len + 1, match_len)
             score = tl.where(
                 alive,
-                match_len.to(tl.int64) * _SCORE_STRIDE
-                + candidate_end.to(tl.int64),
+                match_len.to(tl.int64) * _SCORE_STRIDE + candidate_end.to(tl.int64),
                 -1,
             )
             best = tl.maximum(best, tl.max(score, axis=0))
@@ -155,24 +154,15 @@ def _fuse_draft_kernel(
     ).to(tl.int64)
 
     disagreement = (
-        (drafted != looked_up)
-        & (offsets < valid)
-        & (offsets < draft_block)
-        & mask
+        (drafted != looked_up) & (offsets < valid) & (offsets < draft_block) & mask
     )
-    agreement = tl.minimum(
-        tl.min(tl.where(disagreement, offsets, draft_block)), valid
-    )
+    agreement = tl.minimum(tl.min(tl.where(disagreement, offsets, draft_block)), valid)
     take_head = (match_len >= nstrong) | (
         (match_len >= nmin) & (agreement >= agree_min)
     )
     tail = offsets >= draft_block
-    take_tail = (match_len >= nmin_tail) & (
-        take_head | (agreement >= draft_block)
-    )
-    from_lookup = (
-        tl.where(tail, take_tail, take_head) & (offsets < valid) & mask
-    )
+    take_tail = (match_len >= nmin_tail) & (take_head | (agreement >= draft_block))
+    from_lookup = tl.where(tail, take_tail, take_head) & (offsets < valid) & mask
     tl.store(
         draft_tokens_ptr + req * draft_stride + offsets,
         looked_up,
@@ -183,9 +173,7 @@ def _fuse_draft_kernel(
     # block is replayed, including sticky transition steps without a match.
     use = (from_lookup | tail) & mask
     tl.store(use_ptr + req * k + offsets, use.to(tl.int32), mask=mask)
-    has_tail = (
-        (match_len >= long_min) & (valid > draft_block) & take_tail
-    )
+    has_tail = (match_len >= long_min) & (valid > draft_block) & take_tail
     tl.store(take_flags_ptr + req, has_tail.to(tl.int32))
     tl.atomic_add(hits_ptr, take_head.to(tl.int64))
 

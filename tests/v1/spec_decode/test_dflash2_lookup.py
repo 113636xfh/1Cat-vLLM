@@ -30,8 +30,7 @@ def _reference_lookup(
             match_len < nmax
             and candidate_end - match_len >= 0
             and suffix_end - match_len >= 0
-            and tokens[candidate_end - match_len]
-            == tokens[suffix_end - match_len]
+            and tokens[candidate_end - match_len] == tokens[suffix_end - match_len]
         ):
             match_len += 1
         if match_len >= nmin and (match_len, candidate_end) > best:
@@ -89,9 +88,7 @@ def test_suffix_lookup_matches_reference_and_supports_overlap(k: int) -> None:
 
 def test_suffix_lookup_honors_per_request_eligibility() -> None:
     device = torch.device("cuda")
-    all_ids = torch.tensor(
-        [[1, 2, 3, 4, 1, 2, 3, 0]], dtype=torch.int32, device=device
-    )
+    all_ids = torch.tensor([[1, 2, 3, 4, 1, 2, 3, 0]], dtype=torch.int32, device=device)
     total_len = torch.tensor([7], dtype=torch.int32, device=device)
     idx_mapping = torch.zeros(7, dtype=torch.int32, device=device)
     eligible = torch.zeros(1, dtype=torch.int32, device=device)

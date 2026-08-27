@@ -486,9 +486,7 @@ class DFlash2Speculator(DFlashSpeculator):
                 device=device,
             )
             self._lookup_take_flags = torch.zeros_like(self._lookup_match_len)
-            self._lookup_controller_flags = torch.zeros_like(
-                self._lookup_match_len
-            )
+            self._lookup_controller_flags = torch.zeros_like(self._lookup_match_len)
             self._lookup_hits = torch.zeros((), dtype=torch.int64, device=device)
             self._lookup_copy_stream = torch.cuda.Stream(device=device)
             self._lookup_copy_event = torch.cuda.Event()
@@ -664,9 +662,7 @@ class DFlash2Speculator(DFlashSpeculator):
             long_active=self._lookup_long_active,
         )
         width = (
-            self.num_speculative_steps
-            if self._lookup_long_active
-            else self.draft_block
+            self.num_speculative_steps if self._lookup_long_active else self.draft_block
         )
         reason = "strong-copy" if self._lookup_long_active else "adaptive-default"
         return self._record_lookup_width(width, reason)
@@ -688,11 +684,7 @@ class DFlash2Speculator(DFlashSpeculator):
         scores = scores.contiguous()
         candidate_ids = candidate_ids.contiguous()
         block_k = triton.next_power_of_2(self.selector_top_k)
-        walk_steps = (
-            self.draft_block - 1
-            if self._use_sm70_tail
-            else self.draft_block
-        )
+        walk_steps = self.draft_block - 1 if self._use_sm70_tail else self.draft_block
         _selector_walk_kernel[(num_reqs,)](
             scores,
             candidate_ids,
@@ -919,9 +911,7 @@ class DFlash2Speculator(DFlashSpeculator):
             return
         cached_scores = self._cached_candidate_scores
         block_k = triton.next_power_of_2(self.selector_top_k)
-        _point_mass_draft_logits_kernel[
-            (num_reqs * self.num_speculative_steps,)
-        ](
+        _point_mass_draft_logits_kernel[(num_reqs * self.num_speculative_steps,)](
             draft_logits,
             self._cached_candidate_ids,
             self._selector_scores if cached_scores is None else cached_scores,

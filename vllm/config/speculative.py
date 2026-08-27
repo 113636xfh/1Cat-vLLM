@@ -88,12 +88,9 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     Lookup-augmented DFlash2 may hand a wider proposal to the target, but its
     model/convolutions must retain the block size used during training.
     """
-    verify_tokens = int(
-        getattr(speculative_config, "num_speculative_tokens", 0) or 0
-    )
-    if (
-        getattr(speculative_config, "method", None) != "dflash"
-        or not getattr(speculative_config, "ngram_assist", False)
+    verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    if getattr(speculative_config, "method", None) != "dflash" or not getattr(
+        speculative_config, "ngram_assist", False
     ):
         return verify_tokens
 
@@ -109,9 +106,7 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
 
 def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     """Whether DFlash2 can switch between model and augmented widths."""
-    verify_tokens = int(
-        getattr(speculative_config, "num_speculative_tokens", 0) or 0
-    )
+    verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
     return (
         getattr(speculative_config, "method", None) == "dflash"
         and bool(getattr(speculative_config, "ngram_assist", False))
