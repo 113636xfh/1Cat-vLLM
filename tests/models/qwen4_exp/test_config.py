@@ -102,7 +102,7 @@ def test_qwen4_exp_defaults_to_v2_even_when_quantized_moe(
     assert VllmConfig._is_default_v2_model_runner_model(vllm_config)
 
 
-def test_initial_sm70_v2_route_rejects_speculative_decode(
+def test_initial_sm70_v2_route_accepts_native_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -124,7 +124,32 @@ def test_initial_sm70_v2_route_rejects_speculative_decode(
         speculative_config=SimpleNamespace(method="mtp"),
     )
 
-    with pytest.raises(NotImplementedError, match="initial SM70 V2 route"):
+    Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_initial_sm70_v2_route_rejects_unvalidated_speculator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        Qwen3_5ForConditionalGenerationConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                hc_count=4,
+                ple_layer_ids=[2],
+                indexer_n_heads=4,
+            ),
+            multimodal_config=None,
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    with pytest.raises(NotImplementedError, match="supports only its native MTP"):
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
