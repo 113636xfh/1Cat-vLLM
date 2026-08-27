@@ -105,6 +105,29 @@ _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
+def _warmup_sm70_qwen_gdn_causal_conv1d(
+    forward_context: dict[str, object],
+) -> bool:
+    """Warm one bound Qwen GDN layer using its production cache layout.
+
+    MRV2 owns the cache on the modules registered in ``forward_context``.
+    Scanning ``model.modules()`` therefore misses the bound cache and leaves
+    the non-speculative causal-conv variant to JIT on the first structured
+    request.
+    """
+    if (
+        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
+        or not current_platform.is_device_capability(70)
+    ):
+        return False
+
+    for layer in forward_context.values():
+        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
+        if warmup is not None and warmup():
+            return True
+    return False
+
+
 @triton.jit
 def _sm70_pack_qwen_gdn_qkv_kernel(
     mixed_qkv,
@@ -2374,7 +2397,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _sm70_gdn_rmsnorm_onepass_enabled()
             and current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
-            and self.hidden_size == 5120
+            and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
             and self.num_v_heads == 48
             and self.head_v_dim == 128
@@ -2383,7 +2406,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_sm70_gdn_qpn8_ba_split = (
             current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
-            and self.hidden_size == 5120
+            and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
             and self.num_v_heads == 48
             and self.head_v_dim == 128
@@ -7127,6 +7150,9 @@ def _sm70_gdn_qpn8_ba_weight_contract(
     qkvz_weight = getattr(qkvz, "weight", None)
     qkvz_scales = getattr(qkvz, "weight_scale_inv", None)
     ba_weight = getattr(ba, "weight", None) if ba is not None else None
+    input_width = (
+        int(qkvz_weight.shape[0]) if isinstance(qkvz_weight, torch.Tensor) else 0
+    )
     return bool(
         self.enable_sm70_gdn_qpn8_ba_split
         and ba is not None
@@ -7134,7 +7160,8 @@ def _sm70_gdn_qpn8_ba_weight_contract(
         and int(getattr(qkvz, "sm70_fp8_prefill_exact_dense_workspace_ptr", 0)) > 0
         and isinstance(qkvz_weight, torch.Tensor)
         and qkvz_weight.dtype == torch.uint8
-        and qkvz_weight.shape == (5120, 4096)
+        and input_width in (2560, 5120)
+        and qkvz_weight.shape == (input_width, 4096)
         and qkvz_weight.is_contiguous()
         and isinstance(qkvz_scales, torch.Tensor)
         and qkvz_scales.dtype == torch.float16
@@ -7142,7 +7169,7 @@ def _sm70_gdn_qpn8_ba_weight_contract(
         and qkvz_scales.is_contiguous()
         and isinstance(ba_weight, torch.Tensor)
         and ba_weight.dtype == torch.float16
-        and ba_weight.shape == (24, 5120)
+        and ba_weight.shape == (24, input_width)
         and ba_weight.is_contiguous()
         and qkvz_weight.device == qkvz_scales.device == ba_weight.device
         and getattr(qkvz, "bias", None) is None
@@ -7166,7 +7193,7 @@ def _sm70_gdn_qpn8_ba_dispatch_eligible(
         and hidden_states.is_cuda
         and hidden_states.dtype == torch.float16
         and hidden_states.ndim == 2
-        and hidden_states.shape[1] == 5120
+        and hidden_states.shape[1] == self.in_proj_qkvz.weight.shape[0]
         and hidden_states.is_contiguous()
         and hidden_states.device == qkvz.weight.device == ba.weight.device
     )
@@ -7229,7 +7256,7 @@ def qwen_gdn_input_projection_core(
             self.in_proj_ba.weight,
         )
         _log_runtime_route_once(
-            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+            "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         z = z_out
     else:
@@ -7337,7 +7364,7 @@ def qwen_gdn_input_projection(
             self.in_proj_ba.weight,
         )
         _log_runtime_route_once(
-            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+            "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         return
 
