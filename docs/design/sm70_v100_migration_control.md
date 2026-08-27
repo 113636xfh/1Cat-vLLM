@@ -43750,3 +43750,131 @@ Interpretation:
   occurs once after loading; capture and per-token execution perform no packing.
   The retained buffers add 549.66 MiB without pipeline parallelism, or at most
   282.34 MiB per rank for the audited PP2 partition.
+
+## 2026-08-26 DeepSeek V4 PP2 x TP4 100-token/s continuation
+
+- The active target is single-request pure decode on eight V100s, PP2 x TP4,
+  CUDA Graph enabled, no speculative decoding and no DSpark. The acceptance
+  target remains `100 token/s` (`10 ms/token`) with matched model, quantization,
+  GPU/rank layout, input/output lengths, sampling, attention, KV-cache and
+  graph state. Prefill and TTFT are reported separately. The pinned quality
+  baseline remains coherent and scores GSM8K `63/64`. A narrowly bounded
+  operator may default on after graph, numerical and source gates pass, with
+  an explicit rollback; it is not reported as an endpoint gain until a matched
+  full-model benchmark exists.
+- The latest usable endpoint before the current queued stack is source
+  `089feeae7241daaaf7ccb2a4fb2a821925be5350`: QPN8-off records
+  `68.279 token/s`, and QPN8-on records a three-repeat median
+  `69.287 token/s` (`14.433 ms/token`). The corresponding coherent aggregate
+  quality observations are retained as controls. The earlier direct-order
+  `69.949 token/s` run is rejected because mutable compact offsets produced
+  incoherent output; the repaired route reads immutable slot offsets.
+- The first exact combined stack at source
+  `6abbed64a95dd2e27e8a1daeb10118db926d857b` now closes its matched
+  endpoint and aggregate-quality run. Direct top-6/order, QPN8 including
+  WQA, static PP transfer, TP4 push all-reduce, fused Q/KV normalization,
+  MXFP4 exponent fold and joined FP16 auxiliaries are enabled; speculation,
+  DSpark and FP8 prescaling are disabled. Three 1024+256 pure-decode repeats
+  measure `72.372`, `72.353` and `72.381 token/s`, with median TPOT
+  `13.817 ms` and population standard deviation `0.0117 token/s`. All three
+  output-token hashes are identical. The Chinese smoke is coherent and
+  GSM8K-64 scores `62/64` with zero invalid answers, matching the preceding
+  accepted exact-stack observation and remaining one item below the pinned
+  `63/64` baseline. This is the new accepted speed endpoint, but it misses
+  the 100-token/s target by `27.628 token/s`. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-qpn8-exact-combined-fullmodel-20260826-r1/`.
+- The latest 26-step Nsight Systems trace measures a `16.535 ms` wall replay
+  interval. Excluding PP dependency waits, stage-sum service is led by FP8
+  dense GEMMs `5.814 ms`, MXFP4 MoE `2.629 ms`, FP16 GEMV/compressor
+  `2.554 ms`, mHC `1.693 ms`, routing/activation `1.665 ms`, Q/KV work
+  `1.190 ms`, sparse MLA `1.103 ms`, TP all-reduce `0.745 ms`, and
+  LM-head/sample `0.415 ms`. The PP send/feedback rows are synchronization
+  residency, not additive transfer cost; actual payload kernels are only tens
+  of microseconds. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-exact-stack-nsys-20260826-r1/`.
+- A no-copy MXFP4 QPN prototype consumes the existing TurboMind E2M1/UE8M0
+  pack directly. On real layer-0 TP4-rank-0 weights, W13 split-16/one-chain
+  plus W2 split-8/one-chain moves the W13--SwiGLU--W2 pipeline from
+  `51.299` to `37.934 us`, is CUDA-Graph stable, and is bitwise for the timing
+  input. Its 40-layer service projection is `0.535 ms/token`, not endpoint
+  TPOT. Full endpoint, three-repeat pure decode and GSM8K-64 remain pidfd
+  queued under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-tm-qpn-exact-combined-fullmodel-20260826-r1/`.
+- The same no-copy kernel now defaults on under the exact B1 direct-order TP4
+  six-route W13/W2 tensor contract; all other calls keep the existing
+  TurboMind dense-stage path. `VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE=0` is the
+  rollback. A loaded older extension without the new operator falls back when
+  the default is implicit, while explicit `=1` fails closed. A clean SM70 AOT
+  build produces only `sm_70` cubins with extension SHA256
+  `9781c406cbd3cb38261df7be721bd8a7325e1f4cace6a06b6bb63014f5809507`.
+  The split-8 and split-16 kernels each use 56 registers and respectively
+  1 KiB and 2 KiB shared memory. Worktree-source/new-extension binding and
+  the focused MXFP4 plus FP8-QPN compatibility suites pass (`41 passed`).
+  The selected operator pipeline is bitwise and graph-stable; no unmatched
+  operator projection is relabeled as a full-model speed result.
+- The exact FP16 auxiliary candidate joins the C4 `N=2048`, `N=512` and
+  `N=64` projections into one `N=2624` launch while preserving their original
+  FP32 FMA and reduction order. All joined outputs and the concurrent main
+  projection are bitwise across 64 changing inputs. Relative to the old FP16
+  three-stream path, warm four-stream overlap moves `103.809` to
+  `51.639 us/C4 layer`; a real-V100 graph test, driver-free SM70 compile gate
+  and the combined endpoint quality gate pass. It is not ported to the newer
+  private source because that source already defaults to packed-FP13: the
+  three-stream FP13 path measures `50.879 us` warm and `70.072 us` cold,
+  versus `51.639 us` and `73.856 us` for joined exact FP16. Joined FP13 is
+  also slightly slower than three-stream FP13. Spending another 20.5 MiB per
+  C4 layer for a slower current-source route is rejected.
+- The previously excluded shared-expert gate/up role was re-audited without
+  the unsafe fused-SiLU epilogue. The exact production semantics are full
+  `K4096/N1024` gate/up followed by `SiluAndMulWithClamp(10)`. Non-fused QPN8
+  split-32/two-chain plus the identical clamp moves `62.299` to `11.582 us`
+  (`5.38x`) on real weights. Two low-scale patterns are bitwise after clamp;
+  the remaining patterns retain at least `99.609%` exact FP16 elements with
+  maximum relative L2 `4.63e-6`. The exact tensor-role route now defaults on,
+  retains the external production activation, and does not inspect model or
+  checkpoint identity. `VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE=0` is the
+  rollback. A matched endpoint remains useful for attribution, but the
+  operator result is not presented as an endpoint-speed measurement.
+- Sparse-MLA long-context decay is now directly quantified. With the current
+  exact `BLOCK_K=16`, one C128 layer measures `12.43 us` at 1K context,
+  `18.37 us` at 64K, `26.98 us` at 128K, `42.40 us` at 256K,
+  `85.63 us` at 512K and `168.74 us` at 1M. `BLOCK_K=32/64` is slower at every
+  tested context and changes roughly 36--44% of FP16 elements; `BLOCK_K=8`
+  is not a valid Triton dot shape. Dynamic larger-K selection is rejected.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-sparse-mla-blockk-screen-20260826-r1/`.
+- Grouping two independent 64-D value tiles per CTA is bitwise, but its gain is
+  only `1.25%` at C4, `0.78%` at 64K and `1.21%` at 1M, while SWA and 1K
+  regress; four/eight-tile waves regress further. The D-wave source candidate
+  is therefore not retained. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-sparse-mla-dwave-screen-20260826-r1/`.
+- A primary-source long-context review confirms that generic Flash-Decoding
+  is not a missing route: the official FlashAttention inference path splits
+  KV sequence loading across CTAs and combines online-softmax partials, while
+  FlashInfer sizes KV chunks against available SM work. The current V4 SM70
+  decode kernel already implements the same structure with direct FP8 paged
+  loads, 16-token partial max/sum/accumulators and a separate reduction.
+  Local K32/K64 and D-wave results therefore reject a blind copy of either
+  generic scheduler. The next long-context trace must separate QK tiles,
+  score reduction, value tiles and final reduction. Only if the merge or SM
+  tail is dominant should a LeanAttention-style hierarchical stream-K merge
+  be screened above a long-context threshold; TP4-local decode-context
+  partitioning over NVLink is the alternative when KV bandwidth dominates.
+  Primary references are the
+  [FlashAttention inference implementation](https://github.com/Dao-AILab/flash-attention/blob/main/README.md),
+  [FlashInfer scheduler](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/scheduler.cuh),
+  [FlashInfer paper](https://arxiv.org/abs/2501.01005), and
+  [LeanAttention paper](https://arxiv.org/abs/2405.10480).
+- The next bounded MoE screen replaces the historical nondeterministic FP16
+  atomic weighted epilogue with one CTA per W2 `N=32` tile. It rounds each
+  route result to FP16, then performs the same fixed route-order FP32 FMA as
+  the standalone reducer. The SM70 AOT build passes; the exclusive-V100
+  bitwise/performance screen is queued only after the full-model A/B pair.
+  No production source or default changes are admitted from this build-only
+  result.
+- Shared-machine GPU ownership remains fail-closed: benchmarks wait on pidfds,
+  claim only genuinely idle cards, never terminate unrelated processes, and
+  release claims immediately after bounded tests. Development and any Draft
+  PR for this continuation use the private remote and the isolated branch
+  `agent/private-v100-dsv4-pp2tp4-100tps-20260826`; public upstream is
+  fetch-only for this work.

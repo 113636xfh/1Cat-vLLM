@@ -485,6 +485,10 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     int64_t num_experts, int64_t k, int64_t n,
                                     int64_t group_size);
 
+void mxfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weights, torch::Tensor scales,
+                               torch::Tensor expert_ids, bool broadcast_input);
+
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,
                                     torch::Tensor dense_expert_ids,
