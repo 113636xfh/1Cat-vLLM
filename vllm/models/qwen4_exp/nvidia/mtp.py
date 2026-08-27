@@ -116,6 +116,28 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+def _validate_mtp_expert_weights_loaded(
+    model: nn.Module,
+    loaded_weights: set[str],
+) -> None:
+    """Reject a silently incomplete Qwen4Exp MTP routed-expert load."""
+
+    required_suffixes = (
+        ".mlp.experts.w13_weight",
+        ".mlp.experts.w2_weight",
+    )
+    required = {
+        name for name, _ in model.named_parameters() if name.endswith(required_suffixes)
+    }
+    missing = required - loaded_weights
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        raise ValueError(
+            "Qwen4Exp MTP routed-expert checkpoint weights were not loaded: "
+            f"{missing_names}. Check fused/per-expert checkpoint mappings."
+        )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -459,7 +481,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names())
+        loaded_weights = loader.load_weights(remap_weight_names())
+        _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        return loaded_weights
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

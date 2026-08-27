@@ -13,6 +13,7 @@ from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpSparseMoeBlock,
     _remap_qsa_cache_scale_name,
 )
+from vllm.models.qwen4_exp.nvidia.mtp import _validate_mtp_expert_weights_loaded
 
 
 @pytest.mark.parametrize(
@@ -222,6 +223,24 @@ def test_fused_mtp_expert_checkpoint_loads_every_expert() -> None:
     torch.testing.assert_close(experts.calls[3][3], gate_up[1, 3:])
     torch.testing.assert_close(experts.calls[4][3], down[0])
     torch.testing.assert_close(experts.calls[5][3], down[1])
+
+
+def test_mtp_expert_loading_fails_closed() -> None:
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].mlp = nn.Module()
+    model.model.layers[0].mlp.experts = nn.Module()
+    experts = model.model.layers[0].mlp.experts
+    experts.w13_weight = nn.Parameter(torch.empty(1))
+    experts.w2_weight = nn.Parameter(torch.empty(1))
+
+    w13_name = "model.layers.0.mlp.experts.w13_weight"
+    w2_name = "model.layers.0.mlp.experts.w2_weight"
+    _validate_mtp_expert_weights_loaded(model, {w13_name, w2_name})
+
+    with pytest.raises(ValueError, match="w2_weight"):
+        _validate_mtp_expert_weights_loaded(model, {w13_name})
 
 
 @pytest.mark.parametrize(
