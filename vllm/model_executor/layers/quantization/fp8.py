@@ -132,25 +132,25 @@ _SM70_FP8_QPN8_EXTRA_SHAPES = {
     "qkv_proj": (5120, 3584),
 }
 _SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
-    # Accuracy-first real-weight schedules: (K, N, fused gated-SiLU) maps to
-    # (split-K, accumulator chains, prefetch codes). The shared-expert gate/up
-    # projection is deliberately absent after its four-pattern comparison
-    # matched only 53.5--60.9% of TurboMind FP16 elements.
-    (4096, 1536, False): (16, 1, True),
-    (1024, 8192, False): (4, 1, False),
-    (2048, 4096, False): (8, 2, False),
-    (4096, 1024, False): (16, 1, True),
-    (512, 4096, False): (4, 1, False),
+    # Real-weight speed winners remain numerically bounded for every admitted
+    # projection. Shared-expert gate/up may use K4096/N1024 only through its
+    # separately gated non-fused contract; its fused activation remains unsafe.
+    (4096, 1536, False): (32, 2, False),
+    (1024, 8192, False): (8, 2, False),
+    (2048, 4096, False): (16, 2, False),
+    (4096, 1024, False): (32, 2, False),
+    (512, 4096, False): (16, 2, False),
 }
 _SM70_FP8_QPN8_PP2_TP4_SHAPES = {
-    # Operator role: accepted (layer TP size, K, N) tuples. The shared-expert
-    # gate/up projection is excluded by numerical evidence. The replicated
-    # indexer wq_b is excluded by TP size: its long-prefill work may overlap
-    # the main wq_b and cannot share one dense fallback workspace.
+    # Operator role: accepted (layer TP size, K, N) tuples. Gate/up has an
+    # additional exact shared-expert and explicit opt-in check below. The
+    # replicated indexer wq_b is excluded by TP size: its long-prefill work
+    # may overlap the main wq_b and cannot share one dense fallback workspace.
     "fused_wqa_wkv": {(1, 4096, 1536)},
     "wq_b": {(4, 1024, 8192)},
     "wo_b": {(4, 2048, 4096)},
     "down_proj": {(4, 512, 4096)},
+    "gate_up_proj": {(4, 4096, 1024)},
 }
 _SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS = max(
     k * n for k, n, _ in _SM70_FP8_QPN8_PP2_TP4_CONFIGS
@@ -169,8 +169,22 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] 
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
-def _is_sm70_dsv4_fp8_prescaled_decode_layer(layer: torch.nn.Module) -> bool:
-    """Admit only the replicated V4 fused WQA/WKV block-FP8 projection."""
+def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
+    """Match the exact PP2 x TP4 shared-expert gate/up tensor."""
+    prefix = str(getattr(layer, "prefix", ""))
+    return bool(
+        prefix.endswith(".shared_experts.gate_up_proj")
+        and int(getattr(layer, "tp_size", 1)) == 4
+        and getattr(layer, "weight_block_size", None) == [128, 128]
+        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
+        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
+        and getattr(layer, "output_partition_sizes", None) == [512, 512]
+        and tuple(layer.weight.shape) == (1024, 4096)
+    )
+
+
+def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
+    """Admit only the measured replicated fused WQA/WKV tensor contract."""
     return bool(
         getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "fused_wqa_wkv"
         and int(getattr(layer, "tp_size", 1)) == 1
@@ -181,7 +195,7 @@ def _is_sm70_dsv4_fp8_prescaled_decode_layer(layer: torch.nn.Module) -> bool:
     )
 
 
-def _is_sm70_dsv4_fp8_prescaled_decode_runtime_contract() -> bool:
+def _is_sm70_fp8_prescaled_m1_decode_runtime_contract() -> bool:
     """Require the measured PP2 x TP4 no-spec single-request decode lane."""
     vllm_config = get_current_vllm_config()
     parallel_config = vllm_config.parallel_config
@@ -194,6 +208,20 @@ def _is_sm70_dsv4_fp8_prescaled_decode_runtime_contract() -> bool:
         and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
         and getattr(vllm_config, "speculative_config", None) is None
     )
+
+
+def _try_sm70_fp8_prescaled_decode_scales(
+    scales: torch.Tensor,
+) -> torch.Tensor | None:
+    """Prescale only when the FP16 exponent shift is finite and reversible."""
+    if scales.dtype != torch.float16 or not bool(torch.all(scales >= 0).item()):
+        return None
+    prescaled = scales.mul(256)
+    if not bool(torch.isfinite(prescaled).all().item()):
+        return None
+    if not torch.equal(prescaled.mul(1.0 / 256.0), scales):
+        return None
+    return prescaled
 
 
 def _is_sm70_fp8_exact_8k_prefill_layer(layer: torch.nn.Module) -> bool:
@@ -286,6 +314,13 @@ def _is_sm70_fp8_qpn8_pp2_tp4_runtime_contract() -> bool:
     )
 
 
+def _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(
+    layer: torch.nn.Module,
+) -> bool:
+    """Match only the measured non-fused shared-expert gate/up tensor."""
+    return _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
+
+
 def _sm70_fp8_qpn8_pp2_tp4_config(
     layer: torch.nn.Module, *, gated_silu: bool
 ) -> tuple[int, int, bool] | None:
@@ -293,6 +328,12 @@ def _sm70_fp8_qpn8_pp2_tp4_config(
     if getattr(layer, "weight_block_size", None) != [128, 128]:
         return None
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    if suffix == "gate_up_proj" and (
+        gated_silu
+        or not envs.VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE
+        or not _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+    ):
+        return None
     accepted = _SM70_FP8_QPN8_PP2_TP4_SHAPES.get(suffix)
     if accepted is None:
         return None
@@ -866,7 +907,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         )
                     if missing_ops:
                         logger.warning_once(
-                            "The default SM70 PP2 x TP4 QPN8 route is unavailable "
+                            "The requested SM70 PP2 x TP4 QPN8 route is unavailable "
                             "in the loaded vllm._C; retaining TurboMind FP8."
                         )
                     workspace = (
@@ -1014,6 +1055,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 or (generic_qpn8_candidate and _is_sm70_fp8_qpn8_runtime_contract())
             )
+            nonfused_shared_gate = bool(
+                pp2_tp4_qpn8_candidate
+                and qpn8_runtime
+                and _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(layer)
+            )
+            if nonfused_shared_gate:
+                use_gated_silu = False
             if qpn8_candidate_layer and not qpn8_runtime:
                 logger.info_once(
                     "The SM70 FP8 QPN8 route retains TurboMind unless its "
@@ -1035,6 +1083,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     explicitly_enabled = (
                         os.getenv("VLLM_SM70_FP8_QPN8") == "1"
                         or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4") == "1"
+                        or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE") == "1"
                     )
                     if explicitly_enabled:
                         raise RuntimeError(
@@ -1042,7 +1091,7 @@ class Fp8LinearMethod(LinearMethodBase):
                             f"source-built operators; missing: {missing_ops}."
                         )
                     logger.warning_once(
-                        "The default SM70 FP8 QPN8 route is unavailable in "
+                        "The requested SM70 FP8 QPN8 route is unavailable in "
                         "the loaded vllm._C; retaining the TurboMind layout."
                     )
 
@@ -1095,6 +1144,11 @@ class Fp8LinearMethod(LinearMethodBase):
                             "Default SM70 QPN8 enabled for the validated "
                             "serialized PP2 x TP4 operator contract."
                         )
+                        if nonfused_shared_gate:
+                            logger.info_once(
+                                "Default SM70 QPN8 shared-expert gate/up route "
+                                "enabled with its external activation retained."
+                            )
                     else:
                         logger.info_once(
                             "Memory-neutral SM70 FP8 QPN8 path enabled for "
@@ -1107,11 +1161,28 @@ class Fp8LinearMethod(LinearMethodBase):
                         "workspace; retaining the TurboMind layout."
                     )
 
-            use_dsv4_prescaled_decode = bool(
-                envs.VLLM_SM70_DSV4_FP8_PRESCALED_DECODE
+            prescaled_decode_requested = envs.VLLM_SM70_FP8_PRESCALED_M1_DECODE
+            prescaled_decode_explicit = (
+                os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE") == "1"
+            )
+            prescaled_decode_layer = _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+            prescaled_decode_runtime = bool(
+                prescaled_decode_layer
+                and _is_sm70_fp8_prescaled_m1_decode_runtime_contract()
+            )
+            if (
+                prescaled_decode_explicit
+                and prescaled_decode_layer
+                and not (self.is_scale_e8m0 and prescaled_decode_runtime)
+            ):
+                raise RuntimeError(
+                    "Explicit SM70 FP8 prescaled decode requires UE8M0 128x128 "
+                    "scales and the PP2 x TP4 no-spec single-request contract."
+                )
+            use_prescaled_m1_decode = bool(
+                prescaled_decode_requested
                 and self.is_scale_e8m0
-                and _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
-                and _is_sm70_dsv4_fp8_prescaled_decode_runtime_contract()
+                and prescaled_decode_runtime
             )
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
@@ -1140,23 +1211,36 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
-            if use_dsv4_prescaled_decode:
-                if not hasattr(
-                    torch.ops._C, "fp8_gemm_sm70_prefill_prescaled_out"
-                ):
+            if use_prescaled_m1_decode:
+                has_prescaled_op = hasattr(
+                    torch.ops._C, "fp8_gemm_sm70_prescaled_m1_out"
+                )
+                prescaled_scales = (
+                    _try_sm70_fp8_prescaled_decode_scales(tm_scales)
+                    if has_prescaled_op
+                    else None
+                )
+                if prescaled_scales is None and prescaled_decode_explicit:
                     raise RuntimeError(
-                        "VLLM_SM70_DSV4_FP8_PRESCALED_DECODE=1 requires the "
-                        "source-built SM70 prescaled FP8 operator."
+                        "Explicit SM70 FP8 prescaled decode requires the "
+                        "source-built operator and finite, reversible FP16 "
+                        "scales after the 256x exponent shift."
                     )
-                layer.register_buffer(
-                    "sm70_fp8_decode_prescaled_scales",
-                    tm_scales.mul(256),
-                    persistent=False,
-                )
-                logger.info_once(
-                    "Exact SM70 DeepSeek V4 fused-WQA/WKV prescaled decode "
-                    "path enabled."
-                )
+                if prescaled_scales is None:
+                    logger.warning_once(
+                        "SM70 FP8 prescaled decode is unavailable for the "
+                        "loaded extension or scale range; retaining the "
+                        "ordinary TurboMind transform."
+                    )
+                else:
+                    layer.register_buffer(
+                        "sm70_fp8_decode_prescaled_scales",
+                        prescaled_scales,
+                        persistent=False,
+                    )
+                    logger.info_once(
+                        "Exact SM70 fused-WQA/WKV prescaled decode path enabled."
+                    )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
                 and envs.VLLM_SM70_FP8_PREFILL_PRESCALED
@@ -1460,10 +1544,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if (
                 decode_prescaled_scales is not None
-                and envs.VLLM_SM70_DSV4_FP8_PRESCALED_DECODE
+                and envs.VLLM_SM70_FP8_PRESCALED_M1_DECODE
                 and x_2d.shape[0] == 1
             ):
-                sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                sm70_ops.fp8_gemm_sm70_prescaled_m1_out(
                     out_2d,
                     x_2d,
                     layer.weight,

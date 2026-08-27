@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     _sm70_dflash2_dense_order_topk,
     _sm70_dflash2_rerank_output_buffers,
+    _sm70_dflash2_use_dense_order,
 )
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
@@ -63,8 +64,8 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
-        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY",
         "VLLM_SM70_DFLASH2_QPN8_RERANK",
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
         "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
@@ -83,6 +84,19 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     envs.disable_envs_cache()
     try:
         assert not any(getattr(envs, name) for name in names)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_dflash2_grouped_verify_is_default_on_with_rollback(monkeypatch):
+    name = "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
     finally:
         envs.disable_envs_cache()
 
@@ -343,6 +357,7 @@ def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
         self.max_num_reqs = 2
         self.num_query_per_req = 8
         self.num_speculative_steps = 7
+        self.draft_block = 7
         self.vocab_size = 31
         self.draft_tokens = torch.empty((2, 7), dtype=torch.int64, device=device)
         self.draft_logits = draft_logits
@@ -927,6 +942,23 @@ def test_qpn8_rerank_restores_dense_vocab_tie_order():
     assert torch.equal(actual_ids, expected_ids + vocab_start)
 
 
+def test_qpn8_candidate_order_requires_explicit_experimental_opt_in(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", False)
+    monkeypatch.setattr(
+        envs,
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
+        False,
+    )
+    assert _sm70_dflash2_use_dense_order()
+
+    monkeypatch.setattr(
+        envs,
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
+        True,
+    )
+    assert not _sm70_dflash2_use_dense_order()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("selector_k", [16, 20])
 @pytest.mark.parametrize("num_rows", [1, 7, 8])
@@ -1115,6 +1147,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator.max_model_len = 256
     speculator.num_query_per_req = 8
     speculator.num_speculative_steps = 7
+    speculator.draft_block = 7
     speculator.max_num_reqs = 1
     speculator.max_num_tokens = 8
     speculator.hidden_states = torch.zeros(8, 3)

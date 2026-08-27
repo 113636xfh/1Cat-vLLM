@@ -47,7 +47,12 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
-from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .speculative import (
+    EagleModelTypes,
+    NgramGPUTypes,
+    SpeculativeConfig,
+    uses_adaptive_dflash_lookup,
+)
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -66,7 +71,15 @@ else:
 
 logger = init_logger(__name__)
 
-DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+    {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
@@ -693,10 +706,17 @@ class VllmConfig:
             return False
 
         architectures = getattr(model_config, "architectures", [])
-        if not any(
+        is_default_v2_architecture = any(
             arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures
-        ):
+        )
+        if not is_default_v2_architecture:
             return False
+
+        # Qwen4Exp is a hybrid MoE model whose QSA ring cache and PLE raw-token
+        # inputs are implemented by Model Runner V2. Its quantized checkpoint
+        # is therefore an explicit V2 route rather than a generic fallback.
+        if any(arch.startswith("Qwen4ExpFor") for arch in architectures):
+            return True
 
         return not model_config.is_moe and not model_config.is_quantized
 
@@ -1110,11 +1130,23 @@ class VllmConfig:
             and self.speculative_config.use_dflash_ddtree()
             and not self.speculative_config.ddtree_disable_tree_verify
         )
+        adaptive_dflash_lookup = bool(
+            self.speculative_config is not None
+            and uses_adaptive_dflash_lookup(self.speculative_config)
+            and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
+            if adaptive_dflash_lookup:
+                raise ValueError(
+                    "Async scheduling fixes the DFlash2 proposal width at its "
+                    "configured maximum and is incompatible with adaptive q8/q16 "
+                    "lookup verification. Disable async scheduling or set "
+                    "VLLM_DFLASH2_LOOKUP_ADAPTIVE=0 to use fixed q16 verification."
+                )
             if dflash_ddtree_tree_verify:
                 raise ValueError(
                     "Async scheduling is not compatible with dflash_ddtree "
@@ -1151,6 +1183,13 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif adaptive_dflash_lookup:
+                logger.warning_once(
+                    "Disabling asynchronous scheduling because adaptive DFlash2 "
+                    "lookup verification must return a per-step q8/q16 width to "
+                    "the scheduler."
                 )
                 self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:

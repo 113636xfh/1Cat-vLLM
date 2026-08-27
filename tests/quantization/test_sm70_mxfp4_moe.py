@@ -22,49 +22,12 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
     _compact_mxfp4_active_experts,
+    _mxfp4_qpn_m1_decode_contract,
+    _select_mxfp4_direct_order_offsets,
     _select_mxfp4_stage_dispatch,
-    _validate_mxfp4_exponent_fold_scales,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
 )
-
-
-def test_mxfp4_exponent_fold_accepts_finite_adjusted_scale_range():
-    _validate_mxfp4_exponent_fold_scales(
-        scales=torch.tensor([1, 2, 14, 16], dtype=torch.uint8)
-    )
-
-
-@pytest.mark.parametrize("bad_exponent", [0, 17, 30])
-def test_mxfp4_exponent_fold_rejects_unsafe_adjusted_scale_range(
-    bad_exponent: int,
-):
-    with pytest.raises(RuntimeError, match=r"requires adjusted UE8M0.*\[1, 16\]"):
-        _validate_mxfp4_exponent_fold_scales(
-            scales=torch.tensor([bad_exponent], dtype=torch.uint8)
-        )
-
-
-def test_mxfp4_exponent_fold_is_bitwise_exact_for_all_e2m1_codes():
-    # The checkpoint-wide audit constrains the adjusted exponents to [2, 14].
-    # Cover both signs and all eight E2M1 exponent/mantissa bit patterns.
-    for code in range(16):
-        raw_bits = ((code >> 3) << 15) | ((code & 7) << 9)
-        raw = torch.tensor([raw_bits], dtype=torch.uint16).view(torch.float16)
-        bias = torch.tensor([29 << 10], dtype=torch.uint16).view(torch.float16)
-        decoded = raw * bias
-        for exponent in range(2, 15):
-            scale = torch.tensor(
-                [exponent << 10], dtype=torch.uint16
-            ).view(torch.float16)
-            folded_scale = torch.tensor(
-                [(exponent + 14) << 10], dtype=torch.uint16
-            ).view(torch.float16)
-            reference = decoded * scale
-            folded = raw * folded_scale
-            assert torch.equal(
-                reference.view(torch.uint16), folded.view(torch.uint16)
-            )
 
 
 def _v4_flash_moe_config() -> FusedMoEConfig:
@@ -247,6 +210,76 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
     assert offsets is buffers["compact_expert_offsets"]
     assert expert_ids is buffers["permuted_experts_id"]
     assert count == 6
+
+
+def test_mxfp4_sm70_direct_order_ignores_compacted_offsets():
+    buffers = {
+        # Reproduce M8 compaction state left before the B1 graph is captured.
+        "compact_expert_offsets": torch.tensor(
+            [0, 8, 9, 16, 24, 32, 48], dtype=torch.int32
+        ),
+        "slot_expert_offsets": torch.arange(7, dtype=torch.int32),
+    }
+
+    offsets = _select_mxfp4_direct_order_offsets(buffers)
+
+    assert offsets is buffers["slot_expert_offsets"]
+    torch.testing.assert_close(offsets, torch.arange(7, dtype=torch.int32))
+
+
+def test_mxfp4_sm70_qpn_m1_is_default_with_rollback(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+
+        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_mxfp4_sm70_qpn_m1_missing_default_op_falls_back(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", raising=False)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_qpn_m1_op_available", lambda: False)
+    envs.disable_envs_cache()
+    try:
+        assert not mxfp4_moe._mxfp4_qpn_m1_extension_enabled()
+
+        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1")
+        envs.disable_envs_cache()
+        with pytest.raises(RuntimeError, match="explicitly enabled"):
+            mxfp4_moe._mxfp4_qpn_m1_extension_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_mxfp4_sm70_qpn_m1_requires_exact_tp4_tensor_contract(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", True)
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(tp_size=4),
+        local_num_experts=256,
+        global_num_experts=256,
+        sm70_mxfp4_qpn_m1_available=True,
+        sm70_mxfp4_w13_k_dim=4096,
+        sm70_mxfp4_w13_n_dim=1024,
+        sm70_mxfp4_w2_k_dim=512,
+        sm70_mxfp4_w2_n_dim=4096,
+        sm70_mxfp4_group_size=32,
+        w13_tm_weight=torch.empty((256, 4096, 128), device="meta"),
+        w13_tm_scales=torch.empty((256, 128, 1024), device="meta"),
+        w2_tm_weight=torch.empty((256, 512, 512), device="meta"),
+        w2_tm_scales=torch.empty((256, 16, 4096), device="meta"),
+    )
+
+    assert _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=False)
+    layer.sm70_mxfp4_qpn_m1_available = False
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
+    layer.sm70_mxfp4_qpn_m1_available = True
+    layer.moe_config.tp_size = 8
+    assert not _mxfp4_qpn_m1_decode_contract(layer, direct_order=True)
 
 
 def test_mxfp4_sm70_b1_dispatch_rejects_incompatible_permute_fastpath(

@@ -65,6 +65,24 @@ def _sm70_dflash2_qpn8_rerank_requested() -> bool:
     )
 
 
+def _sm70_dflash2_use_dense_order() -> bool:
+    """Keep production on the scored full-vocabulary tie-order contract."""
+    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
+        return True
+    if envs.VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER:
+        logger.warning_once(
+            "Using experimental SM70 DFlash2 QPN8 candidate-order top-k. "
+            "This path is not authorized for quality-sensitive serving."
+        )
+        return False
+    logger.warning_once(
+        "Ignoring VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER=0 without the explicit "
+        "benchmark-only VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER=1; "
+        "using the scored dense-order path."
+    )
+    return True
+
+
 def _trace_sm70_lm_head_skip(reason: str) -> None:
     if envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE or envs.VLLM_SM70_PROFILE_TRACE:
         logger.warning_once("SM70 LM head fast path not prepared: %s", reason)
@@ -537,7 +555,8 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     values, _positions, ids = _sm70_dflash2_rerank_output_buffers(
         layer, num_rows, selector_k
     )
-    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
+    use_dense_order = _sm70_dflash2_use_dense_order()
+    if use_dense_order:
         _sm70_dflash2_dense_order_topk(
             layer._sm70_dflash2_rerank_dense_logits[:num_rows],
             qpn8_ids,
@@ -595,7 +614,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     logger.info_once(
         "SM70 DFlash2 QPN8 top-64 plus exact packed TurboMind FP16 rerank "
         "path enabled (dense_order=%s).",
-        envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER,
+        use_dense_order,
     )
     output_shape = (*x.shape[:-1], selector_k)
     return values.reshape(output_shape), ids.reshape(output_shape)
@@ -824,6 +843,8 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -853,8 +874,10 @@ class VocabParallelEmbedding(PluggableLayer):
         )
         self.embedding_dim = embedding_dim
 
-        quant_method = None
-        if quant_config is not None:
+        # Model-specific embeddings can preselect a storage method. This is
+        # required by Qwen4Exp PLE, whose table remains FP8 even when the
+        # routed experts use a different checkpoint quantization config.
+        if quant_method is None and quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
@@ -1077,6 +1100,16 @@ class VocabParallelEmbedding(PluggableLayer):
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         # Mask the output embedding.
         if self.tp_size > 1:
+            if output_parallel.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                # Each token row has exactly one TP owner. Communicate the raw
+                # FP8 bytes as int8 because NCCL does not reduce FP8 directly.
+                comm_output = output_parallel.view(torch.int8)
+                comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
+                output = tensor_model_parallel_all_reduce(comm_output)
+                return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
