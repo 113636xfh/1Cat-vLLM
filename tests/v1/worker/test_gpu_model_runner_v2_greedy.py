@@ -54,6 +54,7 @@ def test_sm70_v2_decode_uses_model_top_tokens(
 
     runner = object.__new__(GPUModelRunner)
     runner.model = Model()
+    runner.lora_config = None
     runner.sampler = SimpleNamespace(
         can_use_sm70_greedy_token_fastpath=lambda _input_batch: True
     )
@@ -90,6 +91,10 @@ def test_sm70_v2_decode_uses_model_top_tokens(
     assert output.sampled_token_ids.tolist() == [[42]]
     assert num_sampled.tolist() == [1]
     assert num_rejected.tolist() == [0]
+
+    runner.lora_config = object()
+    with pytest.raises(AssertionError, match="full logits must not run"):
+        GPUModelRunner.sample(runner, torch.zeros(1, 4), input_batch, None)
 
 
 @pytest.mark.parametrize(

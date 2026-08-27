@@ -10,16 +10,42 @@ import vllm.envs as envs
 from vllm.model_executor.layers.quantization import sm70_online_qpn8 as online_qpn8
 
 
-def test_qwen4_exp_online_qpn8_is_opt_in(monkeypatch):
+def test_qwen4_exp_online_qpn8_defaults_on_and_can_be_disabled(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", raising=False)
     envs.disable_envs_cache()
     try:
-        assert not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
-        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1")
-        envs.disable_envs_cache()
         assert envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
     finally:
         envs.disable_envs_cache()
+
+
+def test_qwen3next_shared_gate_fusion_defaults_on_and_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION
+        monkeypatch.setenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_default_on_qpn_sidecars_load_without_enable_overrides(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_LIBRARY", "/tmp/qpn8.so")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY", "/tmp/qpn-m1.so")
+    monkeypatch.delenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", raising=False)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", raising=False)
+    monkeypatch.setattr(torch.ops, "load_library", calls.append)
+
+    online_qpn8.sm70_ops._maybe_load_fp8_qpn8_library()
+    online_qpn8.sm70_ops._maybe_load_nvfp4_qpn_m1_library()
+
+    assert calls == ["/tmp/qpn8.so", "/tmp/qpn-m1.so"]
 
 
 @pytest.mark.parametrize(
@@ -50,10 +76,19 @@ def test_online_qpn8_shape_gate(prefix, k, n, expected):
 
 def test_online_qpn8_runtime_contract_is_tp4_no_mtp(monkeypatch):
     text_config = SimpleNamespace(
-        model_type="qwen4_exp_text",
+        model_type="generic_hybrid_moe",
         hidden_size=2560,
         num_hidden_layers=48,
         num_experts=512,
+        num_experts_per_tok=10,
+        moe_intermediate_size=640,
+        hc_count=4,
+        hc_lowrank=320,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
     )
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=text_config),
@@ -67,6 +102,9 @@ def test_online_qpn8_runtime_contract_is_tp4_no_mtp(monkeypatch):
     assert not online_qpn8._exact_runtime_contract()
     config.speculative_config = None
     monkeypatch.setattr(online_qpn8, "get_tensor_model_parallel_world_size", lambda: 2)
+    assert not online_qpn8._exact_runtime_contract()
+    monkeypatch.setattr(online_qpn8, "get_tensor_model_parallel_world_size", lambda: 4)
+    text_config.hc_count = 2
     assert not online_qpn8._exact_runtime_contract()
 
 

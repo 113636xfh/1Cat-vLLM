@@ -1054,6 +1054,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and grammar_output is None
             and self.device.type == "cuda"
             and current_platform.is_device_capability(70)
+            and getattr(self, "lora_config", None) is None
             and hasattr(self.model, "get_top_tokens")
             and self.sampler is not None
             and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
