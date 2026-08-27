@@ -851,6 +851,9 @@ class Qwen4ExpForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
 
@@ -1022,6 +1025,9 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.get_top_tokens(hidden_states)
 
     def forward(
         self,

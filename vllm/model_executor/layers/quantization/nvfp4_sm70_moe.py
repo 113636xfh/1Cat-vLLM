@@ -16,6 +16,7 @@ import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -48,6 +49,30 @@ _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_TOKENS: Final = 10
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
+_QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
+_QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
+
+
+def _use_qwen38_qpn_m1_decode(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only the exact validated Qwen3.8 TP4 single-token route."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+        and x.shape == (1, 2560)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (1, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
 
 
 @triton.jit
@@ -295,6 +320,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "awq_moe_build_strided_ptrs",
         )
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
+        ):
+            missing.append("nvfp4_moe_qpn_m1_sm70_out")
         if missing:
             raise RuntimeError(
                 "SM70 NVFP4 MoE requires the TurboMind extension "
@@ -640,6 +670,35 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         output = buffers["output"]
         slots = num_tokens * top_k
         direct_single_token = num_tokens == 1
+        if _use_qwen38_qpn_m1_decode(layer, x, topk_ids):
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 direct QPN-M1 expert path enabled "
+                "(TP4, E512/K10, W13 split8, W2 split1)."
+            )
+            route_ids = topk_ids.view(-1)
+            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+                buffers["gate_up"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                route_ids,
+                True,
+                _QWEN38_QPN_M1_W13_SPLIT_K,
+            )
+            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                route_ids,
+                False,
+                _QWEN38_QPN_M1_W2_SPLIT_K,
+            )
+            _single_token_weighted_reduce(
+                buffers["sorted_output"], topk_weights, output
+            )
+            return output
         if direct_single_token:
             _prepare_single_token_slots(
                 x,

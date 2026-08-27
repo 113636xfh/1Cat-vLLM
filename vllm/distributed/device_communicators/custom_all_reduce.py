@@ -339,7 +339,8 @@ class CustomAllreduce:
             )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
-                "FP16 80-KiB verifier and 8-KiB decode payloads."
+                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
+                "payloads."
             )
 
     @contextmanager

@@ -769,7 +769,11 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
-    BLOCK_N = 64
+    sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
+    # On V100 the GB300 decode tile leaves the 128-d scorer badly
+    # under-occupied. A 32-column, two-warp tile preserves the selected QSA
+    # blocks while exposing enough independent CTAs for the single-row path.
+    BLOCK_N = 32 if sm70_single_token else 64
     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
     # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
@@ -1184,6 +1188,16 @@ def qsa_sparse_paged_attention(
         block_m,
         current_platform.is_device_capability(70),
     )
+
+    if (
+        q.shape[0] == 1
+        and group_size == 6
+        and head_dim == 256
+        and current_platform.is_device_capability(70)
+    ):
+        # Exact Qwen4Exp TP4 decode shape. Two warps preserve the existing
+        # split/merge arithmetic and cut the partial-kernel time on V100.
+        partial_warps = 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.

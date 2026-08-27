@@ -287,6 +287,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_qpn8_gated_pair_sm70_out", torch::kCUDA,
            &fp8_qpn8_gated_pair_sm70_out);
 
+  ops.def(
+      "fp8_qpn8_hc_dispatch_sm70_out(Tensor(a!) block_out, Tensor(b!) "
+      "injection_out, Tensor(c!) down_staging, Tensor(d!) lora_staging, "
+      "Tensor(e!) gate_staging, Tensor(f!) partials, int dense_weight_ptr, "
+      "Tensor xn, Tensor down_codes, Tensor down_scales, Tensor up_codes, "
+      "Tensor up_scales) -> ()");
+  ops.impl("fp8_qpn8_hc_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_hc_dispatch_sm70_out);
+
   ops.def("nvfp4_qpn4_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("nvfp4_qpn4_prepare_sm70", torch::kCUDA, &nvfp4_qpn4_prepare_sm70);
 
@@ -666,6 +675,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_ids, bool broadcast_input) -> ()");
   ops.impl("mxfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
            &mxfp4_moe_qpn_m1_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_m1_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_m1_sm70_out);
 
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
