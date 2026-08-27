@@ -809,6 +809,28 @@ def qsa_select_paged_tokens(
     return out
 
 
+def _qsa_sparse_launch_profile(
+    block_m: int, base_programs: int, *, is_sm70: bool
+) -> tuple[int, int, int]:
+    small_profile_limit = 8 if block_m <= 8 else 4
+
+    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
+    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+    if base_programs <= small_profile_limit:
+        return 16, 64, 4
+    if base_programs < 32:
+        return 16, 32, 4
+    if base_programs <= 256:
+        return 64, 8, 2
+    if base_programs <= 512:
+        return 64, 4, 2
+
+    # This single-split shape uses about 72 KiB shared memory per CTA. That
+    # limits V100 to one resident CTA per SM, so four warps are needed to avoid
+    # leaving the CTA severely under-occupied. Keep the GB300 profile unchanged.
+    return 64, 1, 4 if is_sm70 else 2
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -858,20 +880,11 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
-    small_profile_limit = 8 if block_m <= 8 else 4
-
-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
-        block_n, target_splits, partial_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, partial_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, partial_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, partial_warps = 64, 4, 2
-    else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+    block_n, target_splits, partial_warps = _qsa_sparse_launch_profile(
+        block_m,
+        base_programs,
+        is_sm70=current_platform.is_device_capability(70),
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
