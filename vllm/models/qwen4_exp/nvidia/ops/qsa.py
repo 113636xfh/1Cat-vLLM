@@ -858,20 +858,11 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
-    small_profile_limit = 8 if block_m <= 8 else 4
-
-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
-        block_n, target_splits, partial_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, partial_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, partial_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, partial_warps = 64, 4, 2
-    else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+    block_n, target_splits, partial_warps = _qsa_sparse_launch_profile(
+        base_programs,
+        block_m,
+        current_platform.is_device_capability(70),
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -951,6 +942,34 @@ def qsa_sparse_paged_attention(
         num_stages=1,
     )
     return out
+
+
+def _qsa_sparse_launch_profile(
+    base_programs: int,
+    block_m: int,
+    is_sm70: bool,
+) -> tuple[int, int, int]:
+    """Return BLOCK_N, target splits, and warps for sparse QSA."""
+    small_profile_limit = 8 if block_m <= 8 else 4
+
+    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
+    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+    if base_programs <= small_profile_limit:
+        block_n, target_splits, partial_warps = 16, 64, 4
+    elif base_programs < 32:
+        block_n, target_splits, partial_warps = 16, 32, 4
+    elif base_programs <= 256:
+        block_n, target_splits, partial_warps = 64, 8, 2
+    elif base_programs <= 512:
+        block_n, target_splits, partial_warps = 64, 4, 2
+    else:
+        block_n, target_splits, partial_warps = 64, 1, 2
+    if is_sm70 and block_n == 64:
+        # Two warps serialize the D=256 tensor-core work on V100. Four warps
+        # preserve the exact reduction order while restoring warp-level
+        # parallelism for both split and non-split prefill profiles.
+        partial_warps = 4
+    return block_n, target_splits, partial_warps
 
 
 def qsa_store_cache_rows(

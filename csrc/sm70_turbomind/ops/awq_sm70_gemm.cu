@@ -8583,8 +8583,11 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 256 &&
       ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
        (n == 2048 && (k == 512 || k == 256 || k == 128)));
+  const bool exact_qwen4_exp_prefill_shape =
+      input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 512 &&
+      ((k == 2560 && n == 320) || (k == 160 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
-      exact_qwen36_prefill_shape) {
+      (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
     static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
         logged_nvfp4_grouped_prefill,
