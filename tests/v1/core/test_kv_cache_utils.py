@@ -198,7 +198,7 @@ def test_small_draft_sliding_window_bucket_absorbs_hybrid_padding():
     assert [len(group.layer_names) for group in groups] == [8] * 8 + [5]
 
 
-def test_sliding_window_padding_heuristic_rejects_excessive_padding():
+def test_sliding_window_padding_preserves_generic_singleton_grouping():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     full_spec = new_kv_cache_spec()
     mamba_spec = new_mamba_spec(page_size_padded=full_spec.page_size_bytes)
@@ -209,8 +209,8 @@ def test_sliding_window_padding_heuristic_rejects_excessive_padding():
 
     groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_specs)
 
-    assert len(groups) == 61
-    assert max(len(group.layer_names) for group in groups) == 1
+    assert len(groups) == 13
+    assert [len(group.layer_names) for group in groups] == [5] * 12 + [1]
 
 
 def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
@@ -242,6 +242,26 @@ def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
     assert kv_cache_utils.resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config
     ) == (1648, 16)
+
+
+@pytest.mark.parametrize(
+    ("layer_counts", "expected_group_size"),
+    [
+        ([1, 12, 12, 12, 36], 12),
+        ([1, 20, 30], 10),
+        ([1, 64, 64], 16),
+        ([1, 5, 7], 1),
+        ([3, 7], 3),
+        ([5, 6], 6),
+    ],
+)
+def test_select_hybrid_kv_cache_group_size(
+    layer_counts: list[int], expected_group_size: int
+):
+    assert (
+        kv_cache_utils._select_hybrid_kv_cache_group_size(layer_counts)
+        == expected_group_size
+    )
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
