@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,42 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle_speculator
+
+
+def test_qwen4_exp_mtp_v2_unpacks_logits_and_feedback_hidden_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    speculator.device = torch.device("cpu")
+    speculator.vllm_config = SimpleNamespace()
+    speculator.supports_mm_inputs = False
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(3, dtype=torch.int64),
+        positions=torch.arange(3, dtype=torch.int64),
+    )
+    speculator.hidden_states = torch.zeros(3, 16)
+
+    logits_hidden = torch.ones(3, 4)
+    feedback_hidden = torch.ones(3, 16)
+    speculator.model = lambda **_kwargs: (logits_hidden, feedback_hidden)
+    monkeypatch.setattr(
+        eagle_speculator,
+        "set_forward_context",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    actual_logits_hidden, actual_feedback_hidden = speculator.run_model(
+        num_tokens=3,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+    )
+
+    assert actual_logits_hidden is logits_hidden
+    assert actual_feedback_hidden is feedback_hidden
 
 
 def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(

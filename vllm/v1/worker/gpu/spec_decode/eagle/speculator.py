@@ -222,11 +222,13 @@ class EagleSpeculator:
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
-        if self.method == "mtp":
+        # Some MTP models declare a single-tensor contract but return
+        # (logits_hidden, feedback_hidden) for final-norm correctness.
+        if isinstance(ret_hidden_states, tuple):
+            last_hidden_states, hidden_states = ret_hidden_states
+        else:
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
-        else:
-            last_hidden_states, hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
 
     def _sample_draft(
