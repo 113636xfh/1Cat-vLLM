@@ -738,6 +738,44 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
 
 
+def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    fake_package = types.ModuleType("vllm.vllm_flash_attn")
+    fake_package.__dict__["flash_attn_interface"] = fake_interface
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        fake_interface,
+    )
+
+    namespace = SimpleNamespace()
+    loaded: list[str] = []
+
+    def load_library(path: str) -> None:
+        loaded.append(path)
+        namespace.sm70_d256_splitd_n32_dense_fwd = "dense"
+        namespace.sm70_d256_splitd_n32_paged_fwd = "paged"
+
+    fake_ops = SimpleNamespace(
+        _vllm_fa2_C=namespace,
+        load_library=load_library,
+    )
+    monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
+    monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", "/tmp/stable-fa2.so")
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)
+
+    assert flash_v100._get_sm70_splitd_d256_ops() == (
+        "dense",
+        "paged",
+        None,
+    )
+    assert loaded == ["/tmp/stable-fa2.so"]
+
+
 def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
@@ -891,7 +929,7 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
 
     monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
-    for kv_len in range(40000, 128001, 8000):
+    for kv_len in range(16000, 256001, 8000):
         family_key = torch.empty(
             (1, kv_len, 1, 256), dtype=torch.float16, device="meta"
         )
@@ -904,6 +942,16 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
             softmax_scale=0.0625,
             architecture_op=object(),
         )
+    first_chunk_key = torch.empty((1, 8000, 1, 256), dtype=torch.float16, device="meta")
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query,
+        first_chunk_key,
+        torch.empty_like(first_chunk_key),
+        max_seqlen_q=8000,
+        max_seqlen_k=8000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
     assert not flash_v100._should_use_prefill_d256_gqa_architecture(
         query[:, :7999],
         key,
@@ -924,10 +972,10 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
     )
     assert not flash_v100._should_use_prefill_d256_gqa_architecture(
         query,
-        key[:, :44000],
-        value[:, :44000],
+        key[:, :12000],
+        value[:, :12000],
         max_seqlen_q=8000,
-        max_seqlen_k=44000,
+        max_seqlen_k=12000,
         softmax_scale=0.0625,
         architecture_op=object(),
     )
@@ -1655,7 +1703,10 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
     assert torch.all(output == 1)
 
 
-def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
+@pytest.mark.parametrize("query_len", [8, 16])
+def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
+    query_len: int,
+):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
     impl = FlashAttnV100Impl(
@@ -1690,19 +1741,19 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
     original_block_table = torch.tensor([[7, 3]], dtype=torch.int32)
     original_seq_lens = torch.tensor([2056], dtype=torch.int32)
     attn_metadata = SimpleNamespace(
-        num_actual_tokens=8,
+        num_actual_tokens=query_len,
         causal=True,
         is_dflash_selector_target=True,
         max_model_len=32768,
-        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
         seq_lens=original_seq_lens,
         block_table=original_block_table,
-        smallq_decode_block_table=torch.zeros((8, 2), dtype=torch.int32),
-        smallq_decode_seq_lens=torch.arange(2049, 2057, dtype=torch.int32),
-        smallq_query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        smallq_decode_block_table=torch.zeros((query_len, 2), dtype=torch.int32),
+        smallq_decode_seq_lens=torch.arange(2057 - query_len, 2057, dtype=torch.int32),
+        smallq_query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
     )
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
-    query = torch.zeros((8, 6, 256), dtype=torch.float16)
+    query = torch.zeros((query_len, 6, 256), dtype=torch.float16)
     output = torch.zeros_like(query)
     key_cache = torch.zeros((2, 3296, 1, 256), dtype=torch.uint8)
     value_cache = torch.zeros_like(key_cache)
@@ -1713,7 +1764,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
         key_cache,
         value_cache,
         attn_metadata,
-        num_query_tokens=8,
+        num_query_tokens=query_len,
     )
     attn_metadata.max_model_len = 32768
     result = impl._flash_v100_small_query_prefill_as_decode(
