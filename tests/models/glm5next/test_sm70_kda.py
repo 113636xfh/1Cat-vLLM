@@ -34,7 +34,7 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
         )
 
     run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     expected = (F.linear(f_input, f_weight), F.linear(g_input, g_weight))
     torch.testing.assert_close(f_out, expected[0], rtol=2e-3, atol=2e-4)
     torch.testing.assert_close(g_out, expected[1], rtol=2e-3, atol=2e-4)
@@ -44,7 +44,7 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
     with torch.cuda.graph(graph):
         run()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.testing.assert_close(f_out, eager[0], rtol=0, atol=0)
     torch.testing.assert_close(g_out, eager[1], rtol=0, atol=0)

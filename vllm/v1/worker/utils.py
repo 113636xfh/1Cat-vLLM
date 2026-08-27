@@ -47,6 +47,44 @@ def compressed_kernel_block_size(spec: AttentionSpec) -> int:
     return max_page if storage % max_page == 0 else min_page
 
 
+def _infer_segment_block_strides(
+    seg_addrs: list[int],
+    page_size_el: int,
+) -> list[int]:
+    """Infer logical block strides from block-major segment address runs.
+
+    Dense segments advance by one page. An interleaved pool exposes one segment
+    base per cell, exactly ``page_size_el * 4`` bytes apart, and advances to the
+    next logical block after every segment in that address run. Treat separate
+    runs independently so multiple pools do not disable one another.
+    """
+    if page_size_el <= 0:
+        raise ValueError(f"page_size_el must be positive, got {page_size_el}.")
+    if len(set(seg_addrs)) != len(seg_addrs):
+        raise ValueError("Segment addresses must be unique.")
+
+    block_strides = [page_size_el] * len(seg_addrs)
+    if len(seg_addrs) < 2:
+        return block_strides
+
+    cell_bytes = page_size_el * 4
+    ordered = sorted((addr, index) for index, addr in enumerate(seg_addrs))
+    run_start = 0
+    for run_end in range(1, len(ordered) + 1):
+        if (
+            run_end < len(ordered)
+            and ordered[run_end][0] - ordered[run_end - 1][0] == cell_bytes
+        ):
+            continue
+        run = ordered[run_start:run_end]
+        if len(run) > 1:
+            run_stride = page_size_el * len(run)
+            for _, original_index in run:
+                block_strides[original_index] = run_stride
+        run_start = run_end
+    return block_strides
+
+
 @triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
@@ -64,19 +102,23 @@ def _zero_kv_blocks_kernel(
 
     seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
     allowing segments to live in different CUDA allocations.
+    seg_block_strides_ptr holds the per-segment block-to-block stride in
+    elements, kept separate from the PAGE_SIZE_EL span each block zeros (they
+    differ for interleaved layouts, see init_meta).
 
-    Programs are mapped as (block_index, seg_index, chunk_index).
+    Programs are mapped as (block_index, seg_index, chunk_index). Segment page
+    sizes may differ across hybrid cache groups.
     """
     block_index = tl.program_id(0)
     seg_index = tl.program_id(1)
     chunk_index = tl.program_id(2)
-    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
     chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
     if chunk_offset >= page_size_el:
         return
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     block_offset = block_id.to(tl.int64) * block_stride_el.to(tl.int64)
     cols = chunk_offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -129,19 +171,16 @@ class KVBlockZeroer:
         state tensor views over one raw page per block; the first state tensor
         starts at the page base, so one segment per layer zeros the whole page.
         """
-        seen_segments: dict[tuple[int, int], int] = {}
+        seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
-        seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
 
-        def add_segment(addr: int, block_stride_el: int, page_size_el: int) -> None:
-            key = (addr, block_stride_el)
-            if (idx := seen_segments.get(key)) is not None:
-                seg_page_sizes[idx] = max(seg_page_sizes[idx], page_size_el)
+        def add_segment(address: int, page_size_el: int) -> None:
+            if (index := seen_ptrs.get(address)) is not None:
+                seg_page_sizes[index] = max(seg_page_sizes[index], page_size_el)
                 return
-            seen_segments[key] = len(seg_addrs)
-            seg_addrs.append(addr)
-            seg_block_strides.append(block_stride_el)
+            seen_ptrs[address] = len(seg_addrs)
+            seg_addrs.append(address)
             seg_page_sizes.append(page_size_el)
 
         for group in attn_groups_iter:
@@ -181,7 +220,7 @@ class KVBlockZeroer:
                     outer_strides = [kv.stride(d) * el for d in outer_dims]
                     for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                         off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                        add_segment(dp + off_bytes, cur_page_el, cur_page_el)
+                        add_segment(dp + off_bytes, cur_page_el)
                 elif isinstance(spec, MambaSpec):
                     if not isinstance(kv, (list, tuple)) or not kv:
                         continue
@@ -193,7 +232,7 @@ class KVBlockZeroer:
                     page_bytes = spec.page_size_bytes
                     assert page_bytes % 4 == 0
                     cur_page_el = page_bytes // 4
-                    add_segment(dp, cur_page_el, cur_page_el)
+                    add_segment(dp, cur_page_el)
 
         if not seg_addrs:
             self._meta = None
@@ -201,6 +240,30 @@ class KVBlockZeroer:
 
         max_page_size_el = max(seg_page_sizes)
         blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+
+        # Dense layouts space blocks page_size_el apart. Block-major
+        # interleaved pools expose segment starts one cell apart and advance by
+        # the number of segments in that contiguous address run. Infer each
+        # run separately because a process may own more than one KV pool.
+        n_segs = len(seg_addrs)
+        block_strides = [0] * n_segs
+        for page_size_el in set(seg_page_sizes):
+            indices = [
+                index
+                for index, size in enumerate(seg_page_sizes)
+                if size == page_size_el
+            ]
+            inferred = _infer_segment_block_strides(
+                [seg_addrs[index] for index in indices], page_size_el
+            )
+            for index, stride in zip(indices, inferred):
+                block_strides[index] = stride
+        seg_block_strides = torch.tensor(
+            block_strides,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -210,11 +273,11 @@ class KVBlockZeroer:
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
+            seg_block_strides,
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
-            len(seg_addrs),
+            n_segs,
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
@@ -581,7 +644,7 @@ def bind_kv_cache(
 
     # Bind kv_caches to forward context
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
 def is_residual_scattered_for_sp(

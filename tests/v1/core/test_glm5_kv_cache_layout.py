@@ -80,7 +80,7 @@ def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
     participating_block_sizes = [
         group.kv_cache_spec.block_size
         for group in groups
-        if group.kv_cache_spec.participates_in_prefix_caching
+        if group.kv_cache_spec.prefix_cacheable
     ]
     assert min(participating_block_sizes) == block_size
     assert min(group.kv_cache_spec.block_size for group in groups) == 4

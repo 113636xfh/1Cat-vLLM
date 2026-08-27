@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
@@ -37,7 +38,7 @@ logger = init_logger(__name__)
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
-    supported_kv_cache_dtypes: ClassVar[list[str]] = [
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
         "fp8",
@@ -91,8 +92,6 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
         if config is None or config.model_config is None:
             return None
         text_config = config.model_config.hf_text_config
-        if getattr(text_config, "model_type", None) != "glm5_next_text":
-            return "GLM5_SM70_SPARSE is restricted to glm5_next_text"
         if (
             getattr(text_config, "qk_rope_head_dim", None) != 0
             or getattr(text_config, "kv_lora_rank", None) != 512
@@ -143,14 +142,17 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_cache = kv_cache_dtype in {"fp8", "fp8_e4m3"}
         self.kv_lora_rank = 512
-        self.topk_indices_buffer = indexer.topk_indices_buffer
+        topk_indices_buffer = indexer.topk_indices_buffer
+        if topk_indices_buffer is None:
+            raise ValueError("GLM-5.3 sparse MLA requires an index buffer.")
+        self.topk_indices_buffer = topk_indices_buffer
         self.index_width = self.topk_indices_buffer.shape[1]
 
         config = get_current_vllm_config_or_none()
         if config is None:
             raise RuntimeError("GLM-5.3 SM70 sparse MLA requires VllmConfig.")
         max_tokens = config.scheduler_config.max_num_batched_tokens
-        workspace_specs = [
+        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
         if self.use_fp8_cache:

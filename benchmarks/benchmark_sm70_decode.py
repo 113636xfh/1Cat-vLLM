@@ -30,7 +30,13 @@ def _module_file(module_name: str) -> str | None:
     module = sys.modules.get(module_name)
     if module is not None:
         return getattr(module, "__file__", None)
-    spec = importlib.util.find_spec(module_name)
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (AttributeError, ImportError, ValueError):
+        # Optional extension parents can raise while find_spec imports them.
+        # Diagnostics must report an unavailable extension, not discard an
+        # otherwise successful benchmark at result-serialization time.
+        return None
     return spec.origin if spec is not None else None
 
 
@@ -46,20 +52,42 @@ def _sm70_fa2_d256_prefill_status(torch: Any) -> dict[str, Any]:
         "sm70_d256_splitd_n32_paged_fwd",
     )
     optional_ops = ("sm70_d256_splitd_n32_dense_splitkv3_fwd",)
-    try:
-        importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
-    except (AttributeError, ImportError, RuntimeError) as exc:
-        return {
-            "available": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "extension_file": None,
-            "extension_realpath": None,
-            "required_ops": {name: False for name in required_ops},
-            "optional_ops": {name: False for name in optional_ops},
-        }
-
     extension_file = _module_file("vllm.vllm_flash_attn._vllm_fa2_C")
     namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    import_error: Exception | None = None
+    if namespace is None or not all(hasattr(namespace, name) for name in required_ops):
+        try:
+            importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
+        except (AttributeError, ImportError, RuntimeError) as exc:
+            import_error = exc
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    if namespace is None or not all(hasattr(namespace, name) for name in required_ops):
+        library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+        if library_path is not None:
+            try:
+                torch.ops.load_library(library_path)
+            except (OSError, RuntimeError) as load_exc:
+                return {
+                    "available": False,
+                    "error": f"{type(load_exc).__name__}: {load_exc}",
+                    "extension_file": library_path,
+                    "extension_realpath": str(Path(library_path).resolve()),
+                    "required_ops": {name: False for name in required_ops},
+                    "optional_ops": {name: False for name in optional_ops},
+                }
+            extension_file = library_path
+        elif import_error is not None:
+            return {
+                "available": False,
+                "error": f"{type(import_error).__name__}: {import_error}",
+                "extension_file": None,
+                "extension_realpath": None,
+                "required_ops": {name: False for name in required_ops},
+                "optional_ops": {name: False for name in optional_ops},
+            }
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    if extension_file is None:
+        extension_file = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
     required_status = {
         name: namespace is not None and hasattr(namespace, name)
         for name in required_ops
@@ -163,6 +191,7 @@ def _tracked_env() -> dict[str, str]:
         "VLLM_FLASH_",
         "FLASH_ATTN",
         "FLA_",
+        "PREFIX_",
         "CUDA_MODULE_LOADING",
         "TORCH_CUDA_ARCH_LIST",
         "TORCHINDUCTOR_",
@@ -683,6 +712,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
         True,
     )
+    e5m2_batch_wide_load = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD",
+        True,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -798,6 +831,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD"
         ),
         "e5m2_pair_load_effective": e5m2_pair_load,
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD"
+        ),
+        "e5m2_batch_wide_load_effective": e5m2_batch_wide_load,
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta

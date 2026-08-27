@@ -32,11 +32,15 @@ from typing_extensions import Self, TypeIs
 from vllm.config import ModelConfig, SpeechToTextConfig, SpeechToTextParams
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncsByType,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.tasks import ScoreType
 from vllm.utils.collection_utils import common_prefix
 from vllm.utils.func_utils import supports_kw
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces_base import VllmModel
 
@@ -265,6 +269,8 @@ class SupportsMultiModal(Protocol):
         If `targets` is set, instead include descendants that are an instance
         of `targets`, even if they aren't direct children.
         """
+        from vllm.model_executor.offloader import get_offloader
+
         from .utils import StageMissingLayer, collect_children, no_init_weights
 
         if isinstance(modalities, str):
@@ -290,6 +296,14 @@ class SupportsMultiModal(Protocol):
                 yield
 
         self._tower_model_names = children_names
+        offloader = get_offloader()
+        for name in children_names:
+            if not name:
+                continue
+            tower = self.get_submodule(name)
+            wrapped = offloader.wrap_module(tower, parameter_prefix=name)
+            if wrapped is not tower:
+                self.set_submodule(name, wrapped)
 
     @contextmanager
     def _mark_composite_model(
@@ -826,6 +840,14 @@ class IsHybrid(Protocol):
             caching in align mode.
         """
         ...
+
+    @classmethod
+    def get_mamba_state_copy_funcs(
+        cls,
+        mamba_types: set[MambaAttentionBackendEnum],
+    ) -> MambaStateCopyFuncsByType:
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
 
 @overload
