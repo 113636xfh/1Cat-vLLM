@@ -43740,14 +43740,16 @@ Interpretation:
   with 64/64 bitwise main-path results and maximum auxiliary relative L2
   `4.03e-7`. That overlap result is directional after the mainline FP8 M=1 API
   split and is not relabeled as a current-main endpoint result.
-- FP13 now defaults off because these operator and overlap screens do not
-  constitute a matched model-level dataset gate. Explicit
-  `VLLM_SM70_DSV4_FP13_GEMV=1` remains available for an isolated future A/B.
+- FP13 remains default-on under its narrow tensor/runtime contract because the
+  real-weight operator and graph screens show a bounded numerical delta and a
+  repeatable latency reduction, with no recorded task-quality regression.
+  `VLLM_SM70_DSV4_FP13_GEMV=0` is the explicit rollback. The route is not
+  reported as an endpoint gain until a matched model-level dataset A/B closes.
   Admission still checks SM70, CUDA device equality, dtype, shape, layout,
   output contract, and the actual weight bits; incompatible tensors retain
-  FP16. Packing occurs once after loading. The retained buffers would add
-  549.66 MiB without pipeline parallelism, or at most 282.34 MiB per rank for
-  the audited PP2 partition.
+  FP16. Packing occurs once after loading. The retained buffers add 549.66 MiB
+  without pipeline parallelism, or at most 282.34 MiB per rank for the audited
+  PP2 partition.
 
 ## 2026-08-26 DeepSeek V4 PP2 x TP4 100-token/s continuation
 
@@ -43760,10 +43762,12 @@ Interpretation:
   operator may default on after graph, numerical and source gates pass, with
   an explicit rollback; it is not reported as an endpoint gain until a matched
   full-model benchmark exists.
-- The current quality-safe source-`59adf8d89a` control explicitly disables all
-  FP8 QPN8 routes and packed FP13 while retaining the exact fused-WQA prescale,
-  exact MXFP4 QPN M1, static PP transfer, TP4 push all-reduce, fused Q/KV
-  normalization, direct-order MoE, and exponent fold. It scores GSM8K-64
+- The source-`59adf8d89a` measurement control explicitly disables all FP8 QPN8
+  routes and packed FP13 to isolate the remaining stack; that measurement
+  choice does not change the guarded FP13 runtime default. The control retains
+  the exact fused-WQA prescale, exact MXFP4 QPN M1, static PP transfer, TP4 push
+  all-reduce, fused Q/KV normalization, direct-order MoE, and exponent fold. It
+  scores GSM8K-64
   `64/64` with zero invalid answers, HumanEval `29/32`, and LongBench `44.740`.
   Three matched 1024+256 pure-decode runs measure `73.534`, `73.542`, and
   `73.539 token/s` (median `73.539`, `13.598 ms/token`). This is the accepted
