@@ -19,6 +19,8 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
     _prepare_compact_slot_groups,
+    _prepare_single_token_slots,
+    _single_token_weighted_reduce,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
@@ -192,6 +194,56 @@ def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slot
         torch.arange(total_slots + 1, dtype=torch.int32, device="cpu"),
     )
     assert torch.equal(active_expert_ids.cpu(), sorted_expert_ids.cpu())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_nvfp4_single_token_direct_routing_is_exact_and_graph_dynamic():
+    top_k = 10
+    hidden = 2560
+    x = torch.randn(1, hidden, dtype=torch.float16, device="cuda")
+    topk_ids = torch.tensor(
+        [[401, 7, 310, 99, 211, 3, 470, 120, 55, 256]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    weights = torch.softmax(torch.randn(1, top_k, device="cuda"), dim=-1)
+    expert_output = torch.randn(top_k, hidden, dtype=torch.float16, device="cuda")
+    expanded = torch.empty_like(expert_output)
+    active_ids = torch.empty(top_k, dtype=torch.int32, device="cuda")
+    output = torch.empty(1, hidden, dtype=torch.float16, device="cuda")
+    reference = torch.empty_like(output)
+    identity = torch.arange(top_k, dtype=torch.int32, device="cuda").view(1, -1)
+
+    _prepare_single_token_slots(x, topk_ids, expanded, active_ids)
+    _single_token_weighted_reduce(expert_output, weights, output)
+    torch.ops._moe_C.moe_unpermute(
+        expert_output, weights, identity, None, top_k, reference
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(expanded, x.expand(top_k, -1))
+    assert torch.equal(active_ids, topk_ids[0].int())
+    assert torch.equal(output, reference)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _prepare_single_token_slots(x, topk_ids, expanded, active_ids)
+        _single_token_weighted_reduce(expert_output, weights, output)
+
+    x.add_(0.25)
+    topk_ids.copy_(topk_ids.roll(1, dims=1))
+    weights.copy_(weights.roll(2, dims=1))
+    expert_output.mul_(0.5)
+    graph.replay()
+    torch.ops._moe_C.moe_unpermute(
+        expert_output, weights, identity, None, top_k, reference
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(expanded, x.expand(top_k, -1))
+    assert torch.equal(active_ids, topk_ids[0].int())
+    assert torch.equal(output, reference)
 
 
 def test_mixed_w4a16_moe_requires_turbomind_on_sm70():
