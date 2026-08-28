@@ -44189,3 +44189,40 @@ Interpretation:
   `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
   across repeated runs. A separate FP16 Dense/Indexer candidate screen remains
   benchmark-only and does not alter production dispatch.
+
+## 2026-08-28 Qwen3.8 QSA page4 XQA prefill audit
+
+- The SM70-only route converts each selected four-token QSA block into a
+  virtual Flash-V100 page, sorts physical microblocks for cache locality, and
+  keeps a marked causal tail last. It is restricted to FP16 Hq6/Hkv1/D256,
+  the 2051-token QSA selection layout, compatible contiguous or interleaved
+  KV strides, and at least 4096 query rows. The route remains default-on and
+  retains `VLLM_SM70_QSA_XQA_PAGE4=0` as an operational escape hatch.
+- A production-shaped interleaved-KV V100 A/B at 4096 rows measures the
+  established Triton route at `27.8303 ms` and page4 XQA, including table
+  construction and sort, at `8.84736 ms` (`3.1456x`). Across 6,291,456 FP16
+  outputs, maximum absolute difference is `6.104e-5`, relative L2 is
+  `2.845e-4`, cosine is `0.99999994`, and all outputs are finite.
+- A separate nonmonotonic contiguous-page A/B passes with maximum absolute
+  difference `3.815e-6`, relative L2 `3.645e-4`, and cosine `1.0`. Causal
+  tails of one, two, and three tokens each remain below relative L2 `3.64e-4`
+  with cosine at least `0.99999988`. The 4095-row boundary takes the Triton
+  fallback and is bitwise identical with or without the newly forwarded
+  metadata.
+- The hybrid 784-token scheduler / 16-token kernel geometry is also exercised
+  with a nonmonotonic 128-entry virtual page table after the physical-page
+  correction. Page4 XQA passes at maximum absolute difference `3.815e-6`,
+  relative L2 `3.631e-4`, and cosine `0.99999994`; its CUDA Graph replay is
+  bitwise equal to eager output.
+- Prewarmed CUDA Graph capture succeeds on V100; two replays are bitwise
+  identical to eager page4 XQA with output hash
+  `9b4c76f8420d6e349dc7d552c72d6f0a861332e7e8e8f62459a1c48f0faf278f`.
+  The table kernel now clamps padded or stale query positions to the live
+  request length and admits a partial tail only when the expanded QSA indices
+  contain that exact token, preventing an invalid synthetic tail page.
+- Raising the shared page-ID capacity from 8 to 32 does not reduce the
+  declared two-block V100 occupancy: the page4 padded kernel uses 45,568
+  bytes per CTA (`91,136 < 98,304` bytes for two CTAs), and the pipeline
+  variant uses 47,616 bytes (`95,232 < 98,304`). Existing FP16 page-16 and
+  page-784 XQA-to-scalar smokes pass at relative L2 `3.03e-5` and `4.10e-5`,
+  respectively.
