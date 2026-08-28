@@ -132,11 +132,12 @@ Goal:
 
 ### Grouped Page4 QSA follow-up, 2026-08-28
 
-- Review scope is public Draft PR #378 on
-  `codex/v100-qwen38-qsa-paged-prefill-20260828-041420`, based on public
-  `main@0ca71115639bb4ddad7c7a818825c1261cd7433e`. The frozen endpoint route
-  remains TP4/V2/ModelOpt NVFP4/FP16 activations and KV/no MTP, with 8192-token
-  chunked prefill. The retained BN16 endpoint baseline is
+- Public PR #378 landed the Page4 precursor. The exact grouped follow-up is
+  Draft PR #387 on
+  `codex/v100-qwen38-grouped-page4-prefill-20260828-144759`, rebuilt from
+  public `main@03c04da68e`. The frozen endpoint route remains
+  TP4/V2/ModelOpt NVFP4/FP16 activations and KV/no MTP, with 8192-token chunked
+  prefill. The retained BN16 endpoint baseline is
   `4532.07/4446.64/4108.16 tok/s` at 32K/64K/131K; do not compare short route
   probes or TTFT-inclusive numbers against it.
 - The retained 8192-token Nsight Systems capture makes selected QSA the first
@@ -190,14 +191,46 @@ Goal:
   `0.9999998807907104`. The standalone planner is about `0.32 ms`; its exact
   group-0 block/mask dictionary matches the reference. Focused Python tests
   are `10 passed`, and the SM70 extension builds successfully with zero local
-  memory for the grouped kernel.
-- These are kernel-admission results, not an endpoint claim. One guarded TP4
-  startup must still run the matching quality and 32K/64K/131K cases, then
-  selectively capture only one warmed 8192-token repeat. Re-rank all hotspots
-  after that trace: the next optimization target may be NVFP4 MoE/GEMM, TP
-  communication, GDN, or launch gaps rather than QSA. The benchmark harness
-  accepts `--cuda-profile-case` so endpoint cases can run outside the profiler
-  range in the same loaded engine.
+  memory for the grouped kernel. Focused latest-source coverage is `19 passed,
+  16 warnings`.
+- The TP4 endpoint gate route-hits grouped Page4 on full 8192-row chunks and on
+  the 8120-row 131K tail. Pure-prefill throughput is `5998.65`, `5777.43`, and
+  `5450.92 tok/s` at 32K/64K/131K, versus the matching retained
+  `4532.07/4446.64/4108.16` baseline: `1.3236x/1.2993x/1.3269x`. An exact 8K
+  case measures `6394.74 tok/s`. Arithmetic, Chinese, and all long-context
+  token hashes are bitwise identical to the baseline, including both repeats
+  at 32K and 64K. The recovery endpoint run overlapped host/disk activity from
+  an unrelated GPU4-7 model load beginning at `15:23:39`, so treat these as
+  conservative endpoint values rather than a clean-host ceiling.
+- The clean double-locked 8192-token Nsight capture reports `5094.991 ms` of
+  aggregate kernel service over four ranks. Grouped attention is
+  `9.632 ms` per QSA layer/rank and its planner is `0.362 ms`, or `9.994 ms`
+  together: `5.518x` faster and `81.88%` lower than the old `55.151 ms` QSA
+  path. QSA plus planning is now `9.42%` of aggregate service instead of
+  `36.42%`. Per-GPU kernel-union duty is `98.27-98.61%` over a `1293.2 ms`
+  capture span; only `18.0-22.4 ms` is between kernels. The representative
+  NVML sample is `99-100%` GPU busy at `1530 MHz` and `268-314 W`. These are
+  scheduling-duty and power observations, not achieved Tensor-Core or HBM
+  counters; NCU remains unavailable under `ERR_NVGPUCTRPERM`.
+- The post-QSA first hotspot is the routed NVFP4 MoE chain. Its two grouped
+  GEMMs consume `25.12%`; materializing the top-10 input permutation consumes
+  `5.61%`; deterministic unpermute/finalize consumes `2.46%`. These three
+  stages alone are `33.19%`, before routing, sorting, and activation. The
+  NVFP4 kernel uses 128 threads, 122 registers/thread, and 16.4 KiB shared
+  memory, giving a four-CTA/SM, 16-warp/SM (`25%`) static occupancy ceiling.
+  Useful W13/W2 rates are only about `28.8-31.9 TFLOP/s`. HC combine-norm and
+  gate-mix are `6.44%/3.85%`, NCCL all-reduce is `8.45%`, and the main GDN
+  kernel is `4.43%`. GDN is separately grid/resource limited (48 CTAs for 80
+  SMs, 253 registers/thread, 91 KiB dynamic shared memory), but its absolute
+  opportunity is smaller than routed MoE.
+- Do not spend another full-model startup rechecking the same grouped-QSA
+  route. The next bounded experiment is an indexed-A NVFP4 W13 operator gate:
+  retain the existing deterministic expert sort and inverse map, but avoid
+  materializing 8192 rows into 81920 top-10 rows and let TurboMind's existing
+  indexed SM70 A iterator read the original token-major activation. Admit it
+  only if the complete sort/map/W13 chain wins and remains bitwise or within
+  the existing FP16 accumulation tolerance; a noncontiguous indexed read that
+  merely moves the copy cost into GEMM is rejected before any endpoint run.
 
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
