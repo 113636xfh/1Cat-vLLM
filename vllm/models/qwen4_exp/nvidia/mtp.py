@@ -388,6 +388,18 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
     }
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
+    # target experts and PLE tables. Loading the standalone drafter from that
+    # compact shard set avoids scanning the full target checkpoint a second
+    # time. The remaining patterns preserve compatibility with conventional
+    # Hugging Face checkpoint layouts.
+    allow_patterns_overrides = [
+        "model-bf16-*.safetensors",
+        "*.safetensors",
+        "*.bin",
+        "*.pt",
+    ]
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],

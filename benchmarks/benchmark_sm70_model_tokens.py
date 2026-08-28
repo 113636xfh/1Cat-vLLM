@@ -603,9 +603,9 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
         True,
     )
-    qwen36_mtp_moe_tuned_config = _env_bool(
-        "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG",
-        True,
+    mtp_moe_tuned_config = _env_bool(
+        "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
+        False,
     )
     awq_warmup = _env_bool("VLLM_SM70_AWQ_WARMUP", True)
     awq_moe_disable = _env_bool("VLLM_SM70_AWQ_MOE_DISABLE", False)
@@ -688,7 +688,13 @@ def _sm70_turbomind_policy(
         "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG": os.environ.get(
             "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG"
         ),
-        "qwen36_mtp_moe_tuned_config_effective": qwen36_mtp_moe_tuned_config,
+        "VLLM_SM70_MTP_MOE_TUNED_CONFIG": os.environ.get(
+            "VLLM_SM70_MTP_MOE_TUNED_CONFIG"
+        ),
+        "mtp_moe_tuned_config_effective": mtp_moe_tuned_config,
+        # Backward-compatible output alias. The old Qwen3.6-only environment
+        # variable is no longer consulted by the runtime.
+        "qwen36_mtp_moe_tuned_config_effective": mtp_moe_tuned_config,
         "VLLM_SM70_AWQ_WARMUP": os.environ.get("VLLM_SM70_AWQ_WARMUP"),
         "awq_warmup_effective": awq_warmup,
         "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get("VLLM_SM70_AWQ_WARMUP_MAX_M"),

@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -553,6 +554,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.compilation_config.static_forward_context
         ):
             logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
+
+        if (
+            not envs.VLLM_SM70_AUX_KERNEL_WARMUP
+            or not current_platform.is_device_capability(70)
+        ):
+            return
+
+        warmed: list[str] = []
+        if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
+            warmed.append("zero_kv_blocks")
+
+        speculator_warmup = getattr(
+            self.speculator, "warmup_sm70_mtp_moe_kernels", None
+        )
+        if speculator_warmup is not None:
+            warmed.extend(speculator_warmup(self._dummy_run))
+
+        if warmed:
+            logger.info_once(
+                "SM70 V2 auxiliary kernel warmup finished: %s", tuple(warmed)
+            )
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)

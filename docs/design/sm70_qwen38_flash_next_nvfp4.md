@@ -11,13 +11,16 @@
   by 16.97%. The direct NVFP4 ten-route QPN-M1 MoE and online QPN8 routes are
   therefore default-on for the exact SM70/TP4/B1 contract, with explicit
   diagnostic opt-outs. The preceding 77.370-token/s graph-node trace remains
-  the detailed optimization control. Native MTP4 also completes TP4 model
-  load, graph
-  capture, warmup, and two 1024x256 requests; its separate acceptance and
-  cycle-cost evidence remains recorded below.
-- Integration line: public `origin/main`, through Draft PR
-  [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345).
-- Base SHA: `d63e9490f65f9e01f6649053c1ab72922034b931`.
+  the detailed optimization control. Corrected native MTP4 is stable across an
+  11-request TP4 transition run, and the no-thinking HumanEval8 gate reaches
+  4.747 mean accepted length, 93.676% draft acceptance, 126.81 warmed pure
+  decode tokens/s, and 8/8 standard semantic executions. The V2 M16 plus
+  M5/M1 warmup also removes the first-request MTP `fused_moe_kernel` JIT.
+- Integration line: public `main`; Qwen3.8 bring-up
+  [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345) and initial decode work
+  [#361](https://github.com/1CatAI/1Cat-vLLM/pull/361) are merged. The compact
+  MTP loader, exact SM70 MTP tile, and V2 warmup are the current follow-up.
+- Base SHA: `03c04da68e72bf26271de4986364a72141a7601f`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
   `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Model download: `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`.
@@ -451,14 +454,73 @@ the draft loader fail closed if either routed-expert parameter is absent, so a
 future mapping regression cannot masquerade as a successful model start. The
 focused loader gate is 21 passed tests plus Ruff and format checks.
 
-The next GPU gate is one TP4, prefix-cache-on, four-prompt native MTP4 run with
-greedy local argmax and QSA index sharing explicitly enabled. It uses the same
-prompts, order, sampling, and output cap as the completed four-request baseline
-and records per-request and per-position accepted length, code output quality,
-emitted tokens/s, and peak memory. MTP3 is not an optimization candidate for
-this gate. A subsequent Nsight trace is warranted only after the corrected
-MTP4 acceptance result is stable; it will report proposal time, five-token
-target verification time, and cycle cost per emitted token separately.
+### Corrected MTP4 acceptance, quality, and warmup closure
+
+The standalone drafter now prefers the four compact `model-bf16-*` shards that
+contain all 33 required MTP/shared parameters instead of rescanning all 206
+target shards. The complete-expert validation remains fail closed, and generic
+safetensors/bin/pt patterns remain compatibility fallbacks. In the accepted
+11-request transition artifact
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition9_v16_storage_ratio_natural4_same7_gpu4567.json`,
+target loading reads 206 shards once and MTP reads only four shards / 14.91 GiB
+in 5.04 seconds. All requests complete without a new GPU Xid or cross-request
+state drift.
+
+That run emits 2,816 tokens with 2.9159 mean accepted length including the
+target token, 47.8972% draft-token acceptance, and 72.8972%, 50.2596%,
+38.5254%, and 29.9065% position acceptance. The ten warmed requests average
+78.98 pure decode tokens/s. Minimum host `MemAvailable` is 47.46 GiB, peak swap
+use is 8.03 GiB, and process exit restores roughly 115--120 GiB available with
+no vLLM worker left behind.
+
+Matched QSA index-sharing A/B/A did not expose an acceptance defect: sharing
+is 0.0359 accepted tokens better overall than recomputing indices. SGLang's
+causal-tail refresh candidate is also rejected because it loses 0.0322 accepted
+tokens and reduces decode speed. The retained natural-prompt control measures
+2.762 mean accepted length and 44.05% draft acceptance, inside the published
+NVFP4 range. Conditional acceptance after the first draft is roughly 70--74%,
+so the weakest event is the first proposal rather than accumulated MTP-step
+drift.
+
+The corrected no-thinking HumanEval8 artifact is
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition16_v23_q38_moe_warmup_humaneval8_nothink_gpu0123.json`.
+It emits 797 tokens. Global MTP4 acceptance is 4.747 mean length and 93.676%
+draft acceptance, with 98.82%, 95.88%, 91.76%, and 88.24% by position.
+Excluding the cold first request gives 4.696 mean length, 92.407% draft
+acceptance, and 126.81 weighted pure decode tokens/s. The standard semantic
+policy preserves each task's imports and signature and passes 8/8 in the
+sandboxed executor. Minimum host `MemAvailable` is 48.08 GiB, peak swap use is
+7.98 GiB, and each GPU peaks at 32,179 MiB; the post-exit audit finds no
+persistent worker or host-memory leak.
+
+The exact TP4-local BF16 draft-MoE shape is
+`E=512, N=160, K=2560, topk=10`. An exact-shape SM70 tile of
+`BM=2, BN=128, BK=64, G=1`, four warps, and three stages reduces M5 from
+1492.500 to 283.853 microseconds (5.26x) and M1 from 425.789 to 272.415
+microseconds (1.56x), with bitwise-identical output. The route is bounded to
+Qwen3.8 TP4 and remains opt-in through
+`VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
+
+V2 needs one additional prefill specialization beyond its faithful M5/M1
+decode warmup. The real HumanEval prompt first runs the draft model at M152;
+existing M8 and M18 captures do not cover the sorted-assignment,
+`M * topk`-divisible-by-16 specialization. A fresh-cache V100 microtest records
+two new compilations and 526.97 ms at M152 without M16. Adding only M16 reduces
+M152 to zero new compilations and 4.51 ms. The final TP4 integration run logs
+KV-zero, M16, and M5/M1 warmup before request monitoring and has no first-
+request `fused_moe_kernel` JIT. Its artifact is
+`.artifacts/qwen4_exp_mtp_tp4_20260827/mtp4_transition19_v26_q38_v2_m16_moe_warmup_humaneval1_nothink_gpu0123.json`.
+It emits the same 173 token IDs as the earlier quality run, keeps 4.943 mean
+accepted length / 98.571% draft acceptance, and reaches 138.26 steady decode
+tokens/s.
+
+The accepted Nsight control still identifies target verification as the next
+MTP cost center: one 43.348-ms speculative round spends 30.040 ms in the
+five-token verifier, versus 2.733 ms in the first draft graph and 5.603 ms of
+critical GPU service in the remaining draft/sampling passes. Further MTP speed
+work should reduce verifier cost without trading away the now-validated
+acceptance or code quality. The separate no-MTP final target remains at least
+100 tokens/s; its last accepted control is 82.274 tokens/s.
 
 ## Acceptance gates
 
