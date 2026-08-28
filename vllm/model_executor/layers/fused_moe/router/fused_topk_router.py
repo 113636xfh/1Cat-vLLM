@@ -28,15 +28,19 @@ def _sm70_qwen38_router_topk_kernel(
     token_expert_indices_ptr,
     E: tl.constexpr,
     K: tl.constexpr,
+    M: tl.constexpr,
     BLOCK_E: tl.constexpr,
 ) -> None:
-    """Sort the exact Qwen3.8 decode router in one SM70 program."""
+    """Sort one exact Qwen3.8 decode or MTP verifier row per program."""
 
+    row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_E)
     valid = offsets < E
-    logits = tl.load(gating_ptr + offsets, mask=valid, other=-float("inf")).to(
-        tl.float32
-    )
+    logits = tl.load(
+        gating_ptr + row * E + offsets,
+        mask=valid,
+        other=-float("inf"),
+    ).to(tl.float32)
     max_logit = tl.max(logits, axis=0)
 
     # Match topk_softmax's degenerate-row behavior: NaN, +Inf, or all -Inf
@@ -71,10 +75,13 @@ def _sm70_qwen38_router_topk_kernel(
     denominator = tl.where(denominator > 0.0, denominator, 1.0)
     weights = raw_weights / denominator
 
-    tl.store(topk_ids_ptr + offsets, sorted_ids, mask=top_mask)
-    tl.store(topk_weights_ptr + offsets, weights, mask=top_mask)
-    # The generic op stores rank-major source rows. M is exactly one here.
-    tl.store(token_expert_indices_ptr + offsets, offsets, mask=top_mask)
+    output_offsets = row * K + offsets
+    tl.store(topk_ids_ptr + output_offsets, sorted_ids, mask=top_mask)
+    tl.store(topk_weights_ptr + output_offsets, weights, mask=top_mask)
+    # Match topkGating's rank-major source-row convention.
+    tl.store(
+        token_expert_indices_ptr + output_offsets, offsets * M + row, mask=top_mask
+    )
 
 
 def _sm70_qwen38_router_topk(
@@ -83,13 +90,15 @@ def _sm70_qwen38_router_topk(
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
 ) -> None:
-    _sm70_qwen38_router_topk_kernel[(1,)](
+    num_tokens = gating_output.shape[0]
+    _sm70_qwen38_router_topk_kernel[(num_tokens,)](
         gating_output,
         topk_weights,
         topk_ids,
         token_expert_indices,
         E=512,
         K=10,
+        M=num_tokens,
         BLOCK_E=512,
         num_warps=8,
     )
@@ -175,8 +184,8 @@ def fused_topk(
     if scoring_func == "softmax":
         if (
             envs.VLLM_SM70_QWEN38_ROUTER_TOPK
-            and M == 1
-            and gating_output.shape == (1, 512)
+            and M in (1, 5)
+            and gating_output.shape == (M, 512)
             and gating_output.dtype == torch.float16
             and gating_output.is_contiguous()
             and topk == 10
@@ -184,7 +193,9 @@ def fused_topk(
             and topk_ids.dtype == torch.int32
             and current_platform.is_device_capability(70)
         ):
-            logger.info_once("SM70 Qwen3.8 E512/K10 router top-k path enabled.")
+            logger.info_once(
+                "SM70 Qwen3.8 E512/K10 router top-k path enabled for M=%d.", M
+            )
             _sm70_qwen38_router_topk(
                 topk_weights,
                 topk_ids,
