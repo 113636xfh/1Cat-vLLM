@@ -165,7 +165,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = True
+    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
@@ -1700,12 +1700,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
-    # dense projections. Pure-FP8 checkpoints must opt in;
-    # a mixed NVFP4 checkpoint may select its separately validated default in
-    # the compressed-tensors scheme. Explicit 0 disables both routes.
+    # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
+    # online route also stays opt-in because it requantizes checkpoint BF16
+    # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1"))
+        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
