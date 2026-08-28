@@ -494,7 +494,7 @@ struct Gemm::Impl {
       }
       auto fast_target = GetSm70Fp8BlockPrefillPrescaledTarget(desc);
       if (fast_target && desc.m == 1 && desc.n == 1024 && desc.k == 4096) {
-        // This is the diagnostic PP2 x TP4 shared gate/up shape. Measure()
+        // This is the exact PP2 x TP4 shared gate/up shape. Measure()
         // benchmarks ordinary E4M3 kernels before Dispatch(), even for a
         // prescaled request. Reuse that exact per-rank launch spec so the scale
         // rewrite cannot also change split-K or reduction order. Other M1

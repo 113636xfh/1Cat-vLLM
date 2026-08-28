@@ -44226,3 +44226,28 @@ Interpretation:
   variant uses 47,616 bytes (`95,232 < 98,304`). Existing FP16 page-16 and
   page-784 XQA-to-scalar smokes pass at relative L2 `3.03e-5` and `4.10e-5`,
   respectively.
+
+## 2026-08-28 exact shared-gate prescaled M=1 audit
+
+- The earlier rejected PP2/TP4 shared-gate candidate forced a dedicated
+  prescaled tactic and changed the control split/reduction tree. The repaired
+  selector instead inherits the ordinary per-rank measured kernel family,
+  CTA, split-K, and swizzle for only `M=1`, `N=1024`, `K=4096`; other M=1
+  roles retain their existing selectors. It fails closed when the matching
+  prescaled kernel family is unavailable.
+- The locked SM70 artifact for source
+  `3897ac3d45667e4746dd7c87d18280173b607db6` uses the same
+  `8x128x64`, split-K-7, swizzle-0 launch in both arms. On the real layer-0
+  TP4-rank-0 shared gate/up weight, 64 changing inputs are bitwise equal both
+  before and after the external clamp-SwiGLU; both CUDA Graphs are stable.
+  Same-GPU A/B/B/A timing moves `62.229` to `20.793 us/layer` (`2.99x`).
+- The subsequent source narrowing changes only the guard from every M=1
+  descriptor to the exact measured `M1/N1024/K4096` descriptor, so the tested
+  body is unchanged. Exhaustive simulation over every E4M3 byte and all
+  checkpoint UE8M0 scale codes also finds zero dequantized FP16 differences
+  for the reversible exponent shift.
+- This exact tensor/runtime route defaults on without checkpoint or model
+  identity checks. A missing operator, an incompatible runtime topology, or
+  non-reversible scales retain the ordinary TurboMind transform; explicit
+  incompatible opt-in fails closed. `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=0`
+  is the rollback.
