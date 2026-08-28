@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+import os
+
 import torch
 from torch import nn
 
@@ -45,6 +47,10 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
+
+
+def _sm70_exact_kda_gemv_enabled() -> bool:
+    return os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "1") != "0"
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -209,7 +215,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and self.local_projection_size == 2048
         )
         self._use_sm70_exact_kda_gemv = (
-            self._use_sm70_fused_fg_b_decode and self.hidden_size == 4096
+            self._use_sm70_fused_fg_b_decode
+            and self.hidden_size == 4096
+            and _sm70_exact_kda_gemv_enabled()
         )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).

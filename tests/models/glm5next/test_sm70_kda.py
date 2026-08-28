@@ -6,8 +6,25 @@ import torch
 import torch.nn.functional as F
 
 import vllm._sm70_ops as sm70_ops
+from vllm.models.glm5next.nvidia.kda import _sm70_exact_kda_gemv_enabled
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("1", True), ("0", False)],
+)
+def test_sm70_exact_kda_gemv_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", value)
+    assert _sm70_exact_kda_gemv_enabled() is expected
 
 
 @pytest.mark.skipif(
