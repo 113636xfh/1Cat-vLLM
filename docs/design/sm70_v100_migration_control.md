@@ -44172,3 +44172,20 @@ Interpretation:
   `docs/design/sm70_dflash2_quality_audit.md`. Do not cite acceptance length as
   intelligence: it explains throughput, while official executable scores and
   natural termination are the quality gates.
+
+## 2026-08-28 GLM-5.3 NVFP4 selector audit
+
+- The exact TP4/B1 grouped W13 shape is eight routed slots with local
+  `N=1024`, `K=4096`, and group size 16. A same-GPU random-data screen on one
+  V100 measures the default split-8 median at `51.200 us` and the measured
+  split-12 route at `48.128 us`, a 6.0% stage-latency reduction.
+- The two FP16 outputs differ in 37 of 8192 elements with maximum absolute
+  difference 0.125, relative L2 `1.642e-5`, and cosine `0.99999917`. This is a
+  small accumulation-order difference, not task-quality evidence. The faster
+  measured selector remains enabled while matched endpoint quality is still
+  collected; no model-identity gate or default-split override is added.
+- The grouped-MoE benchmark now supports random inputs, output hashes, tensor
+  dumps, and the real eight-slot GLM shape. Seed 17 reproduces output hash
+  `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
+  across repeated runs. A separate FP16 Dense/Indexer candidate screen remains
+  benchmark-only and does not alter production dispatch.
