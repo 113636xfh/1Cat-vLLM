@@ -17,7 +17,6 @@ from typing import Any
 
 import torch
 
-from vllm import _sm70_ops as sm70_ops
 from vllm.triton_utils import tl, triton
 
 _SM70_GLM53_FP16_GEMV_CONFIGS: dict[tuple[int, int], tuple[int, int]] = {
@@ -47,14 +46,8 @@ def _sm70_glm53_fp16_gemv_kernel(
     offsets = tl.arange(0, BLOCK_K)
     acc = 0.0
     for block_start in tl.static_range(0, K, BLOCK_K):
-        x = tl.load(
-            x_ptr + block_start + offsets,
-            eviction_policy="evict_last",
-        ).to(tl.float32)
-        weight = tl.load(
-            weight_ptr + row * K + block_start + offsets,
-            eviction_policy="evict_first",
-        ).to(tl.float32)
+        x = tl.load(x_ptr + block_start + offsets).to(tl.float32)
+        weight = tl.load(weight_ptr + row * K + block_start + offsets).to(tl.float32)
         acc += tl.sum(x * weight, axis=0)
     tl.store(out_ptr + row, acc)
 
@@ -112,14 +105,14 @@ def _measure_graph_us(
 ) -> float:
     for _ in range(warmups):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
     for _ in range(warmups):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -193,6 +186,8 @@ def _benchmark_turbomind(
     warmups: int,
     repeats: int,
 ) -> dict[str, Any]:
+    from vllm import _sm70_ops as sm70_ops
+
     prepared_weight, meta = sm70_ops.sm70_f16_prepare(weight)
     k_ld = int(meta[0].item())
     out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
