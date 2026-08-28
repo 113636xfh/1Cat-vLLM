@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import math
@@ -13,6 +12,7 @@ import random
 import subprocess
 import time
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from benchmark_sm70_decode import (
 )
 
 INVALID_ANSWER = -9_999_999
+_NUMBER_RE = re.compile(r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w.])")
+_BOXED_RE = re.compile(r"\\boxed\{(?P<value>(?:[^{}]+|\{(?&value)\})*)\}")
 GSM8K_PROMPT_SUFFIX = (
     "\nPlease reason step by step, and put your final answer within \\boxed{}."
 )
@@ -167,13 +169,18 @@ def _model_weight_files(model: Path) -> dict[str, str]:
 
 
 def _answer_value(text: str) -> int:
-    numbers = re.findall(r"\d+", text.replace(",", ""))
+    boxed = list(_BOXED_RE.finditer(text))
+    answer_text = boxed[-1].group("value") if boxed else text
+    numbers = _NUMBER_RE.findall(answer_text)
     if not numbers:
         return INVALID_ANSWER
     try:
-        return int(ast.literal_eval(numbers[-1]))
-    except (SyntaxError, ValueError):
+        value = Decimal(numbers[-1].replace(",", ""))
+    except InvalidOperation:
         return INVALID_ANSWER
+    if not value.is_finite() or value != value.to_integral_value():
+        return INVALID_ANSWER
+    return int(value)
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:
