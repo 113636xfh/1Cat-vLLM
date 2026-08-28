@@ -23,6 +23,7 @@ from benchmark_sm70_decode import (
     _json_safe,
     _module_file,
     _module_realpath,
+    _parse_extra_engine_args,
     _request_metrics_dict,
     _spec_metrics_snapshot,
     _tracked_env,
@@ -115,6 +116,16 @@ def _parse_args() -> argparse.Namespace:
         "--cuda-profiler-capture",
         action="store_true",
         help="Wrap the measured generation in cudaProfilerStart/Stop for nsys.",
+    )
+    parser.add_argument(
+        "--engine-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Additional vLLM engine argument. May be repeated; JSON scalar "
+            "values are decoded consistently with benchmark_sm70_decode.py."
+        ),
     )
     return parser.parse_args()
 
@@ -319,6 +330,7 @@ def main() -> int:
         "seed": args.seed,
         "speculative_config": speculative_config,
     }
+    engine_kwargs.update(_parse_extra_engine_args(args.engine_arg))
     if args.mamba_cache_mode is not None:
         engine_kwargs["mamba_cache_mode"] = args.mamba_cache_mode
     if args.cuda_profiler_capture:
