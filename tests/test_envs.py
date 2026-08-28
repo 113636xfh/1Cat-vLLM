@@ -155,9 +155,9 @@ def test_sm70_concurrency_tuning_envs(
 
     name = "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE"
     monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() is False
-    monkeypatch.setenv(name, "1")
     assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
 
     name = "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE"
     monkeypatch.delenv(name, raising=False)

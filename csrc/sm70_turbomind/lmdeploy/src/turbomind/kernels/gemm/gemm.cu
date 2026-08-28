@@ -494,7 +494,7 @@ struct Gemm::Impl {
       }
       auto fast_target = GetSm70Fp8BlockPrefillPrescaledTarget(desc);
       if (fast_target && desc.m == 1 && desc.n == 1024 && desc.k == 4096) {
-        // This is the diagnostic PP2 x TP4 shared gate/up shape. Measure()
+        // This is the exact PP2 x TP4 shared gate/up shape. Measure()
         // benchmarks ordinary E4M3 kernels before Dispatch(), even for a
         // prescaled request. Reuse that exact per-rank launch spec so the scale
         // rewrite cannot also change split-K or reduction order. Other M1
@@ -538,6 +538,22 @@ struct Gemm::Impl {
         if (!control_spec || !control_spec->kernel ||
             control_spec->kernel->name().find("c8x128_a1x1x64_01") ==
                 std::string::npos) {
+          // A reused/imported cache can contain a feasible but numerically
+          // different family. Reselect the locked ordinary launch instead of
+          // turning a default-on route into a cache-dependent hard failure.
+          const Sm70AwqTp2FastTarget audited_control_target{
+              desc.n, desc.k, 8, 128, 64, 7, 0, true,
+              "c8x128_a1x1x64_01"};
+          auto control_specs =
+              Find(ctx, barriers_size, partials_size, 0, false);
+          control_spec = SelectSm70AwqTp2FastSpec(
+              ctx, control_specs, audited_control_target, barriers_size,
+              partials_size);
+          if (control_spec) {
+            cache_.Insert(desc, *control_spec);
+          }
+        }
+        if (!control_spec) {
           MaybeTraceSm70AwqTp2FastSelector(desc, "prescaled_control_no_match");
           return {};
         }

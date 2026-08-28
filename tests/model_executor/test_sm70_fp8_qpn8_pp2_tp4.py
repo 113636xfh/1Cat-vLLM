@@ -354,10 +354,12 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
     assert not getattr(layer, "sm70_fp8_gated_silu", False)
 
 
-def test_pp2_tp4_shared_gate_prescaled_keeps_turbomind_layout(monkeypatch) -> None:
+def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0")
     monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
-    monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1")
+    monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_DENSE_GATED_SILU", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "0")
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "0")

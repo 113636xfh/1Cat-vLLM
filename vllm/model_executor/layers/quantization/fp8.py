@@ -184,7 +184,7 @@ def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
 
 
 def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
-    """Admit measured WQA or the diagnostic shared-gate contract."""
+    """Admit the measured WQA or exact shared-gate contract."""
     fused_wqa_wkv = bool(
         getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "fused_wqa_wkv"
         and int(getattr(layer, "tp_size", 1)) == 1
@@ -1252,7 +1252,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     if prescaled_shared_gate_layer:
                         logger.info_once(
-                            "Diagnostic SM70 shared-expert gate/up prescaled "
+                            "Exact SM70 shared-expert gate/up prescaled "
                             "decode path enabled with external activation retained."
                         )
                     else:
