@@ -13,6 +13,25 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
+def test_kpool_tail_admission_uses_in_flight_keyword() -> None:
+    spec = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=256,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+
+    assert (
+        spec.max_admission_blocks_per_request(
+            max_in_flight_tokens=2048,
+            max_model_len=32768,
+        )
+        == 1
+    )
+
+
 def test_glm53_pp2_kpool_tail_shares_indexer_storage(monkeypatch):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     model_config = SimpleNamespace(

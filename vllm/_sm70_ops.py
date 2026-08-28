@@ -46,6 +46,18 @@ def _maybe_load_nvfp4_qpn_m1_library() -> None:
 _maybe_load_nvfp4_qpn_m1_library()
 
 
+def _maybe_load_glm53_fp16_gemv_library() -> None:
+    """Load the exact GLM-5.3 decode GEMV during source-side validation."""
+    if hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out"):
+        return
+    library_path = os.getenv("VLLM_SM70_GLM53_FP16_GEMV_LIBRARY")
+    if library_path is not None:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_glm53_fp16_gemv_library()
+
+
 def _maybe_load_sm70_sampler_library() -> None:
     """Load the sampler fragment only when the main ``vllm._C`` lacks it."""
     if hasattr(torch.ops._C, "sm70_sample_chunked_top20_philox_token_out"):
@@ -1870,6 +1882,25 @@ if hasattr(torch.ops._C, "sm70_glm_kda_fg_b_out"):
         g_input: torch.Tensor,
         f_weight: torch.Tensor,
         g_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def sm70_glm53_fp16_gemv_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _op("sm70_glm53_fp16_gemv_out")(output, input, weight)
+
+
+if hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out"):
+
+    @register_fake("_C::sm70_glm53_fp16_gemv_out")
+    def _sm70_glm53_fp16_gemv_out_fake(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
     ) -> None:
         return None
 

@@ -647,9 +647,9 @@ class KpoolTailSpec(SlidingWindowSpec):
     """Per-request circular cache for an incomplete GLM KPool group."""
 
     def max_admission_blocks_per_request(
-        self, max_num_batched_tokens: int, max_model_len: int
+        self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
-        del max_num_batched_tokens, max_model_len
+        del max_in_flight_tokens, max_model_len
         return 1
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:

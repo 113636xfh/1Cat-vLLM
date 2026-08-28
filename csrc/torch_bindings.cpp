@@ -437,6 +437,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_glm_kda_fg_b_out", torch::kCUDA, &sm70_glm_kda_fg_b_out);
 
   ops.def(
+      "sm70_glm53_fp16_gemv_out(Tensor(a!) output, Tensor input, Tensor "
+      "weight) -> ()");
+  ops.impl("sm70_glm53_fp16_gemv_out", torch::kCUDA, &sm70_glm53_fp16_gemv_out);
+
+  ops.def(
       "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor candidate_ids, Tensor(b!) selected_raw, "
       "Tensor(c!) selected_packed, Tensor(d!) expanded, Tensor(e!) partials, "
