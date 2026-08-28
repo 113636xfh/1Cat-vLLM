@@ -1433,12 +1433,10 @@ turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream) {
-  const bool exact_glm53_b1_w13 =
-      total_tokens == 8 && n == 1024 && k == 4096 && num_experts == 8 &&
-      group_size == 16;
-  const bool exact_glm53_b1_w2 =
-      total_tokens == 8 && n == 4096 && k == 512 && num_experts == 8 &&
-      group_size == 16;
+  const bool exact_glm53_b1_w13 = total_tokens == 8 && n == 1024 && k == 4096 &&
+                                  num_experts == 8 && group_size == 16;
+  const bool exact_glm53_b1_w2 = total_tokens == 8 && n == 4096 && k == 512 &&
+                                 num_experts == 8 && group_size == 16;
   if (exact_glm53_b1_w13 || exact_glm53_b1_w2) {
     // GLM-5.3 decode relies on the default W13 split-8 and W2 split-2
     // accumulation trees. Measured alternatives change FP16 expert outputs.
