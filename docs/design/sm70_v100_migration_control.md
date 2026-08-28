@@ -44180,14 +44180,16 @@ Interpretation:
   V100 measures the default split-8 median at `51.200 us` and the measured
   split-12 route at `48.128 us`, a 6.0% stage-latency reduction.
 - The two FP16 outputs differ in 37 of 8192 elements with maximum absolute
-  difference 0.125, relative L2 `1.642e-5`, and cosine `0.99999917`. Because no
-  matched endpoint audit accepts that accumulation change, the exact GLM W13
-  shape remains on the default split-8 policy.
+  difference 0.125, relative L2 `1.642e-5`, and cosine `0.99999917`. This is a
+  small accumulation-order difference rather than task-quality regression
+  evidence, so the faster dynamic W13 selector remains enabled.
 - The exact TP4/B1 W2 shape is eight routed slots with local `N=4096`, `K=512`,
   and group size 16. Across five random seeds, the measured split-1 policy is
   only 2.8%-3.5% faster than default split-2 in the materialized grouped-MoE
   screen. It changes 52-70 of 32768 FP16 outputs per seed with maximum absolute
-  difference 0.0625, so the exact W2 shape also remains on the default policy.
+  difference 0.0625. With no task-quality regression evidence, the dynamic W2
+  selector also remains enabled. `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0`
+  remains the common stable-accumulation rollback for both shapes.
 - The grouped-MoE benchmark now supports random inputs, output hashes, tensor
   dumps, and the real eight-slot GLM shape. Seed 17 reproduces output hash
   `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
