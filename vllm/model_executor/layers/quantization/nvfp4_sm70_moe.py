@@ -10,6 +10,7 @@ expert-weight copy.
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 import torch
@@ -51,6 +52,7 @@ _COMPACT_GROUPED_MAX_TOKENS: Final = 10
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
 _QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
+_QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 
 
 def _use_qwen38_qpn_m1_decode(
@@ -67,6 +69,33 @@ def _use_qwen38_qpn_m1_decode(
         and topk_ids.shape == (1, 10)
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_indexed_prefill(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only long exact Qwen3.8 TP4 W13 prefill batches."""
+    return bool(
+        getattr(
+            layer,
+            "sm70_nvfp4_qwen38_indexed_prefill",
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL,
+        )
+        and envs.VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL
+        and x.ndim == 2
+        and x.shape[0] >= _QWEN38_INDEXED_PREFILL_MIN_TOKENS
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
         and int(layer.moe_config.tp_size) == 4
         and int(layer.sm70_nvfp4_num_experts) == 512
         and int(layer.sm70_nvfp4_hidden_size) == 2560
@@ -325,6 +354,36 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
         ):
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        indexed_prefill_ops = {
+            "nvfp4_moe_indexed_dense_stage_sm70_out": hasattr(
+                torch.ops._C, "nvfp4_moe_indexed_dense_stage_sm70_out"
+            ),
+            "moe_permute_metadata_with_scratch": hasattr(
+                torch.ops._moe_C, "moe_permute_metadata_with_scratch"
+            ),
+        }
+        indexed_prefill_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL
+        )
+        indexed_prefill_available = all(indexed_prefill_ops.values())
+        indexed_prefill_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL" in os.environ
+        )
+        if (
+            indexed_prefill_requested
+            and not indexed_prefill_available
+            and indexed_prefill_explicit
+        ):
+            missing.extend(
+                name for name, available in indexed_prefill_ops.items() if not available
+            )
+        elif indexed_prefill_requested and not indexed_prefill_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 indexed-A prefill route is not "
+                "present in the loaded extension; falling back to the "
+                "materialized-input route. Explicitly setting "
+                "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL=1 fails closed."
+            )
         if missing:
             raise RuntimeError(
                 "SM70 NVFP4 MoE requires the TurboMind extension "
@@ -432,6 +491,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_w2_k_dim = intermediate
         layer.sm70_nvfp4_w2_n_dim = hidden
         layer.sm70_nvfp4_group_size = NVFP4_GROUP_SIZE
+        layer.sm70_nvfp4_qwen38_indexed_prefill = bool(
+            indexed_prefill_requested and indexed_prefill_available
+        )
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_tokens = _COMPACT_GROUPED_MAX_TOKENS
         self._allocate_graph_safe_decode_buffers(layer)
@@ -469,6 +531,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer._nvfp4_sm70_permuted_input = torch.empty(
             max_slots, hidden, dtype=torch.float16, device=device
+        )
+        layer._nvfp4_sm70_input_row_indices = torch.empty(
+            max_slots, dtype=torch.int32, device=device
         )
         layer._nvfp4_sm70_gate_up = torch.empty(
             max_slots, 2 * intermediate, dtype=torch.float16, device=device
@@ -536,6 +601,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         return {
             "output": layer._nvfp4_sm70_output[:num_tokens],
             "permuted_input": layer._nvfp4_sm70_permuted_input[:slots],
+            "input_row_indices": layer._nvfp4_sm70_input_row_indices[:slots],
             "gate_up": layer._nvfp4_sm70_gate_up[:slots],
             "intermediate": layer._nvfp4_sm70_intermediate[:slots],
             "sorted_output": layer._nvfp4_sm70_sorted_output[:slots],
@@ -558,7 +624,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
     @staticmethod
     def _eager_buffers(
-        layer: RoutedExperts, num_tokens: int
+        layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
         device = layer.w13_tm_weight.device
         top_k = int(layer.sm70_nvfp4_top_k)
@@ -573,8 +639,15 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "output": torch.empty(
                 num_tokens, hidden, dtype=torch.float16, device=device
             ),
-            "permuted_input": torch.empty(
-                slots, hidden, dtype=torch.float16, device=device
+            "permuted_input": (
+                torch.empty(0, hidden, dtype=torch.float16, device=device)
+                if indexed_w13
+                else torch.empty(slots, hidden, dtype=torch.float16, device=device)
+            ),
+            "input_row_indices": (
+                torch.empty(slots, dtype=torch.int32, device=device)
+                if indexed_w13
+                else torch.empty(0, dtype=torch.int32, device=device)
             ),
             "gate_up": torch.empty(
                 slots, 2 * intermediate, dtype=torch.float16, device=device
@@ -615,11 +688,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         }
 
     def _get_buffers(
-        self, layer: RoutedExperts, num_tokens: int
+        self, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
         if 0 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS:
             return self._persistent_buffers(layer, num_tokens)
-        return self._eager_buffers(layer, num_tokens)
+        return self._eager_buffers(layer, num_tokens, indexed_w13)
 
     @staticmethod
     def _apply_swiglu(
@@ -666,7 +739,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
-        buffers = self._get_buffers(layer, num_tokens)
+        indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
+        buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
         direct_single_token = num_tokens == 1
@@ -714,23 +788,42 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             topk_ids_i32 = buffers["topk_ids"]
             topk_ids_i32.copy_(topk_ids, non_blocking=True)
             buffers["permuted_idx"].fill_(slots)
-            torch.ops._moe_C.moe_permute_with_scratch(
-                x,
-                topk_ids_i32,
-                buffers["token_expert_indices"],
-                layer.expert_map,
-                layer.global_num_experts,
-                layer.local_num_experts,
-                top_k,
-                buffers["permuted_input"],
-                buffers["expert_offsets64"],
-                buffers["inv_permuted_idx"],
-                buffers["permuted_idx"],
-                buffers["sort_workspace"],
-                buffers["permuted_experts_id"],
-                buffers["sorted_row_idx"],
-                buffers["topk_ids_for_sort"],
-            )
+            if indexed_w13:
+                torch.ops._moe_C.moe_permute_metadata_with_scratch(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    layer.expert_map,
+                    layer.global_num_experts,
+                    layer.local_num_experts,
+                    top_k,
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["input_row_indices"],
+                    buffers["sort_workspace"],
+                    buffers["permuted_experts_id"],
+                    buffers["sorted_row_idx"],
+                    buffers["topk_ids_for_sort"],
+                )
+            else:
+                torch.ops._moe_C.moe_permute_with_scratch(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    layer.expert_map,
+                    layer.global_num_experts,
+                    layer.local_num_experts,
+                    top_k,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["sort_workspace"],
+                    buffers["permuted_experts_id"],
+                    buffers["sorted_row_idx"],
+                    buffers["topk_ids_for_sort"],
+                )
             buffers["expert_offsets"].copy_(
                 buffers["expert_offsets64"], non_blocking=True
             )
@@ -749,18 +842,37 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
 
-        sm70_ops.nvfp4_moe_dense_stage_sm70_out(
-            buffers["gate_up"],
-            buffers["permuted_input"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w13_strided_ptrs_w,
-            layer.w13_strided_ptrs_s,
-            stage_experts,
-            layer.sm70_nvfp4_w13_k_dim,
-            layer.sm70_nvfp4_w13_n_dim,
-            layer.sm70_nvfp4_group_size,
-        )
+        if indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A W13 prefill route enabled "
+                "(TP4, E512/K10, materialized input rows skipped)."
+            )
+            sm70_ops.nvfp4_moe_indexed_dense_stage_sm70_out(
+                buffers["gate_up"],
+                x,
+                buffers["input_row_indices"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        else:
+            sm70_ops.nvfp4_moe_dense_stage_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
         self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
         sm70_ops.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],

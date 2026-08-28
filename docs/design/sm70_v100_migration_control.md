@@ -44373,3 +44373,57 @@ Interpretation:
   non-reversible scales retain the ordinary TurboMind transform; explicit
   incompatible opt-in fails closed. `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=0`
   is the rollback.
+
+## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
+
+- Public Draft PR #390 is stacked on grouped-QSA PR #387. The retained clean
+  #387 trace showed that the copied routed-MoE input alone cost about
+  `1.488 ms/layer/rank`, while the NVFP4 W13 and W2 grouped GEMMs remained the
+  largest combined post-QSA service category. This follow-up changes only the
+  exact Qwen3.8 TP4 `E512/K10`, `K2560/N320` W13 prefill route; decode, W2,
+  routing order, expert offsets, activation, and weighted unpermute are
+  unchanged.
+- The metadata-only permute keeps the same CUB stable expert sort, inverse map,
+  permuted map, and expert offsets. A 256-thread kernel derives the original
+  token row for each sorted route instead of launching one 256-thread CTA per
+  route to copy 2,560 FP16 values. TurboMind consumes those rows through its
+  existing SM70 `MatrixLayout.idxs` iterator. The materialized
+  `[tokens * 10, 2560]` allocation is omitted for the admitted route.
+- One locked V100 operator screen, using production dimensions and physically
+  distinct repeated real layer-0 packed weights, passes exact metadata and
+  output checks at 128, 512, 2,048, and 8,192 input tokens. At 8,192 tokens:
+    - sort plus materialization moves from `1.578496 ms` to metadata-only
+      `0.095232 ms` (`16.58x`);
+    - contiguous W13 moves from `4.409344 ms` to indexed W13 `4.184064 ms`;
+    - the complete sort/metadata plus W13 chain moves from `6.026752 ms` to
+      `4.235264 ms` (`1.423x`, `1.791488 ms/layer/rank` saved);
+    - expert offsets, inverse maps, permuted maps, sorted rows, and sorted
+      expert IDs are elementwise equal; indexed rows reproduce the expanded
+      input bitwise and W13 output is bitwise equal.
+- Incremental SM70 builds of `_C` and `_moe_C` pass and both new schemas import
+  in the production Python 3.12/Torch 2.10/CUDA 12.8 environment. The focused
+  admission suite passes `15 passed, 5 skipped`; ruff and repository
+  clang-format hooks pass.
+- A single model startup then completes the same TP4 V2, no-MTP, 8,192-token
+  chunk, QSA-page4 endpoint matrix used by #387. Runtime logs hit both
+  `SM70 Qwen3.8 NVFP4 indexed-A W13 prefill route enabled` and grouped QSA.
+  Pure-prefill results are:
+    - 32K: `5.4625646 -> 5.0357304 s`,
+      `5,998.65 -> 6,507.10 token/s` (`+8.47%`);
+    - 64K: `11.3434579 -> 10.5000728 s`,
+      `5,777.43 -> 6,241.48 token/s` (`+8.03%`);
+    - 131K: `24.0326333 -> 22.3112715 s`,
+      `5,450.92 -> 5,871.47 token/s` (`+7.71%`);
+    - 8K: `1.2810527 -> 1.1751880 s`,
+      `6,394.74 -> 6,970.80 token/s` (`+9.01%`).
+- Arithmetic text/hash, Chinese text/hash, and every retained long-context
+  token hash exactly match #387. The route therefore defaults on from 128
+  tokens under the exact contract. `VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL=0`
+  is the rollback. An implicitly enabled route falls back when paired with an
+  older extension; explicit `=1` fails closed if either new operator is
+  missing.
+- This clears 6K at 32K and 64K. The 131K result is still about 2.19% below
+  6K. Using the retained trace plus the measured indexed W13 time, W13 and W2
+  are still projected near 26% of 8K per-rank service, so the next bounded
+  screen remains the NVFP4 grouped-GEMM scheduler/register-pressure path, not
+  another model startup or a return to QSA launch tuning.

@@ -8682,7 +8682,9 @@ void nvfp4_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    torch::Tensor b_group_indices, bool compact_grouped_rows = false) {
+    torch::Tensor b_group_indices, bool compact_grouped_rows = false,
+    int64_t logical_total_tokens = -1,
+    torch::Tensor a_indices = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "nvfp4_moe_gemm_sm70: input must be CUDA float16.");
@@ -8703,9 +8705,6 @@ void nvfp4_moe_gemm_sm70_out_impl(
               "nvfp4_moe_gemm_sm70: k must be divisible by group_size.");
   TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
               "nvfp4_moe_gemm_sm70: input shape mismatch.");
-  TORCH_CHECK(out.dim() == 2 && out.size(0) == sorted_input.size(0) &&
-                  out.size(1) == n && out.stride(1) == 1,
-              "nvfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "nvfp4_moe_gemm_sm70: expert_offsets too small.");
   TORCH_CHECK(b_group_indices.is_cuda() &&
@@ -8715,7 +8714,28 @@ void nvfp4_moe_gemm_sm70_out_impl(
               "nvfp4_moe_gemm_sm70: B group indices must be contiguous CUDA "
               "int32.");
 
-  const int64_t total_tokens = sorted_input.size(0);
+  const int64_t input_tokens = sorted_input.size(0);
+  const int64_t total_tokens =
+      logical_total_tokens > 0 ? logical_total_tokens : input_tokens;
+  const bool use_a_indices = a_indices.defined() && a_indices.numel() > 0;
+  torch::Tensor a_indices_flat = a_indices;
+  if (use_a_indices) {
+    TORCH_CHECK(a_indices.is_cuda() &&
+                    a_indices.scalar_type() == torch::kInt32 &&
+                    a_indices.is_contiguous(),
+                "nvfp4_moe_gemm_sm70: A row indices must be contiguous CUDA "
+                "int32.");
+    a_indices_flat = a_indices.view({-1});
+    TORCH_CHECK(a_indices_flat.numel() >= total_tokens,
+                "nvfp4_moe_gemm_sm70: A row indices size mismatch.");
+  } else {
+    TORCH_CHECK(input_tokens == total_tokens,
+                "nvfp4_moe_gemm_sm70: non-indexed input rows must match "
+                "logical rows.");
+  }
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == total_tokens &&
+                  out.size(1) == n && out.stride(1) == 1,
+              "nvfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
   if (total_tokens == 0) {
     return;
   }
@@ -8742,6 +8762,7 @@ void nvfp4_moe_gemm_sm70_out_impl(
   };
   desc_A.num = static_cast<int>(num_experts);
   desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
   turbomind::gemm::MatrixLayout desc_U{};
 
   const auto order_w = conv_w->order;
@@ -8826,6 +8847,43 @@ void nvfp4_moe_gemm_sm70_out_impl(
   TORCH_CHECK(ec == 0,
               "nvfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
               ").");
+}
+
+void nvfp4_moe_indexed_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  constexpr int kQwen38TopK = 10;
+  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
+                  input.scalar_type() == torch::kFloat16 && input.is_cuda(),
+              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 CUDA "
+              "FP16 [tokens, 2560] input is required.");
+  TORCH_CHECK(num_experts == 512 && k == 2560 && n == 320 && group_size == 16,
+              "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 TP4 W13 "
+              "contract is required.");
+  TORCH_CHECK(input_row_indices.is_cuda() &&
+                  input_row_indices.scalar_type() == torch::kInt32 &&
+                  input_row_indices.is_contiguous() &&
+                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
+              "nvfp4_moe_indexed_dense_stage_sm70_out: input row indices must "
+              "contain exactly tokens*10 contiguous CUDA int32 entries.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
+                  out.size(1) == n,
+              "nvfp4_moe_indexed_dense_stage_sm70_out: output shape mismatch.");
+  TORCH_CHECK(vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled(),
+              "nvfp4_moe_indexed_dense_stage_sm70_out requires grouped "
+              "prefill dispatch.");
+
+  static std::atomic<unsigned> logged_nvfp4_indexed_prefill{0u};
+  maybe_log_sm70_moe_route_once(
+      logged_nvfp4_indexed_prefill,
+      "SM70 Qwen3.8 NVFP4 MoE indexed-A W13 prefill path enabled C++ op "
+      "reached",
+      input, input_row_indices.numel(), num_experts);
+  nvfp4_moe_gemm_sm70_out_impl(
+      out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
+      dense_expert_ids, false, input_row_indices.numel(), input_row_indices);
 }
 
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,

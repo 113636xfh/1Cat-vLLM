@@ -1197,6 +1197,9 @@ def _sm70_moe_policy() -> dict[str, Any]:
     add_allreduce = _env_bool("VLLM_SM70_MOE_ADD_ALLREDUCE", False)
     qwen38_router_topk = _env_bool("VLLM_SM70_QWEN38_ROUTER_TOPK", True)
     qwen38_nvfp4_qpn_m1 = _env_bool("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", True)
+    qwen38_nvfp4_indexed_prefill = _env_bool(
+        "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", True
+    )
     single_token_fastpath = _env_bool("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", False)
     single_token_permute = _env_bool(
         "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", False
@@ -1234,6 +1237,10 @@ def _sm70_moe_policy() -> dict[str, Any]:
             "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE"
         ),
         "qwen38_nvfp4_qpn_m1_effective": qwen38_nvfp4_qpn_m1,
+        "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": os.environ.get(
+            "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL"
+        ),
+        "qwen38_nvfp4_indexed_prefill_effective": (qwen38_nvfp4_indexed_prefill),
         "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH"
         ),
@@ -1282,6 +1289,7 @@ def _sm70_moe_policy() -> dict[str, Any]:
         "expected_default": False,
         "qwen38_router_topk_expected_default": True,
         "qwen38_nvfp4_qpn_m1_expected_default": True,
+        "qwen38_nvfp4_indexed_prefill_expected_default": True,
         "single_token_unpermute_expected_default": True,
         "route_hit_oracle": (
             "The exact Qwen3.8 E512/K10 lane requires "
@@ -1290,6 +1298,9 @@ def _sm70_moe_policy() -> dict[str, Any]:
             "The accepted routed-expert lane additionally requires "
             "qwen38_nvfp4_qpn_m1_effective=true and the `SM70 Qwen3.8 "
             "NVFP4 direct QPN-M1 expert path enabled` marker. "
+            "Long exact TP4 prefill additionally requires "
+            "qwen38_nvfp4_indexed_prefill_effective=true and the `SM70 "
+            "Qwen3.8 NVFP4 indexed-A W13 prefill route enabled` marker. "
             "For CUDA-graph fast-path acceptance, require the C++ trace "
             "`SM70 custom all_reduce_sum2 op reached ... capture=active`; "
             "the Python MoERunner candidate log alone is not a custom-op hit. "

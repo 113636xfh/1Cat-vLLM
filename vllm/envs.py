@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -1839,6 +1840,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reached 82.274 tokens/s with unchanged arithmetic and Chinese hashes.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1"))
+    ),
+    # Exact TP4 Qwen3.8 W13 prefill route. It retains the stable expert sort
+    # and unpermute maps but reads original token rows through TurboMind's
+    # indexed-A iterator instead of materializing top-k replicated FP16 rows.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "1"))
     ),
     "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": lambda: os.getenv(
         "VLLM_SM70_NVFP4_QPN_M1_LIBRARY"
