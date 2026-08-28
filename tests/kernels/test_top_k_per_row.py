@@ -843,3 +843,111 @@ def test_persistent_topk_padded_stride(top_k: int) -> None:
                 f"Row {i}: persistent_topk with padded stride doesn't match. "
                 f"seq_len={sl}, stride={padded_stride}"
             )
+
+
+def _qsa_lexicographic_topk_reference(
+    logits: torch.Tensor, lengths: list[int], top_k: int
+) -> torch.Tensor:
+    rows = []
+    for row, length in enumerate(lengths):
+        if length <= top_k:
+            selected = torch.arange(length, device=logits.device, dtype=torch.int32)
+            selected = torch.nn.functional.pad(selected, (0, top_k - length), value=-1)
+        else:
+            # Stable descending argsort gives the required low-index tie break.
+            selected = torch.argsort(
+                logits[row, :length], descending=True, stable=True
+            )[:top_k]
+            selected = selected.sort().values.to(torch.int32)
+        rows.append(selected)
+    return torch.stack(rows)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_qsa_lexicographic_topk_is_exact_and_repeatable() -> None:
+    """QSA top-k is exact across overflow ramps and real score ties."""
+
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    padded_stride = 806736
+    live_lengths = [511, 4096, 4096, 16384]
+    logits = torch.full(
+        (len(live_lengths), padded_stride),
+        float("-inf"),
+        dtype=torch.float32,
+    )
+    logits[0, : live_lengths[0]] = torch.arange(
+        live_lengths[0], 0, -1, dtype=torch.float32
+    )
+    # This mirrors the V100 reproducer: every value exceeds FP16 range even
+    # though the FP32 keys are strictly descending and unique.
+    logits[1, : live_lengths[1]] = torch.arange(
+        padded_stride,
+        padded_stride - live_lengths[1],
+        -1,
+        dtype=torch.float32,
+    )
+    logits[2, : live_lengths[2] : 2] = 0.0
+    logits[2, 1 : live_lengths[2] : 2] = -0.0
+    # A dense, natural zero/tie boundary plus nonzero score bands.
+    logits[3, : live_lengths[3]] = (
+        torch.arange(live_lengths[3], dtype=torch.float32) % 17
+    )
+
+    lengths = torch.tensor(live_lengths, dtype=torch.int32)
+    output = torch.empty((len(live_lengths), top_k), dtype=torch.int32)
+    expected = _qsa_lexicographic_topk_reference(logits, live_lengths, top_k)
+
+    for _ in range(10):
+        torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, top_k)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_qsa_lexicographic_topk_supports_prefill_batches() -> None:
+    """The exact path also covers prefill chunks with more than 32 rows."""
+
+    torch.set_default_device("cuda:0")
+    rows = 64
+    columns = 4096
+    top_k = 512
+    logits = (
+        torch.arange(columns, dtype=torch.float32).unsqueeze(0)
+        + torch.arange(rows, dtype=torch.float32).unsqueeze(1)
+    ) % 23
+    live_lengths = [columns - (row % 8) * 128 for row in range(rows)]
+    lengths = torch.tensor(live_lengths, dtype=torch.int32)
+    output = torch.empty((rows, top_k), dtype=torch.int32)
+    expected = _qsa_lexicographic_topk_reference(logits, live_lengths, top_k)
+
+    torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, top_k)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_qsa_lexicographic_topk_cuda_graph_replay_is_stable() -> None:
+    """The selector keeps identical membership and order across graph replays."""
+
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    live_length = 4096
+    logits = torch.zeros((1, 8192), dtype=torch.float32)
+    lengths = torch.tensor([live_length], dtype=torch.int32)
+    output = torch.empty((1, top_k), dtype=torch.int32)
+    expected = torch.arange(top_k, dtype=torch.int32).unsqueeze(0)
+
+    torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, top_k)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, top_k)
+
+    for _ in range(10):
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)

@@ -972,6 +972,12 @@ def _qsa_indexer_cublas_work_supported(rows: int, columns: int) -> bool:
     return rows * columns >= _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS
 
 
+def _use_sm70_qsa_lexicographic_topk(topk: int) -> bool:
+    """Use the exact, deterministic selector for Volta QSA."""
+
+    return topk == 512 and current_platform.is_device_capability(70)
+
+
 def _qsa_visible_blocks(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
@@ -1227,19 +1233,31 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        topk_op = (
-            torch.ops._C.cooperative_topk
-            if use_cooperative_topk
-            else torch.ops._C.persistent_topk
-        )
-        topk_op(
-            logits,
-            visible_blocks,
-            blocks,
-            topk_workspace,
-            block_topk,
-            score_columns,
-        )
+        if _use_sm70_qsa_lexicographic_topk(block_topk):
+            logger.info_once(
+                "Using exact SM70 QSA lexicographic top-k "
+                "(score descending, block index ascending)."
+            )
+            torch.ops._C.qsa_lexicographic_topk(
+                logits,
+                visible_blocks,
+                blocks,
+                block_topk,
+            )
+        else:
+            topk_op = (
+                torch.ops._C.cooperative_topk
+                if use_cooperative_topk
+                else torch.ops._C.persistent_topk
+            )
+            topk_op(
+                logits,
+                visible_blocks,
+                blocks,
+                topk_workspace,
+                block_topk,
+                score_columns,
+            )
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
