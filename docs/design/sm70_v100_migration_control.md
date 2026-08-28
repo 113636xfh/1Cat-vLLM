@@ -130,6 +130,108 @@ Goal:
   [long-context result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5437096030)
   comments.
 
+### Grouped Page4 QSA follow-up, 2026-08-28
+
+- Public PR #378 landed the Page4 precursor. The exact grouped follow-up is
+  Draft PR #387 on
+  `codex/v100-qwen38-grouped-page4-prefill-20260828-144759`, rebuilt from
+  public `main@03c04da68e`. The frozen endpoint route remains
+  TP4/V2/ModelOpt NVFP4/FP16 activations and KV/no MTP, with 8192-token chunked
+  prefill. The retained BN16 endpoint baseline is
+  `4532.07/4446.64/4108.16 tok/s` at 32K/64K/131K; do not compare short route
+  probes or TTFT-inclusive numbers against it.
+- The retained 8192-token Nsight Systems capture makes selected QSA the first
+  optimization target: `55.151 ms` per layer/rank and `36.42%` of kernel time.
+  GEMM is about `35.8%`, TP collectives about `12.8%`, and the main GDN kernel
+  `3.11%`. Nsight Compute counters remain unavailable to this user with
+  `ERR_NVGPUCTRPERM`; do not repeat the counter attempt or change host policy
+  for this campaign.
+- Upstream audits found no drop-in SM70 kernel. FlashInfer PRs
+  [#4474](https://github.com/flashinfer-ai/flashinfer/pull/4474) and
+  [#4689](https://github.com/flashinfer-ai/flashinfer/pull/4689) provide the
+  useful BSR/KV256 and weight-stationary scheduling ideas, but target SM75+
+  and assume one semantic query block shares one sparse row. SGLang PR
+  [#36497](https://github.com/sgl-project/sglang/pull/36497) and vLLM PR
+  [#53896](https://github.com/vllm-project/vllm/pull/53896) retain a direct
+  per-row Triton QSA prefill kernel. Qwen TP4 has six query heads, D256, and
+  different top-k sets per row, so exact cross-query masks are required.
+- The retained production-layout Page4 partition sweep admits P1024 without
+  changing the 192-thread/two-CTA-per-SM resource contract. P256/P512/P1024
+  measure `30.742/29.361/28.769 ms`; P1024 is `6.4%` faster than P256 with
+  maximum absolute error `0.000244140625` and relative L2 about `3.95e-4`.
+  This is the fallback for large rows that cannot use grouped planning.
+- The grouped candidate assigns one CTA to eight adjacent query rows and six
+  heads, reusing each unioned FP16 K/V Page4 block. A 32-bit mask carries four
+  token bits for each of eight queries, preserving different top-k sets and
+  causal tails exactly. Real retained selection diagnostics are `81.92%`
+  adjacent-row overlap and `54.88%` at gap four; the admission microbenchmark
+  uses a 1163-page union matching both values, rather than assuming one common
+  set across all eight rows.
+- The GPU planner uses a per-group 8192-entry shared-memory hash table. It
+  resolves physical pages for every request independently, unions all rows,
+  and groups output by the seven possible active WMMA row-tile masks. Category
+  boundaries are padded to eight Page4 blocks so a 32-token kernel tile never
+  mixes categories. A deterministic block-wide prefix orders entries by hash
+  slot; four replays produce bitwise-identical tables and outputs. The earlier
+  shared-atomic ordering is rejected despite a slightly lower median because
+  it varied by one FP16 ULP across replays.
+- After the latest-main repair and QSA cache-table canonicalization, grouped
+  planning also consumes per-row query positions and per-request live sequence
+  lengths. It truncates early prompt rows, validates partial tails, request and
+  logical-page bounds, and rejects stale physical pages before hashing. A
+  4096-row hybrid Page16/Page4 test spans 1/2/3/4-token early rows, the
+  2048/2049/2050/2051 boundaries, mature rows, and a nonmonotonic physical page
+  table; it matches Triton at relative L2 `2.434e-4` and cosine `1.0`. An all
+  invalid/padded-group test produces bitwise-equal zero output instead of
+  leaving the caller's output buffer untouched.
+- The final isolated route, including Python dispatch, GPU planning, padding,
+  and grouped attention, measures `16.132 ms` median (`15.588 ms` minimum)
+  versus Triton `55.940 ms`, a `3.468x` speedup. Maximum absolute error is
+  `0.0001220703125`, relative L2 `3.535e-4`, and cosine
+  `0.9999998807907104`. The standalone planner is about `0.32 ms`; its exact
+  group-0 block/mask dictionary matches the reference. Focused Python tests
+  are `10 passed`, and the SM70 extension builds successfully with zero local
+  memory for the grouped kernel. Focused latest-source coverage is `19 passed,
+  16 warnings`.
+- The TP4 endpoint gate route-hits grouped Page4 on full 8192-row chunks and on
+  the 8120-row 131K tail. Pure-prefill throughput is `5998.65`, `5777.43`, and
+  `5450.92 tok/s` at 32K/64K/131K, versus the matching retained
+  `4532.07/4446.64/4108.16` baseline: `1.3236x/1.2993x/1.3269x`. An exact 8K
+  case measures `6394.74 tok/s`. Arithmetic, Chinese, and all long-context
+  token hashes are bitwise identical to the baseline, including both repeats
+  at 32K and 64K. The recovery endpoint run overlapped host/disk activity from
+  an unrelated GPU4-7 model load beginning at `15:23:39`, so treat these as
+  conservative endpoint values rather than a clean-host ceiling.
+- The clean double-locked 8192-token Nsight capture reports `5094.991 ms` of
+  aggregate kernel service over four ranks. Grouped attention is
+  `9.632 ms` per QSA layer/rank and its planner is `0.362 ms`, or `9.994 ms`
+  together: `5.518x` faster and `81.88%` lower than the old `55.151 ms` QSA
+  path. QSA plus planning is now `9.42%` of aggregate service instead of
+  `36.42%`. Per-GPU kernel-union duty is `98.27-98.61%` over a `1293.2 ms`
+  capture span; only `18.0-22.4 ms` is between kernels. The representative
+  NVML sample is `99-100%` GPU busy at `1530 MHz` and `268-314 W`. These are
+  scheduling-duty and power observations, not achieved Tensor-Core or HBM
+  counters; NCU remains unavailable under `ERR_NVGPUCTRPERM`.
+- The post-QSA first hotspot is the routed NVFP4 MoE chain. Its two grouped
+  GEMMs consume `25.12%`; materializing the top-10 input permutation consumes
+  `5.61%`; deterministic unpermute/finalize consumes `2.46%`. These three
+  stages alone are `33.19%`, before routing, sorting, and activation. The
+  NVFP4 kernel uses 128 threads, 122 registers/thread, and 16.4 KiB shared
+  memory, giving a four-CTA/SM, 16-warp/SM (`25%`) static occupancy ceiling.
+  Useful W13/W2 rates are only about `28.8-31.9 TFLOP/s`. HC combine-norm and
+  gate-mix are `6.44%/3.85%`, NCCL all-reduce is `8.45%`, and the main GDN
+  kernel is `4.43%`. GDN is separately grid/resource limited (48 CTAs for 80
+  SMs, 253 registers/thread, 91 KiB dynamic shared memory), but its absolute
+  opportunity is smaller than routed MoE.
+- Do not spend another full-model startup rechecking the same grouped-QSA
+  route. The next bounded experiment is an indexed-A NVFP4 W13 operator gate:
+  retain the existing deterministic expert sort and inverse map, but avoid
+  materializing 8192 rows into 81920 top-10 rows and let TurboMind's existing
+  indexed SM70 A iterator read the original token-major activation. Admit it
+  only if the complete sort/map/W13 chain wins and remains bitwise or within
+  the existing FP16 accumulation tolerance; a noncontiguous indexed read that
+  merely moves the copy cost into GEMM is rejected before any endpoint run.
+
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
 - Integration base: `onecat/main@7aede2cf010d92815c9d7bff25867b4fa009b6cb`.
