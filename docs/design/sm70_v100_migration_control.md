@@ -44187,9 +44187,11 @@ Interpretation:
   and group size 16. Across five random seeds, the measured split-1 policy is
   only 2.8%-3.5% faster than default split-2 in the materialized grouped-MoE
   screen. It changes 52-70 of 32768 FP16 outputs per seed with maximum absolute
-  difference 0.0625. With no task-quality regression evidence, the dynamic W2
-  selector also remains enabled. `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0`
-  remains the common stable-accumulation rollback for both shapes.
+  difference 0.0625, relative L2 `1.34e-5`-`2.01e-5`, and cosine
+  `0.9999972`-`0.9999981`. With no task-quality regression evidence, the
+  dynamic W2 selector also remains enabled.
+  `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0` remains the common
+  stable-accumulation rollback for both shapes.
 - The grouped-MoE benchmark now supports random inputs, output hashes, tensor
   dumps, and the real eight-slot GLM shape. Seed 17 reproduces output hash
   `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
