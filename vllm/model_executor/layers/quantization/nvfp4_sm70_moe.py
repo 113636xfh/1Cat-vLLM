@@ -415,6 +415,40 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_experts = int(layer.local_num_experts)
         hidden = int(layer.moe_config.hidden_dim)
         intermediate = int(layer.moe_config.intermediate_size_per_partition)
+        fused_swiglu_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+            and int(layer.moe_config.tp_size) == 4
+            and num_experts == 512
+            and hidden == 2560
+            and intermediate == 160
+            and int(layer.moe_config.experts_per_token) == 10
+            and layer.swiglu_limit is None
+        )
+        fused_swiglu_available = hasattr(
+            torch.ops._C, "nvfp4_moe_indexed_fused_swiglu_sm70_out"
+        )
+        fused_swiglu_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL" in os.environ
+        )
+        if (
+            fused_swiglu_requested
+            and not fused_swiglu_available
+            and fused_swiglu_explicit
+        ):
+            raise RuntimeError(
+                "SM70 Qwen3.8 fused-SwiGLU prefill requires the TurboMind "
+                "extension with nvfp4_moe_indexed_fused_swiglu_sm70_out."
+            )
+        if fused_swiglu_requested and not fused_swiglu_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 fused-SwiGLU prefill op is absent "
+                "from the loaded extension; retaining the standalone "
+                "activation route. Explicit opt-in fails closed."
+            )
+        fused_swiglu_prefill = bool(fused_swiglu_requested and fused_swiglu_available)
+        fast_prefill = bool(
+            fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
+        )
 
         w13_tm_weights: list[torch.Tensor] = []
         w13_tm_scales: list[torch.Tensor] = []
@@ -432,6 +466,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 w13_packed,
                 w13_scales.half().t().contiguous(),
                 NVFP4_GROUP_SIZE,
+                interleave_gated_silu=fused_swiglu_prefill,
             )
             w13_tm_weights.append(prepared_w13[0])
             w13_tm_scales.append(prepared_w13[1])
@@ -476,6 +511,39 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             w2_q_ld,
             num_experts,
         )
+        if fast_prefill:
+            # TurboMind packs this exact N320 weight as five contiguous N64
+            # tiles per expert. The N256/N64 views therefore partition the
+            # existing allocation without copying it. Scales remain a strided
+            # N320 view, so both subprojections retain the original q_ld.
+            w13_flat = layer.w13_tm_weight.view(num_experts, -1)
+            head_words = hidden * 256 // 8
+            w13_head_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+                w13_flat[:, :head_words],
+                layer.w13_tm_scales[:, :, :256],
+                w13_k_ld,
+                w13_q_ld,
+                num_experts,
+            )
+            w13_tail_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+                w13_flat[:, head_words:],
+                layer.w13_tm_scales[:, :, 256:],
+                w13_k_ld,
+                w13_q_ld,
+                num_experts,
+            )
+            layer.w13_head_strided_ptrs_w = Parameter(
+                w13_head_ptrs[0], requires_grad=False
+            )
+            layer.w13_head_strided_ptrs_s = Parameter(
+                w13_head_ptrs[1], requires_grad=False
+            )
+            layer.w13_tail_strided_ptrs_w = Parameter(
+                w13_tail_ptrs[0], requires_grad=False
+            )
+            layer.w13_tail_strided_ptrs_s = Parameter(
+                w13_tail_ptrs[1], requires_grad=False
+            )
         layer.w13_strided_ptrs_w = Parameter(w13_ptrs[0], requires_grad=False)
         layer.w13_strided_ptrs_s = Parameter(w13_ptrs[1], requires_grad=False)
         layer.w2_strided_ptrs_w = Parameter(w2_ptrs[0], requires_grad=False)
@@ -494,6 +562,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_qwen38_indexed_prefill = bool(
             indexed_prefill_requested and indexed_prefill_available
         )
+        layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
+        layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_tokens = _COMPACT_GROUPED_MAX_TOKENS
         self._allocate_graph_safe_decode_buffers(layer)
@@ -517,6 +587,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             _GRAPH_SAFE_MAX_TOKENS,
             _COMPACT_GROUPED_MAX_TOKENS,
         )
+        if fused_swiglu_prefill:
+            logger.info_once(
+                "SM70 Qwen3.8 indexed-A fused-SwiGLU prefill candidate "
+                "enabled (interleaved W13, exact FP16 epilogue arithmetic)."
+            )
+        if fast_prefill:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 fast grouped prefill enabled "
+                "(zero-copy W13 N256+N64, cached-B W2)."
+            )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
@@ -696,8 +776,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
     @staticmethod
     def _apply_swiglu(
-        layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
+        layer: RoutedExperts,
+        out: torch.Tensor,
+        gate_up: torch.Tensor,
+        *,
+        interleaved: bool = False,
     ) -> None:
+        if interleaved:
+            if layer.swiglu_limit is not None:
+                raise RuntimeError(
+                    "Interleaved SM70 NVFP4 SwiGLU does not support clamping."
+                )
+            torch.ops._C.silu_and_mul_interleaved(out, gate_up)
+            return
         if layer.swiglu_limit is None:
             torch.ops._C.silu_and_mul(out, gate_up)
         else:
@@ -740,6 +831,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         if num_tokens == 0:
             return x.new_empty((0, hidden))
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
+        interleaved_w13 = bool(
+            getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)
+        )
+        fused_indexed_w13 = indexed_w13 and interleaved_w13
+        split_fused_indexed_w13 = fused_indexed_w13 and bool(
+            getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)
+        )
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
@@ -759,7 +857,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 True,
                 _QWEN38_QPN_M1_W13_SPLIT_K,
             )
-            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+            self._apply_swiglu(
+                layer,
+                buffers["intermediate"],
+                buffers["gate_up"],
+                interleaved=interleaved_w13,
+            )
             sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
                 buffers["sorted_output"],
                 buffers["intermediate"],
@@ -842,7 +945,57 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
 
-        if indexed_w13:
+        if split_fused_indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU split-W13 "
+                "prefill route enabled (N256+N64)."
+            )
+            for intermediate, ptrs_w, ptrs_s, n in (
+                (
+                    buffers["intermediate"][:, :128],
+                    layer.w13_head_strided_ptrs_w,
+                    layer.w13_head_strided_ptrs_s,
+                    256,
+                ),
+                (
+                    buffers["intermediate"][:, 128:],
+                    layer.w13_tail_strided_ptrs_w,
+                    layer.w13_tail_strided_ptrs_s,
+                    64,
+                ),
+            ):
+                sm70_ops.nvfp4_moe_indexed_fused_swiglu_sm70_out(
+                    intermediate,
+                    x,
+                    buffers["input_row_indices"],
+                    stage_offsets,
+                    stage_expert_ids,
+                    ptrs_w,
+                    ptrs_s,
+                    stage_experts,
+                    layer.sm70_nvfp4_w13_k_dim,
+                    n,
+                    layer.sm70_nvfp4_group_size,
+                )
+        elif fused_indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU W13 prefill "
+                "candidate enabled."
+            )
+            sm70_ops.nvfp4_moe_indexed_fused_swiglu_sm70_out(
+                buffers["intermediate"],
+                x,
+                buffers["input_row_indices"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        elif indexed_w13:
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 indexed-A W13 prefill route enabled "
                 "(TP4, E512/K10, materialized input rows skipped)."
@@ -873,7 +1026,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer.sm70_nvfp4_w13_n_dim,
                 layer.sm70_nvfp4_group_size,
             )
-        self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+        if not fused_indexed_w13:
+            self._apply_swiglu(
+                layer,
+                buffers["intermediate"],
+                buffers["gate_up"],
+                interleaved=interleaved_w13,
+            )
         sm70_ops.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
             buffers["intermediate"],

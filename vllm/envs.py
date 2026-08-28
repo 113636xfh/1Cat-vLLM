@@ -182,6 +182,8 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -1846,6 +1848,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexed-A iterator instead of materializing top-k replicated FP16 rows.
     "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "1"))
+    ),
+    # Exact Qwen3.8 route: interleave W13 columns at load time and apply SwiGLU
+    # in the indexed grouped-GEMM epilogue. The arithmetic is bitwise equal to
+    # the standalone FP16 activation and avoids its intermediate traffic.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL", "1"))
+    ),
+    # Exact TP4 long-prefill grouped-GEMM policy: split W13 N320 into an N256
+    # head plus N64 tail, and retain W2 weights in cache across expert-local M
+    # tiles. Both use zero-copy views of the established packed weights.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL", "1"))
     ),
     "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": lambda: os.getenv(
         "VLLM_SM70_NVFP4_QPN_M1_LIBRARY"

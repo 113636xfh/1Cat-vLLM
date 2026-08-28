@@ -292,12 +292,13 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
         torch.cat((shard_0[2:4], shard_1[0:2])).float(),
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
-    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
 
 
 def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module._offload_model_dtype = torch.float16
     weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
     monkeypatch.setattr(ple_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
@@ -315,8 +316,9 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     )
 
     assert loaded == {"ngram_embedding.weight_scale"}
-    assert torch.equal(module._offload_weight_scale, weight_scale)
-    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+    assert module._offload_weight_scale.dtype == torch.float16
+    assert torch.equal(module._offload_weight_scale, weight_scale.to(torch.float16))
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
 
     ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(ple_layer)
@@ -519,7 +521,7 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
         query_start_loc,
         ngram_context,
     )
-    output_buffer = torch.empty(2, 2, dtype=torch.float8_e4m3fn)
+    output_buffer = torch.empty(2, 2, dtype=torch.uint8)
 
     output = module.forward_impl(
         hidden_states,
@@ -530,8 +532,8 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
     )
 
     assert output.data_ptr() == output_buffer.data_ptr()
-    assert output.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(output.float(), quantized.float())
+    assert output.dtype == torch.uint8
+    assert torch.equal(output, quantized.view(torch.uint8))
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:

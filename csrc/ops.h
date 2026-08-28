@@ -526,6 +526,12 @@ void nvfp4_moe_indexed_dense_stage_sm70_out(
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
     int64_t n, int64_t group_size);
 
+void nvfp4_moe_indexed_fused_swiglu_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size);
+
 void mxfp4_moe_single_token_prepare_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
     torch::Tensor topk_ids, torch::Tensor w13_ptrs_w, torch::Tensor w13_ptrs_s,
