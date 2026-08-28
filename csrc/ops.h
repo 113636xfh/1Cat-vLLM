@@ -333,6 +333,9 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
                            torch::Tensor f_input, torch::Tensor g_input,
                            torch::Tensor f_weight, torch::Tensor g_weight);
 
+void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
+                              torch::Tensor weight);
+
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,
                                torch::Tensor indices_out,
                                torch::Tensor _in_feats, torch::Tensor _kernel,

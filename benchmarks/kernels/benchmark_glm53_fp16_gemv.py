@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -100,6 +101,72 @@ def _sm70_glm53_fp16_gemv_cg_kernel(
     tl.store(out_ptr + row, acc)
 
 
+@triton.jit
+def _pair_fold_8x16(values, WIDTH: tl.constexpr):
+    lo, hi = tl.split(tl.reshape(values, (8, WIDTH // 2, 2)))
+    return lo + hi
+
+
+@triton.jit
+def _sm70_glm53_cublas_match_gemv_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    NUM_CHUNKS,
+    CHUNK_TILES,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    VECTOR_WIDTH: tl.constexpr,
+    BUTTERFLY_DOWN: tl.constexpr,
+):
+    """Reconstruct the observed 128-thread cuBLAS gemv2T reduction tree."""
+    rows = tl.program_id(0) * 8 + tl.arange(0, 8)
+    row_mask = rows < N
+    lanes = tl.arange(0, 16)
+    if BUTTERFLY_DOWN:
+        # A bit-reversed lane order turns shfl_down into adjacent pair folds.
+        lane_slots = (
+            (lanes & 1) * 8
+            + ((lanes >> 1) & 1) * 4
+            + ((lanes >> 2) & 1) * 2
+            + ((lanes >> 3) & 1)
+        )
+    else:
+        lane_slots = lanes
+
+    lane_offsets = lane_slots.to(tl.int64) * VECTOR_WIDTH
+    acc = tl.zeros((8, 16), dtype=tl.float32)
+    for chunk in range(0, NUM_CHUNKS):
+        chunk_acc = tl.zeros((8, 16), dtype=tl.float32)
+        chunk_base = chunk * CHUNK_TILES * VECTOR_WIDTH * 16
+        for tile in range(0, CHUNK_TILES):
+            tile_base = chunk_base + tile * VECTOR_WIDTH * 16
+            for item in tl.static_range(0, VECTOR_WIDTH):
+                k = tile_base + lane_offsets + item
+                k_mask = k < K
+                x = tl.load(x_ptr + k, mask=k_mask, other=0.0)
+                weight = tl.load(
+                    weight_ptr + rows[:, None] * K + k[None, :],
+                    mask=row_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                chunk_acc += x[None, :].to(tl.float32) * weight.to(tl.float32)
+        acc = tl.where(chunk == 0, chunk_acc, acc + chunk_acc)
+
+    if BUTTERFLY_DOWN:
+        reduced = _pair_fold_8x16(acc, 16)
+        reduced = _pair_fold_8x16(reduced, 8)
+        reduced = _pair_fold_8x16(reduced, 4)
+        reduced = _pair_fold_8x16(reduced, 2)
+        total = tl.reshape(reduced, (8,))
+    else:
+        total = tl.zeros((8,), dtype=tl.float32)
+        for lane in tl.static_range(0, 16):
+            value = tl.sum(tl.where(lanes[None, :] == lane, acc, 0.0), axis=1)
+            total = value if lane == 0 else total + value
+    tl.store(out_ptr + rows, total, mask=row_mask)
+
+
 def _measure_graph_us(
     launch: Callable[[], None], *, warmups: int, repeats: int
 ) -> float:
@@ -173,6 +240,116 @@ def _benchmark_kernel(
         ).item(),
         "cublas_fp16_fp32_reference_relative_l2_error": (
             cublas_fp32_error.norm() / fp32_reference.norm()
+        ).item(),
+    }
+
+
+def _benchmark_cublas_match_kernel(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    reference: torch.Tensor,
+    fp32_reference: torch.Tensor,
+    *,
+    vector_width: int,
+    chunk_tiles: int,
+    butterfly_down: bool,
+    warmups: int,
+    repeats: int,
+) -> dict[str, Any]:
+    n, k = weight.shape
+    out = torch.empty((1, n), dtype=x.dtype, device=x.device)
+
+    def launch() -> None:
+        _sm70_glm53_cublas_match_gemv_kernel[(triton.cdiv(n, 8),)](
+            x,
+            weight,
+            out,
+            triton.cdiv(k, chunk_tiles * vector_width * 16),
+            chunk_tiles,
+            N=n,
+            K=k,
+            VECTOR_WIDTH=vector_width,
+            BUTTERFLY_DOWN=butterfly_down,
+            num_warps=4,
+        )
+
+    latency_us = _measure_graph_us(launch, warmups=warmups, repeats=repeats)
+    error = out.float() - reference.float()
+    fp32_error = out.float() - fp32_reference
+    traffic_bytes = 2 * (weight.numel() + x.numel() + out.numel())
+    return {
+        "kernel": "cublas_match_gemv2t",
+        "vector_width": vector_width,
+        "chunk_tiles": chunk_tiles,
+        "butterfly_down": butterfly_down,
+        "latency_us": latency_us,
+        "effective_gbps": traffic_bytes / (latency_us * 1000.0),
+        "exact_equal": torch.equal(out, reference),
+        "output_sha256": hashlib.sha256(
+            out.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        ).hexdigest(),
+        "max_abs_error": error.abs().max().item(),
+        "relative_l2_error": (error.norm() / reference.float().norm()).item(),
+        "cosine_similarity": torch.nn.functional.cosine_similarity(
+            out.float(), reference.float()
+        ).item(),
+        "fp32_reference_relative_l2_error": (
+            fp32_error.norm() / fp32_reference.norm()
+        ).item(),
+    }
+
+
+def _load_glm53_cuda_extension() -> None:
+    from torch.utils.cpp_extension import load
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/sm70_turbomind/ops/glm53_fp16_gemv_sm70.cu"
+    )
+    load(
+        name="_C_glm53_gemv_bench",
+        sources=[str(source)],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-DVLLM_GLM53_GEMV_STANDALONE"],
+        with_cuda=True,
+        is_python_module=False,
+        verbose=True,
+    )
+
+
+def _benchmark_cuda_chunk_parallel_kernel(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    reference: torch.Tensor,
+    fp32_reference: torch.Tensor,
+    *,
+    warmups: int,
+    repeats: int,
+) -> dict[str, Any]:
+    out = torch.empty_like(reference)
+
+    def launch() -> None:
+        torch.ops._C_glm53_gemv_bench.sm70_glm53_fp16_gemv_out(out, x, weight)
+
+    latency_us = _measure_graph_us(launch, warmups=warmups, repeats=repeats)
+    error = out.float() - reference.float()
+    fp32_error = out.float() - fp32_reference
+    traffic_bytes = 2 * (weight.numel() + x.numel() + out.numel())
+    return {
+        "kernel": "cuda_cublas_match_gemv2t",
+        "latency_us": latency_us,
+        "effective_gbps": traffic_bytes / (latency_us * 1000.0),
+        "exact_equal": torch.equal(out, reference),
+        "output_sha256": hashlib.sha256(
+            out.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        ).hexdigest(),
+        "max_abs_error": error.abs().max().item(),
+        "relative_l2_error": (error.norm() / reference.float().norm()).item(),
+        "cosine_similarity": torch.nn.functional.cosine_similarity(
+            out.float(), reference.float()
+        ).item(),
+        "fp32_reference_relative_l2_error": (
+            fp32_error.norm() / fp32_reference.norm()
         ).item(),
     }
 
@@ -342,10 +519,14 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str)
+    parser.add_argument("--cublas-match-kda-sweep", action="store_true")
+    parser.add_argument("--cuda-kernel-sweep", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("This benchmark requires an NVIDIA SM70 GPU.")
+    if args.cuda_kernel_sweep:
+        _load_glm53_cuda_extension()
     torch.manual_seed(args.seed)
     rows: list[dict[str, Any]] = []
     candidates = (
@@ -353,7 +534,10 @@ def main() -> None:
         ("evict", _sm70_glm53_fp16_gemv_evict_kernel),
         ("cg", _sm70_glm53_fp16_gemv_cg_kernel),
     )
-    for (n, k), (block_k, num_warps) in _SM70_GLM53_FP16_GEMV_CONFIGS.items():
+    shape_configs = _SM70_GLM53_FP16_GEMV_CONFIGS.items()
+    if args.cublas_match_kda_sweep or args.cuda_kernel_sweep:
+        shape_configs = [((6416, 4096), _SM70_GLM53_FP16_GEMV_CONFIGS[(6416, 4096)])]
+    for (n, k), (block_k, num_warps) in shape_configs:
         x = torch.randn((1, k), dtype=torch.float16, device="cuda")
         weight = torch.randn((n, k), dtype=torch.float16, device="cuda")
         reference = torch.nn.functional.linear(x, weight)
@@ -404,6 +588,61 @@ def main() -> None:
                 **result,
             }
         )
+        if args.cublas_match_kda_sweep:
+            for vector_width in (1, 2, 4, 8):
+                for chunk_tiles in (1, 2, 4, 8, 16, 32, 64):
+                    for butterfly_down in (False, True):
+                        try:
+                            result = _benchmark_cublas_match_kernel(
+                                x,
+                                weight,
+                                reference,
+                                fp32_reference,
+                                vector_width=vector_width,
+                                chunk_tiles=chunk_tiles,
+                                butterfly_down=butterfly_down,
+                                warmups=args.warmups,
+                                repeats=args.repeats,
+                            )
+                        except Exception as exc:
+                            result = {
+                                "kernel": "cublas_match_gemv2t",
+                                "vector_width": vector_width,
+                                "chunk_tiles": chunk_tiles,
+                                "butterfly_down": butterfly_down,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        rows.append(
+                            {
+                                "shape": [n, k],
+                                "block_k": None,
+                                "num_warps": 4,
+                                **result,
+                            }
+                        )
+        if args.cuda_kernel_sweep:
+            try:
+                result = _benchmark_cuda_chunk_parallel_kernel(
+                    x,
+                    weight,
+                    reference,
+                    fp32_reference,
+                    warmups=args.warmups,
+                    repeats=args.repeats,
+                )
+            except Exception as exc:
+                result = {
+                    "kernel": "cuda_cublas_match_gemv2t",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            rows.append(
+                {
+                    "shape": [n, k],
+                    "block_k": None,
+                    "num_warps": None,
+                    **result,
+                }
+            )
         for padded_m in (1, 2, 4, 8, 16):
             try:
                 result = _benchmark_padded_cublas_gemm(

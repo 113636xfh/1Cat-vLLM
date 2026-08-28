@@ -44271,3 +44271,47 @@ Interpretation:
   non-reversible scales retain the ordinary TurboMind transform; explicit
   incompatible opt-in fails closed. `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=0`
   is the rollback.
+
+## 2026-08-28 GLM-5.3 exact KDA FP16 GEMV candidate
+
+- Development starts from public main
+  `03c04da68e72bf26271de4986364a72141a7601f` in isolated worktree
+  `v100-glm53-cublas-match-gemv-20260828-145134`, branch
+  `codex/v100-glm53-cublas-match-gemv-20260828-145134`. The target contract is
+  GLM-5.3-Flash-NVFP4, FP16 unquantized KDA weights, TP4/PP2 on eight V100s,
+  B1 decode, no MTP, FP8 E4M3 KV cache, and CUDA Graphs.
+- An exact-recipe sweep reconstructs the V100 cuBLAS `gemv2T` arithmetic for
+  the TP4 KDA projection `[M=1,N=6416,K=4096]`: 16 lanes per output, eight
+  512-element chunks, 32 ascending FP32 FMAs per `(chunk,lane)`, then chunk
+  `0..7` and lane `0..15` FP32 additions. The only matching Triton recipe is
+  vector width 1, 32 tiles per chunk, and a left-to-right lane fold. It is
+  bitwise equal to cuBLAS across five random seeds but slower, so it remains
+  an arithmetic oracle rather than the production route.
+- The CUDA candidate assigns one 128-thread CTA to each output row. All eight
+  chunks run in parallel, consume 512 bytes of shared memory, and join in the
+  reconstructed cuBLAS order. Across five post-cleanup runs it is bitwise
+  equal with zero maximum error and measures `65.485-65.509 us`; paired
+  cuBLAS measures `77.532-77.657 us`. This is a `15.55%-15.68%` latency
+  reduction and `802.6-802.9 GB/s` effective traffic bandwidth. The sidecar
+  contains only an `sm_70` cubin and has SHA256
+  `21924e7e93634eebce03199d264be5ec2bba08441d4f02f5881979bb6548b404`.
+- The focused native test passes all six cases. Five random seeds require
+  eager and CUDA Graph output to be bitwise equal to `torch.nn.functional.linear`.
+  A checkpoint audit additionally fuses the real layer-0 BF16 q/k/v/b/f_a/g_a
+  weights after the runtime FP16 cast for all four TP ranks. Sixteen changing
+  hidden states plus a CUDA Graph replay per rank, 68 comparisons in total,
+  are all bitwise equal with zero maximum error.
+- Retained evidence is under
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `cublas_match_kda_20260828/`, including `cuda_final_seed0.json` through
+  `cuda_final_seed4.json` and
+  `checkpoint_layer0_tp4_exact_audit.json`. Nsight Compute hardware counters
+  are unavailable on this host with `ERR_NVGPUCTRPERM`; bytes divided by
+  synchronized CUDA Graph time provide only the stated bandwidth lower bound.
+- Rejected one-pass row-grouped CUDA variants reached only about `78.7 us`,
+  and the global split-partial workspace route was about `130 us`. Neither is
+  retained in production. The accepted kernel theoretically removes about
+  `0.403 ms/token` over 34 KDA calls; this is a projection, not an end-to-end
+  result. Production admission still requires a compiled `_C` route hit,
+  real-model token/logit audit, and same-contract unprofiled TP4/PP2 A/B before
+  a new per-token trace is accepted.

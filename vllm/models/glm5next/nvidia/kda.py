@@ -208,6 +208,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and self.head_dim == 128
             and self.local_projection_size == 2048
         )
+        self._use_sm70_exact_kda_gemv = (
+            self._use_sm70_fused_fg_b_decode and self.hidden_size == 4096
+        )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
@@ -333,7 +336,31 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        weight = self.in_proj_qkvbfg_a.weight
+        use_sm70_exact_gemv = (
+            self._use_sm70_exact_kda_gemv
+            and num_tokens == 1
+            and hidden_states.dtype == torch.float16
+            and weight.dtype == torch.float16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and weight.shape == (6416, 4096)
+        )
+        if use_sm70_exact_gemv:
+            if not hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out"):
+                raise RuntimeError(
+                    "SM70 GLM KDA decode requires the exact native FP16 GEMV op. "
+                    "Rebuild vLLM from source with CUDA arch 7.0."
+                )
+            projected = torch.empty(
+                (1, 6416),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            sm70_ops.sm70_glm53_fp16_gemv_out(projected, hidden_states, weight)
+            logger.info_once("SM70 GLM KDA exact FP16 GEMV decode path enabled.")
+        else:
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,

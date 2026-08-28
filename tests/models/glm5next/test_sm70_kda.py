@@ -48,3 +48,34 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
 
     torch.testing.assert_close(f_out, eager[0], rtol=0, atol=0)
     torch.testing.assert_close(g_out, eager[1], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and current_platform.get_device_capability() == DeviceCapability(7, 0)
+        and hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out")
+    ),
+    reason="native NVIDIA V100/SM70 GLM-5.3 exact FP16 GEMV op required",
+)
+@pytest.mark.parametrize("seed", range(5))
+def test_sm70_glm53_fp16_gemv_matches_cublas_and_graph(seed: int) -> None:
+    torch.manual_seed(seed)
+    device = current_platform.device_type
+    input = torch.randn((1, 4096), device=device, dtype=torch.float16)
+    weight = torch.randn((6416, 4096), device=device, dtype=torch.float16)
+    output = torch.empty((1, 6416), device=device, dtype=torch.float16)
+
+    sm70_ops.sm70_glm53_fp16_gemv_out(output, input, weight)
+    torch.accelerator.synchronize()
+    expected = F.linear(input, weight)
+    assert torch.equal(output, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm70_ops.sm70_glm53_fp16_gemv_out(output, input, weight)
+    input.copy_(torch.randn_like(input))
+    expected = F.linear(input, weight)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(output, expected)
