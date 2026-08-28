@@ -44209,6 +44209,11 @@ Interpretation:
   with cosine at least `0.99999988`. The 4095-row boundary takes the Triton
   fallback and is bitwise identical with or without the newly forwarded
   metadata.
+- The hybrid 784-token scheduler / 16-token kernel geometry is also exercised
+  with a nonmonotonic 128-entry virtual page table after the physical-page
+  correction. Page4 XQA passes at maximum absolute difference `3.815e-6`,
+  relative L2 `3.631e-4`, and cosine `0.99999994`; its CUDA Graph replay is
+  bitwise equal to eager output.
 - Prewarmed CUDA Graph capture succeeds on V100; two replays are bitwise
   identical to eager page4 XQA with output hash
   `9b4c76f8420d6e349dc7d552c72d6f0a861332e7e8e8f62459a1c48f0faf278f`.
