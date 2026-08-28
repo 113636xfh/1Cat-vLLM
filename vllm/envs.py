@@ -545,7 +545,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
-    VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = False
+    VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = True
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -3241,10 +3241,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))
     ),
-    # Opt-in decode tiles for the exact E256/N128/K2048/top-k8 SM70 contract.
-    # Larger or unmatched token shapes retain the 0.0.3 config.
+    # Default-on decode tiles for the audited exact-shape SM70 MTP contracts.
+    # Larger or unmatched token shapes retain the 0.0.3 config; setting this
+    # variable to zero is the explicit rollback.
     "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0"))
+        int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on

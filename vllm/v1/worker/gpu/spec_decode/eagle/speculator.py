@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -197,6 +200,52 @@ class EagleSpeculator:
             active_layer_names=self.draft_attn_layer_names,
         )
         self.block_tables = block_tables
+
+    def warmup_sm70_mtp_moe_kernels(
+        self, dummy_run: Callable[..., Any]
+    ) -> tuple[str, ...]:
+        """Warm the finite Qwen3.8 MTP-MoE prefill and decode signatures."""
+        if (
+            self.method != "mtp"
+            or self.device.type != "cuda"
+            or not current_platform.is_device_capability(70)
+            or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+        ):
+            return ()
+        if getattr(self, "_sm70_mtp_moe_warmed", False):
+            return ()
+
+        text_config = self.draft_model_config.hf_text_config
+        if not (
+            self.draft_model_config.get_num_experts() == 512
+            and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
+            and self.draft_model_config.get_hidden_size() == 2560
+            and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
+            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+        ):
+            return ()
+        self._sm70_mtp_moe_warmed = True
+
+        warmed: list[str] = []
+        try:
+            if self.max_num_tokens >= 16:
+                # M16 is the smallest sorted-assignment shape with
+                # M * topk divisible by 16. It covers the Triton
+                # specialization used by longer aligned prompt prefills such
+                # as the 152-token HumanEval request; M18 graph capture covers
+                # only the non-divisible specialization.
+                dummy_run(16)
+                warmed.append("mtp_draft_moe_prefill_m16")
+
+            # One real decode-shaped round executes the M5 verifier window
+            # followed by all three M1 continuation passes.
+            dummy_run(1, uniform_decode=True)
+            torch.accelerator.synchronize()
+            warmed.append("mtp_draft_moe_decode_m5_m1")
+        except Exception as err:  # pragma: no cover - best-effort warmup
+            logger.warning_once("SM70 V2 MTP MoE warmup skipped: %s", err)
+            return ()
+        return tuple(warmed)
 
     @torch.inference_mode()
     def run_model(

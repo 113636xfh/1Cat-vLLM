@@ -1055,7 +1055,7 @@ class SpecDecodeBaseProposer:
         top_k = int(getattr(text_config, "num_experts_per_tok", 0))
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        use_mtp_decode_tiles = (
+        use_qwen36_mtp_decode_tiles = (
             envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
             and num_experts == 256
             and top_k == 8
@@ -1063,13 +1063,28 @@ class SpecDecodeBaseProposer:
             and int(getattr(text_config, "moe_intermediate_size", 0)) == 512
             and tp_size == 4
         )
+        use_qwen38_mtp_decode_tiles = (
+            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            and num_experts == 512
+            and top_k == 10
+            and self.draft_model_config.get_hidden_size() == 2560
+            and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
+            and tp_size == 4
+        )
+        decode_tile_max_tokens = (
+            16
+            if use_qwen36_mtp_decode_tiles
+            else 5
+            if use_qwen38_mtp_decode_tiles
+            else 0
+        )
         sizes = _sm70_mtp_moe_warmup_sizes(
             num_experts,
             top_k,
             self.max_num_tokens,
-            decode_tile_max_tokens=16 if use_mtp_decode_tiles else 0,
+            decode_tile_max_tokens=decode_tile_max_tokens,
         )
-        legacy_sizes = (1, 2, 9, 10) if use_mtp_decode_tiles else ()
+        legacy_sizes = (1, 2, 9, 10) if use_qwen36_mtp_decode_tiles else ()
         if not sizes:
             return ()
 

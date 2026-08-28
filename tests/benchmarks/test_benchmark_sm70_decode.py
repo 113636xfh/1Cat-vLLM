@@ -104,3 +104,20 @@ def test_spec_decoding_delta_reports_one_sequential_prompt():
     assert metrics["num_accepted_tokens"] == 7
     assert metrics["accepted_tokens_per_pos"] == [3, 2, 2]
     assert metrics["mean_acceptance_length"] == 2.75
+
+
+def test_sm70_policy_records_generic_mtp_moe_tuning(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG", "1")
+    monkeypatch.delenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", raising=False)
+
+    policy = benchmark_sm70_model_tokens._sm70_turbomind_policy()
+
+    assert policy["VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG"] == "1"
+    assert policy["VLLM_SM70_MTP_MOE_TUNED_CONFIG"] is None
+    assert policy["mtp_moe_tuned_config_effective"] is True
+    assert policy["qwen36_mtp_moe_tuned_config_effective"] is True
+
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0")
+    policy = benchmark_sm70_model_tokens._sm70_turbomind_policy()
+    assert policy["mtp_moe_tuned_config_effective"] is False
+    assert policy["qwen36_mtp_moe_tuned_config_effective"] is False

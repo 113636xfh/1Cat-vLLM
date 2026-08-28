@@ -42936,8 +42936,9 @@ Interpretation:
   M1-M16 plus M33/M257
   and explicitly covers legacy M1/M2/M9/M10 naive/aligned signatures; a fresh
   48-request run then produced no inference-time `fused_moe_kernel` JIT.
-  Unmatched shapes retain the old `(9,33,257)` warmup set, and the tuned route
-  requires `VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
+  Unmatched shapes retain the old `(9,33,257)` warmup set. The audited
+  exact-shape tuned route is now enabled by default and can be rolled back
+  with `VLLM_SM70_MTP_MOE_TUNED_CONFIG=0`.
 - Full-model evidence rejects the isolated M1 result. A physical-GPU4-7 C1
   candidate/control/candidate sandwich measured endpoint-mean summed pure
   decode `112.233` versus control `115.451 tok/s` (`-2.79%`) and endpoint-mean
