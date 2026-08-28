@@ -44417,6 +44417,7 @@ Interpretation:
   result. Production admission still requires a compiled `_C` route hit,
   real-model token/logit audit, and same-contract unprofiled TP4/PP2 A/B before
   a new per-token trace is accepted.
+
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 
 - Public Draft PR #390 is stacked on grouped-QSA PR #387. The retained clean
