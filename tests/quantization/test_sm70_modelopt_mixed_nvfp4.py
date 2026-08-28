@@ -99,6 +99,22 @@ def test_nvfp4_grouped_prefill_defaults_on_and_can_be_disabled(monkeypatch):
     assert not envs.VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL
 
 
+def test_qwen38_fast_prefill_defaults_on_and_can_be_disabled(monkeypatch):
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL"
+    monkeypatch.delenv(name, raising=False)
+    assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+
+    monkeypatch.setenv(name, "0")
+    assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL"
+    monkeypatch.delenv(name, raising=False)
+    assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
+
+    monkeypatch.setenv(name, "0")
+    assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

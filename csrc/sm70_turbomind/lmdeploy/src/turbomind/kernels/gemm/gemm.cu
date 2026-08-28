@@ -90,6 +90,12 @@ bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
   return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Nvfp4Qwen38MoeFastPrefillEnabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+  return !raw || std::atoi(raw) != 0;
+}
+
 // Default-on gate for exact block-FP8 8K prefill GEMM descriptors.
 bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
   const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR");
@@ -175,6 +181,26 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
     const GemmDesc& desc) {
   const std::string desc_str = to_string(desc);
+  if (Sm70Nvfp4Qwen38MoeFastPrefillEnabled() && desc.arch == 700 &&
+      desc_str.starts_with("sm70_f16_e2m1k16_f16_tnt_") && desc.m >= 1280 &&
+      desc.num == 512) {
+    if (desc.n == 320 && desc.k == 2560) {
+      return Sm70AwqTp2FastTarget{
+          desc.n, desc.k, 32, 128, 32, 1, 2, true, "c32x128_a1x1x32_01"};
+    }
+    if (desc.n == 256 && desc.k == 2560) {
+      return Sm70AwqTp2FastTarget{
+          desc.n, desc.k, 32, 128, 32, 1, 0, true, "c32x128_a1x1x32_01"};
+    }
+    if (desc.n == 64 && desc.k == 2560) {
+      return Sm70AwqTp2FastTarget{
+          desc.n, desc.k, 32, 64, 32, 1, 0, true, "c32x64_a1x1x32_01"};
+    }
+    if (desc.n == 2560 && desc.k == 160) {
+      return Sm70AwqTp2FastTarget{
+          desc.n, desc.k, 32, 128, 32, 1, 2, true, "c32x128_a1x1x32_00"};
+    }
+  }
   if (Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled()) {
     // Qwen3.8-27B NVFP4 TP4 decode. The exact-MNK registry entries keep
     // these small-N tactics out of prefill and unrelated model shapes.

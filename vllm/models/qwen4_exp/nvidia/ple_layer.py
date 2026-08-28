@@ -128,6 +128,24 @@ def _gather_ple_fp8_from_pinned_kernel(
     tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
 
 
+@triton.jit
+def _dequantize_ple_fp8_bytes_kernel(
+    input_ptr,
+    scale_ptr,
+    output_ptr,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    """Dequantize raw E4M3FN bytes without exposing FP8 to SM70 Inductor."""
+
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    raw = tl.load(input_ptr + offsets, mask=mask, other=0)
+    scale = tl.load(scale_ptr).to(tl.float32)
+    values = _e4m3fn_byte_to_float(raw) * scale
+    tl.store(output_ptr + offsets, values, mask=mask)
+
+
 def _splitmix64(value: int) -> int:
     value = (value + _SPLITMIX_GAMMA) & _MASK64
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
@@ -671,23 +689,33 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_ids = torch.cat(id_blocks, dim=-1)
         if output_buffer is not None:
             output = output_buffer[:num_tokens, : self.embedding_dim]
+            # Cross-process FP8 results travel as raw bytes. Keeping the IPC
+            # buffers uint8 prevents TorchInductor from treating their graph
+            # inputs as native FP8, which SM70 Triton does not support.
+            embedding_output = (
+                output.view(torch.float8_e4m3fn)
+                if output.dtype == torch.uint8
+                else output
+            )
             torch.index_select(
                 self.ngram_embedding.weight,
                 0,
                 ngram_ids.reshape(-1),
-                out=output.reshape(-1, self.head_dim),
+                out=embedding_output.reshape(-1, self.head_dim),
             )
             return output
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
-        """Keep quantized lookup results in their embedding storage dtype."""
+        """Transport quantized lookup results as opaque E4M3FN bytes."""
         embedding = getattr(self, "ngram_embedding", None)
         weight = getattr(embedding, "weight", None)
+        if weight is not None and weight.dtype == torch.float8_e4m3fn:
+            return torch.uint8
+        if hasattr(self, "_offload_weight_scale"):
+            return torch.uint8
         if weight is not None:
             return weight.dtype
-        if hasattr(self, "_offload_weight_scale"):
-            return torch.float8_e4m3fn
         return default_dtype
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -701,9 +729,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             for name, loaded_weight in weights:
                 if name != "ngram_embedding.weight_scale":
                     continue
+                # Match the resident FP8 embedding contract: its global scale
+                # is a graph input in the model dtype. Retaining a checkpoint
+                # BF16 scale in an otherwise-FP16 graph makes Inductor reject
+                # SM70 before the explicit dequantization cast is lowered.
+                scale_dtype = getattr(self, "_offload_model_dtype", loaded_weight.dtype)
                 self.register_buffer(
                     "_offload_weight_scale",
-                    loaded_weight.to(device=torch.accelerator.current_accelerator()),
+                    loaded_weight.to(
+                        device=torch.accelerator.current_accelerator(),
+                        dtype=scale_dtype,
+                    ),
                     persistent=False,
                 )
                 retained.add(name)
@@ -824,6 +860,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 quant_config=quant_config,
                 params_dtype=model_config.dtype,
             )
+        # PleOffloadLayer skips the embedding subclass constructor in GPU
+        # workers, so preserve the model-dtype scale contract explicitly for
+        # its checkpoint-only load path.
+        self.ple_embedding._offload_model_dtype = model_config.dtype
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -879,6 +919,21 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
 
+        if embeddings.dtype == torch.uint8:
+            weight_scale = self._get_embedding_weight_scale()
+            if weight_scale is None:
+                raise RuntimeError("FP8 PLE embedding is missing its global scale")
+            if weight_scale.device != embeddings.device:
+                raise RuntimeError(
+                    "FP8 PLE embedding scale must be on the output device"
+                )
+            output = torch.empty_like(embeddings, dtype=output_dtype)
+            torch.ops.vllm.qwen4_exp_ple_fp8_bytes_dequant(
+                embeddings,
+                weight_scale,
+                output,
+            )
+            return output
         if not is_fp8(embeddings):
             return embeddings
         weight_scale = self._get_embedding_weight_scale()
@@ -1509,11 +1564,49 @@ def qwen4_exp_ple_pinned_gather_fake(
     return
 
 
+def qwen4_exp_ple_fp8_bytes_dequant(
+    input_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if input_bytes.dtype != torch.uint8:
+        raise TypeError(
+            f"Qwen4Exp PLE byte dequant expects uint8 input, got {input_bytes.dtype}"
+        )
+    if input_bytes.numel() == 0:
+        return
+    block = 1024
+    _dequantize_ple_fp8_bytes_kernel[(triton.cdiv(input_bytes.numel(), block),)](
+        input_bytes,
+        weight_scale,
+        output,
+        input_bytes.numel(),
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+def qwen4_exp_ple_fp8_bytes_dequant_fake(
+    input_bytes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return
+
+
 direct_register_custom_op(
     op_name="qwen4_exp_ple_pinned_gather",
     op_func=qwen4_exp_ple_pinned_gather,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_pinned_gather_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_fp8_bytes_dequant",
+    op_func=qwen4_exp_ple_fp8_bytes_dequant,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_fp8_bytes_dequant_fake,
 )
 
 

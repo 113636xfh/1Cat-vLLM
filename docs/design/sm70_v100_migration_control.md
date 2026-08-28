@@ -44471,3 +44471,75 @@ Interpretation:
   are still projected near 26% of 8K per-rank service, so the next bounded
   screen remains the NVFP4 grouped-GEMM scheduler/register-pressure path, not
   another model startup or a return to QSA launch tuning.
+
+## 2026-08-28 Qwen3.8 NVFP4 grouped-GEMM prefill audit
+
+- Public Draft PR #393 is stacked on indexed-A PR #390. The retained route is
+  restricted to the exact Qwen3.8 TP4 prefill descriptors and leaves decode
+  on the original packed weights. W13 partitions its existing packed N320
+  storage without copies: the N256 head uses the SM70 M32xN128xK32 streaming-B
+  tactic and the N64 tail uses M32xN64xK32. W2 keeps M32xN128xK32 and changes
+  only its cache-B policy. The W13 epilogue writes exact FP16 clamp-SwiGLU
+  values directly, removing the separate activation launch.
+- The partition is zero-copy. For every expert, the N256 head is the first
+  81,920 packed int32 words and the N64 tail the last 20,480 words. Their scale
+  tensors are column views with the original N320 leading dimension, so the
+  route adds no duplicate expert weights and no roughly 10-GiB/rank capacity
+  penalty. Missing operators in an older extension retain the unsplit route
+  unless the feature was explicitly forced.
+- One locked V100 operator screen uses physically repeated real layer-0 expert
+  weights, 8,192 tokens, top-K 10, and 512 local expert slots. The original
+  indexed W13 plus activation plus W2 chain measures `6.684 ms/layer/rank`.
+  The default production selector measures `6.12096 ms/layer/rank`: W13 is
+  `3.97773 ms`, W2 is `2.27123 ms`, and intermediate and final hashes are
+  exactly
+  `6d96da1848ed7ac92111df786a04afd54ef743f2e768dbc1ebca9ac9ffa2eae4`
+  and
+  `ceb78a76571ff57ea5eec6cba7b5c3b796d2af96e4225b8b2b4618a3fe592a1f`.
+  The measured saving is about `0.563 ms/layer/rank` per 8K chunk.
+- Bounded screens rejected the following paths and they must not be retried
+  without a new kernel design: full-W13 N64 tiles (`6.098 ms` for W13 alone),
+  M16 tactics, larger W2 M64/M128 tactics, and a padded dequantize-to-FP16
+  `bmm` route (`3.684 + 2.223 ms` before paying for about 1.26 GiB of
+  dequantized writes). A direct W2 atomic weighted reduction is also rejected
+  because multi-token accumulation is nondeterministic. Cache-B helps W2 by
+  about `0.08 ms`; applying the same policy to W13 does not help.
+- The first exact-256K startup exposed two PLE CPU-offload graph-boundary bugs
+  before any benchmark request ran. GPU placeholders now retain the checkpoint
+  scale in the model dtype, preventing a BF16 graph input on the FP16 V100
+  route. Quantized PLE IPC results are transported in the same one-byte-per-
+  element footprint as raw `uint8`, then decoded by an opaque SM70 Triton
+  E4M3FN-byte kernel. This keeps the 20-MiB-per-8K-chunk transfer size and
+  prevents TorchInductor from generating unsupported native-FP8 loads on
+  compute capability 7.0. The focused PLE suite passes 18 tests, and a Dynamo
+  export contains the opaque byte-dequant op with no float8 graph nodes.
+- A locked V100 gate covers all 256 E4M3FN byte patterns. Eager and
+  `torch.compile(fullgraph=True)` results exactly match the PyTorch FP8
+  reference for finite values and agree on NaN patterns. Dequantizing one
+  production `8192x2560` raw-byte
+  buffer takes `0.127 ms` median (`0.114 ms` minimum) and produces hash
+  `c15a97bc70b4d7de66d4cff36b989e34413b5fe966ccafe18f422ece8c897728`.
+  The ten PLE checkpoint files occupy 47.684 GiB on host storage/RAM; no PLE
+  embedding table is replicated onto any GPU.
+- One subsequent startup completed the full TP4 V2, no-MTP, FP16-KV,
+  PLE-CPU-offload, 8,192-token-chunk matrix through the model's exact
+  262,144-token limit. Every request reports `is_corrupted=false`; arithmetic
+  and Chinese outputs are respectively `42<|im_end|>` and
+  `在标准大气压下，水的沸点是100摄氏度。<|im_end|>`. Pure prefill is:
+    - 8K: `1.160956 s`, `7,056.26 token/s`;
+    - 32K: `4.962370 s`, `6,603.30 token/s`;
+    - 64K: `10.357441 s`, `6,327.43 token/s`;
+    - 131K: `22.101014 s`, `5,927.33 token/s`;
+    - input 262,143 plus output 1: `49.945010 s`,
+      `5,248.63 token/s`.
+- Against #390 at the four shared lengths, throughput improves
+  1.23%/1.48%/1.38%/0.95%. The exact-256K output is token `This`, hash
+  `274dfec6e079fb08d6b5771537c54d3f0bd36c64c3d8ed0a4e6d2f201b489274`.
+  KV capacity is 487,405 tokens/rank (1.86x maximum 256K concurrency), with
+  5.98 GiB reported free for KV allocation after model profiling. During the
+  steady 256K request, allocation is 32,409-32,471 MiB/rank; three ranks sample
+  100% GPU utilization for all 48 interior seconds and rank zero averages
+  99.81%, at 261-267 W average power. This rules out CPU/PLE starvation as the
+  long-context limiter. The next trace must be taken at 256K and separate the
+  context-growing QSA indexer/attention work from the now-fixed MoE projection
+  cost; 128K-only traces are no longer sufficient acceptance evidence.
