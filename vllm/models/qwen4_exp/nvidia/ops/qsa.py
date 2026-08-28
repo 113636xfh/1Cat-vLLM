@@ -358,36 +358,52 @@ def _qsa_xqa_page4_table_kernel(
     row = tl.program_id(0)
     slots = tl.arange(0, BLOCK_PAGES)
     request = tl.load(token_to_req_ptr + row)
+    request_is_valid = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
     query_position = tl.load(query_positions_ptr + row)
     sequence_length = tl.load(
         sequence_lengths_ptr + safe_request,
-        mask=(request >= 0) & (request < num_requests),
+        mask=request_is_valid,
         other=0,
     )
-    visible_tokens = query_position + 1
+    # Padded graph rows use position -1. Clamp malformed or stale positions to
+    # the request's live sequence so they cannot expose a synthetic tail page.
+    visible_tokens = tl.minimum(
+        tl.maximum(query_position + 1, 0),
+        sequence_length,
+    )
     complete_pages = tl.minimum(
         tl.minimum(visible_tokens // 4, sequence_length // 4),
         COMPLETE_PAGES,
     )
     tail_count = visible_tokens - (visible_tokens // 4) * 4
     is_complete = slots < complete_pages
-    is_tail = (slots == complete_pages) & (tail_count > 0)
     selected_token = tl.load(
         indices_ptr + row * stride_indices_row + slots * 4,
         mask=(row < rows) & is_complete,
         other=-1,
     )
     tail_token = (visible_tokens // 4) * 4
-    logical_token = tl.where(is_tail, tail_token, selected_token)
+    selected_tail_token = tl.load(
+        indices_ptr + row * stride_indices_row + complete_pages * 4,
+        mask=(row < rows) & (tail_count > 0),
+        other=-1,
+    )
+    tail_is_valid = (
+        (tail_count > 0)
+        & (selected_tail_token == tail_token)
+        & (selected_tail_token < sequence_length)
+    )
+    is_tail = (slots == complete_pages) & tail_is_valid
+    logical_token = tl.where(is_tail, selected_tail_token, selected_token)
     safe_token = tl.maximum(logical_token, 0)
     logical_page = safe_token // PAGE_SIZE
     page_offset = safe_token - logical_page * PAGE_SIZE
     valid = (
         (row < rows)
-        & (request >= 0)
-        & (request < num_requests)
+        & request_is_valid
         & (logical_token >= 0)
+        & (logical_token < sequence_length)
         & (logical_page < PAGE_TABLE_WIDTH)
         & (is_complete | is_tail)
     )
@@ -418,7 +434,7 @@ def _qsa_xqa_page4_table_kernel(
     )
     tl.store(
         xqa_sequence_lengths_ptr + row,
-        complete_pages * 4 + tail_count,
+        complete_pages * 4 + tl.where(tail_is_valid, tail_count, 0),
         mask=row < rows,
     )
 
