@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
     _single_token_weighted_reduce,
+    _use_qwen38_indexed_prefill,
     _use_qwen38_qpn_m1_decode,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
@@ -142,6 +143,32 @@ def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
 
     layer.moe_config.tp_size = 2
     assert not _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
+
+
+def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+    )
+    x = torch.empty(128, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(128, 10, dtype=torch.int32)
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", raising=False)
+    assert _use_qwen38_indexed_prefill(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "0")
+    assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "1")
+    assert _use_qwen38_indexed_prefill(layer, x, topk_ids)
+    assert not _use_qwen38_indexed_prefill(layer, x[:127], topk_ids[:127])
+    assert not _use_qwen38_indexed_prefill(layer, x, topk_ids[:, :9])
+
+    layer.moe_config.tp_size = 2
+    assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
 
 
 def test_nvfp4_moe_contract_rejects_shape_consistent_unvalidated_tp8():
