@@ -9,7 +9,10 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
     _qsa_sparse_launch_profile,
     _qsa_xqa_page4_shape_supported,
+    _use_sm70_qsa_lexicographic_topk,
 )
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def test_sm70_qsa_prefill_uses_narrow_tiles_and_four_warps():
@@ -230,3 +233,21 @@ def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
 
     assert not qsa_ops._qsa_indexer_cublas_work_supported(1024, 512)
     assert qsa_ops._qsa_indexer_cublas_work_supported(2048, 512)
+
+
+def test_qsa_lexicographic_topk_is_limited_to_sm70_qsa_shape(monkeypatch):
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+
+    assert _use_sm70_qsa_lexicographic_topk(512)
+    assert not _use_sm70_qsa_lexicographic_topk(1024)
+
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: False,
+    )
+    assert not _use_sm70_qsa_lexicographic_topk(512)

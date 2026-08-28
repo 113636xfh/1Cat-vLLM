@@ -1197,6 +1197,9 @@ def _sm70_moe_policy() -> dict[str, Any]:
     add_allreduce = _env_bool("VLLM_SM70_MOE_ADD_ALLREDUCE", False)
     qwen38_router_topk = _env_bool("VLLM_SM70_QWEN38_ROUTER_TOPK", True)
     qwen38_nvfp4_qpn_m1 = _env_bool("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", True)
+    qwen38_nvfp4_indexed_prefill = _env_bool(
+        "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", True
+    )
     single_token_fastpath = _env_bool("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", False)
     single_token_permute = _env_bool(
         "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", False
@@ -1234,6 +1237,10 @@ def _sm70_moe_policy() -> dict[str, Any]:
             "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE"
         ),
         "qwen38_nvfp4_qpn_m1_effective": qwen38_nvfp4_qpn_m1,
+        "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": os.environ.get(
+            "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL"
+        ),
+        "qwen38_nvfp4_indexed_prefill_effective": (qwen38_nvfp4_indexed_prefill),
         "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH"
         ),
@@ -1282,6 +1289,7 @@ def _sm70_moe_policy() -> dict[str, Any]:
         "expected_default": False,
         "qwen38_router_topk_expected_default": True,
         "qwen38_nvfp4_qpn_m1_expected_default": True,
+        "qwen38_nvfp4_indexed_prefill_expected_default": True,
         "single_token_unpermute_expected_default": True,
         "route_hit_oracle": (
             "The exact Qwen3.8 E512/K10 lane requires "
@@ -1290,6 +1298,9 @@ def _sm70_moe_policy() -> dict[str, Any]:
             "The accepted routed-expert lane additionally requires "
             "qwen38_nvfp4_qpn_m1_effective=true and the `SM70 Qwen3.8 "
             "NVFP4 direct QPN-M1 expert path enabled` marker. "
+            "Long exact TP4 prefill additionally requires "
+            "qwen38_nvfp4_indexed_prefill_effective=true and the `SM70 "
+            "Qwen3.8 NVFP4 indexed-A W13 prefill route enabled` marker. "
             "For CUDA-graph fast-path acceptance, require the C++ trace "
             "`SM70 custom all_reduce_sum2 op reached ... capture=active`; "
             "the Python MoERunner candidate log alone is not a custom-op hit. "
@@ -1746,6 +1757,7 @@ def _write_results(
         "engine_kwargs": llm_kwargs,
         "sampling_params": first_case["sampling_params"],
         "cuda_profile_repeat": args.cuda_profile_repeat,
+        "cuda_profile_case": args.cuda_profile_case,
         "reset_prefix_cache_before_case": args.reset_prefix_cache_before_case,
         "reset_prefix_cache_between_runs": args.reset_prefix_cache_between_runs,
         "prompt": first_case["prompt"],
@@ -1874,6 +1886,14 @@ def _parse_args() -> argparse.Namespace:
         help="Wrap only measured repeats in cudaProfilerStart/Stop.",
     )
     parser.add_argument(
+        "--cuda-profile-case",
+        help=(
+            "When profiling measured repeats, capture only the named case. "
+            "Other cases remain in the same loaded engine but outside the "
+            "cudaProfilerStart/Stop range."
+        ),
+    )
+    parser.add_argument(
         "--require-sm70-fa2-d256-prefill",
         action="store_true",
         help=(
@@ -1895,6 +1915,8 @@ def main() -> int:
         raise ValueError(
             "Choose only one prefix-cache reset mode: before-case or between-runs."
         )
+    if args.cuda_profile_case and not args.cuda_profile_repeat:
+        raise ValueError("--cuda-profile-case requires --cuda-profile-repeat")
 
     import torch
     from transformers import AutoTokenizer
@@ -1941,6 +1963,12 @@ def main() -> int:
                     seed=args.seed,
                 ),
             }
+        )
+    if args.cuda_profile_case and not any(
+        case["name"] == args.cuda_profile_case for case in cases
+    ):
+        raise ValueError(
+            f"--cuda-profile-case did not match a case: {args.cuda_profile_case}"
         )
 
     engine_kwargs = _parse_extra_engine_args(args.engine_arg)
@@ -1998,6 +2026,18 @@ def main() -> int:
             }
         )
 
+    def start_cuda_profile() -> None:
+        try:
+            llm.start_profile()
+        except Exception as exc:
+            raise RuntimeError(
+                "--cuda-profile-repeat requires a worker profiler for "
+                "multiprocess TP runs. Pass "
+                '--engine-arg \'profiler_config={"profiler":"cuda"}\' '
+                "so Nsight Compute/Systems capture the TP worker kernels."
+            ) from exc
+
+    profile_active = False
     if args.cuda_profile_repeat:
         # Warm every case before starting the profiler so the capture contains
         # measured repeats only. Normal sweeps warm each case immediately
@@ -2014,15 +2054,9 @@ def main() -> int:
                 )
                 for _ in range(case["warmup"])
             ]
-        try:
-            llm.start_profile()
-        except Exception as exc:
-            raise RuntimeError(
-                "--cuda-profile-repeat requires a worker profiler for "
-                "multiprocess TP runs. Pass "
-                '--engine-arg \'profiler_config={"profiler":"cuda"}\' '
-                "so Nsight Compute/Systems capture the TP worker kernels."
-            ) from exc
+        if args.cuda_profile_case is None:
+            start_cuda_profile()
+            profile_active = True
     try:
         for case, result in zip(cases, case_results):
             if not args.cuda_profile_repeat:
@@ -2037,15 +2071,26 @@ def main() -> int:
                     )
                     for _ in range(case["warmup"])
                 ]
-            repeats = [
-                _run_once(
-                    llm,
-                    case["prompt"],
-                    case["sampling_params"],
-                    reset_prefix_cache=args.reset_prefix_cache_between_runs,
-                )
-                for _ in range(case["repeat"])
-            ]
+            profile_this_case = (
+                args.cuda_profile_repeat and args.cuda_profile_case == case["name"]
+            )
+            if profile_this_case:
+                start_cuda_profile()
+                profile_active = True
+            try:
+                repeats = [
+                    _run_once(
+                        llm,
+                        case["prompt"],
+                        case["sampling_params"],
+                        reset_prefix_cache=args.reset_prefix_cache_between_runs,
+                    )
+                    for _ in range(case["repeat"])
+                ]
+            finally:
+                if profile_this_case and profile_active:
+                    llm.stop_profile()
+                    profile_active = False
             result["repeats"] = repeats
             result["summary"] = _summarize(repeats)
             if args.checkpoint_after_case:
@@ -2058,7 +2103,7 @@ def main() -> int:
                     case_results,
                 )
     finally:
-        if args.cuda_profile_repeat:
+        if profile_active:
             llm.stop_profile()
 
     payload = _write_results(
