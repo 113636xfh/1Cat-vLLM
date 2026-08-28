@@ -203,6 +203,44 @@ model quality is not guaranteed. Promotion to a default requires a matched
 TP4/no-MTP model-level gate with the same prompts, seeds, sampling, KV dtype,
 attention backend, graph mode, and runtime binaries as the FP16-dense control.
 
+The retained matched gate uses 32 fixed GSM8K questions with three indexed
+sampling seeds per question (96 sequential requests), temperature 0.6,
+top-p 0.95, top-k 20, natural EOS, and an 8192-token output limit. Both arms
+run source `f4040b8f`, TP4/PP1, V2, no MTP, FP16 activation/KV,
+FlashAttention-V100/FlashQLA, and FULL+PIECEWISE graphs; only online QPN8 and
+its dependent GDN BA split differ. A boxed-first scorer gives 96/96 for both
+arms, with zero invalid, replacement-character, NUL, or non-`stop` outputs.
+The QPN8 opt-in raises mean steady decode from 67.627 to 79.105 tokens/s
+(+16.97%) and median steady decode from 67.640 to 79.369 tokens/s (+17.34%).
+
+This subset does not show a task-accuracy regression, but it does not establish
+precision equivalence. Only 8/96 token hashes match; the mean absolute output
+length delta is 133.5 tokens and the maximum is 4477. One ambiguous-interest
+sample remains correct but grows from 1653 tokens and a repeated-4-gram ratio
+of 0.199 with QPN8 off to 3626 tokens and 0.507 with QPN8 on. Aggregate mean
+repetition is nearly unchanged (0.0394 versus 0.0410), so this is a severe
+single-sample amplification rather than evidence of a global repetition
+shift. Together with the destructive 2.44%-2.75% projection error, this keeps
+QPN8 opt-in despite its speed and memory benefit.
+
+The fixed A/B execution SHA predates the compressed-QSA zeroing repair merged
+as PR #373 (`ddd8c0b601`). A compressed QSA scheduler block is logically 784
+tokens but stores one 98-row physical page. The old zeroer multiplied the
+compression ratio a second time and could clear the wrong range when a block
+was reused. Current main derives zeroing from `storage_block_size`, clears
+exactly the selected physical page, and is covered by a real V100 page test
+and a TP4 1K/4K generation smoke. Both A/B arms intentionally use the same old
+binary to isolate the QPN8 feature; the A/B is therefore not a final-branch
+whole-stack acceptance gate, while this branch includes the QSA repair.
+
+The checkpoint also carries multimodal `mrope_section` and
+`mrope_interleaved` fields in its text config. The initial SM70 route requires
+`language_model_only` and removes those fields before constructing text RoPE.
+For text-only positions the three MRoPE axes are identical, so this reduces to
+the same one-dimensional rotation; Transformers warnings emitted while the
+raw config is first validated do not indicate that the model used an unknown
+RoPE implementation.
+
 The other default decode paths remain enabled under narrower evidence:
 
 - the shared-expert output-gate fusion is bitwise against its FP16 control;
