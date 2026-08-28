@@ -18,7 +18,7 @@ except ImportError:
 
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
-E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 1024)
+E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
@@ -1036,11 +1036,12 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
 ) -> torch.Tensor:
-    """Exact grouped q8/H6/D256 DFlash2 verifier prototype for SM70.
+    """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
     The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across four GQA heads. Workspaces are stream-local and fixed
-    size so a warmed entry is CUDA-graph safe. Unsupported shapes fail closed.
+    paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
+    uses two three-head groups, retaining 48 rows per CTA and the same workspace
+    byte count. Workspaces are stream-local and CUDA-graph safe.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1049,6 +1050,12 @@ def flash_attn_grouped_verify_paged(
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
     workspace = _get_grouped_verify_workspace(q)
+    if q.shape[0] > 8:
+        partial_out = workspace.partial_out.view(40, 16, 6, 256)
+        partial_lse = workspace.partial_lse.view(40, 16, 6)
+    else:
+        partial_out = workspace.partial_out
+        partial_lse = workspace.partial_lse
     return flash_attn_v100_cuda.grouped_verify_paged_fwd(
         q,
         k_cache,
@@ -1056,8 +1063,8 @@ def flash_attn_grouped_verify_paged(
         out,
         block_table,
         seq_lens,
-        workspace.partial_out,
-        workspace.partial_lse,
+        partial_out,
+        partial_lse,
         float(softmax_scale),
         kv_cache_dtype,
         float(k_scale),

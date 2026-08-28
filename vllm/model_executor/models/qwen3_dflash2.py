@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -218,8 +219,9 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             hidden_size=config.hidden_size,
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
-            # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            # Keep the convolution boundary at the checkpoint-trained block
+            # even when lookup augments the target verification block.
+            block_size=1 + get_dflash_model_draft_tokens(speculative_config),
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(
@@ -451,16 +453,26 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
-        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
-        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
-        values, ids = _topk(logits, selector.top_k)
-        ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+        local_candidates = self.lm_head.maybe_get_sm70_dflash2_top20(
+            hidden_states, selector.top_k
+        )
+        if local_candidates is None:
+            logits = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states, bias=None
+            )
+            num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+            if num_pad > 0:
+                logits[..., -num_pad:] = -float("inf")
+            values, ids = _topk(logits, selector.top_k)
+            ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+        else:
+            values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
             values = tensor_model_parallel_all_gather(values, dim=-1)
             ids = tensor_model_parallel_all_gather(ids, dim=-1)
+
+        if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)
             ids = ids.gather(-1, selected)
 

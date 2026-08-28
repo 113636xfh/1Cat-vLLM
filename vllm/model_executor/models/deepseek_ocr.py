@@ -315,12 +315,11 @@ class DeepseekOCRMultiModalProcessor(
                 size = images.get_image_size(item_idx)
 
                 # Count with the SAME processor instance the request's
-                # mm kwargs construct (mode/crops), and the same sibling
-                # count — the producer/counter pair must never diverge.
+                # mm kwargs construct (mode/crops) — the producer/counter
+                # pair must never diverge.
                 num_image_tokens = hf_processor.count_image_tokens(
                     image_width=size.width,
                     image_height=size.height,
-                    num_images=images.get_count(),
                 )
             return [image_token_id] * num_image_tokens
 

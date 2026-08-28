@@ -96,6 +96,11 @@ bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
   return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Fp8GroupedBmmDecodeEnabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
+  return !raw || std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
   int n;
   int k;
@@ -184,6 +189,13 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
        desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1")) {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, ""};
   }
+  if (Sm70Fp8GroupedBmmDecodeEnabled() &&
+      desc_str == "sm70_f16_e4m3k128_f16_tnt_bbb_2x1024x4096_1") {
+    // Match the accepted dense 1x1024x4096 accumulation tree while launching
+    // both independent WO-A groups through one blocked descriptor.
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 7, 2, true, "c8x128_a1x1x64_01"};
+  }
   const bool awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
   if (awq_fast_selector_enabled) {
     if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
@@ -267,6 +279,23 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
     return Sm70AwqTp2FastTarget{
         desc.n, desc.k, 64, 256, 16, 1, 3, true, "sm70_fp8_pscale_full"};
+  }
+  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1536x4096_1") {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 5, 1, true,
+                                "sm70_fp8_pscale_m1"};
+  }
+  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x8192x1024_1" ||
+      desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x2048_1") {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 3, true,
+                                "sm70_fp8_pscale_m1"};
+  }
+  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1024x4096_1") {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 7, 1, true,
+                                "sm70_fp8_pscale_m1"};
+  }
+  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x512_1") {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 1, true,
+                                "sm70_fp8_pscale_m1"};
   }
   return std::nullopt;
 }
@@ -449,8 +478,13 @@ struct Gemm::Impl {
   LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
                       size_t partials_size) {
     const auto& desc = ctx.desc();
+    const bool allow_prescaled =
+        policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
     const auto is_feasible = [&](const LaunchSpec& spec) {
       return spec.kernel &&
+             (allow_prescaled ||
+              spec.kernel->name().find("_sm70_fp8_pscale") ==
+                  std::string::npos) &&
              spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
     };
     if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
@@ -459,7 +493,7 @@ struct Gemm::Impl {
         return *spec;
       }
       if (auto fast_target = GetSm70Fp8BlockPrefillPrescaledTarget(desc)) {
-        auto specs = Find(ctx, barriers_size, partials_size, 0);
+        auto specs = Find(ctx, barriers_size, partials_size, 0, true);
         if (auto fast_spec = SelectSm70AwqTp2FastSpec(
                 ctx, specs, *fast_target, barriers_size, partials_size)) {
           sm70_fp8_prefill_cache_.Insert(desc, *fast_spec);
@@ -470,7 +504,7 @@ struct Gemm::Impl {
     }
     if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
       if (auto fast_target = GetSm70Mxfp4MoeGroupedM8FastTarget(desc)) {
-        auto specs = Find(ctx, barriers_size, partials_size, 0);
+        auto specs = Find(ctx, barriers_size, partials_size, 0, false);
         if (auto fast_spec = SelectSm70AwqTp2FastSpec(
                 ctx, specs, *fast_target, barriers_size, partials_size)) {
           return *fast_spec;
@@ -494,7 +528,8 @@ struct Gemm::Impl {
     }
 
     const auto fast_target = GetSm70AwqTp2FastTarget(desc);
-    auto specs = Find(ctx, barriers_size, partials_size, fast_target ? 0 : 1);
+    auto specs =
+        Find(ctx, barriers_size, partials_size, fast_target ? 0 : 1, false);
     if (!specs.empty()) {
       auto selected = specs.front();
       if (fast_target) {
@@ -510,8 +545,16 @@ struct Gemm::Impl {
   }
 
   std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size,
-                               size_t partials_size, int top_k) {
+                               size_t partials_size, int top_k,
+                               bool include_prescaled) {
     std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
+    if (!include_prescaled) {
+      feasible.erase(
+          std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
+            return k->name().find("_sm70_fp8_pscale") != std::string::npos;
+          }),
+          feasible.end());
+    }
 
     std::vector<std::vector<LaunchSpec>> clusters;
     {
@@ -606,7 +649,8 @@ struct Gemm::Impl {
     // std::cerr << "GEMM: " << desc.m << "x" << desc.n << "x" << desc.k <<
     // "\n";
 
-    const auto tmp = Find(ctx, barriers_size, partials_size, tuning_.top_k);
+    const auto tmp =
+        Find(ctx, barriers_size, partials_size, tuning_.top_k, false);
 
     std::vector<LaunchSpec> specs;
     for (const auto& spec : tmp) {
@@ -749,7 +793,7 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
         (preserve_default_kernel || preserve_default_split_count)) {
       auto default_specs =
           impl_->Find(*dispatch_context, workspace.barriers_size,
-                      workspace.partials_size, 1);
+                      workspace.partials_size, 1, false);
       if (!default_specs.empty()) {
         const auto default_spec = default_specs.front();
         if (preserve_default_kernel) {

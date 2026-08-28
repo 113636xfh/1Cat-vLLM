@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -53,8 +54,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
+        # A lookup-augmented DFlash2 proposal may be wider than the checkpoint
+        # block. The model still emits only its trained block; lookup fills the
+        # remaining target-verification positions.
+        self.draft_block = get_dflash_model_draft_tokens(self.speculative_config)
+        self.num_query_per_req = 1 + self.draft_block
+        if self.draft_block < self.num_speculative_steps:
+            logger.info(
+                "%s emits %d model drafts and lookup may fill %d additional "
+                "target-verification positions.",
+                self._speculator_name,
+                self.draft_block,
+                self.num_speculative_steps - self.draft_block,
+            )
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -88,7 +100,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
-        max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
+        max_num_sampled_tokens = self.max_num_reqs * self.draft_block
         self.sample_indices = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
@@ -104,7 +116,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
         self.sample_col = torch.arange(
-            self.num_speculative_steps, dtype=torch.int32, device=device
+            self.draft_block, dtype=torch.int32, device=device
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
@@ -271,7 +283,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        num_sample = num_reqs * self.num_speculative_steps
+        num_sample = num_reqs * self.draft_block
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
@@ -284,8 +296,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
+        self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
+            num_reqs, self.draft_block
         )
 
     def _build_draft_attn_metadata(
@@ -325,6 +337,28 @@ class DFlashSpeculator(DraftModelSpeculator):
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
+    def _prepare_ngram_assist(
+        self,
+        input_batch: InputBatch,
+        output_copy_event: torch.cuda.Event | None,
+        sampled_token_ids_cpu: np.ndarray | None,
+        num_sampled_tokens_cpu: np.ndarray | None,
+        all_token_ids_cpu: np.ndarray | None,
+    ) -> bool:
+        """Prepare an optional draftless proposal; return whether it is complete."""
+        return False
+
+    def _prepare_proposal_runtime(
+        self,
+        input_batch: InputBatch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """Refresh optional proposal-controller state before graph replay."""
+
+    def _apply_ngram_assist(self, num_reqs: int) -> None:
+        """Override model proposals for ngram-hit rows, if configured."""
+
     @torch.inference_mode()
     def propose(
         self,
@@ -352,6 +386,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        output_copy_event: torch.cuda.Event | None = None,
+        sampled_token_ids_cpu: np.ndarray | None = None,
+        num_sampled_tokens_cpu: np.ndarray | None = None,
+        all_token_ids_cpu: np.ndarray | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -360,6 +398,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
+        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
@@ -425,7 +464,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.block_tables.cp_interleave,
                     self.parallel_drafting_token_id,
                     self.num_query_per_req,
-                    self.num_speculative_steps,
+                    self.draft_block,
                     self.max_num_reqs,
                     self.max_num_tokens,
                     self.max_model_len,
@@ -465,6 +504,16 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self._speculator_name,
                 )
                 self._context_only_prefill_logged = True
+            return self.draft_tokens[:num_reqs]
+
+        if self._prepare_ngram_assist(
+            input_batch,
+            output_copy_event,
+            sampled_token_ids_cpu,
+            num_sampled_tokens_cpu,
+            all_token_ids_cpu,
+        ):
+            self._apply_ngram_assist(num_reqs)
             return self.draft_tokens[:num_reqs]
 
         with record_function_or_nullcontext("dflash: query and selector"):
@@ -510,6 +559,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+
+        self._apply_ngram_assist(num_reqs)
 
         return self.draft_tokens[:num_reqs]
 

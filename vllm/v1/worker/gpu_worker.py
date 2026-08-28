@@ -154,8 +154,102 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._ple_offload_worker_handle: Any | None = None
+        self._ple_offload_enabled = self._has_ple_layers()
+        if envs.VLLM_PLE_CPU_OFFLOAD:
+            if self._ple_offload_enabled:
+                self._validate_ple_offload_config()
+            elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
+                text_config = self.model_config.hf_text_config
+                logger.warning(
+                    "VLLM_PLE_CPU_OFFLOAD is enabled, but the model has no "
+                    "PLE layers (ple_layer_ids=%s); skipping PLE offload "
+                    "process creation.",
+                    getattr(text_config, "ple_layer_ids", None),
+                )
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+
+    def _has_ple_layers(self) -> bool:
+        if not envs.VLLM_PLE_CPU_OFFLOAD:
+            return False
+        return bool(getattr(self.model_config.hf_text_config, "ple_layer_ids", None))
+
+    def _validate_ple_offload_config(self) -> None:
+        parallel_config = self.parallel_config
+        unsupported = []
+        if not current_platform.is_cuda():
+            unsupported.append(f"device={current_platform.device_type}")
+        if parallel_config.nnodes != 1:
+            unsupported.append(f"nnodes={parallel_config.nnodes}")
+        if parallel_config.data_parallel_backend != "mp":
+            unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
+        if (
+            parallel_config.data_parallel_size_local
+            != parallel_config.data_parallel_size
+        ):
+            unsupported.append(
+                "non-local DP "
+                f"({parallel_config.data_parallel_size_local}/"
+                f"{parallel_config.data_parallel_size} local ranks)"
+            )
+        if parallel_config.pipeline_parallel_size != 1:
+            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+        if parallel_config.prefill_context_parallel_size != 1:
+            unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+        if parallel_config.decode_context_parallel_size != 1:
+            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
+        if parallel_config.use_ubatching:
+            unsupported.append("ubatching/DBO")
+        if self.vllm_config.weight_transfer_config is not None:
+            unsupported.append("weight transfer")
+
+        if unsupported:
+            raise ValueError(
+                "VLLM_PLE_CPU_OFFLOAD does not support the requested "
+                "configuration. Unsupported settings: " + ", ".join(unsupported)
+            )
+
+    def spawn_ple_offload(self) -> None:
+        if (
+            not self._ple_offload_enabled
+            or self.rank != 0
+            or self.parallel_config.data_parallel_rank != 0
+        ):
+            return
+
+        from vllm.v1.ple_offload.worker import PleOffloadWorker
+
+        ipc_addr = self.parallel_config._ple_offload_ipc_path
+        if not ipc_addr:
+            raise RuntimeError("PLE offload IPC address was not initialized")
+        dp_size = self.parallel_config.data_parallel_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        num_workers = dp_size * tp_size
+        logger.info(
+            "PleOffload: spawning worker "
+            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "
+            "num_workers=%d, ipc_addr=%s).",
+            self.rank,
+            self.local_rank,
+            dp_size,
+            tp_size,
+            num_workers,
+            ipc_addr,
+        )
+        self._ple_offload_worker_handle = PleOffloadWorker.make_process(
+            self.vllm_config,
+            num_workers,
+            ipc_addr,
+        )
+
+    def wait_ple_offload_ready(self) -> None:
+        if self._ple_offload_worker_handle is None:
+            return
+
+        from vllm.v1.ple_offload.worker import PleOffloadWorker
+
+        PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -220,9 +314,9 @@ class Worker(WorkerBase):
             yield
             return
 
-        set_allocator_settings = getattr(torch._C,
-                                         "_accelerator_setAllocatorSettings",
-                                         None)
+        set_allocator_settings = getattr(
+            torch._C, "_accelerator_setAllocatorSettings", None
+        )
         if set_allocator_settings is None:
             yield
             return
@@ -349,6 +443,11 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        if self._ple_offload_enabled:
+            self.model_runner._setup_ple_offload(
+                self.parallel_config._ple_offload_ipc_path
+            )
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -360,6 +459,10 @@ class Worker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        if self._ple_offload_enabled:
+            raise NotImplementedError(
+                "Weight reload is not supported with PLE CPU offload"
+            )
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
@@ -788,6 +891,92 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
+        """Whether this step has the exact metadata-free PP tensor contract."""
+        if not envs.VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER or num_tokens != 1:
+            return False
+        cached = getattr(self, "_sm70_static_pp_hidden_contract", None)
+        if cached is not None:
+            return bool(cached)
+
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        compilation_config = config.compilation_config
+        model_config = config.model_config
+        enabled = not (
+            parallel_config.pipeline_parallel_size != 2
+            or parallel_config.tensor_parallel_size != 4
+            or parallel_config.enable_dbo
+            or parallel_config.ubatch_size > 1
+            or config.scheduler_config.max_num_seqs != 1
+            or getattr(config, "speculative_config", None) is not None
+            or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            or compilation_config.pass_config.enable_sp
+            or model_config.dtype != torch.float16
+        )
+
+        schema_matches = False
+        if enabled:
+            try:
+                schema = self.model_runner.model.make_empty_intermediate_tensors(
+                    batch_size=1,
+                    dtype=model_config.dtype,
+                    device=torch.device("meta"),
+                ).tensors
+                hidden_states = schema.get("hidden_states")
+                schema_matches = bool(
+                    tuple(schema) == ("hidden_states",)
+                    and isinstance(hidden_states, torch.Tensor)
+                    and hidden_states.shape == (1, 4, 4096)
+                    and hidden_states.dtype == torch.float16
+                    and hidden_states.is_contiguous()
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                # This is an optional fast path; unsupported model-provided
+                # schema construction retains the metadata protocol.
+                schema_matches = False
+        enabled = bool(
+            enabled
+            and schema_matches
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+        self._sm70_static_pp_hidden_contract = enabled
+        return enabled
+
+    @staticmethod
+    def _is_static_pp_hidden_tensor_dict(
+        tensor_dict: dict[str, torch.Tensor], num_tokens: int
+    ) -> bool:
+        if tuple(tensor_dict) != ("hidden_states",):
+            return False
+        hidden_states = tensor_dict["hidden_states"]
+        return bool(
+            hidden_states.shape == (num_tokens, 4, 4096)
+            and hidden_states.dtype == torch.float16
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+        )
+
+    def _static_pp_hidden_recv_buffers(
+        self, num_tokens: int
+    ) -> dict[str, torch.Tensor] | None:
+        if not self._use_sm70_static_pp_hidden_transfer(num_tokens):
+            return None
+        buffers = self.model_runner.intermediate_tensors
+        if buffers is None or tuple(buffers.tensors) != ("hidden_states",):
+            raise RuntimeError(
+                "static PP hidden transfer requires one persistent "
+                "hidden_states input buffer"
+            )
+        hidden_states = buffers.tensors["hidden_states"][:num_tokens]
+        tensor_dict = {"hidden_states": hidden_states}
+        if not self._is_static_pp_hidden_tensor_dict(tensor_dict, num_tokens):
+            raise RuntimeError(
+                "static PP hidden transfer input buffer violates its fixed schema"
+            )
+        return tensor_dict
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -835,12 +1024,20 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
+            if tensor_dict is not None:
+                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+                comm_postprocess: list[Callable[[], None]] = []
+                logger.info_once(
+                    "Default SM70 metadata-free PP hidden transfer enabled."
                 )
-            )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -870,12 +1067,23 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        # The exact SM70 B1 path sends the replicated tensor directly into
+        # the next stage's persistent graph-input buffer without CPU metadata.
+        if self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
+            if not self._is_static_pp_hidden_tensor_dict(
+                output.tensors, num_scheduled_tokens
+            ):
+                raise RuntimeError(
+                    "static PP hidden transfer output violates its fixed schema"
+                )
+            self._pp_send_work = get_pp_group().isend_tensor_dict_static(output.tensors)
+            logger.info_once("Default SM70 metadata-free PP hidden transfer enabled.")
+        else:
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 
@@ -1119,6 +1327,10 @@ class Worker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+
+        if self._ple_offload_worker_handle is not None:
+            self._ple_offload_worker_handle.close()
+            self._ple_offload_worker_handle = None
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

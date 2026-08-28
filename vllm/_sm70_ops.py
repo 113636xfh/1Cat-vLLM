@@ -19,14 +19,31 @@ def _maybe_load_fp8_qpn8_library() -> None:
     path lets source experiments add only the QPN8 operators to an otherwise
     compatible installed build, including in spawned TP workers.
     """
-    if os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1":
-        return
     library_path = os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY")
-    if library_path:
+    if library_path is None:
+        return
+    generic_override = os.getenv("VLLM_SM70_FP8_QPN8")
+    specific_override = os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4")
+    online_override = os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8")
+    generic_enabled = generic_override == "1"
+    specific_enabled = generic_override != "0" and specific_override == "1"
+    online_enabled = online_override != "0"
+    if generic_enabled or specific_enabled or online_enabled:
         torch.ops.load_library(library_path)
 
 
 _maybe_load_fp8_qpn8_library()
+
+
+def _maybe_load_nvfp4_qpn_m1_library() -> None:
+    """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
+    library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
+    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    if library_path is not None and route_enabled:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_nvfp4_qpn_m1_library()
 
 
 def _maybe_load_sm70_sampler_library() -> None:
@@ -63,6 +80,26 @@ def _op(name: str):
             "Build vLLM with CUDA arch 7.0 to enable it."
         )
     return getattr(torch.ops._C, name)
+
+
+def _qwen38_qpn8_op(name: str):
+    """Prefer the task sidecar, then fall back to the production namespace."""
+    sidecar = torch.ops._C_qwen38
+    if hasattr(sidecar, name):
+        return getattr(sidecar, name)
+    return _op(name)
+
+
+def has_fp8_qpn8_hc_dispatch() -> bool:
+    return hasattr(torch.ops._C_qwen38, "fp8_qpn8_hc_dispatch_sm70_out") or hasattr(
+        torch.ops._C, "fp8_qpn8_hc_dispatch_sm70_out"
+    )
+
+
+def has_nvfp4_qpn_m1_dispatch() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out") or hasattr(
+        torch.ops._C, "nvfp4_moe_qpn_m1_sm70_out"
+    )
 
 
 def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
@@ -486,12 +523,41 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_prescaled_out"):
         return None
 
 
+def fp8_gemm_sm70_prescaled_m1_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    prescaled_factors: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+) -> None:
+    _op("fp8_gemm_sm70_prescaled_m1_out")(
+        out, input, qweight, prescaled_factors, group_size, k_ld, q_ld
+    )
+
+
+if hasattr(torch.ops._C, "fp8_gemm_sm70_prescaled_m1_out"):
+
+    @register_fake("_C::fp8_gemm_sm70_prescaled_m1_out")
+    def _fp8_gemm_sm70_prescaled_m1_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        prescaled_factors: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_prepare_sm70(
     qweight: torch.Tensor,
     scales: torch.Tensor,
 ) -> list[torch.Tensor]:
     """Pack checkpoint-native block/channel FP8 weights into QPN8 layout."""
-    return _op("fp8_qpn8_prepare_sm70")(qweight, scales)
+    return _qwen38_qpn8_op("fp8_qpn8_prepare_sm70")(qweight, scales)
 
 
 if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
@@ -517,7 +583,7 @@ def fp8_qpn8_dequantize_sm70_out(
     group_scales: torch.Tensor,
 ) -> None:
     """Materialize one QPN8 weight into a caller-owned FP16 workspace."""
-    _op("fp8_qpn8_dequantize_sm70_out")(out, codes, group_scales)
+    _qwen38_qpn8_op("fp8_qpn8_dequantize_sm70_out")(out, codes, group_scales)
 
 
 if hasattr(torch.ops._C, "fp8_qpn8_dequantize_sm70_out"):
@@ -540,7 +606,7 @@ def fp8_qpn8_prefill_sm70_out(
     gated_silu: bool,
 ) -> None:
     """Dequantize QPN8 into bounded workspace and run a large-M FP16 GEMM."""
-    _op("fp8_qpn8_prefill_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_prefill_sm70_out")(
         out,
         dense_weight_ptr,
         input,
@@ -576,7 +642,7 @@ def fp8_qpn8_dispatch_sm70_out(
     gated_silu: bool,
 ) -> None:
     """Runtime-dispatch dynamic M without specializing a Python branch."""
-    _op("fp8_qpn8_dispatch_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_dispatch_sm70_out")(
         out,
         dense_weight_ptr,
         input,
@@ -621,7 +687,7 @@ def fp8_qpn8_gemm_sm70_out(
     The model- and shape-gated automatic route and operator benchmark share
     this entry point. ``codes`` and ``group_scales`` use the QPN8 layout.
     """
-    _op("fp8_qpn8_gemm_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_gemm_sm70_out")(
         out,
         input,
         codes,
@@ -660,7 +726,7 @@ def fp8_qpn8_gemm_ba_split_sm70_out(
     ba_weight: torch.Tensor,
 ) -> None:
     """Run the exact-shape GDN QKV/Z FP8 and b/a FP16 projections."""
-    _op("fp8_qpn8_gemm_ba_split_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_gemm_ba_split_sm70_out")(
         qkv_out,
         z_out,
         b_out,
@@ -702,7 +768,7 @@ def fp8_qpn8_dispatch_ba_split_sm70_out(
     ba_weight: torch.Tensor,
 ) -> None:
     """Dispatch exact M=1 fusion or the original large-M projection path."""
-    _op("fp8_qpn8_dispatch_ba_split_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_dispatch_ba_split_sm70_out")(
         qkv_out,
         z_out,
         b_out,
@@ -747,7 +813,7 @@ def fp8_qpn8_gated_pair_sm70_out(
     prefetch_codes: bool = False,
 ) -> None:
     """Run the single-kernel paired-tile QPN8 gated SiLU experiment."""
-    _op("fp8_qpn8_gated_pair_sm70_out")(
+    _qwen38_qpn8_op("fp8_qpn8_gated_pair_sm70_out")(
         out,
         input,
         codes,
@@ -757,6 +823,77 @@ def fp8_qpn8_gated_pair_sm70_out(
         fast_decoder,
         prefetch_codes,
     )
+
+
+def fp8_qpn8_hc_dispatch_sm70_out(
+    block_out: torch.Tensor,
+    injection_out: torch.Tensor,
+    down_staging: torch.Tensor,
+    lora_staging: torch.Tensor,
+    gate_staging: torch.Tensor,
+    partials: torch.Tensor,
+    dense_weight_ptr: int,
+    xn: torch.Tensor,
+    down_codes: torch.Tensor,
+    down_scales: torch.Tensor,
+    up_codes: torch.Tensor,
+    up_scales: torch.Tensor,
+) -> None:
+    """Dispatch the exact Qwen4Exp HC pair without a Python M branch."""
+    _qwen38_qpn8_op("fp8_qpn8_hc_dispatch_sm70_out")(
+        block_out,
+        injection_out,
+        down_staging,
+        lora_staging,
+        gate_staging,
+        partials,
+        dense_weight_ptr,
+        xn,
+        down_codes,
+        down_scales,
+        up_codes,
+        up_scales,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_hc_dispatch_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_hc_dispatch_sm70_out")
+    def _fp8_qpn8_hc_dispatch_sm70_out_fake(
+        block_out: torch.Tensor,
+        injection_out: torch.Tensor,
+        down_staging: torch.Tensor,
+        lora_staging: torch.Tensor,
+        gate_staging: torch.Tensor,
+        partials: torch.Tensor,
+        dense_weight_ptr: int,
+        xn: torch.Tensor,
+        down_codes: torch.Tensor,
+        down_scales: torch.Tensor,
+        up_codes: torch.Tensor,
+        up_scales: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "fp8_qpn8_hc_dispatch_sm70_out"):
+
+    @register_fake("_C_qwen38::fp8_qpn8_hc_dispatch_sm70_out")
+    def _fp8_qpn8_hc_dispatch_sm70_out_sidecar_fake(
+        block_out: torch.Tensor,
+        injection_out: torch.Tensor,
+        down_staging: torch.Tensor,
+        lora_staging: torch.Tensor,
+        gate_staging: torch.Tensor,
+        partials: torch.Tensor,
+        dense_weight_ptr: int,
+        xn: torch.Tensor,
+        down_codes: torch.Tensor,
+        down_scales: torch.Tensor,
+        up_codes: torch.Tensor,
+        up_scales: torch.Tensor,
+    ) -> None:
+        return None
 
 
 if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
@@ -773,6 +910,29 @@ if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
         prefetch_codes: bool,
     ) -> None:
         return None
+
+
+def _register_qwen38_qpn8_out_fakes() -> None:
+    """Teach Dynamo about out-variant operators from the task sidecar."""
+
+    def fake_out(*args, **kwargs) -> None:
+        del args, kwargs
+        return None
+
+    for name in (
+        "fp8_qpn8_dequantize_sm70_out",
+        "fp8_qpn8_prefill_sm70_out",
+        "fp8_qpn8_dispatch_sm70_out",
+        "fp8_qpn8_gemm_sm70_out",
+        "fp8_qpn8_gemm_ba_split_sm70_out",
+        "fp8_qpn8_dispatch_ba_split_sm70_out",
+        "fp8_qpn8_gated_pair_sm70_out",
+    ):
+        if hasattr(torch.ops._C_qwen38, name):
+            register_fake(f"_C_qwen38::{name}")(fake_out)
+
+
+_register_qwen38_qpn8_out_fakes()
 
 
 def nvfp4_qpn4_prepare_sm70(
@@ -1189,6 +1349,83 @@ if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+def mxfp4_moe_qpn_m1_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+) -> None:
+    _op("mxfp4_moe_qpn_m1_sm70_out")(
+        out, input, weights, scales, expert_ids, broadcast_input
+    )
+
+
+if hasattr(torch.ops._C, "mxfp4_moe_qpn_m1_sm70_out"):
+
+    @register_fake("_C::mxfp4_moe_qpn_m1_sm70_out")
+    def _mxfp4_moe_qpn_m1_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_moe_qpn_m1_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+    split_k: int,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_m1_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        broadcast_input,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_m1_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_m1_sm70_out")
+    def _nvfp4_moe_qpn_m1_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_m1_sm70_out")
+    def _nvfp4_moe_qpn_m1_sm70_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
 def nvfp4_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1459,6 +1696,65 @@ if hasattr(torch.ops._C, "sm70_f16_gemm_out"):
         return None
 
 
+def sm70_glm_mhc_pre_norm_out(
+    gemm_mul: torch.Tensor,
+    gemm_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+) -> None:
+    _op("sm70_glm_mhc_pre_norm_out")(
+        gemm_mul,
+        gemm_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult,
+        sinkhorn_repeat,
+        norm_eps,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
+
+    @register_fake("_C::sm70_glm_mhc_pre_norm_out")
+    def _sm70_glm_mhc_pre_norm_out_fake(
+        gemm_mul: torch.Tensor,
+        gemm_sqrsum: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        layer_input: torch.Tensor,
+        norm_weight: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+    ) -> None:
+        return None
+
+
 def sm70_f16_indexed_rerank_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1502,6 +1798,31 @@ if hasattr(torch.ops._C, "sm70_f16_indexed_rerank_out"):
         barriers: torch.Tensor,
         cta_n: int,
         split_k: int,
+    ) -> None:
+        return None
+
+
+def sm70_glm_kda_fg_b_out(
+    f_out: torch.Tensor,
+    g_out: torch.Tensor,
+    f_input: torch.Tensor,
+    g_input: torch.Tensor,
+    f_weight: torch.Tensor,
+    g_weight: torch.Tensor,
+) -> None:
+    _op("sm70_glm_kda_fg_b_out")(f_out, g_out, f_input, g_input, f_weight, g_weight)
+
+
+if hasattr(torch.ops._C, "sm70_glm_kda_fg_b_out"):
+
+    @register_fake("_C::sm70_glm_kda_fg_b_out")
+    def _sm70_glm_kda_fg_b_out_fake(
+        f_out: torch.Tensor,
+        g_out: torch.Tensor,
+        f_input: torch.Tensor,
+        g_input: torch.Tensor,
+        f_weight: torch.Tensor,
+        g_weight: torch.Tensor,
     ) -> None:
         return None
 

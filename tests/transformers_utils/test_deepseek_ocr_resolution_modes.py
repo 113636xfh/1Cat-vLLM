@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek-OCR resolution modes (R4): per-request ``image_mode`` selection,
-crop parametrization, the multi-image safeguard, and — critically — the
-producer/counter consistency contract (`tokenize_with_images` versus
+"""DeepSeek-OCR resolution modes: per-request ``image_mode`` selection,
+crop parametrization, and — critically — the producer/counter consistency
+contract (`tokenize_with_images` versus
 `count_image_tokens`), whose violation is the "N multimodal tokens vs M
 placeholders" crash class."""
 
-import os
-
 import pytest
+from transformers.processing_utils import ProcessorMixin
 
 from vllm.transformers_utils.processors.deepseek_ocr import (
     BASE_SIZE,
@@ -18,9 +17,6 @@ from vllm.transformers_utils.processors.deepseek_ocr import (
     DeepseekOCRProcessor,
     count_image_tokens_for,
 )
-
-DSOCR_PATH = os.environ.get("DSOCR_CHECKPOINT", "/mnt/models/DeepSeek-OCR")
-
 
 # ---------------------------------------------------------------------------
 # Pure-function tests (no tokenizer).
@@ -79,18 +75,35 @@ def test_max_crops_bounds_the_tile_count():
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer-backed tests (real checkpoint; run on the GPU host, CPU-only).
+# Processor tests with a minimal tokenizer (CPU-only, no model files).
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def tokenizer():
-    pytest.importorskip("transformers")
-    if not os.path.isdir(DSOCR_PATH):
-        pytest.skip("checkpoint unavailable")
-    from transformers import AutoTokenizer
+class _TokenizerStub:
+    bos_token_id = 1
+    eos_token_id = 2
+    pad_token_id = 0
+    pad_token = None
+    padding_side = "right"
+    vocab = {"<image>": 99}
 
-    return AutoTokenizer.from_pretrained(DSOCR_PATH)
+    def add_special_tokens(self, tokens):
+        self.pad_token = tokens["pad_token"]
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return [10] if text else []
+
+    def decode(self, tokens, **kwargs):
+        del kwargs
+        return " ".join(map(str, tokens))
+
+
+@pytest.fixture
+def tokenizer(monkeypatch):
+    monkeypatch.setattr(ProcessorMixin, "__init__", lambda *args, **kwargs: None)
+
+    return _TokenizerStub()
 
 
 def _images(sizes):
@@ -112,6 +125,8 @@ def test_invalid_mode_and_crops_raise(tokenizer):
         DeepseekOCRProcessor(tokenizer=tokenizer, image_mode="giant")
     with pytest.raises(ValueError, match="crop bounds"):
         DeepseekOCRProcessor(tokenizer=tokenizer, min_crops=5, max_crops=2)
+    with pytest.raises(ValueError, match="crop bounds"):
+        DeepseekOCRProcessor(tokenizer=tokenizer, min_crops=2, max_crops=10)
 
 
 def test_image_mode_authoritative_over_trio(tokenizer):
@@ -134,29 +149,15 @@ def test_producer_counter_consistency(tokenizer, mode, size):
     proc = DeepseekOCRProcessor(tokenizer=tokenizer, **kwargs)
     out = proc(prompt="<image>\nFree OCR. ", images=_images([size]))
     produced = int(out["num_image_tokens"][0])
-    counted = proc.count_image_tokens(
-        image_width=size[0], image_height=size[1], num_images=1
-    )
+    counted = proc.count_image_tokens(image_width=size[0], image_height=size[1])
     assert produced == counted
 
 
-def test_multi_image_guard_disables_crops_consistently(tokenizer):
-    proc = DeepseekOCRProcessor(tokenizer=tokenizer, disable_crop_for_multi_image=True)
+def test_multi_image_producer_counter_consistency(tokenizer):
+    proc = DeepseekOCRProcessor(tokenizer=tokenizer)
     sizes = [(1200, 800), (1000, 2200)]
     out = proc(prompt="<image>a<image>b", images=_images(sizes))
-    spatial = out["images_spatial_crop"]
-    assert (spatial <= 1).all(), "multi-image request must not be tiled"
     for i, size in enumerate(sizes):
         produced = int(out["num_image_tokens"][i])
-        counted = proc.count_image_tokens(
-            image_width=size[0], image_height=size[1], num_images=len(sizes)
-        )
+        counted = proc.count_image_tokens(image_width=size[0], image_height=size[1])
         assert produced == counted
-
-
-def test_multi_image_default_keeps_cropping_byte_compat(tokenizer):
-    # DeepSeek-OCR's max_crops=6 is documented safe for multi-image; the
-    # guard defaults OFF so existing behavior is unchanged.
-    proc = DeepseekOCRProcessor(tokenizer=tokenizer)
-    out = proc(prompt="<image>a<image>b", images=_images([(1200, 800)] * 2))
-    assert (out["images_spatial_crop"] > 1).any()

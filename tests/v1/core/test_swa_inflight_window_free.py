@@ -9,8 +9,13 @@ back), so `allocate_slots` frees on the processed-token basis:
 `num_computed_tokens - num_in_flight_tokens`.
 """
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
+from vllm import envs
+from vllm.config import VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -31,6 +36,35 @@ NUM_OUT_OF_WINDOW_BLOCKS = 85 // BLOCK_SIZE
 # (100 // 32) * 32 = 96 settled tokens -> 6 full blocks.
 CHUNK_SIZE = 32
 NUM_OUT_OF_CHUNK_BLOCKS = (NUM_PROMPT_TOKENS // CHUNK_SIZE) * CHUNK_SIZE // BLOCK_SIZE
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "async_scheduling", "queue_depth", "expected_batches"),
+    [
+        (1, False, 0, 1),
+        (1, True, 0, 2),
+        (1, True, 4, 4),
+        (3, False, 0, 3),
+        (3, True, 4, 3),
+    ],
+)
+def test_max_in_flight_tokens_matches_executor_concurrency(
+    monkeypatch,
+    pp_size: int,
+    async_scheduling: bool,
+    queue_depth: int,
+    expected_batches: int,
+):
+    monkeypatch.setattr(envs, "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH", queue_depth)
+    config = object.__new__(VllmConfig)
+    config.parallel_config = SimpleNamespace(pipeline_parallel_size=pp_size)
+    config.scheduler_config = SimpleNamespace(
+        async_scheduling=async_scheduling,
+        max_num_batched_tokens=1024,
+    )
+
+    assert config.max_concurrent_batches == expected_batches
+    assert config.max_in_flight_tokens == expected_batches * 1024
 
 
 def _make_model_runner_output(

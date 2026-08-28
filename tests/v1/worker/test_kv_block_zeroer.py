@@ -12,13 +12,117 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.utils import KVBlockZeroer, _infer_segment_block_strides
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    _infer_segment_block_strides,
+    _resolve_zeroer_kernel_layout,
+)
 
 CELL_ELS = 8  # int32 elements zeroed per (block, segment)
 CELL_BYTES = CELL_ELS * 4
 N_LAYERS = 3  # -> n_segs = 3 interleaved segments
 N_BLOCKS = 4
+
+
+class _BlockFirstAttentionBackend:
+    @staticmethod
+    def get_kv_cache_block_dim(*args, **kwargs) -> int:
+        return 0
+
+
+@pytest.mark.parametrize(
+    ("spec", "group_kernel_bs", "expected"),
+    [
+        (
+            FullAttentionSpec(
+                block_size=784,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+            ),
+            16,
+            (16, 49),
+        ),
+        (
+            MLAAttentionSpec(
+                block_size=784,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+                compress_ratio=8,
+            ),
+            16,
+            (98, 1),
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_resolve_zeroer_kernel_layout(
+    spec: FullAttentionSpec,
+    group_kernel_bs: int,
+    expected: tuple[int, int],
+) -> None:
+    assert _resolve_zeroer_kernel_layout(spec, group_kernel_bs) == expected
+
+
+@pytest.mark.skip_global_cleanup
+def test_resolve_zeroer_kernel_layout_rejects_nondivisible_size() -> None:
+    spec = FullAttentionSpec(
+        block_size=784,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="must be divisible"):
+        _resolve_zeroer_kernel_layout(spec, 30)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_compressed_attention_storage_page() -> None:
+    device = torch.device("cuda")
+    num_blocks = 8
+    spec = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.bfloat16,
+        compress_ratio=2,
+    )
+    kv = torch.ones(
+        (num_blocks, spec.storage_block_size, 1, spec.head_size),
+        dtype=spec.dtype,
+        device=device,
+    )
+    layer_name = "qsa.compressed"
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=[layer_name],
+        backend=_BlockFirstAttentionBackend,
+    )
+    static_forward_context = {layer_name: SimpleNamespace(kv_cache=kv)}
+
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[2],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=static_forward_context,
+    )
+
+    target = 1
+    zeroer.zero_block_ids([target])
+    torch.accelerator.synchronize()
+
+    pages = kv.view(num_blocks, -1)
+    zeroed = {index for index in range(num_blocks) if bool((pages[index] == 0).all())}
+    assert zeroed == {target}
 
 
 @pytest.mark.parametrize(
@@ -159,3 +263,81 @@ def test_zero_block_ids_multiple_interleaved_pools() -> None:
             index for index in range(cells.shape[0]) if bool((cells[index] == 0).all())
         }
         assert zeroed == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_nonuniform_page_sizes() -> None:
+    device = torch.device("cuda")
+    page_sizes = [8, 16]
+    buffers = [
+        torch.ones(N_BLOCKS * page_size, dtype=torch.int32, device=device)
+        for page_size in page_sizes
+    ]
+    groups = []
+    static_forward_context = {}
+    for index, (page_size, buffer) in enumerate(zip(page_sizes, buffers)):
+        spec = MambaSpec(
+            block_size=16,
+            shapes=((1,),),
+            dtypes=(torch.int32,),
+            page_size_padded=page_size * 4,
+        )
+        layer_name = f"mamba.nonuniform.{index}"
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=spec,
+                kv_cache_group_id=index,
+                layer_names=[layer_name],
+                backend=None,
+            )
+        )
+        static_forward_context[layer_name] = SimpleNamespace(kv_cache=[buffer])
+
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        groups,
+        kernel_block_sizes=[16, 16],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=static_forward_context,
+    )
+
+    target = 2
+    zeroer.zero_block_ids([target])
+    torch.accelerator.synchronize()
+
+    for page_size, buffer in zip(page_sizes, buffers):
+        pages = buffer.view(N_BLOCKS, page_size)
+        zeroed = {index for index in range(N_BLOCKS) if bool((pages[index] == 0).all())}
+        assert zeroed == {target}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zeroer_supports_heterogeneous_page_sizes() -> None:
+    device = torch.device("cuda")
+    small = torch.ones((3, 8), dtype=torch.int32, device=device)
+    large = torch.ones((3, 20), dtype=torch.int32, device=device)
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer._id_cap = 8
+    zeroer._ids_pinned = torch.empty(8, dtype=torch.int64)
+    zeroer._ids_gpu = torch.empty(8, dtype=torch.int64, device=device)
+    zeroer._meta = (
+        torch.tensor(
+            [small.data_ptr(), large.data_ptr()], dtype=torch.uint64, device=device
+        ),
+        torch.tensor([8, 20], dtype=torch.int64, device=device),
+        torch.tensor([8, 20], dtype=torch.int64, device=device),
+        3,
+        8,
+        2,
+    )
+
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(small[0], torch.ones_like(small[0]))
+    torch.testing.assert_close(small[1], torch.zeros_like(small[1]))
+    torch.testing.assert_close(small[2], torch.ones_like(small[2]))
+    torch.testing.assert_close(large[0], torch.ones_like(large[0]))
+    torch.testing.assert_close(large[1], torch.zeros_like(large[1]))
+    torch.testing.assert_close(large[2], torch.ones_like(large[2]))
