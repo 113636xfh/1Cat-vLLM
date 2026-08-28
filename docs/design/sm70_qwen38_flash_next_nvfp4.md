@@ -497,9 +497,10 @@ The exact TP4-local BF16 draft-MoE shape is
 `E=512, N=160, K=2560, topk=10`. An exact-shape SM70 tile of
 `BM=2, BN=128, BK=64, G=1`, four warps, and three stages reduces M5 from
 1492.500 to 283.853 microseconds (5.26x) and M1 from 425.789 to 272.415
-microseconds (1.56x), with bitwise-identical output. The route is bounded to
-Qwen3.8 TP4 and remains opt-in through
-`VLLM_SM70_MTP_MOE_TUNED_CONFIG=1`.
+microseconds (1.56x), with bitwise-identical output. The route is bounded by
+the exact SM70 TP4 local MoE shape (currently exercised by Qwen3.8), is enabled
+by default, and can be rolled back with
+`VLLM_SM70_MTP_MOE_TUNED_CONFIG=0`.
 
 V2 needs one additional prefill specialization beyond its faithful M5/M1
 decode warmup. The real HumanEval prompt first runs the draft model at M152;

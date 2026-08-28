@@ -605,7 +605,7 @@ def _sm70_turbomind_policy(
     )
     mtp_moe_tuned_config = _env_bool(
         "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
-        False,
+        True,
     )
     awq_warmup = _env_bool("VLLM_SM70_AWQ_WARMUP", True)
     awq_moe_disable = _env_bool("VLLM_SM70_AWQ_MOE_DISABLE", False)
