@@ -5,8 +5,8 @@
 #include <torch/library.h>
 
 #ifdef VLLM_QPN4_STANDALONE
-#include <ATen/core/dispatch/Dispatcher.h>
-#include <ATen/core/stack.h>
+  #include <ATen/core/dispatch/Dispatcher.h>
+  #include <ATen/core/stack.h>
 #endif
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -650,12 +650,14 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
 }
 
 #ifndef VLLM_QPN4_STANDALONE
-void nvfp4_qpn2_dispatch_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
-    torch::Tensor scales, double global_scale, int64_t split_k,
-    int64_t accumulator_chains, torch::Tensor tm_weight,
-    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
-    int64_t tm_q_ld, bool gated_silu);
+void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor codes, torch::Tensor scales,
+                                  double global_scale, int64_t split_k,
+                                  int64_t accumulator_chains,
+                                  torch::Tensor tm_weight,
+                                  torch::Tensor tm_scales,
+                                  int64_t tm_group_size, int64_t tm_k_ld,
+                                  int64_t tm_q_ld, bool gated_silu);
 #endif
 
 void nvfp4_qpn2_prefill_dispatch_sm70_out(
@@ -677,9 +679,9 @@ void nvfp4_qpn2_prefill_dispatch_sm70_out(
   }
 
 #ifndef VLLM_QPN4_STANDALONE
-  nvfp4_qpn2_dispatch_sm70_out(
-      out, input, codes, scales, global_scale, split_k, accumulator_chains,
-      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+  nvfp4_qpn2_dispatch_sm70_out(out, input, codes, scales, global_scale, split_k,
+                               accumulator_chains, tm_weight, tm_scales,
+                               tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
 #else
   // Source overlays retain the validated decode extension. Route small M
   // through its existing opaque dispatch without exposing an M-dependent
