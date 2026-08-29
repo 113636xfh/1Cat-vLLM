@@ -99,3 +99,46 @@ target-only versus DFlash2 PPL comparison of `5.4993116/5.4993622`. This PR
 does not change that operator or the verifier/sampler path. Its newly promoted
 large-M route reuses the previously bitwise-equal packed prefill operator, and
 the latest-main long-prefill run preserved the retained output hash.
+
+## 2026-08-29 opaque dispatch and practical defaults
+
+A release audit on `onecat/main` at
+`cda10f1220f78cb1fe9d62b0001912d0a0b59c95` found that the first integration
+used a Python `M >= 1024` branch around the prefill operator. AOTInductor
+captured that dynamic branch into the decode graph: the graph pool grew from
+`0.13` to `0.28 GiB`, and a complete DFlash2 round regressed from about
+`17.4` to `41.98 ms`. Sidecar loading alone did not fix the graph because the
+Python shape branch remained visible.
+
+The retained implementation exposes one opaque
+`nvfp4_qpn2_prefill_dispatch_sm70_out` operator for all M. Its C++ dispatcher
+keeps M below the threshold on the established QPN2/TurboMind path and sends
+large M to the QPN2-packed prefill kernel. The prefill kernel creates and
+releases its bounded FP16 dense workspace within the operator; no large
+persistent workspace is captured by the decode graph. Production wheels link
+the dispatcher into `_C`; a separately loaded fragment is supported only for
+source-overlay validation against an already accepted native extension.
+
+The route passed exact V100 screens for M8/M16, normal/gated output, and
+pointer-zero ephemeral versus explicit workspace (`max_abs=0` throughout).
+The focused CPU contract suite passes seven tests, including strict admission
+and explicit rollback.
+
+For the practical NVFP4 DFlash2 service contract, source configuration now
+also defaults the already quality-audited verifier/GDN metadata paths and the
+QPN8 dense-order rerank. Admission requires Qwen3.8-27B compressed-tensors
+NVFP4, FP16 execution, TP4/PP1/B1, q7/top16 DFlash2, FP8 E5M2 target KV,
+`max_num_batched_tokens=4096`, no DBO, and Flash-V100 on SM70. Every explicit
+environment value wins. Candidate-order rerank remains off because its FP16
+tie-cutoff changes candidate sets; dense-order is the quality release path.
+
+The four-V100 source-default proof removed all QPN2/prefill booleans and all
+DFlash2 fastpath booleans from the launch file. Logs showed automatic defaults,
+opaque QPN2 prefill, QPN8 `dense_order=True`, and a `0.13 GiB` graph pool.
+Three 512-token single-request runs measured complete rounds of
+`17.4035/17.3569/17.3697 ms` (mean `17.3767 ms`). One cold 32K token-ID prefill
+measured `4039.49 tok/s`; the following decode measured `17.3640 ms/round`, so
+the large-M route did not poison or slow the decode graph. Three distinct
+function-call schemas and one strict JSON-schema response also passed on the
+same source-default service. Raw evidence is in
+`/data/minimax-h3/task-cache/v100-dflash2-release-audit-20260829/remote-18ms-restart/source-default-validation.json`.

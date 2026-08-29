@@ -128,7 +128,7 @@ _SM70_NVFP4_QPN2_REQUIRED_OPS = (
     "nvfp4_qpn2_gated_sm70_out",
     "nvfp4_qpn2_dispatch_sm70_out",
 )
-_SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS = ("nvfp4_qpn4_prefill_sm70_out",)
+_SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS = ("nvfp4_qpn2_prefill_dispatch_sm70_out",)
 
 
 def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
@@ -355,7 +355,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     layer.weight.data, layer.weight_scale.data
                 )
                 qpn2_global_scale = float(layer.weight_global_scale.item())
-                qpn2_prefill_workspace = None
+                qpn2_prefill_enabled = False
                 if _sm70_nvfp4_qpn2_prefill_enabled():
                     missing_prefill_ops = _missing_qpn2_prefill_ops()
                     if missing_prefill_ops:
@@ -365,15 +365,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                             f"large M. Missing ops: {missing_prefill_ops}."
                         )
                     else:
-                        qpn2_prefill_workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(
-                            layer.weight
-                        )
-                        if qpn2_prefill_workspace is None:
-                            logger.warning_once(
-                                "Insufficient memory for the bounded SM70 "
-                                "NVFP4 QPN2-packed prefill workspace; "
-                                "retaining TurboMind for large M."
-                            )
+                        qpn2_prefill_enabled = True
 
             use_gated_silu = bool(
                 envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU and is_qpn4_gate and not use_qpn2
@@ -398,26 +390,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 layer.sm70_nvfp4_qpn2_split_k = split_k
                 layer.sm70_nvfp4_qpn2_nacc = nacc
                 layer.sm70_nvfp4_qpn2_gated_silu = suffix == "gate_up_proj"
-                layer.sm70_nvfp4_qpn2_prefill_dense_weight_ptr = (
-                    0
-                    if qpn2_prefill_workspace is None
-                    else qpn2_prefill_workspace.data_ptr()
-                )
-                if qpn2_prefill_workspace is not None:
-                    # QPN2 and QPN4 use the same physical tile order, but
-                    # expose checkpoint-native [N, K/2] and GEMM-native
-                    # [K, N/2] shapes respectively.  Keep zero-copy views so
-                    # prefill does not retain a third multi-GB weight layout.
-                    layer.sm70_nvfp4_qpn2_prefill_codes = qpn2_codes.view(k, n // 2)
-                    layer.sm70_nvfp4_qpn2_prefill_scales = qpn2_scales.view(k // 16, n)
+                layer.sm70_nvfp4_qpn2_prefill_enabled = qpn2_prefill_enabled
                 logger.info_once(
                     "SM70 NVFP4 QPN2 M<=8 route enabled for a compatible "
                     "TP4 projection contract."
                 )
-                if qpn2_prefill_workspace is not None:
+                if qpn2_prefill_enabled:
                     logger.info_once(
-                        "SM70 NVFP4 QPN2-packed bounded FP16 prefill route "
-                        "enabled for M>=%d.",
+                        "SM70 NVFP4 opaque QPN2 decode plus QPN2-packed "
+                        "ephemeral FP16 prefill dispatch enabled for M>=%d.",
                         envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M,
                     )
             elif use_gated_silu:
@@ -490,26 +471,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         )
         if x_2d.shape[0] == 0:
             return out_2d.reshape(*x.shape[:-1], output_size)
-        prefill_dense_weight_ptr = int(
-            getattr(layer, "sm70_nvfp4_qpn2_prefill_dense_weight_ptr", 0)
-        )
-        if (
-            x_2d.shape[0] >= envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M
-            and prefill_dense_weight_ptr
-        ):
-            sm70_ops.nvfp4_qpn4_prefill_sm70_out(
-                out_2d,
-                prefill_dense_weight_ptr,
-                x_2d,
-                layer.sm70_nvfp4_qpn2_prefill_codes,
-                layer.sm70_nvfp4_qpn2_prefill_scales,
-                float(layer.sm70_nvfp4_qpn2_global_scale),
-                True,
-                gated_silu,
-            )
-            if bias is not None:
-                out_2d.add_(bias)
-            return out_2d.reshape(*x.shape[:-1], output_size)
         state = getattr(layer, sm70_tm.STATE_ATTR)
         split_k = int(layer.sm70_nvfp4_qpn2_split_k)
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
@@ -517,21 +478,39 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[
                 (x_2d.shape[1], output_size * 2, True)
             ]
-        sm70_ops.nvfp4_qpn2_dispatch_sm70_out(
-            out_2d,
-            x_2d,
-            layer.sm70_nvfp4_qpn2_codes,
-            layer.sm70_nvfp4_qpn2_scales,
-            float(layer.sm70_nvfp4_qpn2_global_scale),
-            split_k,
-            nacc,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-            gated_silu,
-        )
+        if getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
+            sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(
+                out_2d,
+                x_2d,
+                layer.sm70_nvfp4_qpn2_codes,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.weight,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+                envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M,
+            )
+        else:
+            sm70_ops.nvfp4_qpn2_dispatch_sm70_out(
+                out_2d,
+                x_2d,
+                layer.sm70_nvfp4_qpn2_codes,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.weight,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+            )
         if bias is not None:
             out_2d.add_(bias)
         return out_2d.reshape(*x.shape[:-1], output_size)
