@@ -166,7 +166,10 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = True
+    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
+    VLLM_SM70_QWEN38_FP16_GEMV: bool = False
+    VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
+    VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
@@ -1705,12 +1708,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
-    # dense projections. Pure-FP8 checkpoints must opt in;
-    # a mixed NVFP4 checkpoint may select its separately validated default in
-    # the compressed-tensors scheme. Explicit 0 disables both routes.
+    # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
+    # online route also stays opt-in because it requantizes checkpoint BF16
+    # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1"))
+        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
+    ),
+    # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
+    # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
+    # opt-in until operator, token, task-quality, and matched speed gates pass.
+    "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
+    ),
+    # Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 GDN
+    # QKVZ and b/a projections and write their consumed splits in one launch.
+    "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
+    ),
+    # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
+    # stages while retaining FP16 checkpoint weights and inter-stage rounding.
+    # This remains opt-in pending the same model-level quality gates as GEMV.
+    "VLLM_SM70_QWEN38_FUSED_HC_FP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
