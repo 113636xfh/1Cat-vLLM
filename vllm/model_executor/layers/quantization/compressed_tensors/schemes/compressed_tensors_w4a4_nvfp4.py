@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 from torch.nn.parameter import Parameter
@@ -58,14 +58,23 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
     return bool(
         getattr(speculative_config, "method", None) == "dflash"
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and selector_top_k == 16
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.tensor_parallel_size == 4
         and scheduler_config.max_num_seqs == 1
         and not getattr(parallel_config, "enable_dbo", False)
-        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
     )
 
 

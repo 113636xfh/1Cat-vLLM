@@ -36,7 +36,9 @@ def test_nvfp4_qpn2_is_default_off_with_explicit_on(monkeypatch):
         envs.disable_envs_cache()
 
 
-def _runtime_config(*, method="dflash", draft_tokens=7, tp=4, max_num_seqs=1):
+def _runtime_config(
+    *, method="dflash", draft_tokens=7, selector_top_k=16, tp=4, max_num_seqs=1
+):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
@@ -51,6 +53,11 @@ def _runtime_config(*, method="dflash", draft_tokens=7, tp=4, max_num_seqs=1):
             else SimpleNamespace(
                 method=method,
                 num_speculative_tokens=draft_tokens,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        dflash_config={"selector_top_k": selector_top_k}
+                    )
+                ),
             )
         ),
     )
@@ -79,6 +86,13 @@ def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
             nvfp4_scheme,
             "get_current_vllm_config",
             lambda: _runtime_config(draft_tokens=5),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(selector_top_k=0),
         )
         assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
 
