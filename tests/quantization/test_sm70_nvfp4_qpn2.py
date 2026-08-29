@@ -36,6 +36,97 @@ def test_nvfp4_qpn2_is_default_off_with_explicit_on(monkeypatch):
         envs.disable_envs_cache()
 
 
+def _runtime_config(
+    *, method="dflash", draft_tokens=7, selector_top_k=16, tp=4, max_num_seqs=1
+):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=tp,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=(
+            None
+            if method is None
+            else SimpleNamespace(
+                method=method,
+                num_speculative_tokens=draft_tokens,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        dflash_config={"selector_top_k": selector_top_k}
+                    )
+                ),
+            )
+        ),
+    )
+
+
+def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QPN2", raising=False)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QPN2_PREFILL", raising=False)
+    monkeypatch.setattr(
+        nvfp4_scheme, "get_current_vllm_config", lambda: _runtime_config()
+    )
+    envs.disable_envs_cache()
+    try:
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(method=None),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(draft_tokens=5),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(selector_top_k=0),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(tp=2),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(max_num_seqs=2),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_nvfp4_qpn2_dflash2_explicit_rollback(monkeypatch):
+    monkeypatch.setattr(
+        nvfp4_scheme, "get_current_vllm_config", lambda: _runtime_config()
+    )
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "0")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0")
+    envs.disable_envs_cache()
+    try:
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     layer = SimpleNamespace(
         tp_size=4,
