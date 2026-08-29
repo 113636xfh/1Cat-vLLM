@@ -44611,3 +44611,29 @@ Interpretation:
 - Retained and rejected routes, full contracts, operator evidence, trace
   tables, quality details, and artifact paths are recorded in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-29 DFlash2 grouped-verifier binary capability guard
+
+- A production NVFP4 DFlash2 TP4 service failed on a 51,088-token cached
+  request whose final chunk scheduled 16 target tokens. The Python source
+  admitted q16 grouped verification, but the deployed Flash-V100 extension
+  still enforced the legacy q8 limit. Its `TORCH_CHECK` killed EngineCore and
+  left the systemd unit falsely active with four orphaned TP workers.
+- Draft PR #422 makes the native extension report its maximum grouped-verifier
+  query length. Source overlays paired with an older binary conservatively
+  infer q8; rebuilt extensions report q16. Unsupported q16 work uses the exact
+  independent paged-decode fallback, while the normal seven-draft-plus-bonus
+  q8 verifier remains on the 18-ms grouped fast path.
+- Five focused policy tests pass, including q8/q16 admission with a simulated
+  current extension and q16 fallback with a legacy extension. The deployed
+  legacy binary reports max-q 8 through the compatibility interface.
+- The four-V100 deployment reproduced the incident boundary with exactly
+  49,084 prompt tokens: twelve 4,089-token chunks plus a final q16 chunk. It
+  completed in 13.288 seconds without an engine error. Repeating the same
+  prefix completed in 1.715 seconds, confirming prefix-cache health. A tool
+  smoke returned a valid `get_weather` call with `{"city":"北京"}`.
+- The historical single-request web-generation prompt produced 512 tokens at
+  206.06 token/s streaming decode. Metrics recorded 142 speculative rounds,
+  369 accepted draft tokens, 3.599 emitted tokens per round, and 17.463 ms per
+  engine round. The service remained healthy with no post-restart traceback or
+  grouped-verifier shape failure.
