@@ -27,7 +27,7 @@ def _maybe_load_fp8_qpn8_library() -> None:
     online_override = os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8")
     generic_enabled = generic_override == "1"
     specific_enabled = generic_override != "0" and specific_override == "1"
-    online_enabled = online_override != "0"
+    online_enabled = online_override == "1"
     if generic_enabled or specific_enabled or online_enabled:
         torch.ops.load_library(library_path)
 

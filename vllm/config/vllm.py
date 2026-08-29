@@ -660,10 +660,23 @@ class VllmConfig:
     @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        architectures = (
+            getattr(self.model_config, "architectures", [])
+            if self.model_config is not None
+            else []
+        )
+        is_qwen4_exp = any(
+            architecture.startswith("Qwen4ExpFor") for architecture in architectures
+        )
         is_mrv2_dflash = (
             self.speculative_config is not None and self.speculative_config.use_dflash()
         )
         if use_v2_model_runner is not None:
+            if is_qwen4_exp and not use_v2_model_runner:
+                raise ValueError(
+                    "Qwen4Exp requires Model Runner V2 for its QSA ring cache "
+                    "and rollback-safe PLE n-gram context."
+                )
             if is_mrv2_dflash and not use_v2_model_runner:
                 raise ValueError(
                     "method='dflash' is implemented only by Model Runner V2. "
