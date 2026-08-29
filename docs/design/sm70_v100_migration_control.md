@@ -44543,3 +44543,27 @@ Interpretation:
   long-context limiter. The next trace must be taken at 256K and separate the
   context-growing QSA indexer/attention work from the now-fixed MoE projection
   cost; 128K-only traces are no longer sufficient acceptance evidence.
+
+## 2026-08-29 DFlash2 18-ms source-default and prefill closure
+
+- The first NVFP4 QPN2-prefill integration exposed `M >= 1024` in Python.
+  AOT decode captured the wrong branch, grew the graph pool from 0.13 to
+  0.28 GiB, and regressed a complete DFlash2 round from about 17.4 to
+  41.98 ms. Sidecar-only and persistent-workspace variants are rejected.
+- One opaque C++ dispatcher now selects established QPN2/TurboMind for small M
+  and the QPN2-packed bounded prefill kernel for large M. The latter owns an
+  ephemeral FP16 workspace inside the operator. M8/M16 normal/gated and
+  explicit/ephemeral workspace comparisons are bitwise equal.
+- The exact quality-audited NVFP4 DFlash2 TP4/B1 q7/top16, E5M2-KV, q4096
+  contract now source-defaults the accepted verifier/GDN fast paths and QPN8
+  dense-order rerank. Explicit overrides remain authoritative. Candidate-order
+  stays off because its candidate-set tie cutoff is not quality-equivalent.
+- A four-V100 restart with the corresponding booleans absent from the launch
+  file logged automatic admission, opaque prefill, `dense_order=True`, and a
+  0.13-GiB graph pool. Three 512-token single-request runs measured
+  `17.4035/17.3569/17.3697 ms` per complete round (mean `17.3767 ms`). Cold
+  32K prefill was `4039.49 tok/s`; post-prefill decode remained
+  `17.3640 ms/round`.
+- Evidence:
+  `docs/design/sm70_dflash2_nvfp4_prefill_promotion.md` and
+  `/data/minimax-h3/task-cache/v100-dflash2-release-audit-20260829/remote-18ms-restart/source-default-validation.json`.

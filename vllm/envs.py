@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
+    VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
@@ -1749,6 +1750,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
     "VLLM_SM70_NVFP4_QPN2_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": lambda: os.getenv(
+        "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": lambda: int(
         os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")
