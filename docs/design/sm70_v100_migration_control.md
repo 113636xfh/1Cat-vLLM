@@ -44543,3 +44543,47 @@ Interpretation:
   long-context limiter. The next trace must be taken at 256K and separate the
   context-growing QSA indexer/attention work from the now-fixed MoE projection
   cost; 128K-only traces are no longer sufficient acceptance evidence.
+
+## 2026-08-29 Qwen3.8 Flash-Next no-MTP checkpoint-native decode
+
+- Draft PR #415 carries the isolated source work. This contract is
+  `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`, TP4 on GPU0-3, V2,
+  ModelOpt FP4, FP16 activation/KV, Flash-V100, full CUDA Graph, aligned Mamba
+  prefix caching, max length 262,144, input 8,192, output 512, five cache-reset
+  greedy repetitions, and no MTP. Online QPN8 and top1-only LM-head lanes are
+  explicitly off. It is not the input-1,024/output-256 E4M3/QPN8 acceptance
+  recorded on 2026-08-24.
+- The matched control is 65.872/65.882/65.856/65.855/65.853 tok/s:
+  **65.864 tok/s** mean and **15.183 ms** mean TPOT. A four-rank graph-node
+  trace localizes 7.502 ms/rank/token and 812 launches/rank/token to dense
+  GEMV/GEMM and compressor work, led by two cuBLAS GEMV families at 3.656 and
+  2.254 ms/rank/token.
+- The retained default-off exact-topology route replaces audited
+  checkpoint-FP16 batch-one projections with SM70 row GEMV, fuses the exact
+  HyperConnection projection/mix, reduces QSA lexicographic top-k from eight
+  composite-key radix passes to four score-pivot passes plus exact
+  increasing-index tie compaction, and computes GDN QKVZ+b/a with direct
+  qkv/z/b/a outputs in one launch. It prepares 288 projections, 96 HC modules,
+  and 36 GDN inputs. Unsupported contracts retain the prior path.
+- The full matched candidate records
+  80.367/80.451/80.463/81.560/80.822 tok/s: **80.732 tok/s** mean,
+  **12.387 ms** mean TPOT, and 0.442 tok/s population standard deviation.
+  This is +22.57% throughput and -18.41% TPOT from control; all five token
+  arrays are identical. Warm 8K prefill median is 2,766.4 ms versus 2,777.6 ms
+  for control.
+- Frozen natural-output GSM8K indices 8-23 at xhigh,
+  temperature/top-p/top-k `1.0/0.95/20`, seed 20260828, and max output 4,096
+  score **15/16 raw and 15/16 strict**. All 16 stop naturally, all thinking
+  sections close, and there are no caps or structural failures. The historical
+  same-prompt MTP4 result is 15/16 raw and 14/16 strict; both miss item 12 with
+  prediction 12 versus answer 13. Repository repetition/character health
+  checks pass 16/16 with zero replacement characters and maximum same-token
+  run 3.
+- Focused static closure currently includes 25/25 QSA and new route policy tests,
+  Ruff check/format, shell syntax, and `git diff --check`. The exact QSA
+  sidecar previously passed its three GPU exactness, prefill-batch, and CUDA
+  Graph replay tests. Unused fused-W13 and shared-expert prototypes were
+  removed rather than stacked onto the accepted result.
+- Retained and rejected routes, full contracts, operator evidence, trace
+  tables, quality details, and artifact paths are recorded in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.
