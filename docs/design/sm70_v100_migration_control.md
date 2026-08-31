@@ -44725,3 +44725,85 @@ Interpretation:
   the matched four-V100 source-default proof. A built 1.5.0 wheel still needs
   install/import, grouped-verifier max-q, API tool/schema, and TP4 route smokes
   before tagging.
+
+## 2026-08-31 1.5.0 wheel RPATH release gate
+
+- The first post-merge 1.5.0 RC wheel built successfully from
+  `onecat/main@87c615a02ffcba08cc00a0e48ad1363a23cb29d6`, but the build
+  environment did not contain `patchelf`. Packaging only warned and retained
+  the build host's absolute Conda RPATH in both bundled Flash-V100 extensions.
+  `readelf -d` reported
+  `/home/ymzx/miniconda3/envs/1cat-vllm-1.3.0/lib`; that artifact is rejected
+  even though it can import on the build host.
+- The build dependency contract now installs `patchelf`, and wheel assembly
+  fails closed if it is absent or cannot remove an RPATH. This converts a
+  silent portability hazard into a build-time error and applies to source and
+  precompiled-extension wheel assembly.
+- The first incremental rebuild also exposed a pre-existing FetchContent
+  failure: CMake reran the SM70 FA2 patch command against its already-patched
+  source checkout. The patch step now resets and cleans only the downloaded,
+  pinned dependency and its CUTLASS submodule before reapplying the four
+  repository patches. Explicit `VLLM_FLASH_ATTN_SRC_DIR` development trees
+  remain outside this reset path.
+- The rejected diagnostic wheel is
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`, SHA256
+  `e09fd22f4030560a54ad59a783d82ee054e52ea6da014c5c755ee5e8a51a8fb1`.
+  Do not publish it. A rebuilt wheel must show no absolute RPATH before its
+  clean-environment and four-V100 runtime gates count.
+- The first RPATH-clean replacement, SHA256
+  `112888af049c66fecdc96aa1cee12ca16ede54aee62819dd8018762069352995`,
+  has no `RPATH` or `RUNPATH` in any of its ten native libraries and installs
+  in an isolated Python 3.12 environment. It is nevertheless also rejected:
+  its dependency metadata selects FastAPI `0.141.1` together with
+  `prometheus-fastapi-instrumentator` `7.1.0`. A real Uvicorn request then
+  fails with HTTP 500 because the metrics middleware reads `.path` from
+  FastAPI's `_IncludedRouter`.
+- The metrics dependency now requires `prometheus-fastapi-instrumentator`
+  `>=8.1.0,<9.0.0`. Upstream fixed `_IncludedRouter` handling in `8.0.1`, and
+  `8.1.0` also repairs nested-route resolution. A final wheel must resolve the
+  new dependency contract, pass `pip check`, and repeat the live plain-chat,
+  tool-call, and JSON-schema API gates before publication.
+
+### Final wheel proof
+
+- The final wheel was built from exact head
+  `c660086aa1aa264058b1fe54c1cd9f0620bb978d` and is stored at
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist-final/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`. Its size is `147,963,867`
+  bytes and SHA256 is
+  `9dbb1118d670f081563b202127e77af41f9261d9ec7f7a829ec1357f53037d71`.
+  It is a validated release candidate, not a published/tagged artifact.
+- The wheel contains ten expected native libraries. All ten have zero
+  `RPATH`/`RUNPATH`, no `/home/ymzx` string, and no unresolved dependency when
+  checked with the normal Torch/CUDA runtime library set. Wheel metadata is
+  version `1.5.0` and requires
+  `prometheus-fastapi-instrumentator>=8.1.0,<9.0.0`.
+- A source-independent Python 3.12 environment force-installed the final wheel
+  and passed `pip check` with FastAPI `0.141.1`, Starlette `1.6.0`, and
+  instrumentator `8.1.0`. On a V100-SXM2 it imported the core and SM70
+  extensions, FlashQLA, grouped-verifier q16 capability, QPN2 prepare/decode/
+  prefill dispatch, SM70 LM-head top20, and the Qwen3 Coder tool parser.
+- The wheel then started a real TP4/B1 server on four V100s with the README
+  profile. Startup logs resolved q7/probabilistic DFlash2, target and draft
+  Flash-V100, FP8 E5M2 target KV, prefix cache plus Mamba align, q4096,
+  QPN2-packed prefill, exact grouped verification, and the quality-audited
+  DFlash2 defaults without explicit fast-path environment variables.
+- `/v1/models` and `/metrics` both returned HTTP 200. Plain chat returned
+  `42`; non-streaming `get_weather` and streaming `read_file` calls returned
+  the correct function names and JSON arguments; JSON-schema output returned
+  exactly `{"name":"小林","age":27}`. The schema case passed with thinking
+  enabled at a 512-token budget and with per-request thinking disabled at a
+  128-token budget. A 128-token thinking budget ended in reasoning before the
+  final JSON, confirming normal shared-budget semantics rather than DFlash2
+  token corruption; the public README now calls out this request contract.
+- Two identical 10,017-token prefix requests returned the same `收到` output.
+  Wall time fell from `2.642 s` cold to `0.164 s` cached, and the server
+  reported a `47.3%` aggregate prefix-cache hit rate while hitting the
+  Flash-V100 prefix/chunked prefill and FP8-KV routes. Shutdown released GPUs
+  4-7 back to `5 MiB` each.
+- A completely cold Triton cache still JIT-compiled three small kernels on the
+  first inference (`_sm70_qwen35_gdn_split_kernel`,
+  `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
+  remained correct and completed in `0.547 s`; this is a bounded cold-start
+  warmup follow-up, not a steady-state or publication correctness blocker.

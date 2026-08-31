@@ -262,6 +262,18 @@ concurrent service. That preserves capacity but intentionally leaves the B1
 also an authoritative rollback. Do not enable candidate-order reranking;
 dense-order reranking is the validated path.
 
+Keep a custom `TMPDIR` short enough for Linux Unix-domain sockets; the default
+`/tmp` is safe. Very long cache-derived temporary paths can exceed ZeroMQ's IPC
+path limit before model loading starts.
+
+`max_tokens`/`max_completion_tokens` covers both reasoning and the final
+answer. For short JSON-schema responses and other machine-consumed calls,
+either give reasoning enough output budget or disable it for that request with
+`"chat_template_kwargs":{"enable_thinking":false}`. This keeps the server's
+reasoning default available for general requests while preventing a small
+completion budget from ending after reasoning but before the structured
+answer.
+
 ## OpenAI-Compatible Request Example
 
 ```bash
@@ -352,6 +364,12 @@ python -m pip install -r requirements/cuda.txt
 python -m pip install -r requirements/common.txt
 python -m pip install cmake build
 ```
+
+The build requirements install `patchelf`. Do not remove it: SM70 wheel
+assembly fails closed when a bundled CUDA extension cannot have its
+build-machine RPATH removed. Re-running a build in the same worktree is
+supported; the downloaded Flash-Attention dependency is restored to its pinned
+commit before the SM70 patch set is reapplied.
 
 Build wheels:
 
