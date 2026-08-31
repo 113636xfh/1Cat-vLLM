@@ -169,6 +169,12 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] 
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
+def clear_sm70_fp8_workspaces() -> None:
+    """Release process-global SM70 FP8 prefill and QPN8 workspaces."""
+    _sm70_fp8_prefill_dense_workspaces.clear()
+    _sm70_fp8_qpn8_pp2_tp4_workspaces.clear()
+
+
 def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
     """Match the exact PP2 x TP4 shared-expert gate/up tensor."""
     prefix = str(getattr(layer, "prefix", ""))
