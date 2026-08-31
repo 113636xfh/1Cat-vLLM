@@ -44694,3 +44694,34 @@ Interpretation:
   accompanies exact observed output parity rather than a changed prompt or
   sampling contract. PR #393 passes this prefill quality gate; the two page4
   environment variables remain its immediate rollback.
+
+## 2026-08-31 1.5.0 DFlash2 release usability audit
+
+- Integration base is public `onecat/main@187b932dbd11940f0bcf52fb3675dd47fd69f313`.
+  The audit does not change a CUDA kernel, sampler, rejection rule, or target
+  distribution. It closes configuration and documentation gaps around the
+  already accepted Qwen3.8 NVFP4 DFlash2 TP4/B1 profile.
+- Explicit SM70 DFlash now defaults its draft backend to `FLASH_ATTN_V100`.
+  `--performance-mode interactivity` selects the scored B1/q4096 capacity
+  values only when neither value was supplied. Balanced/concurrent services
+  and every explicit override retain their requested capacity.
+- Selector-based DFlash2 now derives seven draft tokens from the official
+  checkpoint's block size eight when the user omits the field. Config SHA256
+  `873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980`
+  at revision `dedf8df68adfb1afeaf7b7480c0a0243108177b4` resolves to block
+  size eight and selector top-K 16 in a source-only configuration load.
+- The practical-default admission now checks for an actual NVFP4 format,
+  including `nvfp4-pack-quantized` inside a mixed-precision compressed-tensors
+  config group. A same-shape non-NVFP4 compressed checkpoint no longer receives
+  the NVFP4-only default set. Legacy MTP-disable variables no longer suppress
+  explicit DFlash defaults, and SM75 no longer receives SM70 backends.
+- CPU gates pass: SM70 EngineArgs defaults `13 passed`, DFlash2 targeted suite
+  `84 passed, 12 CUDA-only skipped`, Qwen3 coder tool parser `104 passed`, and
+  changed-file pre-commit passes. Initial source-only pytest collection tried
+  to import the absent worktree `_C`; rerunning with host platform detection
+  disabled exercised the Python contracts without borrowing a stale binary.
+- No new throughput claim is made. The runtime values remain the accepted
+  `17.3767 ms` mean complete round and `4,039.49 token/s` cold 32K prefill from
+  the matched four-V100 source-default proof. A built 1.5.0 wheel still needs
+  install/import, grouped-verifier max-q, API tool/schema, and TP4 route smokes
+  before tagging.

@@ -99,6 +99,26 @@ _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS = {
 }
 
 
+def _is_compressed_tensors_nvfp4(model_config: Any) -> bool:
+    """Recognize NVFP4, including mixed-precision config groups."""
+    if getattr(model_config, "quantization", None) != "compressed-tensors":
+        return False
+    model_arch_config = getattr(model_config, "model_arch_config", None)
+    quant_config = getattr(model_arch_config, "quantization_config", None)
+    if not isinstance(quant_config, Mapping):
+        return False
+
+    formats = [quant_config.get("format", "")]
+    config_groups = quant_config.get("config_groups", {})
+    if isinstance(config_groups, Mapping):
+        formats.extend(
+            group.get("format", "")
+            for group in config_groups.values()
+            if isinstance(group, Mapping)
+        )
+    return any("nvfp4" in str(format_name).lower() for format_name in formats)
+
+
 def _is_sm70_nvfp4_dflash2_practical_contract(
     model_config: Any,
     speculative_config: Any,
@@ -131,7 +151,7 @@ def _is_sm70_nvfp4_dflash2_practical_contract(
     architectures = set(getattr(model_config, "architectures", ()) or ())
     return bool(
         "Qwen3_5ForConditionalGeneration" in architectures
-        and getattr(model_config, "quantization", None) == "compressed-tensors"
+        and _is_compressed_tensors_nvfp4(model_config)
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 5120
         and getattr(hf_text_config, "num_attention_heads", None) == 24
@@ -568,7 +588,8 @@ class VllmConfig:
     performance_mode: PerformanceMode = "balanced"
     """Performance mode for runtime behavior, 'balanced' is the default.
     'interactivity' favors low end-to-end per-request latency at small batch
-    sizes (fine-grained CUDA graphs, latency-oriented kernels).
+    sizes (fine-grained CUDA graphs, latency-oriented kernels). For explicit
+    DFlash on SM70, it also selects the audited B1/q4096 capacity defaults.
     'throughput' favors aggregate tokens/sec at high concurrency (larger CUDA
     graphs, more aggressive batching, throughput-oriented kernels)."""
 

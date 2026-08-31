@@ -33,9 +33,13 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
   per prompt by default; video inputs remain opt-in.
 - **Tool calling and OpenAI API compatibility**: validated with OpenAI-style
   clients such as Cherry Studio, OpenClaw, and similar tools.
+- **Validated Qwen3.8 DFlash2 profile**: the four-V100 NVFP4/TP4/B1 profile
+  includes prefix caching, Mamba state alignment, tool/reasoning parsing,
+  FP8 E5M2 target KV, and guarded Flash-V100 grouped verification.
 - **Experimental FP8 work**: FP8 model and KV-cache paths are included for
   validation, but they are not production defaults.
-- **Experimental DFlash work**: included for continued research and validation.
+- **Experimental speculative research**: DFlash1/DDTree, lookup-augmented q16,
+  and n-gram chaining remain opt-in research paths.
 
 ## Recommended Model Providers
 
@@ -160,12 +164,14 @@ python - <<'PY'
 import torch, triton, vllm, sys
 import flash_attn_v100
 from flash_attn_v100 import flash_attn_v100_cuda, paged_kv_utils
+from flash_attn_v100 import flash_attn_grouped_verify_max_query_tokens
 print("python", sys.version.split()[0])
 print("torch", torch.__version__)
 print("torch_cuda", torch.version.cuda)
 print("triton", triton.__version__)
 print("vllm", vllm.__version__)
 print("flash_attn_v100", flash_attn_v100.__version__)
+print("dflash2_grouped_verify_max_q", flash_attn_grouped_verify_max_query_tokens())
 PY
 ```
 
@@ -214,6 +220,48 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
+### Qwen3.8-27B-NVFP4 + DFlash2, TP4 low-latency profile
+
+This is the quality-audited four-V100 DFlash2 profile. The target checkpoint
+must use compressed-tensors NVFP4 with an unquantized/BF16-compatible LM head;
+the draft revision and selector top-K are part of the checkpoint contract.
+
+```bash
+python -m vllm.entrypoints.cli.main serve /path/to/Qwen3.8-27B-NVFP4 \
+  --served-model-name qwen3.8-27b-dflash2 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --attention-backend FLASH_ATTN_V100 \
+  --kv-cache-dtype fp8_e5m2 \
+  --max-model-len 262144 \
+  --performance-mode interactivity \
+  --gpu-memory-utilization 0.80 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":true}' \
+  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","kv_cache_dtype":"auto"}' \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+On SM70, this command resolves the following values automatically unless an
+explicit override is present:
+
+- DFlash2 draft width `7`, from checkpoint block size `8`;
+- probabilistic draft sampling and the draft `FLASH_ATTN_V100` backend;
+- `max_num_seqs=1` and `max_num_batched_tokens=4096` for
+  `--performance-mode interactivity`;
+- prefix caching and Mamba `align` state caching for the API server;
+- the quality-audited NVFP4 DFlash2 fast paths when the exact TP4/B1,
+  selector-top16, q4096, and E5M2-KV contract is present.
+
+Use explicit `--max-num-seqs` and `--max-num-batched-tokens` values for a
+concurrent service. That preserves capacity but intentionally leaves the B1
+17-18 ms admission contract. Every `VLLM_SM70_DFLASH2_*` environment value is
+also an authoritative rollback. Do not enable candidate-order reranking;
+dense-order reranking is the validated path.
+
 ## OpenAI-Compatible Request Example
 
 ```bash
@@ -250,11 +298,12 @@ Example:
 --kv-cache-dtype fp8_e5m2
 ```
 
-### DFlash
+### Other DFlash modes
 
-DFlash is included as an experimental path for continued validation. Treat it
-as a research feature until you have validated speed and output quality on your
-own workload.
+The Qwen3.8 DFlash2 command above is the validated release profile. DFlash1,
+`dflash_ddtree`, lookup-augmented q16 verification, n-gram assist, and
+drafter-free chaining remain workload-dependent opt-in modes. Validate their
+acceptance, output quality, and end-to-end throughput before production use.
 
 ### MTP
 
@@ -310,10 +359,13 @@ Build wheels:
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-export TORCH_CUDA_ARCH_LIST="7.0;8.0"
+export TORCH_CUDA_ARCH_LIST="7.0"
 export FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"
 export MAX_JOBS=12
 export NVCC_THREADS=1
+# Use this for a pre-tag 1.5.0 release candidate. An exact v1.5.0 checkout
+# derives the same version from its Git tag and does not need the override.
+export VLLM_VERSION_OVERRIDE=1.5.0
 
 rm -rf build vllm.egg-info
 rm -rf .deps/*-build .deps/*-subbuild
