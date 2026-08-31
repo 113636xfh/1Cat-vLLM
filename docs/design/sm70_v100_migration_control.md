@@ -44751,3 +44751,16 @@ Interpretation:
   `e09fd22f4030560a54ad59a783d82ee054e52ea6da014c5c755ee5e8a51a8fb1`.
   Do not publish it. A rebuilt wheel must show no absolute RPATH before its
   clean-environment and four-V100 runtime gates count.
+- The first RPATH-clean replacement, SHA256
+  `112888af049c66fecdc96aa1cee12ca16ede54aee62819dd8018762069352995`,
+  has no `RPATH` or `RUNPATH` in any of its nine native libraries and installs
+  in an isolated Python 3.12 environment. It is nevertheless also rejected:
+  its dependency metadata selects FastAPI `0.141.1` together with
+  `prometheus-fastapi-instrumentator` `7.1.0`. A real Uvicorn request then
+  fails with HTTP 500 because the metrics middleware reads `.path` from
+  FastAPI's `_IncludedRouter`.
+- The metrics dependency now requires `prometheus-fastapi-instrumentator`
+  `>=8.1.0,<9.0.0`. Upstream fixed `_IncludedRouter` handling in `8.0.1`, and
+  `8.1.0` also repairs nested-route resolution. A final wheel must resolve the
+  new dependency contract, pass `pip check`, and repeat the live plain-chat,
+  tool-call, and JSON-schema API gates before publication.

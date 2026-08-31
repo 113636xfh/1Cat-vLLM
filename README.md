@@ -262,6 +262,10 @@ concurrent service. That preserves capacity but intentionally leaves the B1
 also an authoritative rollback. Do not enable candidate-order reranking;
 dense-order reranking is the validated path.
 
+Keep a custom `TMPDIR` short enough for Linux Unix-domain sockets; the default
+`/tmp` is safe. Very long cache-derived temporary paths can exceed ZeroMQ's IPC
+path limit before model loading starts.
+
 ## OpenAI-Compatible Request Example
 
 ```bash
