@@ -266,6 +266,14 @@ Keep a custom `TMPDIR` short enough for Linux Unix-domain sockets; the default
 `/tmp` is safe. Very long cache-derived temporary paths can exceed ZeroMQ's IPC
 path limit before model loading starts.
 
+`max_tokens`/`max_completion_tokens` covers both reasoning and the final
+answer. For short JSON-schema responses and other machine-consumed calls,
+either give reasoning enough output budget or disable it for that request with
+`"chat_template_kwargs":{"enable_thinking":false}`. This keeps the server's
+reasoning default available for general requests while preventing a small
+completion budget from ending after reasoning but before the structured
+answer.
+
 ## OpenAI-Compatible Request Example
 
 ```bash
