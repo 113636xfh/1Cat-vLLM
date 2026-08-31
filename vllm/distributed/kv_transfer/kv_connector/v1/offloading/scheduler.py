@@ -695,6 +695,11 @@ class OffloadingConnectorScheduler:
                     gpu_blk_idx = (
                         (k + 1) * offloaded_block_size
                     ) // gpu_block_size - 1
+                    # Clamp to the request's last real GPU block. The final
+                    # offloaded block may be partial (cached token count not a
+                    # multiple of gpu_block_size), so its boundary falls past
+                    # the last allocated GPU block -> IndexError otherwise.
+                    gpu_blk_idx = min(gpu_blk_idx, num_gpu_blocks - 1)
                     dst_block_ids.append(group_blocks[gpu_blk_idx].block_id)
                 group_sizes.append(num_blocks - start_key)
                 block_indices.append(num_locally_computed_gpu_blocks)
