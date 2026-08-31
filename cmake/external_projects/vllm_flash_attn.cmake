@@ -55,6 +55,10 @@ elseif(VLLM_FLASH_ATTN_SM70)
           COMMAND
             ${GIT_EXECUTABLE} -C <SOURCE_DIR> clean -fd
           COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass reset --hard
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass clean -fd
+          COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_pipeline.patch
           COMMAND
