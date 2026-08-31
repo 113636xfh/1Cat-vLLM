@@ -363,6 +363,9 @@ export TORCH_CUDA_ARCH_LIST="7.0"
 export FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"
 export MAX_JOBS=12
 export NVCC_THREADS=1
+# Use this for a pre-tag 1.5.0 release candidate. An exact v1.5.0 checkout
+# derives the same version from its Git tag and does not need the override.
+export VLLM_VERSION_OVERRIDE=1.5.0
 
 rm -rf build vllm.egg-info
 rm -rf .deps/*-build .deps/*-subbuild
