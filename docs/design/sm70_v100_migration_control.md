@@ -44739,6 +44739,11 @@ Interpretation:
   fails closed if it is absent or cannot remove an RPATH. This converts a
   silent portability hazard into a build-time error and applies to source and
   precompiled-extension wheel assembly.
+- The first incremental rebuild also exposed a pre-existing FetchContent
+  failure: CMake reran the SM70 FA2 patch command against its already-patched
+  source checkout. The patch step now resets and cleans only the downloaded,
+  pinned dependency before reapplying the four repository patches. Explicit
+  `VLLM_FLASH_ATTN_SRC_DIR` development trees remain outside this reset path.
 - The rejected diagnostic wheel is
   `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist/`
   `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`, SHA256

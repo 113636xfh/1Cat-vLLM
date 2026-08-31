@@ -355,7 +355,9 @@ python -m pip install cmake build
 
 The build requirements install `patchelf`. Do not remove it: SM70 wheel
 assembly fails closed when a bundled CUDA extension cannot have its
-build-machine RPATH removed.
+build-machine RPATH removed. Re-running a build in the same worktree is
+supported; the downloaded Flash-Attention dependency is restored to its pinned
+commit before the SM70 patch set is reapplied.
 
 Build wheels:
 
