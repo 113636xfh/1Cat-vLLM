@@ -16,10 +16,14 @@ import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm import envs
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import (
+    SpeculativeConfig,
+    _get_dflash2_checkpoint_draft_tokens,
+)
 from vllm.config.vllm import (
     _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS,
     _apply_sm70_nvfp4_dflash2_practical_defaults,
+    _is_compressed_tensors_nvfp4,
     _is_sm70_nvfp4_dflash2_practical_contract,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -73,6 +77,15 @@ def _sm70_nvfp4_dflash2_practical_contract_args():
         architectures=("Qwen3_5ForConditionalGeneration",),
         quantization="compressed-tensors",
         dtype=torch.float16,
+        model_arch_config=SimpleNamespace(
+            quantization_config={
+                "format": "mixed-precision",
+                "config_groups": {
+                    "nvfp4": {"format": "nvfp4-pack-quantized"},
+                    "fp8": {"format": "float-quantized"},
+                },
+            }
+        ),
         hf_text_config=SimpleNamespace(
             hidden_size=5120,
             num_attention_heads=24,
@@ -105,6 +118,26 @@ def _sm70_nvfp4_dflash2_practical_contract_args():
         scheduler_config,
         cache_config,
     )
+
+
+def test_dflash2_checkpoint_draft_tokens_follow_block_contract():
+    hf_config = SimpleNamespace(dflash_config={"block_size": 8, "selector_top_k": 16})
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) == 7
+
+    hf_config.dflash_config["selector_top_k"] = 0
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+    hf_config.dflash_config = {"block_size": 1, "selector_top_k": 16}
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+
+def test_nvfp4_practical_contract_requires_nvfp4_quantization_group():
+    args = _sm70_nvfp4_dflash2_practical_contract_args()
+    assert _is_compressed_tensors_nvfp4(args[0])
+
+    args[0].model_arch_config.quantization_config = {"format": "float-quantized"}
+    assert not _is_compressed_tensors_nvfp4(args[0])
+    assert not _is_sm70_nvfp4_dflash2_practical_contract(*args)
 
 
 def test_sm70_nvfp4_dflash2_practical_contract_is_narrow():
