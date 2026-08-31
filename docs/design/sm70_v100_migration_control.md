@@ -44725,3 +44725,23 @@ Interpretation:
   the matched four-V100 source-default proof. A built 1.5.0 wheel still needs
   install/import, grouped-verifier max-q, API tool/schema, and TP4 route smokes
   before tagging.
+
+## 2026-08-31 1.5.0 wheel RPATH release gate
+
+- The first post-merge 1.5.0 RC wheel built successfully from
+  `onecat/main@87c615a02ffcba08cc00a0e48ad1363a23cb29d6`, but the build
+  environment did not contain `patchelf`. Packaging only warned and retained
+  the build host's absolute Conda RPATH in both bundled Flash-V100 extensions.
+  `readelf -d` reported
+  `/home/ymzx/miniconda3/envs/1cat-vllm-1.3.0/lib`; that artifact is rejected
+  even though it can import on the build host.
+- The build dependency contract now installs `patchelf`, and wheel assembly
+  fails closed if it is absent or cannot remove an RPATH. This converts a
+  silent portability hazard into a build-time error and applies to source and
+  precompiled-extension wheel assembly.
+- The rejected diagnostic wheel is
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`, SHA256
+  `e09fd22f4030560a54ad59a783d82ee054e52ea6da014c5c755ee5e8a51a8fb1`.
+  Do not publish it. A rebuilt wheel must show no absolute RPATH before its
+  clean-environment and four-V100 runtime gates count.

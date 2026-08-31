@@ -353,6 +353,10 @@ python -m pip install -r requirements/common.txt
 python -m pip install cmake build
 ```
 
+The build requirements install `patchelf`. Do not remove it: SM70 wheel
+assembly fails closed when a bundled CUDA extension cannot have its
+build-machine RPATH removed.
+
 Build wheels:
 
 ```bash
