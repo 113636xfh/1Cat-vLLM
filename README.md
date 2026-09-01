@@ -1,3 +1,16 @@
+> **本 fork 改动说明（硬件目标：双卡 V100 16G + 32G 内存，持续优化边角料）**
+>
+> ## 硬件 / 场景
+> 在 **2× Tesla V100-SXM2-16GB、32GB 主机内存**（无 NVLink，TP=2，PCIe x16/x8）的本地部署下，继续优化性能与显存的"边角料"。
+>
+> ## 相对上游的主要改动
+> 1. **SM70 TurboQuant 长前缀续写(continuation) prefill → 分块在线-softmax**（`vllm/v1/attention/backends/turboquant_attn.py`）
+>    - 问题：V100(SM70) 上 GQA(Hk<Hq) 的 `scaled_dot_product_attention` 只能走 PyTorch math 后端，中间显存是 O(q_len×seq_len)，长前缀续写一旦 prefill 就 OOM。
+>    - 修复：改为 flash 风格的分块在线-softmax（每块 1024，含 GQA 扩头 + 自定义因果掩码 `j<=cached_len+p`），中间显存降到 O(block)，与上下文长度无关。已与 math SDPA 对拍（max_err≈1e-6）。
+> 2. （fork 既有）KV offload connector 边界 clamp、per-group mamba offload granularity、单实例 external-prefix-cache keep-first 等（见 git log）。
+>
+> 其余保持上游内容不变。
+
 # 1Cat-vLLM
 
 > 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判“过时”。
