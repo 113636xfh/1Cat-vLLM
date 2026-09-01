@@ -44852,6 +44852,7 @@ Interpretation:
   `/home/ymzx/1cat-vllm-deploy/logs/`
   `nvfp4-dflash2-pr432-011adcf8ce-256k.log` and
   `/home/ymzx/1cat-vllm-deploy/test-artifacts/pr432-011adcf8ce/`.
+
 ## 2026-09-01 DFlash2 default-capacity 17 ms root cause
 
 - A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
