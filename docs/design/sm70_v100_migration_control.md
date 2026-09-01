@@ -44807,3 +44807,39 @@ Interpretation:
   `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
   remained correct and completed in `0.547 s`; this is a bounded cold-start
   warmup follow-up, not a steady-state or publication correctness blocker.
+
+## 2026-09-01 DFlash2 default-capacity 17 ms root cause
+
+- A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
+  256K maximum length, prefix cache, Mamba align, tool/reasoning parsers, and
+  graph policy fixed. Changing only `max_num_seqs` from the source default 256
+  to 1 moved the steady complete round from about `18.52 ms` to
+  `17.39 ms`. Changing graph capture sizes, available KV memory, and dense
+  draft-logit allocation order did not recover the gap.
+- The CUDA Graph descriptor and attention metadata are not capacity-expanded.
+  For the single live q8 request both configurations capture `num_reqs=1` and
+  `num_tokens=8`; Mamba/GDN state indices and Flash-V100 metadata are sliced to
+  that descriptor. Node traces placed the difference inside the target q8
+  graph, while the DFlash graph remained unchanged.
+- The causal branch was a model-load predicate in the NVFP4 scheme. The
+  DFlash2 QPN2 contract required `scheduler_config.max_num_seqs == 1`, so a
+  default-capacity server retained TurboMind for every compatible target MLP
+  even when the live verifier width was eight. The old default-capacity log
+  had no QPN2 route hit; the B1 log reported `QPN2 M<=8 route enabled`.
+- Scheduler capacity is not an operator capability. The opaque C++ dispatcher
+  already selects the byte-preserving QPN2 layout only for live `M<=8` and
+  falls back to the retained TurboMind layout for larger dynamic M. The model-
+  load contract now keeps TP4, q7/top16, PP1, no-DBO, dtype, tensor-shape, and
+  operator-availability checks, but no longer reads `max_num_seqs`. Explicit
+  `VLLM_SM70_NVFP4_QPN2=0` and prefill rollback controls remain authoritative.
+- With source-default capacity 256, the repaired launch now reports both QPN2
+  decode and QPN2-packed prefill routes. After one first-request warmup at
+  `18.972 ms`, two independent steady requests measure `17.391 ms` and
+  `17.394 ms`; the historical B1 controls were `17.396 ms` and `17.386 ms`.
+  This recovers about `1.13 ms` without constraining service concurrency.
+- The focused NVFP4 QPN2 module reports `5 passed`. A live forced-tool request
+  returns `get_weather` with `{"city":"北京"}`, and a JSON-schema request
+  returns exactly `{"name":"小明","age":18}`. The change introduces no new
+  arithmetic path: it makes default capacity select the same previously
+  quality-audited, checkpoint-code-preserving B1 operator path. Test services
+  were stopped after collection and all four V100s returned to idle memory.
