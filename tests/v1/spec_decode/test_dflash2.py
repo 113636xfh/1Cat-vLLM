@@ -457,6 +457,7 @@ def test_selector_edges_match_sequential_reference():
 
 def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
     def init_base(self, _vllm_config, device):
+        self.device = device
         self.draft_model_config = SimpleNamespace(
             hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
         )
@@ -467,6 +468,9 @@ def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
         self.vocab_size = 31
         self.draft_tokens = torch.empty((2, 7), dtype=torch.int64, device=device)
         self.draft_logits = draft_logits
+        self._draft_logits_init = (
+            None if draft_logits is None else (torch.float32, -float("inf"))
+        )
 
     monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
 
@@ -478,7 +482,7 @@ def test_selector_leaves_greedy_without_proposal_logits(monkeypatch):
 
 
 def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
     monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
@@ -490,7 +494,7 @@ def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch)
 
 
 def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
     speculator = DFlash2Speculator(None, torch.device("cpu"))
@@ -503,7 +507,7 @@ def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
 
 
 def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
     monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
@@ -542,6 +546,20 @@ def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
     assert speculator.selector_top_k == 16
     assert dtype is torch.float32
     assert fill == float("-inf")
+
+
+def test_probabilistic_dense_fallback_is_allocated_after_initialization(monkeypatch):
+    _stub_base(monkeypatch, None)
+    speculator = DFlash2Speculator(None, torch.device("cpu"))
+    speculator._draft_logits_init = (torch.float32, -float("inf"))
+
+    assert speculator.draft_logits is None
+    speculator._allocate_draft_logits()
+
+    assert speculator.draft_logits is not None
+    assert speculator.draft_logits.shape == (2, 7, 31)
+    assert speculator.draft_logits.dtype is torch.float32
+    assert torch.isneginf(speculator.draft_logits).all()
 
 
 def _sparse_sampling_contract_fixture():

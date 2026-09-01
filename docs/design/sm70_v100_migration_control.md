@@ -44837,6 +44837,13 @@ Interpretation:
   `18.972 ms`, two independent steady requests measure `17.391 ms` and
   `17.394 ms`; the historical B1 controls were `17.396 ms` and `17.386 ms`.
   This recovers about `1.13 ms` without constraining service concurrency.
+- The probabilistic dense draft-logit fallback is about `1.66 GiB` per rank at
+  capacity 256. It was previously allocated before the model-loading memory
+  profile, allowing KV sizing to overcommit that already-resident memory. Its
+  allocation is now deferred until draft weights load, while the compact
+  rejection cache and dense compatibility semantics are unchanged. This is a
+  startup/OOM accounting fix, not a speed claim: its isolated latency result
+  remained about `18.52 ms` before the QPN2 admission repair.
 - The focused NVFP4 QPN2 module reports `5 passed`. A live forced-tool request
   returns `get_weather` with `{"city":"北京"}`, and a JSON-schema request
   returns exactly `{"name":"小明","age":18}`. The change introduces no new
