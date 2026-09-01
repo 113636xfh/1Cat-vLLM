@@ -1338,24 +1338,39 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            # SM70 has no fused kernel that supports GQA (Hk < Hq); only the
+            # PyTorch math backend works and its intermediates are
+            # O(q_len*seq_len), which OOMs on long continuations. Implement a
+            # chunked online-softmax (flash-style) over blocks of K/V so the
+            # per-step workspace stays O(block), independent of seq_len.
+            BLOCK = 1024
+            rep = (Hq // Hk) if (Hk < Hq) else 1
+            _acc = torch.zeros(Hq, q_len, D, device=device, dtype=torch.float32)
+            sum_w = torch.zeros(Hq, q_len, device=device, dtype=torch.float32)
+            m = torch.full((Hq, q_len), float("-inf"),
+                           device=device, dtype=torch.float32)
+            q3 = query.transpose(0, 1).float()
+            p_idx = torch.arange(q_len, device=device)
+            for s in range(0, seq_len, BLOCK):
+                e = min(s + BLOCK, seq_len)
+                kb = k_full[s:e].transpose(0, 1).repeat_interleave(
+                    rep, dim=0).float()
+                vb = v_full[s:e].transpose(0, 1).repeat_interleave(
+                    rep, dim=0).float()
+                sc = torch.einsum("hqd,hkd->hqk", q3, kb) * self.scale
+                j = torch.arange(s, e, device=device)
+                msk = j.unsqueeze(0) <= (cached_len + p_idx).unsqueeze(1)
+                sc = sc.masked_fill(~msk.unsqueeze(0), float("-inf"))
+                m_new = torch.maximum(m, sc.amax(-1))
+                p = torch.exp(sc - m_new.unsqueeze(-1))
+                p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+                ob = torch.einsum("hqk,hkd->hqd", p, vb)
+                rescale = torch.exp(m - m_new)
+                _acc = _acc * rescale.unsqueeze(-1) + ob
+                sum_w = sum_w * rescale + p.sum(-1)
+                m = m_new
+            out = _acc / sum_w.unsqueeze(-1).clamp_min(1e-20)
+            return out.permute(1, 0, 2).to(query.dtype)  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
