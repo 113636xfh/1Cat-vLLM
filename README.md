@@ -1,14 +1,16 @@
+<!-- markdownlint-disable MD041 -->
+
 <p align="center">
   <img src="./assets/1cat-vllm-logo.png" alt="1Cat-vLLM logo" width="420">
 </p>
 
 # 1Cat-vLLM
 
-## Make Volta Fast Again.
+## Make Volta Fast Again
 
-### Modern LLM inference for NVIDIA Tesla V100 / SM70.
+### Modern LLM inference for NVIDIA Tesla V100 / SM70
 
-**4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s**
+<strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
 > Tesla V100 was released in 2017.
 >
@@ -356,7 +358,7 @@ Representative gates include:
 
 ## We are not just “making FlashAttention compile on V100.”
 
-## We are rebuilding the dataflow for Volta.
+## We are rebuilding the dataflow for Volta
 
 FlashAttention is fundamentally an **IO and scheduling problem**:
 
@@ -462,7 +464,7 @@ The corresponding operator gain reaches roughly **21%–26.5%** on representativ
 
 ---
 
-# Layer 2 — Rewrite D=256 Attention as a Volta-Native Pipeline
+## Layer 2 — Rewrite D=256 Attention as a Volta-Native Pipeline
 
 After reducing data-movement overhead, the Attention body itself is restructured.
 
