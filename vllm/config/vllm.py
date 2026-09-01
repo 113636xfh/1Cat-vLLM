@@ -84,6 +84,10 @@ _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # This is the target projection's memory-neutral FP8 layout, not the
+    # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
+    # original layout whenever the exact operator contract is unavailable.
+    "VLLM_SM70_FP8_QPN8": "1",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
     "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
