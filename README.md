@@ -950,7 +950,7 @@ PY
 
 # ▶ Qwen3.8-27B-NVFP4 + DFlash2
 
-## Recommended TP4 serving command
+## Example TP4 + E5M2 serving command
 
 ```bash
 vllm serve /path/to/Qwen3.8-27B-NVFP4 \
@@ -978,14 +978,17 @@ Representative automatic values:
 official draft block size = 8
 draft width               = 7
 selector Top-K            = 16
-target KV                 = FP8 E5M2
+example target KV         = FP8 E5M2 (optional)
 draft attention backend   = FLASH_ATTN_V100
 verification fast paths   = automatic
 ```
 
-The SM70 verification fast paths are independent of target quantization, KV
-dtype, TP degree, and service capacity. Each operator capability-checks its
-local dtype/shape and falls back independently. Set `--max-num-seqs`,
+Enabling the SM70 DFlash2 verifier defaults is independent of target
+quantization, KV dtype, TP degree, and service capacity. Each operator then
+capability-checks its local dtype/shape and falls back independently. For
+example, the current one-pass grouped Attention operator is E5M2-specific and
+the compact LM-head rerank is TP4-specific; a different KV dtype or TP degree
+retains DFlash2 and only falls back for those operators. Set `--max-num-seqs`,
 `--max-num-batched-tokens`, or `--performance-mode` for the desired concurrency
 and prefill policy; these options do not opt a compatible single-request
 verifier out of its fast path.
