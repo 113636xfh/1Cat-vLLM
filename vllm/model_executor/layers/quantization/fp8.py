@@ -163,7 +163,6 @@ _SM70_FP8_QPN8_REQUIRED_OPS = (
     "fp8_qpn8_gemm_sm70_out",
     "fp8_qpn8_gated_pair_sm70_out",
 )
-_SM70_FP8_QPN8_MAX_NUM_SEQS = 8
 # Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
 _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
@@ -279,18 +278,15 @@ def _is_sm70_fp8_qpn8_layer(layer: torch.nn.Module) -> bool:
 
 
 def _is_sm70_fp8_qpn8_runtime_contract() -> bool:
-    """Admit only the no-MTP M range with a measured native decode kernel."""
-    vllm_config = get_current_vllm_config()
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 1))
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if max_num_seqs > _SM70_FP8_QPN8_MAX_NUM_SEQS:
-        return False
-    if speculative_config is None:
-        return True
-    # Speculative workloads require an explicit operator opt-in; admission is
-    # still based only on bounded concurrency and the layer tensor contract.
-    return os.getenv("VLLM_SM70_FP8_QPN8") is not None
+    """Keep scheduler capacity out of the QPN8 weight-layout contract.
+
+    The opaque dispatcher selects the measured QPN8 decode kernel from the
+    live ``M <= 8`` shape and the exact dense-prefill fallback for larger M.
+    Model-level capacity and speculative decoding therefore do not need an
+    explicit environment opt-in; layer shape and operator availability remain
+    the actual admission gates.
+    """
+    return True
 
 
 def _sm70_fp8_qpn8_pp2_tp4_enabled() -> bool:
