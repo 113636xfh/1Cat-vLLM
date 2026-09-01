@@ -44808,6 +44808,51 @@ Interpretation:
   remained correct and completed in `0.547 s`; this is a bounded cold-start
   warmup follow-up, not a steady-state or publication correctness blocker.
 
+## 2026-08-31 API failure and in-process cleanup gate
+
+- Draft PR #432 is based on `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`;
+  tested head is `011adcf8ce`. It changes no DFlash2 proposal, selector,
+  rejection, sampling, verifier, or attention arithmetic.
+- Historical assistant tool calls now preserve object arguments, decode valid
+  JSON objects, and coerce malformed, null, or non-object arguments to an empty
+  object. This prevents one truncated tool call from making every later turn
+  in the conversation fail during template rendering.
+- Async multimodal items are stored as deferred factories, so per-prompt limit
+  validation happens before a coroutine exists. Resolution gathers with
+  `return_exceptions=True`, drains sibling fetches, then re-raises the first
+  failure. The two-image-over-limit API probe returned the expected HTTP 400
+  and produced no `coroutine ... was never awaited` warning, including after
+  server shutdown.
+- MRV2 shutdown now drops the target and draft CUDA Graph managers, detaches
+  target and draft layer KV/state views, removes Dynamo bytecode hooks, releases
+  `model_state` and `speculator`, and clears process-global Flash-V100, FP8, and
+  NVFP4 workspace owners. The multimodal language-model lookup cache is weak
+  keyed so it no longer pins models for the interpreter lifetime.
+- Focused Python gates pass `15 passed`; changed-file Ruff formatting/checks
+  and `git diff --check` pass. The broader pre-existing multimodal suite was
+  stopped while downloading its external model/assets and is not counted.
+- Remote TP4 proof used four V100-SXM2-32GB GPUs, Qwen3.8-27B NVFP4 target,
+  FP8 E5M2 target KV, FP16 draft KV, q7 probabilistic DFlash2, 256K maximum
+  context, q4096 chunked prefill, prefix cache plus Mamba align, Flash-V100,
+  and target/draft CUDA Graphs. Startup hit exact grouped verification and the
+  quality-audited fast-path defaults.
+- A malformed historical tool call returned HTTP 200 and continued with `OK`;
+  forced `get_weather` returned valid Guangzhou arguments; JSON Schema returned
+  exactly `{"name":"Alice","age":30}`. A no-thinking coding smoke naturally
+  stopped with valid typed binary-search code and three assertions. Its 176
+  completion tokens took `0.889 s` wall time (about 198 completion token/s),
+  which is a route smoke rather than a new performance baseline.
+- Graceful termination removed the API, engine, and all four worker processes;
+  GPU 0-3 memory fell from `26,259 MiB` to `9 MiB` each. No recent `/dev/shm`
+  file, port listener, or unawaited-coroutine warning remained. Python's
+  multiprocessing resource tracker still reported semaphore/shared-memory
+  cleanup warnings while removing them; this is retained as a logging cleanup
+  follow-up, not evidence of a surviving process, file, or GPU allocation.
+- Retained remote log and request/response artifacts are under
+  `/home/ymzx/1cat-vllm-deploy/logs/`
+  `nvfp4-dflash2-pr432-011adcf8ce-256k.log` and
+  `/home/ymzx/1cat-vllm-deploy/test-artifacts/pr432-011adcf8ce/`.
+
 ## 2026-09-01 DFlash2 default-capacity 17 ms root cause
 
 - A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
