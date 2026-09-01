@@ -21,10 +21,9 @@ from vllm.config.speculative import (
     _get_dflash2_checkpoint_draft_tokens,
 )
 from vllm.config.vllm import (
-    _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS,
-    _apply_sm70_nvfp4_dflash2_practical_defaults,
-    _is_compressed_tensors_nvfp4,
-    _is_sm70_nvfp4_dflash2_practical_contract,
+    _SM70_DFLASH2_VERIFIER_DEFAULTS,
+    _apply_sm70_dflash2_verifier_defaults,
+    _is_sm70_dflash2_verifier_contract,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -72,7 +71,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 )
 
 
-def _sm70_nvfp4_dflash2_practical_contract_args():
+def _sm70_dflash2_verifier_contract_args():
     model_config = SimpleNamespace(
         architectures=("Qwen3_5ForConditionalGeneration",),
         quantization="compressed-tensors",
@@ -106,18 +105,7 @@ def _sm70_nvfp4_dflash2_practical_contract_args():
         enable_dbo=False,
         ubatch_size=0,
     )
-    scheduler_config = SimpleNamespace(
-        max_num_seqs=1,
-        max_num_batched_tokens=4096,
-    )
-    cache_config = SimpleNamespace(cache_dtype="fp8_e5m2")
-    return (
-        model_config,
-        speculative_config,
-        parallel_config,
-        scheduler_config,
-        cache_config,
-    )
+    return model_config, speculative_config, parallel_config
 
 
 def test_dflash2_checkpoint_draft_tokens_follow_block_contract():
@@ -131,49 +119,50 @@ def test_dflash2_checkpoint_draft_tokens_follow_block_contract():
     assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
 
 
-def test_nvfp4_practical_contract_requires_nvfp4_quantization_group():
-    args = _sm70_nvfp4_dflash2_practical_contract_args()
-    assert _is_compressed_tensors_nvfp4(args[0])
-
-    args[0].model_arch_config.quantization_config = {"format": "float-quantized"}
-    assert not _is_compressed_tensors_nvfp4(args[0])
-    assert not _is_sm70_nvfp4_dflash2_practical_contract(*args)
-
-
-def test_sm70_nvfp4_dflash2_practical_contract_is_narrow():
-    args = _sm70_nvfp4_dflash2_practical_contract_args()
-    assert _is_sm70_nvfp4_dflash2_practical_contract(*args)
+def test_sm70_dflash2_verifier_contract_is_narrow():
+    args = _sm70_dflash2_verifier_contract_args()
+    assert _is_sm70_dflash2_verifier_contract(*args)
 
     for config_index, attribute, incompatible_value in (
-        (0, "quantization", "fp8"),
+        (0, "dtype", torch.bfloat16),
         (1, "num_speculative_tokens", 5),
-        (2, "tensor_parallel_size", 2),
-        (3, "max_num_seqs", 2),
-        (3, "max_num_batched_tokens", 8192),
-        (4, "cache_dtype", "auto"),
+        (2, "pipeline_parallel_size", 2),
+        (2, "enable_dbo", True),
+        (2, "ubatch_size", 2),
     ):
-        incompatible_args = _sm70_nvfp4_dflash2_practical_contract_args()
+        incompatible_args = _sm70_dflash2_verifier_contract_args()
         setattr(incompatible_args[config_index], attribute, incompatible_value)
-        assert not _is_sm70_nvfp4_dflash2_practical_contract(*incompatible_args)
+        assert not _is_sm70_dflash2_verifier_contract(*incompatible_args)
 
-    incompatible_args = _sm70_nvfp4_dflash2_practical_contract_args()
+    incompatible_args = _sm70_dflash2_verifier_contract_args()
     incompatible_args[1].draft_model_config.hf_config.dflash_config[
         "selector_top_k"
     ] = 8
-    assert not _is_sm70_nvfp4_dflash2_practical_contract(*incompatible_args)
+    assert not _is_sm70_dflash2_verifier_contract(*incompatible_args)
 
 
-def test_sm70_nvfp4_dflash2_practical_defaults_preserve_overrides(monkeypatch):
-    for name in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS:
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("quantization", [None, "fp8", "compressed-tensors"])
+def test_sm70_dflash2_verifier_contract_is_tp_and_quantization_independent(
+    tensor_parallel_size, quantization
+):
+    args = _sm70_dflash2_verifier_contract_args()
+    args[0].quantization = quantization
+    args[2].tensor_parallel_size = tensor_parallel_size
+    assert _is_sm70_dflash2_verifier_contract(*args)
+
+
+def test_sm70_dflash2_verifier_defaults_preserve_overrides(monkeypatch):
+    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
         monkeypatch.delenv(name, raising=False)
     overridden_name = "VLLM_SM70_DFLASH2_QPN8_RERANK"
     monkeypatch.setenv(overridden_name, "0")
 
-    applied = _apply_sm70_nvfp4_dflash2_practical_defaults()
+    applied = _apply_sm70_dflash2_verifier_defaults()
 
     assert overridden_name not in applied
     assert os.environ[overridden_name] == "0"
-    for name, expected_value in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS.items():
+    for name, expected_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
         if name != overridden_name:
             assert name in applied
             assert os.environ[name] == expected_value
