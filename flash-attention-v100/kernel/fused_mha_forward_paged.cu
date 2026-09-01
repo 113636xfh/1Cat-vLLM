@@ -726,6 +726,12 @@ __global__ void __launch_bounds__(
     first_n_tile = partition_id * tiles_per_partition;
     last_n_tile = min(num_n_tiles, first_n_tile + tiles_per_partition);
   }
+  if constexpr (!ANCHORED_SWA) {
+    // DFlash2 draft attention is non-causal with a short sliding window. Jump
+    // directly to the first tile that can intersect the window instead of
+    // visiting every historical tile only to reject it inside the loop.
+    first_n_tile = max(first_n_tile, min_key_pos / BLOCK_N);
+  }
 
   for (int block_n = first_n_tile; block_n < last_n_tile; ++block_n) {
     const int start_col = block_n * BLOCK_N;

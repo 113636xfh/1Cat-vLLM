@@ -16,6 +16,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import cast
@@ -23,6 +24,7 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -495,6 +497,7 @@ _flash_attn_decode_paged = None
 _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
 _flash_attn_grouped_verify_paged = None
+_flash_attn_grouped_verify_max_query_tokens = 8
 _flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
@@ -502,6 +505,8 @@ _flash_attn_prefill_paged_bfla = None
 _flash_attn_prefill_paged_splitkv = None
 _sm70_splitd_d256_ops = None
 _sm70_splitd_d256_ops_checked = False
+_sm70_d256_gqa_architecture_op = None
+_sm70_d256_gqa_architecture_op_checked = False
 _sm70_fa2_cu_seqlens_cache: dict[
     tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
@@ -515,6 +520,7 @@ _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
 _warned_prefill_gather_oom = False
 _warned_prefill_dense_splitkv3_oom = False
+_warned_prefill_d256_gqa_architecture_oom = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -527,6 +533,7 @@ _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
 _logged_prefill_fa2_d256 = False
 _logged_prefill_dense_splitkv3 = False
+_logged_prefill_d256_gqa_architecture = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -569,6 +576,15 @@ _prefill_dense_splitkv3_workspaces: dict[
     tuple[int, int, torch.dtype],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
+
+
+def clear_flash_attn_v100_workspaces() -> None:
+    """Release process-global Flash-V100 tensors during engine shutdown."""
+    _sm70_fa2_cu_seqlens_cache.clear()
+    _fp8_prefill_bridge_workspaces.clear()
+    _fp8_prefill_bridge_tail_workspaces.clear()
+    _prefill_gather_dense_workspaces.clear()
+    _prefill_dense_splitkv3_workspaces.clear()
 
 
 def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
@@ -1247,6 +1263,7 @@ def _get_flash_ops():
 def _get_flash_grouped_verify_op():
     """Load the optional exact SM70 DFlash2 grouped verifier."""
     global _flash_attn_grouped_verify_paged
+    global _flash_attn_grouped_verify_max_query_tokens
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
         return _flash_attn_grouped_verify_paged
@@ -1256,6 +1273,16 @@ def _get_flash_grouped_verify_op():
         from flash_attn_v100 import flash_attn_grouped_verify_paged
 
         _flash_attn_grouped_verify_paged = flash_attn_grouped_verify_paged
+        try:
+            from flash_attn_v100 import (
+                flash_attn_grouped_verify_max_query_tokens,
+            )
+
+            _flash_attn_grouped_verify_max_query_tokens = int(
+                flash_attn_grouped_verify_max_query_tokens()
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            _flash_attn_grouped_verify_max_query_tokens = 8
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
@@ -1270,8 +1297,30 @@ def _get_sm70_splitd_d256_ops():
 
     _sm70_splitd_d256_ops_checked = True
     try:
-        # Importing the interface loads the vendored FA2 torch library.
-        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+        required_ops = (
+            "sm70_d256_splitd_n32_dense_fwd",
+            "sm70_d256_splitd_n32_paged_fwd",
+        )
+        with suppress(ImportError):
+            # Importing the interface loads the bundled FA2 torch library.
+            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+        if namespace is None or not all(
+            hasattr(namespace, op_name) for op_name in required_ops
+        ):
+            # A partially cached Python interface can import successfully
+            # without registering its native operators. Source-overlay
+            # deployments can also intentionally keep the extension outside
+            # the checkout. In both cases, load only an explicitly selected
+            # sidecar and then validate the actual operator capability below.
+            library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+            if library_path is not None:
+                torch.ops.load_library(library_path)
+                logger.info(
+                    "Loaded external SM70 D256 prefill library from %s.",
+                    library_path,
+                )
 
         dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
         paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
@@ -1281,7 +1330,7 @@ def _get_sm70_splitd_d256_ops():
             None,
         )
         _sm70_splitd_d256_ops = (dense, paged, splitkv3)
-    except (AttributeError, ImportError, RuntimeError) as exc:
+    except (AttributeError, ImportError, OSError, RuntimeError) as exc:
         _sm70_splitd_d256_ops = None
         logger.warning_once(
             "SM70 D256 exact-prefill operators are unavailable (%s: %s). "
@@ -1293,6 +1342,40 @@ def _get_sm70_splitd_d256_ops():
             exc,
         )
     return _sm70_splitd_d256_ops
+
+
+def _get_sm70_d256_gqa_architecture_op():
+    """Load the optional SM70 GQA long-prefill architecture operator."""
+    global _sm70_d256_gqa_architecture_op
+    global _sm70_d256_gqa_architecture_op_checked
+    if _sm70_d256_gqa_architecture_op_checked:
+        return _sm70_d256_gqa_architecture_op
+
+    _sm70_d256_gqa_architecture_op_checked = True
+    try:
+        # The Split-D loader also resolves an explicit source-overlay
+        # sidecar. Calling it here keeps both operator families on one binary.
+        if not hasattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_gqa_architecture_fwd",
+        ):
+            _get_sm70_splitd_d256_ops()
+
+        _sm70_d256_gqa_architecture_op = getattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_gqa_architecture_fwd",
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        _sm70_d256_gqa_architecture_op = None
+        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL:
+            logger.warning_once(
+                "SM70 D256 GQA architecture operator is unavailable "
+                "(%s: %s); using the exact dense prefill kernel.",
+                type(exc).__name__,
+                exc,
+            )
+    return _sm70_d256_gqa_architecture_op
 
 
 def _uniform_cu_seqlens(
@@ -1408,6 +1491,42 @@ def _should_use_prefill_dense_splitkv3(
     )
 
 
+def _should_use_prefill_d256_gqa_architecture(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    architecture_op: Callable[..., torch.Tensor] | None,
+) -> bool:
+    """Gate the stable Q8000/KV16K..256K/Hq6/Hkv1/D256 family."""
+    return (
+        envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+        and architecture_op is not None
+        and query.shape == (1, 8000, 6, 256)
+        and key.ndim == 4
+        and key.shape[0] == 1
+        and key.shape[2:] == (1, 256)
+        and value.shape == key.shape
+        and max_seqlen_q == 8000
+        and max_seqlen_k == key.shape[1]
+        and 16000 <= max_seqlen_k <= 256000
+        and max_seqlen_k % 8000 == 0
+        and query.dtype == torch.float16
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+        and query.device == key.device
+        and query.device == value.device
+        and query.is_contiguous()
+        and key.is_contiguous()
+        and value.is_contiguous()
+        and abs(softmax_scale - 0.0625) <= 1.0e-8
+        and not _is_cuda_graph_capturing(query)
+    )
+
+
 def _try_sm70_fa2_d256_prefill(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1424,6 +1543,9 @@ def _try_sm70_fa2_d256_prefill(
     seqused_k: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
+    global _logged_prefill_d256_gqa_architecture
+    global _warned_prefill_d256_gqa_architecture_oom
+
     int32_max = torch.iinfo(torch.int32).max
     if not envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
         return None
@@ -1524,7 +1646,47 @@ def _try_sm70_fa2_d256_prefill(
             )
             if splitd_eligible:
                 splitd_out = out if out is not None else torch.empty_like(query)
-                if _should_use_prefill_dense_splitkv3(
+                architecture_op = (
+                    _get_sm70_d256_gqa_architecture_op()
+                    if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+                    else None
+                )
+                if _should_use_prefill_d256_gqa_architecture(
+                    query,
+                    key,
+                    value,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    architecture_op=architecture_op,
+                ):
+                    assert architecture_op is not None
+                    try:
+                        splitd_result = architecture_op(
+                            query,
+                            key,
+                            value,
+                            splitd_out,
+                            softmax_scale,
+                            True,
+                        )
+                    except torch.OutOfMemoryError:
+                        if not _warned_prefill_d256_gqa_architecture_oom:
+                            logger.warning(
+                                "Insufficient memory for the default-on "
+                                "SM70 D256 GQA long-prefill architecture; "
+                                "falling back to the exact dense kernel."
+                            )
+                            _warned_prefill_d256_gqa_architecture_oom = True
+                    if splitd_result is not None:
+                        if not _logged_prefill_d256_gqa_architecture:
+                            logger.info(
+                                "FLASH_ATTN_V100 SM70 D256 GQA "
+                                "8K-by-16K..256K architecture route active."
+                            )
+                            _logged_prefill_d256_gqa_architecture = True
+                        _record_route("prefill_dense_d256_gqa_arch_long")
+                if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
                     max_seqlen_q=max_seqlen_q,
@@ -2959,7 +3121,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_selector_target = bool(
             use_dflash
             and not self._is_speculative_draft_model
-            and getattr(spec_config, "num_speculative_tokens", None) == 7
+            and getattr(spec_config, "num_speculative_tokens", None) in (7, 15)
+            and get_dflash_model_draft_tokens(spec_config) == 7
             and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
@@ -4200,6 +4363,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_splitkv,
         ) = _get_flash_ops()
         self.flash_attn_grouped_verify_paged = _get_flash_grouped_verify_op()
+        self.dflash2_grouped_verify_max_query_tokens = (
+            _flash_attn_grouped_verify_max_query_tokens
+        )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -5038,15 +5204,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens == 8
-            and tuple(query.shape) == (8, 6, 256)
+            and num_query_tokens in (8, 16)
+            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+            and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
             and key_cache.ndim == 4
             and value_cache.ndim == 4
             and key_cache.device == query.device
             and value_cache.device == query.device
-            and key_cache.shape[1] in (1648, 3296)
+            # q15 LABD increases the aligned hybrid-cache page from the
+            # block-8 service's 1648/3296 layout to 1728/3456. The grouped
+            # operator's runtime-stride implementation is exact for both.
+            and key_cache.shape[1] in (1648, 1728, 3296, 3456)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8
@@ -5075,7 +5245,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 grouped verifier gate rejected: "
                 "op=%s marker=%s max_model_len=%s min_model_len=%s "
-                "causal=%s window=%s actual=%d q=%s/%s "
+                "causal=%s window=%s actual=%d native_max_q=%d q=%s/%s "
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
                 "seq_lens=%s/%s.",
                 self.flash_attn_grouped_verify_paged is not None,
@@ -5085,6 +5255,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 getattr(attn_metadata, "causal", True),
                 self._flash_v100_window_size(causal=True),
                 num_query_tokens,
+                self.dflash2_grouped_verify_max_query_tokens,
                 tuple(query.shape),
                 query.dtype,
                 tuple(key_cache.shape),
@@ -5114,7 +5285,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q8/H6/Hkv1/D256, FP8 E5M2 KV, one-pass)."
+                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                query.shape[0],
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(

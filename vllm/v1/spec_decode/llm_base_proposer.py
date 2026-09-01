@@ -231,7 +231,7 @@ class SpecDecodeBaseProposer:
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self.draft_model_config.get_hidden_size()
+        self.hidden_size = self._get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
 
         # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
@@ -460,6 +460,10 @@ class SpecDecodeBaseProposer:
             rocm_types.append(FlexAttentionMetadata)
 
             self.allowed_attn_types = tuple(rocm_types)
+
+    def _get_hidden_size(self) -> int:
+        """Return the hidden width consumed by the draft model."""
+        return self.draft_model_config.get_hidden_size()
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
@@ -1051,7 +1055,7 @@ class SpecDecodeBaseProposer:
         top_k = int(getattr(text_config, "num_experts_per_tok", 0))
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        use_mtp_decode_tiles = (
+        use_qwen36_mtp_decode_tiles = (
             envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
             and num_experts == 256
             and top_k == 8
@@ -1059,13 +1063,28 @@ class SpecDecodeBaseProposer:
             and int(getattr(text_config, "moe_intermediate_size", 0)) == 512
             and tp_size == 4
         )
+        use_qwen38_mtp_decode_tiles = (
+            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            and num_experts == 512
+            and top_k == 10
+            and self.draft_model_config.get_hidden_size() == 2560
+            and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
+            and tp_size == 4
+        )
+        decode_tile_max_tokens = (
+            16
+            if use_qwen36_mtp_decode_tiles
+            else 5
+            if use_qwen38_mtp_decode_tiles
+            else 0
+        )
         sizes = _sm70_mtp_moe_warmup_sizes(
             num_experts,
             top_k,
             self.max_num_tokens,
-            decode_tile_max_tokens=16 if use_mtp_decode_tiles else 0,
+            decode_tile_max_tokens=decode_tile_max_tokens,
         )
-        legacy_sizes = (1, 2, 9, 10) if use_mtp_decode_tiles else ()
+        legacy_sizes = (1, 2, 9, 10) if use_qwen36_mtp_decode_tiles else ()
         if not sizes:
             return ()
 

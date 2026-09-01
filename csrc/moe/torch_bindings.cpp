@@ -110,6 +110,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! sorted_row_idx, Tensor! topk_ids_for_sort)->()");
 
   m.def(
+      "moe_permute_metadata_with_scratch(Tensor input, Tensor topk_ids,"
+      "Tensor token_expert_indices, Tensor? expert_map, int n_expert,"
+      "int n_local_expert, int topk, Tensor! expert_first_token_offset, "
+      "Tensor! inv_permuted_idx, Tensor! permuted_idx, Tensor! "
+      "input_row_indices, Tensor! sort_workspace, Tensor! "
+      "permuted_experts_id, Tensor! sorted_row_idx, Tensor! "
+      "topk_ids_for_sort)->()");
+
+  m.def(
       "moe_unpermute(Tensor permuted_hidden_states, Tensor topk_weights,"
       "Tensor inv_permuted_idx, Tensor? expert_first_token_offset, "
       "int topk, Tensor! hidden_states)->()");

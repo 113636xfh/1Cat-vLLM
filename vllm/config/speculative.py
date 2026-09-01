@@ -45,6 +45,7 @@ MTPModelTypes = Literal[
     "exaone_moe_mtp",
     "exaone4_5_mtp",
     "qwen3_next_mtp",
+    "qwen4_exp_mtp",
     "qwen3_5_mtp",
     "longcat_flash_mtp",
     "mtp",
@@ -81,6 +82,46 @@ RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
+def _get_dflash2_checkpoint_draft_tokens(hf_config: Any) -> int | None:
+    """Return the checkpoint-native DFlash2 draft width when declared."""
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
+    block_size = int(dflash_config.get("block_size", 0) or 0)
+    if selector_top_k <= 0 or block_size <= 1:
+        return None
+    return block_size - 1
+
+
+def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
+    """Return the block width produced by the DFlash checkpoint itself.
+
+    Lookup-augmented DFlash2 may hand a wider proposal to the target, but its
+    model/convolutions must retain the block size used during training.
+    """
+    verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    if getattr(speculative_config, "method", None) != "dflash" or not getattr(
+        speculative_config, "ngram_assist", False
+    ):
+        return verify_tokens
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    trained_tokens = _get_dflash2_checkpoint_draft_tokens(hf_config)
+    if trained_tokens is not None and trained_tokens < verify_tokens:
+        return trained_tokens
+    return verify_tokens
+
+
+def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
+    """Whether DFlash2 can switch between model and augmented widths."""
+    verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    return (
+        getattr(speculative_config, "method", None) == "dflash"
+        and bool(getattr(speculative_config, "ngram_assist", False))
+        and 0 < get_dflash_model_draft_tokens(speculative_config) < verify_tokens
+    )
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -90,7 +131,8 @@ class SpeculativeConfig:
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
-    number in the draft model config if present, otherwise, it is required."""
+    number in the draft model config if present; selector-based DFlash2 uses
+    checkpoint ``block_size - 1``. Otherwise, it is required."""
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
@@ -138,6 +180,9 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    index_share_for_mtp_iteration: bool | None = None
+    """Override whether MTP iterations reuse the first step's sparse indices.
+    If ``None``, use the value from the draft model's Hugging Face config."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -158,6 +203,13 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+    ngram_assist: bool = False
+    """Combine prompt-ngram lookup with DFlash2. At the checkpoint-native
+    width, full hits may skip the DFlash2 query and selector. If
+    ``num_speculative_tokens`` is wider than the checkpoint block, DFlash2
+    keeps its trained width and lookup may fill the extra target-verification
+    positions. Only valid with ``method='dflash'`` and a DFlash2 selector
+    capability."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -362,6 +414,15 @@ class SpeculativeConfig:
                 )
             )
 
+        if self.method == "mtp" and self.draft_model_config is not None:
+            factors.append(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "index_share_for_mtp_iteration",
+                    False,
+                )
+            )
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -509,6 +570,26 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
+            )
+
+        if hf_config.model_type in {"qwen4_exp", "qwen4_exp_text"}:
+            hf_config.model_type = "qwen4_exp_mtp"
+        if hf_config.model_type == "qwen4_exp_mtp":
+            text_config = get_hf_text_config(hf_config)
+            n_predict = getattr(
+                text_config,
+                "mtp_num_hidden_layers",
+                getattr(text_config, "num_nextn_predict_layers", None),
+            )
+            hf_config.update(
+                {
+                    "hc_mult": int(text_config.hc_count),
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen4ExpMTP"],
+                    "index_share_for_mtp_iteration": getattr(
+                        text_config, "index_share_for_mtp_iteration", True
+                    ),
+                }
             )
 
         if hf_config.model_type == "exaone_moe":
@@ -665,6 +746,22 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
+        if self.ngram_assist:
+            if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
+                self.prompt_lookup_min = 5
+                self.prompt_lookup_max = 5
+            elif self.prompt_lookup_min is None:
+                self.prompt_lookup_min = self.prompt_lookup_max
+            elif self.prompt_lookup_max is None:
+                self.prompt_lookup_max = self.prompt_lookup_min
+            assert self.prompt_lookup_min is not None
+            assert self.prompt_lookup_max is not None
+            if self.prompt_lookup_min > self.prompt_lookup_max:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must "
+                    f"be <= prompt_lookup_max={self.prompt_lookup_max}"
+                )
+
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
@@ -741,8 +838,9 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
 
         else:
-            self.prompt_lookup_max = 0
-            self.prompt_lookup_min = 0
+            if not self.ngram_assist:
+                self.prompt_lookup_max = 0
+                self.prompt_lookup_min = 0
 
             if self.model is not None:
                 self.draft_model_config = ModelConfig(
@@ -866,6 +964,18 @@ class SpeculativeConfig:
                             f" must be divisible by {n_predict=}"
                         )
 
+                if self.num_speculative_tokens is None and self.use_dflash():
+                    native_draft_tokens = _get_dflash2_checkpoint_draft_tokens(
+                        self.draft_model_config.hf_config
+                    )
+                    if native_draft_tokens is not None:
+                        self.num_speculative_tokens = native_draft_tokens
+                        logger.info_once(
+                            "Defaulting DFlash2 num_speculative_tokens to %d "
+                            "from checkpoint block_size.",
+                            native_draft_tokens,
+                        )
+
                 if self.num_speculative_tokens is None:
                     raise ValueError(
                         "A speculative model was provided, but "
@@ -946,6 +1056,15 @@ class SpeculativeConfig:
                         ),
                     )
                 )
+
+        if self.index_share_for_mtp_iteration is not None:
+            if self.method != "mtp" or self.draft_model_config is None:
+                raise ValueError(
+                    "index_share_for_mtp_iteration is only supported with method='mtp'"
+                )
+            self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
+                self.index_share_for_mtp_iteration
+            )
         return self
 
     def _verify_dspark_final_stage_ownership(self) -> None:
@@ -977,7 +1096,7 @@ class SpeculativeConfig:
         if not has_arctic_inference():
             raise ImportError(
                 "Arctic Inference is required for suffix decoding. "
-                "Install via `pip install arctic-inference==0.1.1`."
+                "Install via `pip install arctic-inference==0.2.0`."
             )
         if self.num_speculative_tokens is None:
             # Suffix decoding decides the actual number of speculative tokens
@@ -1163,6 +1282,13 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        if self.ngram_assist:
+            if not self.use_dflash():
+                raise ValueError("ngram_assist is only supported with method='dflash'.")
+            draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
+            dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+            if int(dflash_config.get("selector_top_k", 0) or 0) <= 0:
+                raise ValueError("ngram_assist requires DFlash2 selector capability.")
         if self.use_dflash_ddtree():
             if self.ddtree_budget is None:
                 self.ddtree_budget = self.num_speculative_tokens
@@ -1253,6 +1379,15 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_qwen4_exp_mtp(self) -> bool:
+        """Return whether Qwen4Exp needs its dedicated proposer."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "qwen4_exp_mtp"
         )
 
     def use_eagle(self) -> bool:

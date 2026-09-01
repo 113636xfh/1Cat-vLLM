@@ -759,6 +759,9 @@ class CompilationConfig:
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
         "vllm::short_conv",
+        "vllm::qwen4_exp_compute_ple_ngram_ids",
+        "vllm::qwen4_exp_ple_short_conv",
+        "vllm::qwen4_exp_qsa_with_output",
         "vllm::linear_attention",
         "vllm::plamo2_mamba_mixer",
         "vllm::qwen_gdn_attention_core",
@@ -775,6 +778,7 @@ class CompilationConfig:
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
+        "vllm::sparse_attn_indexer_kpool",
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
     ]

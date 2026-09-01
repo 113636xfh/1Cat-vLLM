@@ -1223,23 +1223,37 @@ def _get_sm70_mtp_moe_decode_config(
     K: int,
     topk: int,
 ) -> dict[str, int] | None:
-    """Return the graph-tuned exact-shape SM70 MTP tile for M2-M16."""
+    """Return graph-tuned exact-shape SM70 MTP tiles."""
     if _force_sm70_mtp_moe_legacy_config or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG:
         return None
-    if (E, N, K, topk) != (256, 128, 2048, 8) or not 2 <= M <= 16:
-        return None
-
-    # TP4 shards the checkpoint-global I512 expert width to I128 per rank.
-    # M2-M16 all select this tile in the exact local-shape graph oracle.
-    return {
-        "BLOCK_SIZE_M": 8,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 1,
-        "SPLIT_K": 1,
-        "num_warps": 4,
-        "num_stages": 3,
-    }
+    if (E, N, K, topk) == (256, 128, 2048, 8) and 2 <= M <= 16:
+        # Qwen3.6 TP4 shards the checkpoint-global I512 expert width to I128
+        # per rank. M2-M16 all select this tile in the exact local-shape graph
+        # oracle.
+        return {
+            "BLOCK_SIZE_M": 8,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 1,
+            "SPLIT_K": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    if (E, N, K, topk) == (512, 160, 2560, 10) and M in (1, 5):
+        # Qwen3.8-Flash-Next TP4 keeps the BF16 MTP expert weights and shards
+        # the checkpoint-global I640 expert width to I160 per rank. M5 is the
+        # first proposer pass over the verifier window; M1 covers its three
+        # autoregressive continuation passes.
+        return {
+            "BLOCK_SIZE_M": 2,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "SPLIT_K": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    return None
 
 
 def get_default_config(

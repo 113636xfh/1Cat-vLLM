@@ -105,6 +105,29 @@ _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
+def _warmup_sm70_qwen_gdn_causal_conv1d(
+    forward_context: dict[str, object],
+) -> bool:
+    """Warm one bound Qwen GDN layer using its production cache layout.
+
+    MRV2 owns the cache on the modules registered in ``forward_context``.
+    Scanning ``model.modules()`` therefore misses the bound cache and leaves
+    the non-speculative causal-conv variant to JIT on the first structured
+    request.
+    """
+    if (
+        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
+        or not current_platform.is_device_capability(70)
+    ):
+        return False
+
+    for layer in forward_context.values():
+        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
+        if warmup is not None and warmup():
+            return True
+    return False
+
+
 @triton.jit
 def _sm70_pack_qwen_gdn_qkv_kernel(
     mixed_qkv,
@@ -2374,7 +2397,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _sm70_gdn_rmsnorm_onepass_enabled()
             and current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
-            and self.hidden_size == 5120
+            and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
             and self.num_v_heads == 48
             and self.head_v_dim == 128
@@ -2383,7 +2406,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_sm70_gdn_qpn8_ba_split = (
             current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
-            and self.hidden_size == 5120
+            and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
             and self.num_v_heads == 48
             and self.head_v_dim == 128
@@ -4110,45 +4133,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             layer_name,
             hidden_states,
         )
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
-        mixed_qkvz = _sm70_dump_gdn_projection_tensor(
-            "in_proj_qkvz", layer_name, mixed_qkvz
+        use_qwen38_fused_input = bool(
+            getattr(self, "sm70_qwen38_fp16_fused_input", False)
+            and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
-
-        if self.gqa_interleaved_layout:
-            # Qwen3-Next: unpack the interleaved GQA layout
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                mixed_qkvz, ba
+        if use_qwen38_fused_input:
+            assert self.in_proj_ba is not None
+            mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
+                hidden_states,
+                self.in_proj_qkvz.weight,
+                self.in_proj_ba.weight,
             )
-            query, key, value = map(
-                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-            )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
-        else:
-            # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            z_size = self.value_dim // self.tp_size
-            mixed_qkv = mixed_qkvz[..., :qkv_size]
-            mixed_qkv = _sm70_dump_gdn_projection_tensor(
-                "split_mixed_qkv", layer_name, mixed_qkv
-            )
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
-                mixed_qkv = mixed_qkv.contiguous()
-            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
-            z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            ba_size = ba.shape[-1] // 2
-            b = ba[..., :ba_size]
-            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
-            if self.disable_tp_for_ba_proj and self.tp_size > 1:
-                ba_chunk = self.num_v_heads // self.tp_size
-                ba_start = self.tp_rank * ba_chunk
-                b = b[:, ba_start : ba_start + ba_chunk]
-                a = a[:, ba_start : ba_start + ba_chunk]
-            b = b.contiguous()
-            a = a.contiguous()
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _sm70_dump_gdn_projection_tensor(
+                "in_proj_qkvz", layer_name, mixed_qkvz
+            )
+            ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
+
+            if self.gqa_interleaved_layout:
+                # Qwen3-Next: unpack the interleaved GQA layout
+                query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                    mixed_qkvz, ba
+                )
+                query, key, value = map(
+                    lambda x: rearrange(x, "l p d -> l (p d)"),
+                    (query, key, value),
+                )
+                mixed_qkv = torch.cat((query, key, value), dim=-1)
+            else:
+                # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
+                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                z_size = self.value_dim // self.tp_size
+                mixed_qkv = mixed_qkvz[..., :qkv_size]
+                mixed_qkv = _sm70_dump_gdn_projection_tensor(
+                    "split_mixed_qkv", layer_name, mixed_qkv
+                )
+                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                    mixed_qkv = mixed_qkv.contiguous()
+                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+                z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                ba_size = ba.shape[-1] // 2
+                b = ba[..., :ba_size]
+                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+                if self.disable_tp_for_ba_proj and self.tp_size > 1:
+                    ba_chunk = self.num_v_heads // self.tp_size
+                    ba_start = self.tp_rank * ba_chunk
+                    b = b[:, ba_start : ba_start + ba_chunk]
+                    a = a[:, ba_start : ba_start + ba_chunk]
+                b = b.contiguous()
+                a = a.contiguous()
 
         if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
             70
@@ -7127,6 +7164,9 @@ def _sm70_gdn_qpn8_ba_weight_contract(
     qkvz_weight = getattr(qkvz, "weight", None)
     qkvz_scales = getattr(qkvz, "weight_scale_inv", None)
     ba_weight = getattr(ba, "weight", None) if ba is not None else None
+    input_width = (
+        int(qkvz_weight.shape[0]) if isinstance(qkvz_weight, torch.Tensor) else 0
+    )
     return bool(
         self.enable_sm70_gdn_qpn8_ba_split
         and ba is not None
@@ -7134,7 +7174,8 @@ def _sm70_gdn_qpn8_ba_weight_contract(
         and int(getattr(qkvz, "sm70_fp8_prefill_exact_dense_workspace_ptr", 0)) > 0
         and isinstance(qkvz_weight, torch.Tensor)
         and qkvz_weight.dtype == torch.uint8
-        and qkvz_weight.shape == (5120, 4096)
+        and input_width in (2560, 5120)
+        and qkvz_weight.shape == (input_width, 4096)
         and qkvz_weight.is_contiguous()
         and isinstance(qkvz_scales, torch.Tensor)
         and qkvz_scales.dtype == torch.float16
@@ -7142,7 +7183,7 @@ def _sm70_gdn_qpn8_ba_weight_contract(
         and qkvz_scales.is_contiguous()
         and isinstance(ba_weight, torch.Tensor)
         and ba_weight.dtype == torch.float16
-        and ba_weight.shape == (24, 5120)
+        and ba_weight.shape == (24, input_width)
         and ba_weight.is_contiguous()
         and qkvz_weight.device == qkvz_scales.device == ba_weight.device
         and getattr(qkvz, "bias", None) is None
@@ -7166,7 +7207,7 @@ def _sm70_gdn_qpn8_ba_dispatch_eligible(
         and hidden_states.is_cuda
         and hidden_states.dtype == torch.float16
         and hidden_states.ndim == 2
-        and hidden_states.shape[1] == 5120
+        and hidden_states.shape[1] == self.in_proj_qkvz.weight.shape[0]
         and hidden_states.is_contiguous()
         and hidden_states.device == qkvz.weight.device == ba.weight.device
     )
@@ -7229,7 +7270,7 @@ def qwen_gdn_input_projection_core(
             self.in_proj_ba.weight,
         )
         _log_runtime_route_once(
-            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+            "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         z = z_out
     else:
@@ -7337,7 +7378,7 @@ def qwen_gdn_input_projection(
             self.in_proj_ba.weight,
         )
         _log_runtime_route_once(
-            "SM70 GDN QPN8 K5120/N4096 plus FP16 b/a N24 split route enabled."
+            "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         return
 

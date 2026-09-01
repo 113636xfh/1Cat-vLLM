@@ -27,10 +27,12 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
     _is_sm70_fp8_exact_8k_prefill_layer,
     _is_sm70_fp8_prefill_exact_dense_layer,
+    _is_sm70_fp8_prescaled_m1_decode_layer,
     _is_sm70_fp8_qpn8_layer,
     _is_sm70_fp8_qpn8_runtime_contract,
     _sm70_fp8_prefill_dense_workspaces,
     _sm70_fp8_prefill_visible_dense_mm,
+    _try_sm70_fp8_prescaled_decode_scales,
 )
 
 
@@ -468,23 +470,7 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert not _is_sm70_fp8_qpn8_layer(layer)
 
 
-def test_fp8_qpn8_runtime_gate_uses_engine_contract_only(monkeypatch):
-    vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        speculative_config=None,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.get_current_vllm_config",
-        lambda: vllm_config,
-    )
-
-    assert _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 16
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 8
-    vllm_config.speculative_config = object()
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
+def test_fp8_qpn8_runtime_gate_is_capacity_and_speculation_independent():
     assert _is_sm70_fp8_qpn8_runtime_contract()
 
 
@@ -673,6 +659,128 @@ def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
     ]
     assert calls[0][2] is normal_scales
     assert calls[1][2] is prescaled_scales
+    assert calls[2][2] is normal_scales
+
+
+def test_fp8_prescaled_m1_decode_admission_is_exact():
+    layer = SimpleNamespace(
+        prefix="model.layers.2.attn.fused_wqa_wkv",
+        tp_size=1,
+        weight_block_size=[128, 128],
+        input_size_per_partition=4096,
+        output_size_per_partition=1536,
+        weight=torch.empty((1536, 4096), device="meta"),
+    )
+    assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+    layer.tp_size = 4
+    assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+    layer.tp_size = 1
+    layer.prefix = "model.layers.2.attn.indexer.fused_wqa_wkv"
+    assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+    layer.prefix = "model.layers.2.attn.wq_b"
+    assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+
+def test_fp8_prescaled_m1_shared_gate_defaults_on_with_rollback(monkeypatch):
+    layer = SimpleNamespace(
+        prefix="model.layers.2.mlp.shared_experts.gate_up_proj",
+        tp_size=4,
+        weight_block_size=[128, 128],
+        input_size_per_partition=4096,
+        output_size_per_partition=1024,
+        output_partition_sizes=[512, 512],
+        weight=torch.empty((1024, 4096), device="meta"),
+    )
+    monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "0")
+        envs.disable_envs_cache()
+        assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1")
+        envs.disable_envs_cache()
+        layer.prefix = "model.layers.2.mlp.gate_up_proj"
+        assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_fp8_prescaled_m1_decode_scale_gate_is_reversible():
+    scales = torch.tensor([2**-12, 2**-11, 0.0], dtype=torch.float16)
+    prescaled = _try_sm70_fp8_prescaled_decode_scales(scales)
+    assert prescaled is not None
+    torch.testing.assert_close(prescaled, scales * 256, rtol=0, atol=0)
+
+    assert (
+        _try_sm70_fp8_prescaled_decode_scales(
+            torch.tensor([512.0], dtype=torch.float16)
+        )
+        is None
+    )
+    assert (
+        _try_sm70_fp8_prescaled_decode_scales(
+            torch.tensor([-(2**-12)], dtype=torch.float16)
+        )
+        is None
+    )
+
+
+def test_fp8_prescaled_m1_decode_only_handles_m1(monkeypatch):
+    calls = []
+
+    def fake_default(out, input, qweight, scales, *args):
+        calls.append(("default", input.shape[0], scales))
+        out.zero_()
+
+    def fake_prescaled(out, input, qweight, scales, *args):
+        calls.append(("prescaled", input.shape[0], scales))
+        out.zero_()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_gemm_sm70_out",
+        fake_default,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "fp8_gemm_sm70_prescaled_m1_out",
+        fake_prescaled,
+    )
+    normal_scales = torch.empty((1, 6), dtype=torch.float16)
+    prescaled_scales = torch.empty((1, 6), dtype=torch.float16)
+    layer = SimpleNamespace(
+        sm70_fp8_turbomind=True,
+        sm70_fp8_bmm=False,
+        output_size_per_partition=6,
+        weight=torch.empty((4, 6), dtype=torch.uint8),
+        weight_scale_inv=normal_scales,
+        sm70_fp8_decode_prescaled_scales=prescaled_scales,
+        sm70_fp8_k_ld=4,
+        sm70_fp8_q_ld=6,
+    )
+    method = SimpleNamespace()
+
+    monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
+    envs.disable_envs_cache()
+    try:
+        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
+        Fp8LinearMethod.apply(method, layer, torch.empty((2, 4), dtype=torch.float16))
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "0")
+        envs.disable_envs_cache()
+        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
+    finally:
+        envs.disable_envs_cache()
+
+    assert [(route, m) for route, m, _ in calls] == [
+        ("prescaled", 1),
+        ("default", 2),
+        ("default", 1),
+    ]
+    assert calls[0][2] is prescaled_scales
+    assert calls[1][2] is normal_scales
     assert calls[2][2] is normal_scales
 
 

@@ -397,9 +397,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mxfp4_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
 
     set_gencode_flags_for_srcs(
@@ -729,6 +731,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     SOURCES ${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
     WITH_SOABI)
   set_target_properties(_sm70_sampler_C PROPERTIES
     CXX_STANDARD 17

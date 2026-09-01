@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -50,7 +52,12 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -66,6 +73,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    get_explicit_cudagraph_memory_reserve,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -108,9 +116,20 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
 logger = init_logger(__name__)
+
+
+def _detach_model_runtime_state(model: nn.Module) -> None:
+    """Drop layer KV views and compilation hooks that can pin a model."""
+    clear_layer_kv_caches(model.modules())
+
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    for module in model.modules():
+        if isinstance(module, TorchCompileWithNoGuardsWrapper):
+            module.cleanup()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -207,6 +226,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -267,6 +288,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._ple_offload_connector: Any | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -285,6 +307,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        """Attach the shared CPU PLE worker to address-stable MRV2 inputs."""
+        from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+        query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
+        ngram_context_source = getattr(self.model_state, "ngram_context", None)
+        if not isinstance(query_start_loc_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires a query_start_loc source")
+        if not isinstance(ngram_context_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires an ngram_context source")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.model,
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_buffers.input_ids,
+            query_start_loc_source=query_start_loc_source,
+            ngram_context_source=ngram_context_source,
+        )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -395,18 +437,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                specs = tuple(spec.kv_cache_specs.values())
+                assert specs
+                is_circular = all(
+                    isinstance(member, CircularBufferSpec) for member in specs
+                )
+                spec = specs[0]
+            else:
+                is_circular = isinstance(spec, CircularBufferSpec)
             block_sizes.append(spec.block_size)
+            slot_mapping_enabled.append(not is_circular)
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
-            max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
+            max_num_blocks = (
+                1
+                if is_circular
+                else cdiv(block_table_max_model_len, spec.block_size * self.dcp_size)
             )
             # Align to a multiple of (128 / block_size) as required by some attention
             # backends such as TRTLLM (#39324)
-            if spec.block_size <= 128:
+            if not is_circular and spec.block_size <= 128:
                 alignment = 128 // spec.block_size
                 max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
@@ -430,6 +485,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            slot_mapping_enabled=slot_mapping_enabled,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
@@ -498,6 +554,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _warmup_sm70_aux_kernels(self) -> None:
+        """Warm SM70 kernels whose production cache exists only in MRV2."""
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _warmup_sm70_qwen_gdn_causal_conv1d,
+        )
+
+        if _warmup_sm70_qwen_gdn_causal_conv1d(
+            self.compilation_config.static_forward_context
+        ):
+            logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
+
+        if (
+            not envs.VLLM_SM70_AUX_KERNEL_WARMUP
+            or not current_platform.is_device_capability(70)
+        ):
+            return
+
+        warmed: list[str] = []
+        if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
+            warmed.append("zero_kv_blocks")
+
+        speculator_warmup = getattr(
+            self.speculator, "warmup_sm70_mtp_moe_kernels", None
+        )
+        if speculator_warmup is not None:
+            warmed.extend(speculator_warmup(self._dummy_run))
+
+        if warmed:
+            logger.info_once(
+                "SM70 V2 auxiliary kernel warmup finished: %s", tuple(warmed)
+            )
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -670,7 +758,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def profile_cudagraph_memory(self) -> int:
         # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        return get_explicit_cudagraph_memory_reserve(
+            self.compilation_config.cudagraph_mode
+        )
 
     @torch.inference_mode()
     def capture_model(self) -> int:
@@ -689,6 +779,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
         with self.maybe_setup_dummy_loras(self.lora_config):
             captured_attn_states = self.cudagraph_manager.capture(
                 self.model,
@@ -706,6 +798,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.capture()
                 else:
                     self.speculator.capture(captured_attn_states)
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -1025,6 +1119,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output,
             )
+        sm70_greedy_decode = (
+            sampler_output is None
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_reqs == 1
+            and input_batch.num_tokens == 1
+            and not input_batch.is_prefilling_np[0]
+            and grammar_output is None
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and getattr(self, "lora_config", None) is None
+            and hasattr(self.model, "get_top_tokens")
+            and self.sampler is not None
+            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        )
+        if sm70_greedy_decode:
+            sampled = self.model.get_top_tokens(sample_hidden_states)
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled.view(-1, 1),
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            )
+            logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = self.model.compute_logits(sample_hidden_states)
             if grammar_output is not None:
@@ -1247,6 +1364,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                dummy_run,
+            )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -1291,6 +1414,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1420,6 +1546,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            requires_host_token_state = bool(
+                getattr(self.speculator, "requires_host_token_state", False)
+            )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1441,9 +1570,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                output_copy_event=(
+                    async_output.copy_event if requires_host_token_state else None
+                ),
+                sampled_token_ids_cpu=(
+                    async_output.sampled_token_ids
+                    if requires_host_token_state
+                    else None
+                ),
+                num_sampled_tokens_cpu=(
+                    async_output.num_sampled_tokens_np
+                    if requires_host_token_state
+                    else None
+                ),
+                all_token_ids_cpu=(
+                    self.req_states.all_token_ids.get_cpu_view().numpy()
+                    if requires_host_token_state
+                    else None
+                ),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
+            num_draft_tokens = None
+            if hasattr(self.speculator, "next_num_draft_tokens"):
+                num_draft_tokens = self.speculator.next_num_draft_tokens()
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                draft_tokens,
+                num_draft_tokens=num_draft_tokens,
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -1511,6 +1665,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        # CUDA graph managers own graph pools, captured outputs, and persistent
+        # attention metadata. Drop both target and draft managers first.
+        self.cudagraph_manager = None
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
+
+        target_model = getattr(self, "model", None)
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None:
+            if hasattr(speculator, "query_cudagraph_manager"):
+                speculator.query_cudagraph_manager = None
+            draft_model = getattr(speculator, "model", None)
+            if isinstance(draft_model, nn.Module):
+                _detach_model_runtime_state(draft_model)
+        if isinstance(target_model, nn.Module):
+            _detach_model_runtime_state(target_model)
+
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
@@ -1518,6 +1690,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
         free_before_shutdown(self.vllm_config)
+        if hasattr(self, "model_state"):
+            del self.model_state
+        if speculator is not None:
+            self.speculator = None
         if hasattr(self, "model"):
             del self.model
 

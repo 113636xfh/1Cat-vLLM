@@ -64,6 +64,12 @@ void expandInputRowsKernelLauncher(
     int64_t const* num_valid_tokens_ptr, int64_t const cols, int const k,
     int num_local_experts, cudaStream_t stream);
 
+void buildMoePermuteMetadataLauncher(
+    int const* expanded_dest_row_to_expanded_source_row,
+    int* expanded_source_row_to_expanded_dest_row, int* permuted_idx,
+    int* input_row_indices, int64_t num_expanded_rows,
+    int64_t const* num_valid_tokens_ptr, int topk, cudaStream_t stream);
+
 template <class T, class OutputType>
 void finalizeMoeRoutingKernelLauncher(
     T const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
@@ -80,11 +86,12 @@ bool canUseSingleTokenMoePermuteFastPath(int64_t n_token, int64_t topk,
                                          int64_t n_local_expert);
 
 template <typename T>
-void singleTokenMoePermuteLauncher(
-    T const* input, int const* topk_ids, T* permuted_output,
-    int64_t* expert_first_token_offset, int* inv_permuted_idx,
-    int* permuted_idx, int num_experts, int topk, int64_t cols,
-    cudaStream_t stream);
+void singleTokenMoePermuteLauncher(T const* input, int const* topk_ids,
+                                   T* permuted_output,
+                                   int64_t* expert_first_token_offset,
+                                   int* inv_permuted_idx, int* permuted_idx,
+                                   int num_experts, int topk, int64_t cols,
+                                   cudaStream_t stream);
 
 bool canUseSingleTokenMoeUnpermuteFastPath(int64_t n_token, int64_t topk);
 

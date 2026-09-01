@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native SM70 TurboMind NVFP4 MoE for Qwen3.6-35B-A3B.
+"""Native SM70 TurboMind NVFP4 MoE for validated expert shapes.
 
 The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the
 checkpoint's FP8 block scales with its explicit ModelOpt global scales once at
@@ -10,12 +10,14 @@ expert-weight copy.
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -38,13 +40,154 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_QWEN36_HIDDEN_SIZE: Final = 2048
-_QWEN36_INTERMEDIATE_SIZE: Final = 512
-_QWEN36_NUM_EXPERTS: Final = 256
-_QWEN36_TOP_K: Final = 8
-_QWEN36_SUPPORTED_TP_SIZES: Final = (1, 2, 4)
+_SUPPORTED_CONTRACTS: Final = {
+    # (hidden size, global expert intermediate size, experts, top-k)
+    (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
+    (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
+    (4096, 2048, 288, 8),  # GLM-5.3-Flash
+}
+_SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_TOKENS: Final = 10
+_MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
+_QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
+_QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
+_QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
+
+
+def _use_qwen38_qpn_m1_decode(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only the exact validated Qwen3.8 TP4 single-token route."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+        and x.shape == (1, 2560)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (1, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_indexed_prefill(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only long exact Qwen3.8 TP4 W13 prefill batches."""
+    return bool(
+        getattr(
+            layer,
+            "sm70_nvfp4_qwen38_indexed_prefill",
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL,
+        )
+        and envs.VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL
+        and x.ndim == 2
+        and x.shape[0] >= _QWEN38_INDEXED_PREFILL_MIN_TOKENS
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+@triton.jit
+def _prepare_single_token_slots_kernel(
+    input_ptr,
+    topk_ids_ptr,
+    expanded_input_ptr,
+    active_expert_ids_ptr,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    slot = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < HIDDEN
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    tl.store(expanded_input_ptr + slot * HIDDEN + offsets, values, mask=mask)
+    expert_id = tl.load(topk_ids_ptr + slot)
+    tl.store(active_expert_ids_ptr + slot, expert_id.to(tl.int32))
+
+
+def _prepare_single_token_slots(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expanded_input: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    top_k = topk_ids.numel()
+    hidden = x.shape[1]
+    if x.shape[0] != 1 or tuple(topk_ids.shape) != (1, top_k):
+        raise ValueError("SM70 NVFP4 direct routing requires one input token.")
+    if tuple(expanded_input.shape) != (top_k, hidden):
+        raise ValueError("SM70 NVFP4 direct routing buffer shape mismatch.")
+    if active_expert_ids.numel() != top_k:
+        raise ValueError("SM70 NVFP4 direct expert-ID buffer shape mismatch.")
+    _prepare_single_token_slots_kernel[(top_k,)](
+        x,
+        topk_ids,
+        expanded_input,
+        active_expert_ids,
+        HIDDEN=hidden,
+        BLOCK=triton.next_power_of_2(hidden),
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _single_token_weighted_reduce_kernel(
+    expert_output_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < HIDDEN
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for slot in tl.static_range(0, TOP_K):
+        values = tl.load(
+            expert_output_ptr + slot * HIDDEN + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        weight = tl.load(topk_weights_ptr + slot)
+        acc += values.to(tl.float32) * weight
+    tl.store(output_ptr + offsets, acc, mask=mask)
+
+
+def _single_token_weighted_reduce(
+    expert_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    top_k, hidden = expert_output.shape
+    if tuple(topk_weights.shape) != (1, top_k) or tuple(output.shape) != (1, hidden):
+        raise ValueError("SM70 NVFP4 direct weighted-reduce shape mismatch.")
+    block = 256
+    _single_token_weighted_reduce_kernel[(triton.cdiv(hidden, block),)](
+        expert_output,
+        topk_weights,
+        output,
+        HIDDEN=hidden,
+        TOP_K=top_k,
+        BLOCK=block,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -80,7 +223,7 @@ def _prepare_compact_slot_groups(
     active_expert_ids: torch.Tensor,
 ) -> None:
     total_slots = sorted_expert_ids.numel()
-    max_slots = _COMPACT_GROUPED_MAX_TOKENS * _QWEN36_TOP_K
+    max_slots = _COMPACT_GROUPED_MAX_TOKENS * _MAX_SUPPORTED_TOP_K
     if not (0 < total_slots <= max_slots):
         raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
     block = triton.next_power_of_2(total_slots + 1)
@@ -100,25 +243,10 @@ def _prepare_compact_slot_groups(
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
     """Reject every topology outside the validated SM70 NVFP4 contract."""
-    if moe.num_experts != _QWEN36_NUM_EXPERTS:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports Qwen3.6-35B-A3B "
-            f"with {_QWEN36_NUM_EXPERTS} experts, got {moe.num_experts}."
-        )
-    if moe.experts_per_token != _QWEN36_TOP_K:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports top-k="
-            f"{_QWEN36_TOP_K}, got {moe.experts_per_token}."
-        )
-    if moe.hidden_dim != _QWEN36_HIDDEN_SIZE:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports hidden size "
-            f"{_QWEN36_HIDDEN_SIZE}, got {moe.hidden_dim}."
-        )
-    if moe.tp_size not in _QWEN36_SUPPORTED_TP_SIZES:
+    if moe.tp_size not in _SUPPORTED_TP_SIZES:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
-            f"sizes {_QWEN36_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
+            f"sizes {_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
         )
     local_intermediate = moe.intermediate_size_per_partition
     if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
@@ -126,11 +254,19 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
             "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
             f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
         )
-    if local_intermediate * max(moe.tp_size, 1) != _QWEN36_INTERMEDIATE_SIZE:
+    global_intermediate = local_intermediate * max(moe.tp_size, 1)
+    contract = (
+        moe.hidden_dim,
+        global_intermediate,
+        moe.num_experts,
+        moe.experts_per_token,
+    )
+    if contract not in _SUPPORTED_CONTRACTS:
         raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports Qwen3.6 expert "
-            f"intermediate size {_QWEN36_INTERMEDIATE_SIZE}; got local="
-            f"{local_intermediate}, tp_size={moe.tp_size}."
+            "SM70 TurboMind NVFP4 MoE shape is not validated: "
+            f"hidden={moe.hidden_dim}, intermediate={global_intermediate}, "
+            f"experts={moe.num_experts}, top_k={moe.experts_per_token}. "
+            f"Validated contracts: {sorted(_SUPPORTED_CONTRACTS)}."
         )
     if moe.moe_parallel_config.use_all2all_kernels:
         raise NotImplementedError(
@@ -175,7 +311,7 @@ def _validate_weight_layout(layer: RoutedExperts) -> None:
 
 
 class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
-    """Qwen3.6 ModelOpt W4A16_NVFP4 experts on native TurboMind SM70."""
+    """ModelOpt NVFP4 experts with FP16 activations on native SM70."""
 
     def __init__(
         self,
@@ -183,10 +319,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         moe_config: FusedMoEConfig,
     ) -> None:
         FusedMoEMethodBase.__init__(self, moe_config)
-        if quant_config.quant_method != "W4A16_NVFP4":
+        if quant_config.quant_method not in {"NVFP4", "W4A16_NVFP4"}:
             raise NotImplementedError(
-                "SM70 TurboMind ModelOpt NVFP4 MoE currently requires "
-                "W4A16_NVFP4 checkpoint weights."
+                "SM70 TurboMind ModelOpt NVFP4 MoE requires NVFP4-family "
+                f"checkpoint weights, got {quant_config.quant_method}."
             )
         self.quant_config = quant_config
         self.use_a16 = True
@@ -213,15 +349,48 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "awq_moe_build_strided_ptrs",
         )
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
+        ):
+            missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        indexed_prefill_ops = {
+            "nvfp4_moe_indexed_dense_stage_sm70_out": hasattr(
+                torch.ops._C, "nvfp4_moe_indexed_dense_stage_sm70_out"
+            ),
+            "moe_permute_metadata_with_scratch": hasattr(
+                torch.ops._moe_C, "moe_permute_metadata_with_scratch"
+            ),
+        }
+        indexed_prefill_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL
+        )
+        indexed_prefill_available = all(indexed_prefill_ops.values())
+        indexed_prefill_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL" in os.environ
+        )
+        if (
+            indexed_prefill_requested
+            and not indexed_prefill_available
+            and indexed_prefill_explicit
+        ):
+            missing.extend(
+                name for name, available in indexed_prefill_ops.items() if not available
+            )
+        elif indexed_prefill_requested and not indexed_prefill_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 indexed-A prefill route is not "
+                "present in the loaded extension; falling back to the "
+                "materialized-input route. Explicitly setting "
+                "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL=1 fails closed."
+            )
         if missing:
             raise RuntimeError(
-                "Qwen3.6 NVFP4 MoE on SM70 requires the TurboMind extension "
+                "SM70 NVFP4 MoE requires the TurboMind extension "
                 "with " + ", ".join(missing) + "."
             )
         if not hasattr(torch.ops._moe_C, "moe_permute_with_scratch"):
-            raise RuntimeError(
-                "Qwen3.6 NVFP4 MoE on SM70 requires graph-safe MoE permute ops."
-            )
+            raise RuntimeError("SM70 NVFP4 MoE requires graph-safe MoE permute ops.")
         if self.moe.has_bias:
             raise NotImplementedError("SM70 NVFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
@@ -246,6 +415,40 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_experts = int(layer.local_num_experts)
         hidden = int(layer.moe_config.hidden_dim)
         intermediate = int(layer.moe_config.intermediate_size_per_partition)
+        fused_swiglu_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+            and int(layer.moe_config.tp_size) == 4
+            and num_experts == 512
+            and hidden == 2560
+            and intermediate == 160
+            and int(layer.moe_config.experts_per_token) == 10
+            and layer.swiglu_limit is None
+        )
+        fused_swiglu_available = hasattr(
+            torch.ops._C, "nvfp4_moe_indexed_fused_swiglu_sm70_out"
+        )
+        fused_swiglu_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL" in os.environ
+        )
+        if (
+            fused_swiglu_requested
+            and not fused_swiglu_available
+            and fused_swiglu_explicit
+        ):
+            raise RuntimeError(
+                "SM70 Qwen3.8 fused-SwiGLU prefill requires the TurboMind "
+                "extension with nvfp4_moe_indexed_fused_swiglu_sm70_out."
+            )
+        if fused_swiglu_requested and not fused_swiglu_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 fused-SwiGLU prefill op is absent "
+                "from the loaded extension; retaining the standalone "
+                "activation route. Explicit opt-in fails closed."
+            )
+        fused_swiglu_prefill = bool(fused_swiglu_requested and fused_swiglu_available)
+        fast_prefill = bool(
+            fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
+        )
 
         w13_tm_weights: list[torch.Tensor] = []
         w13_tm_scales: list[torch.Tensor] = []
@@ -263,6 +466,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 w13_packed,
                 w13_scales.half().t().contiguous(),
                 NVFP4_GROUP_SIZE,
+                interleave_gated_silu=fused_swiglu_prefill,
             )
             w13_tm_weights.append(prepared_w13[0])
             w13_tm_scales.append(prepared_w13[1])
@@ -307,6 +511,39 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             w2_q_ld,
             num_experts,
         )
+        if fast_prefill:
+            # TurboMind packs this exact N320 weight as five contiguous N64
+            # tiles per expert. The N256/N64 views therefore partition the
+            # existing allocation without copying it. Scales remain a strided
+            # N320 view, so both subprojections retain the original q_ld.
+            w13_flat = layer.w13_tm_weight.view(num_experts, -1)
+            head_words = hidden * 256 // 8
+            w13_head_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+                w13_flat[:, :head_words],
+                layer.w13_tm_scales[:, :, :256],
+                w13_k_ld,
+                w13_q_ld,
+                num_experts,
+            )
+            w13_tail_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+                w13_flat[:, head_words:],
+                layer.w13_tm_scales[:, :, 256:],
+                w13_k_ld,
+                w13_q_ld,
+                num_experts,
+            )
+            layer.w13_head_strided_ptrs_w = Parameter(
+                w13_head_ptrs[0], requires_grad=False
+            )
+            layer.w13_head_strided_ptrs_s = Parameter(
+                w13_head_ptrs[1], requires_grad=False
+            )
+            layer.w13_tail_strided_ptrs_w = Parameter(
+                w13_tail_ptrs[0], requires_grad=False
+            )
+            layer.w13_tail_strided_ptrs_s = Parameter(
+                w13_tail_ptrs[1], requires_grad=False
+            )
         layer.w13_strided_ptrs_w = Parameter(w13_ptrs[0], requires_grad=False)
         layer.w13_strided_ptrs_s = Parameter(w13_ptrs[1], requires_grad=False)
         layer.w2_strided_ptrs_w = Parameter(w2_ptrs[0], requires_grad=False)
@@ -316,11 +553,17 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_num_experts = num_experts
         layer.sm70_nvfp4_hidden_size = hidden
         layer.sm70_nvfp4_intermediate_size = intermediate
+        layer.sm70_nvfp4_top_k = int(layer.moe_config.experts_per_token)
         layer.sm70_nvfp4_w13_k_dim = hidden
         layer.sm70_nvfp4_w13_n_dim = 2 * intermediate
         layer.sm70_nvfp4_w2_k_dim = intermediate
         layer.sm70_nvfp4_w2_n_dim = hidden
         layer.sm70_nvfp4_group_size = NVFP4_GROUP_SIZE
+        layer.sm70_nvfp4_qwen38_indexed_prefill = bool(
+            indexed_prefill_requested and indexed_prefill_available
+        )
+        layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
+        layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_tokens = _COMPACT_GROUPED_MAX_TOKENS
         self._allocate_graph_safe_decode_buffers(layer)
@@ -334,17 +577,31 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer.w2_weight_scale_2
         del layer.w2_input_scale
         logger.info_once(
-            "SM70 ModelOpt NVFP4 TurboMind MoE path enabled for "
-            "Qwen3.6-35B-A3B (local_experts=%d, graph_safe_decode=B1-B%d, "
-            "compact_grouped_decode=B1-B%d).",
+            "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
+            "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
+            "graph_safe_decode=B1-B%d, compact_grouped_decode=B1-B%d).",
+            hidden,
+            intermediate,
             num_experts,
+            layer.sm70_nvfp4_top_k,
             _GRAPH_SAFE_MAX_TOKENS,
             _COMPACT_GROUPED_MAX_TOKENS,
         )
+        if fused_swiglu_prefill:
+            logger.info_once(
+                "SM70 Qwen3.8 indexed-A fused-SwiGLU prefill candidate "
+                "enabled (interleaved W13, exact FP16 epilogue arithmetic)."
+            )
+        if fast_prefill:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 fast grouped prefill enabled "
+                "(zero-copy W13 N256+N64, cached-B W2)."
+            )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
-        max_slots = _GRAPH_SAFE_MAX_TOKENS * _QWEN36_TOP_K
+        top_k = int(layer.sm70_nvfp4_top_k)
+        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
@@ -354,6 +611,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer._nvfp4_sm70_permuted_input = torch.empty(
             max_slots, hidden, dtype=torch.float16, device=device
+        )
+        layer._nvfp4_sm70_input_row_indices = torch.empty(
+            max_slots, dtype=torch.int32, device=device
         )
         layer._nvfp4_sm70_gate_up = torch.empty(
             max_slots, 2 * intermediate, dtype=torch.float16, device=device
@@ -372,19 +632,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer._nvfp4_sm70_inv_permuted_idx = torch.empty(
             _GRAPH_SAFE_MAX_TOKENS,
-            _QWEN36_TOP_K,
+            top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_topk_ids = torch.empty(
             _GRAPH_SAFE_MAX_TOKENS,
-            _QWEN36_TOP_K,
+            top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
-        ).view(_GRAPH_SAFE_MAX_TOKENS, _QWEN36_TOP_K)
+        ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
         layer._nvfp4_sm70_permuted_idx = torch.empty(
             max_slots, dtype=torch.int32, device=device
         )
@@ -406,7 +666,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer._nvfp4_sm70_dense_expert_ids = torch.arange(
             experts, dtype=torch.int32, device=device
         )
-        layer._nvfp4_sm70_compact_offsets = torch.empty(
+        layer._nvfp4_sm70_compact_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
         layer._nvfp4_sm70_active_expert_ids = torch.empty(
@@ -417,10 +677,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     def _persistent_buffers(
         layer: RoutedExperts, num_tokens: int
     ) -> dict[str, torch.Tensor]:
-        slots = num_tokens * _QWEN36_TOP_K
+        slots = num_tokens * int(layer.sm70_nvfp4_top_k)
         return {
             "output": layer._nvfp4_sm70_output[:num_tokens],
             "permuted_input": layer._nvfp4_sm70_permuted_input[:slots],
+            "input_row_indices": layer._nvfp4_sm70_input_row_indices[:slots],
             "gate_up": layer._nvfp4_sm70_gate_up[:slots],
             "intermediate": layer._nvfp4_sm70_intermediate[:slots],
             "sorted_output": layer._nvfp4_sm70_sorted_output[:slots],
@@ -443,10 +704,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
     @staticmethod
     def _eager_buffers(
-        layer: RoutedExperts, num_tokens: int
+        layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
         device = layer.w13_tm_weight.device
-        slots = num_tokens * _QWEN36_TOP_K
+        top_k = int(layer.sm70_nvfp4_top_k)
+        slots = num_tokens * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
@@ -457,8 +719,15 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "output": torch.empty(
                 num_tokens, hidden, dtype=torch.float16, device=device
             ),
-            "permuted_input": torch.empty(
-                slots, hidden, dtype=torch.float16, device=device
+            "permuted_input": (
+                torch.empty(0, hidden, dtype=torch.float16, device=device)
+                if indexed_w13
+                else torch.empty(slots, hidden, dtype=torch.float16, device=device)
+            ),
+            "input_row_indices": (
+                torch.empty(slots, dtype=torch.int32, device=device)
+                if indexed_w13
+                else torch.empty(0, dtype=torch.int32, device=device)
             ),
             "gate_up": torch.empty(
                 slots, 2 * intermediate, dtype=torch.float16, device=device
@@ -476,14 +745,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 experts + 1, dtype=torch.int64, device=device
             ),
             "inv_permuted_idx": torch.empty(
-                num_tokens, _QWEN36_TOP_K, dtype=torch.int32, device=device
+                num_tokens, top_k, dtype=torch.int32, device=device
             ),
             "topk_ids": torch.empty(
-                num_tokens, _QWEN36_TOP_K, dtype=torch.int32, device=device
+                num_tokens, top_k, dtype=torch.int32, device=device
             ),
             "token_expert_indices": torch.arange(
                 slots, dtype=torch.int32, device=device
-            ).view(num_tokens, _QWEN36_TOP_K),
+            ).view(num_tokens, top_k),
             "permuted_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "sort_workspace": torch.empty(
                 workspace_size, dtype=torch.int8, device=device
@@ -492,21 +761,34 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "sorted_row_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "topk_ids_for_sort": torch.empty(slots, dtype=torch.int32, device=device),
             "dense_expert_ids": layer._nvfp4_sm70_dense_expert_ids,
-            "compact_offsets": torch.empty(slots + 1, dtype=torch.int32, device=device),
+            "compact_offsets": torch.arange(
+                slots + 1, dtype=torch.int32, device=device
+            ),
             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
         }
 
     def _get_buffers(
-        self, layer: RoutedExperts, num_tokens: int
+        self, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
         if 0 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS:
             return self._persistent_buffers(layer, num_tokens)
-        return self._eager_buffers(layer, num_tokens)
+        return self._eager_buffers(layer, num_tokens, indexed_w13)
 
     @staticmethod
     def _apply_swiglu(
-        layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
+        layer: RoutedExperts,
+        out: torch.Tensor,
+        gate_up: torch.Tensor,
+        *,
+        interleaved: bool = False,
     ) -> None:
+        if interleaved:
+            if layer.swiglu_limit is not None:
+                raise RuntimeError(
+                    "Interleaved SM70 NVFP4 SwiGLU does not support clamping."
+                )
+            torch.ops._C.silu_and_mul_interleaved(out, gate_up)
+            return
         if layer.swiglu_limit is None:
             torch.ops._C.silu_and_mul(out, gate_up)
         else:
@@ -528,13 +810,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise TypeError("SM70 NVFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
             raise RuntimeError("SM70 NVFP4 MoE dispatch is restricted to CUDA SM70.")
-        if x.shape[1] != _QWEN36_HIDDEN_SIZE:
+        hidden = int(layer.sm70_nvfp4_hidden_size)
+        top_k = int(layer.sm70_nvfp4_top_k)
+        if x.shape[1] != hidden:
             raise ValueError(
                 "SM70 NVFP4 MoE activation hidden size mismatch: expected "
-                f"{_QWEN36_HIDDEN_SIZE}, got {x.shape[1]}."
+                f"{hidden}, got {x.shape[1]}."
             )
-        if tuple(topk_ids.shape) != (x.shape[0], _QWEN36_TOP_K):
-            raise ValueError("SM70 NVFP4 MoE requires top-k IDs with shape [M, 8].")
+        if tuple(topk_ids.shape) != (x.shape[0], top_k):
+            raise ValueError(
+                "SM70 NVFP4 MoE top-k ID shape mismatch: expected "
+                f"{(x.shape[0], top_k)}, got {tuple(topk_ids.shape)}."
+            )
         if tuple(topk_weights.shape) != tuple(topk_ids.shape):
             raise ValueError("SM70 NVFP4 MoE top-k weights and IDs must share shape.")
         if topk_weights.dtype != torch.float32:
@@ -542,34 +829,109 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         num_tokens = x.shape[0]
         if num_tokens == 0:
-            return x.new_empty((0, _QWEN36_HIDDEN_SIZE))
-        buffers = self._get_buffers(layer, num_tokens)
-        output = buffers["output"]
-        output.zero_()
-        slots = num_tokens * _QWEN36_TOP_K
-        topk_ids_i32 = buffers["topk_ids"]
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
-        buffers["permuted_idx"].fill_(slots)
-        torch.ops._moe_C.moe_permute_with_scratch(
-            x,
-            topk_ids_i32,
-            buffers["token_expert_indices"],
-            layer.expert_map,
-            layer.global_num_experts,
-            layer.local_num_experts,
-            _QWEN36_TOP_K,
-            buffers["permuted_input"],
-            buffers["expert_offsets64"],
-            buffers["inv_permuted_idx"],
-            buffers["permuted_idx"],
-            buffers["sort_workspace"],
-            buffers["permuted_experts_id"],
-            buffers["sorted_row_idx"],
-            buffers["topk_ids_for_sort"],
+            return x.new_empty((0, hidden))
+        indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
+        interleaved_w13 = bool(
+            getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)
         )
-        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+        fused_indexed_w13 = indexed_w13 and interleaved_w13
+        split_fused_indexed_w13 = fused_indexed_w13 and bool(
+            getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)
+        )
+        buffers = self._get_buffers(layer, num_tokens, indexed_w13)
+        output = buffers["output"]
+        slots = num_tokens * top_k
+        direct_single_token = num_tokens == 1
+        if _use_qwen38_qpn_m1_decode(layer, x, topk_ids):
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 direct QPN-M1 expert path enabled "
+                "(TP4, E512/K10, W13 split8, W2 split1)."
+            )
+            route_ids = topk_ids.view(-1)
+            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+                buffers["gate_up"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                route_ids,
+                True,
+                _QWEN38_QPN_M1_W13_SPLIT_K,
+            )
+            self._apply_swiglu(
+                layer,
+                buffers["intermediate"],
+                buffers["gate_up"],
+                interleaved=interleaved_w13,
+            )
+            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                route_ids,
+                False,
+                _QWEN38_QPN_M1_W2_SPLIT_K,
+            )
+            _single_token_weighted_reduce(
+                buffers["sorted_output"], topk_weights, output
+            )
+            return output
+        if direct_single_token:
+            _prepare_single_token_slots(
+                x,
+                topk_ids,
+                buffers["permuted_input"],
+                buffers["active_expert_ids"],
+            )
+            stage_offsets = buffers["compact_offsets"]
+            stage_expert_ids = buffers["active_expert_ids"]
+            stage_experts = top_k
+        else:
+            output.zero_()
+            topk_ids_i32 = buffers["topk_ids"]
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
+            buffers["permuted_idx"].fill_(slots)
+            if indexed_w13:
+                torch.ops._moe_C.moe_permute_metadata_with_scratch(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    layer.expert_map,
+                    layer.global_num_experts,
+                    layer.local_num_experts,
+                    top_k,
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["input_row_indices"],
+                    buffers["sort_workspace"],
+                    buffers["permuted_experts_id"],
+                    buffers["sorted_row_idx"],
+                    buffers["topk_ids_for_sort"],
+                )
+            else:
+                torch.ops._moe_C.moe_permute_with_scratch(
+                    x,
+                    topk_ids_i32,
+                    buffers["token_expert_indices"],
+                    layer.expert_map,
+                    layer.global_num_experts,
+                    layer.local_num_experts,
+                    top_k,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["permuted_idx"],
+                    buffers["sort_workspace"],
+                    buffers["permuted_experts_id"],
+                    buffers["sorted_row_idx"],
+                    buffers["topk_ids_for_sort"],
+                )
+            buffers["expert_offsets"].copy_(
+                buffers["expert_offsets64"], non_blocking=True
+            )
 
-        if num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
+        if not direct_single_token and num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
             _prepare_compact_slot_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],
@@ -578,24 +940,99 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
-        else:
+        elif not direct_single_token:
             stage_offsets = buffers["expert_offsets"]
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
 
-        sm70_ops.nvfp4_moe_dense_stage_sm70_out(
-            buffers["gate_up"],
-            buffers["permuted_input"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w13_strided_ptrs_w,
-            layer.w13_strided_ptrs_s,
-            stage_experts,
-            layer.sm70_nvfp4_w13_k_dim,
-            layer.sm70_nvfp4_w13_n_dim,
-            layer.sm70_nvfp4_group_size,
-        )
-        self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+        if split_fused_indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU split-W13 "
+                "prefill route enabled (N256+N64)."
+            )
+            for intermediate, ptrs_w, ptrs_s, n in (
+                (
+                    buffers["intermediate"][:, :128],
+                    layer.w13_head_strided_ptrs_w,
+                    layer.w13_head_strided_ptrs_s,
+                    256,
+                ),
+                (
+                    buffers["intermediate"][:, 128:],
+                    layer.w13_tail_strided_ptrs_w,
+                    layer.w13_tail_strided_ptrs_s,
+                    64,
+                ),
+            ):
+                sm70_ops.nvfp4_moe_indexed_fused_swiglu_sm70_out(
+                    intermediate,
+                    x,
+                    buffers["input_row_indices"],
+                    stage_offsets,
+                    stage_expert_ids,
+                    ptrs_w,
+                    ptrs_s,
+                    stage_experts,
+                    layer.sm70_nvfp4_w13_k_dim,
+                    n,
+                    layer.sm70_nvfp4_group_size,
+                )
+        elif fused_indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU W13 prefill "
+                "candidate enabled."
+            )
+            sm70_ops.nvfp4_moe_indexed_fused_swiglu_sm70_out(
+                buffers["intermediate"],
+                x,
+                buffers["input_row_indices"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        elif indexed_w13:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 indexed-A W13 prefill route enabled "
+                "(TP4, E512/K10, materialized input rows skipped)."
+            )
+            sm70_ops.nvfp4_moe_indexed_dense_stage_sm70_out(
+                buffers["gate_up"],
+                x,
+                buffers["input_row_indices"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        else:
+            sm70_ops.nvfp4_moe_dense_stage_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        if not fused_indexed_w13:
+            self._apply_swiglu(
+                layer,
+                buffers["intermediate"],
+                buffers["gate_up"],
+                interleaved=interleaved_w13,
+            )
         sm70_ops.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
             buffers["intermediate"],
@@ -608,14 +1045,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer.sm70_nvfp4_w2_n_dim,
             layer.sm70_nvfp4_group_size,
         )
-        torch.ops._moe_C.moe_unpermute(
-            buffers["sorted_output"],
-            topk_weights,
-            buffers["inv_permuted_idx"],
-            buffers["expert_offsets64"],
-            _QWEN36_TOP_K,
-            output,
-        )
+        if direct_single_token:
+            _single_token_weighted_reduce(
+                buffers["sorted_output"], topk_weights, output
+            )
+        else:
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                buffers["expert_offsets64"],
+                top_k,
+                output,
+            )
         return output
 
     def apply_monolithic(
