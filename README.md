@@ -4,12 +4,20 @@
 > This fork targets a **2× Tesla V100-SXM2-16GB, 32 GB host memory** deployment (no NVLink, TP=2, PCIe x16/x8), with a focus on incremental performance and memory optimizations on this hardware.
 >
 > ## Changes relative to upstream
-> 1. **SM70 TurboQuant long-prefix continuation prefill → chunked online-softmax** (`vllm/v1/attention/backends/turboquant_attn.py`)
->    - Problem: On V100 (SM70), `scaled_dot_product_attention` for GQA (`Hk < Hq`) only has the PyTorch math backend, whose intermediates are O(q_len × seq_len); long continuation prefill runs out of memory.
->    - Fix: A flash-style chunked online-softmax (block 1024, GQA head expansion, custom causal mask `j <= cached_len + p`), reducing intermediate memory to O(block) independent of context length. Validated against the math SDPA (max_err ≈ 1e-6).
-> 2. (Existing in this fork) KV offload connector boundary clamp, per-group mamba offload granularity, single-instance external-prefix-cache keep-first, etc. (see git log).
+> This fork adds (on top of upstream's 1.5.0 release) the following changes:
+>
+> 1. **KV / cache CPU-offload optimization** (target: dual V100 16G + 32 GB RAM):
+>    - **Real external-prefix-cache hits**: the CPU offload pool now uses a keep-first policy (retains block 0 for the system prompt), so repeated / long sessions actually reuse the prefix instead of re-prefilling.
+>    - **Per-group mamba KV offload granularity**: mamba states are offloaded to CPU per group, letting the CPU pool cover ~4× more prefix tokens.
+>    - **Boundary fix**: clamp the GPU block index in the KV offload connector (mamba-align) to avoid IndexError on partially offloaded blocks.
+>    - Files: `vllm/v1/kv_offload/*`, `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`, `vllm/config/vllm.py`.
+> 2. **SM70 TurboQuant long-prefix continuation prefill → chunked online-softmax** (`vllm/v1/attention/backends/turboquant_attn.py`):
+>    - Problem: on V100 (SM70), `scaled_dot_product_attention` for GQA (`Hk < Hq`) only has the PyTorch math backend (O(q_len × seq_len)), which OOMs on long continuation prefill.
+>    - Fix: a flash-style chunked online-softmax (block 1024, GQA head expansion, custom causal mask `j <= cached_len + p`), reducing intermediates to O(block) independent of context length. Validated against the math SDPA (max_err ≈ 1e-6).
+> 3. **Deployment**: `scripts/launch-vllm.sh` pre-configured for this 2×V100 / 32 GB host (enables the OffloadingConnector external-hit path, SM70/TurboQuant settings).
 >
 > Everything else remains as upstream.
+>
 <!-- markdownlint-disable MD041 -->
 
 <p align="center">
