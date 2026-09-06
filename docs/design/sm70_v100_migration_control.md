@@ -46259,7 +46259,20 @@ state/prefix and performance goals continue after implementation integration.
   the screened prototype. Their FP16 disagreements fall from 1872 to 1640,
   but 45/200 groups worsen; do not claim uniform per-input L2 improvement.
   Four 100-ABBA q5 speed ratios are within 0.08% of one.
-- Model acceptance for this new state is pending. A startup whose driver
-  hash changed was aborted and archived before acceptance. The replacement
-  freezes the driver and checks 128K before permitting 261888+256 validation
-  in the same model process. Keep the route default-off and PR524 Draft.
+- The frozen-driver model run passes the 128K 256-token bracket, then fails
+  261888+256 at one-based token 126: both FP64-attention references choose
+  `speed`, candidate chooses `benchmark`. References are stable, four TP
+  ranks hit the route, and all captured attention outputs are finite. A
+  reference top-two tie is not a waiver. Result SHA256 is
+  `a94d356ce29273fba3a202428ea77c737e7f51bd5152be1885d3ed46b6fb700e`.
+- The length-boundary broadcast wait eventually recovers; all eight model
+  requests complete. A q5-only summarizer assertion failed on valid late q3
+  rows; its width-aware replacement preserves strict token/finite checks.
+  Retain both the original summary failure and the earlier aborted startup
+  with a changed driver hash. Neither is mislabeled as a model pass.
+- A new counterfactual tests main's existing FP32 LM-head flag identically
+  in reference and candidate; the failing cohort used FP16 logits and SSM
+  state. The same-shape synthetic head screen improves arithmetic precision
+  with unchanged operator latency, but does not establish the cause of token
+  126 or approve model speed/quality. Avoid rerunning the same failed FP16
+  cohort without a new hypothesis. Keep the route default-off and PR524 Draft.

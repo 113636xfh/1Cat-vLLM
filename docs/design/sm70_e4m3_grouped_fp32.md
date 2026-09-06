@@ -2,11 +2,11 @@
 
 ## Scope and admission
 
-**Do not merge for production or enable by default.** The historical R6
-token-77 failure remains recorded. The main-synchronized revision-2 build
-passes its refreshed 128K bracket, but that does not establish the cause of
-the earlier difference or approve the new revision-3 state representation.
-Human review and complete model quality/performance admission remain pending.
+**Do not merge for production or enable by default.** Revision 3 passes its
+128K bracket but fails the 261888+256 bracket at output token 126 while both
+FP64-attention reference sequences agree. The historical R6 token-77 failure
+also remains recorded. Human review and complete model quality/performance
+admission remain pending; operator improvements do not waive either gate.
 
 This change integrates the small-query part of a private E4M3 migration into
 `onecat/main`, based on `755baae1d075ee04fa9096b23fc0225b23589a86`.
@@ -448,10 +448,37 @@ are 0.99928/1.00000/1.00041/1.00007. The partial kernel retains 128 registers
 per thread and zero reported local memory; combine uses 32 registers and
 656 bytes of static shared memory. This is not an end-to-end speed claim.
 
-The new 128K/261888+256 model brackets remain pending. An initial startup was
-aborted because a driver edit raced with its recorded hash; it produced no
-accepted model result and its logs are retained. The replacement uses a
-read-only, hash-checked driver and does not repeat the already completed
-operator checks. It must pass the 128K reference/native/reference gate before
-starting the boundary-256K cases. No sampling threshold or token criterion
-is relaxed.
+### Revision-3 model gate: 128K pass, boundary-256K fail
+
+The frozen-driver run completes both brackets without relaxing the sampling
+or token criterion. At 128K, candidate and both references agree on all 256
+tokens. At 261888+256, the reference sequences agree, but the candidate first
+differs at one-based token 126: references choose `speed`, candidate chooses
+`benchmark`. The reference logprobs of these two alternatives tie at
+-1.2728908062; the candidate favors `benchmark` by 0.046875. This near-tie
+does not waive the deterministic gate, nor is it proof of broad semantic
+degradation. Raw result SHA256:
+`a94d356ce29273fba3a202428ea77c737e7f51bd5152be1885d3ed46b6fb700e`.
+
+All four TP ranks hit the native route, and rank-zero records cover all 16
+full-attention layers with finite outputs. The reference computes admitted
+small-Q attention in PyTorch FP64 on identical E4M3 KV and returns FP16;
+the rest of the model is not FP64. This cohort retains FP16 SSM state and
+FP16 LM-head output. Instrumented run times are not production performance.
+
+Boundary execution emits repeated shared-memory broadcast wait warnings,
+then recovers and completes. Late q3 rows appear as speculative drafting
+approaches the model length limit; they occur after the first divergence.
+The original summarizer incorrectly required only q5 and failed after model
+completion. A preserved copy and the corrected q2–8-aware summary distinguish
+this reporting error from the actual token failure; token/finite checks are
+unchanged. The earlier startup with a mismatched driver hash remains aborted
+and is not included in these results.
+
+The next counterfactual enables main's existing opt-in FP32 LM-head output
+identically for both references and candidate. A synthetic local TP4 head
+screen (62080 by 5120, rows 1/5, 100 ABBA samples) reduces selected-column
+relative-L2 from about 2.0e-4 to 2.5e-6 versus FP64, with essentially unchanged
+projection latency. It is not real token-126 replay or model admission.
+Keep the failed FP16-head cohort; a changed output precision is a new
+explicit contract, not a retrospective pass of the old one.
