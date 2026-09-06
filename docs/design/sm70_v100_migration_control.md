@@ -46300,3 +46300,31 @@ state/prefix and performance goals continue after implementation integration.
   revision-3 DSO bitwise. Four q5 100-ABBA speed ratios are
   1.01834/1.00065/1.00036/1.00000. Model admission and human review remain
   outstanding; keep PR524 Draft and production defaults unchanged.
+
+## 2026-09-07 final FP32-SSM counterfactual remains unadmitted
+
+- Guarded-Q source `0c34be5d60` / DSO `c33a8444...b56aaf`, actual FP32 SSM
+  (48 GDN layers on all four ranks), FP16 conv, FP32 logits, page1616:
+  128K reference/native/reference matches all 256 tokens, but 261888+256
+  first differs at token 26 (`-level` vs `-`). Both references are stable.
+  Raw result SHA256:
+  `452a5a1845cae49b8aa26470a2fffacc4e8009a715ebb7625ec3b0e990c3a722`.
+- All captured attention outputs are finite and near the final FP16 rounding
+  floor. This does not waive the deterministic gate. Both prose outputs are
+  coherent; do not portray the local counterexample as universal semantic
+  degradation or claim that an earlier/later divergence ranks configurations.
+- The FP32-SSM configuration does not solve all failures. Do not repeat this
+  unchanged long cohort; next capture/replay the first-divergence prefix to
+  separate local arithmetic error from downstream/MTP-state propagation.
+- Two private dtype-recording setup failures preceded the successful run:
+  a Dynamo graph-break hook and a subclass filter mistake. Both occurred
+  before accepted generation; keep their logs separate from numerical gates.
+- The boundary wait coincides with on-demand compilation of this worktree's
+  strided FlashQLA GDN module, followed by recovery. That dependency uses
+  CUDA 12.0.140, with DSO SHA256
+  `89337e7055cc8ba8f9bd972341f43010ce23a5a7cb991a84eb48e60bc5bbfaf9`.
+  Prebuild/warm it before production timing. Do not label this diagnostic
+  elapsed time as a prefill/decode benchmark or mix its build provenance
+  with the CUDA-12.8 Flash-V100 extension.
+- Model admission and human review remain outstanding. PR524 stays Draft;
+  no auto-merge, production default change, or private long-prefill promotion.

@@ -2,11 +2,12 @@
 
 ## Scope and admission
 
-**Do not merge for production or enable by default.** Revision 3 passes its
-128K bracket but fails the 261888+256 bracket at output token 126 while both
-FP64-attention reference sequences agree. The historical R6 token-77 failure
-also remains recorded. Human review and complete model quality/performance
-admission remain pending; operator improvements do not waive either gate.
+**Do not merge for production or enable by default.** The latest guarded-Q
+build with FP32 SSM and FP32 logits passes 128K but fails the 261888+256
+bracket at output token 26 while both FP64-attention references agree.
+Earlier FP16-SSM failures at tokens 126/191 and historical R6 token 77 remain
+recorded. Human review and complete model quality/performance admission
+remain pending; operator improvements do not waive either gate.
 
 This change integrates the small-query part of a private E4M3 migration into
 `onecat/main`, based on `755baae1d075ee04fa9096b23fc0225b23589a86`.
@@ -522,3 +523,51 @@ The four 100-ABBA q5 speed ratios are 1.01834/1.00065/1.00036/1.00000;
 the short-point difference is not a new arithmetic speedup claim. Previous
 142 policy/38 planner/69 broader memcheck results retain their earlier
 artifact attribution. No model pass is transferred to this build.
+
+### FP32 SSM plus FP32 logits: boundary-256K gate still fails
+
+The completed counterfactual uses source `0c34be5d60` and the guarded-Q DSO
+above. All four ranks confirm 48 allocated GDN SSM caches in FP32, FP16
+convolution state, FP32 logits, and page size 1616. Both context brackets
+complete with stable references. At 128K, all three 256-token sequences
+match. At 261888+256, candidate token 26 is `-level`, versus `-` in the
+references: the prose continues as "low-level kernel changes" rather than
+"low-precision arithmetic". Both are coherent; this is a failed strict token
+gate, not proof of general semantic collapse. The reference top-two margin
+is 0.00760078; candidate reverses it by 0.00913811. Raw result SHA256:
+`452a5a1845cae49b8aa26470a2fffacc4e8009a715ebb7625ec3b0e990c3a722`.
+
+| SSM state | LM-head output | Page | 128K | 261888+256 |
+|---|---|---:|---|---|
+| FP16 | FP16 | 848 | pass | fail, token 126 |
+| FP16 | FP32 | 848 | fail, token 191 | not run: 128K gate stopped expansion |
+| FP32 | FP32 | 1616 | pass | fail, token 26 |
+
+These are different arithmetic/cache-layout contracts; token positions do
+not rank their overall quality. The old failures are not retrospectively
+removed, and FP32 SSM alone is not established as their cause or cure.
+The latest candidate has finite rank-zero outputs across all 16 attention
+layers at both lengths. Its worst L2-to-FP16-rounding-floor ratios are
+1.00002884 at 128K and 1.00001732 at boundary-256K. Very small attention error
+still does not guarantee a stable final token. A targeted replay around the
+first-divergence prefix is the next localization step; do not merely repeat
+this unchanged full-model cohort or relax its token criterion.
+
+Two preceding FP32-SSM diagnostic startups produced no accepted quality
+results: a private dtype hook entered Dynamo with a non-Tensor capture query,
+then an exact-class-name filter omitted the Qwen3.5 GDN subclass. Their logs
+are retained. The accepted recording setup inspects real cache metadata
+outside compiled forward and recognizes the inheritance chain; all dtype,
+layer-count and token assertions remain in place.
+
+At the boundary, the first reference waits while the strided GDN extension
+is compiled on demand; it resumes after compilation, then candidate and final
+reference complete. The observed command builds this worktree's
+`flash_qla_sm70_gdn_strided` with system CUDA 12.0.140, independently of the
+CUDA-12.8 Flash-V100 build. Strided GDN DSO SHA256:
+`89337e7055cc8ba8f9bd972341f43010ce23a5a7cb991a84eb48e60bc5bbfaf9`.
+Its main CUDA source hash is
+`fd6389cef9f1b38df7e122e582221d74d9ae1fba377ac3bec0da047fd3d30af8`.
+This supports a cold-build explanation of this run's tail wait, not an
+attention deadlock. Prebuild/warm this dependency before performance work;
+instrumented elapsed times remain excluded from production speed claims.
