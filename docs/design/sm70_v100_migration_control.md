@@ -46242,3 +46242,24 @@ state/prefix and performance goals continue after implementation integration.
   same-process model bracket is still running; the prior token-77 failure
   remains a separate blocker. Do not promote the route, change defaults, or
   transfer operator passes to model admission. See the linked E4M3 report.
+
+## 2026-09-07 E4M3 revision-3 state precision repair
+
+- Main7 revision 2 completed its refreshed 128K bracket: candidate and both
+  stable references match all 256 tokens, with native route hits on all four
+  TP ranks. This does not establish why the prior cohort differed at token
+  77; keep the old failure and the source/binary boundaries in the report.
+- Revision 3 (`beb172ebd0`) retains max/sum and unnormalized FP32 PV until
+  the final combine. Version-gate the changed workspace so old extensions
+  cannot consume the new layout. FP16-midpoint tests expose a round-up error
+  in the old normalized/LSE path at 128K/256K; the new state returns the
+  correct ties-to-even value without introducing production FP64.
+- Fresh DSO `8880b040...a9d49`: 102 kernel, 142 policy, 38 planner, and 69
+  memcheck passes with zero memory errors. All 200 real-input outputs match
+  the screened prototype. Their FP16 disagreements fall from 1872 to 1640,
+  but 45/200 groups worsen; do not claim uniform per-input L2 improvement.
+  Four 100-ABBA q5 speed ratios are within 0.08% of one.
+- Model acceptance for this new state is pending. A startup whose driver
+  hash changed was aborted and archived before acceptance. The replacement
+  freezes the driver and checks 128K before permitting 261888+256 validation
+  in the same model process. Keep the route default-off and PR524 Draft.

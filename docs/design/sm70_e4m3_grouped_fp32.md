@@ -437,3 +437,21 @@ unchanged. Prototype DSO:
 result: `cd7ac6efed7068101e30e7a8bd98749089b6177128fa4a790a875bf27f109311`.
 The new representation requires its own integration and model admission;
 the revision-2 model pass is not transferred to it.
+
+The integrated revision-3 source is
+`beb172ebd0278b7faa4118e2e0caf12047aa6cb2`, with extension
+`8880b0405d6d7d212c4a738d45ab441815b6c948ab6e4e8ac5e1b83d754a9d49`.
+It passes 102 kernel, 142 routing, and 38 planner checks; 69 Compute Sanitizer
+cases pass with zero errors. All 200 real-input and five midpoint outputs
+match the screened prototype bitwise. Integrated 100-ABBA q5 speed ratios
+are 0.99928/1.00000/1.00041/1.00007. The partial kernel retains 128 registers
+per thread and zero reported local memory; combine uses 32 registers and
+656 bytes of static shared memory. This is not an end-to-end speed claim.
+
+The new 128K/261888+256 model brackets remain pending. An initial startup was
+aborted because a driver edit raced with its recorded hash; it produced no
+accepted model result and its logs are retained. The replacement uses a
+read-only, hash-checked driver and does not repeat the already completed
+operator checks. It must pass the 128K reference/native/reference gate before
+starting the boundary-256K cases. No sampling threshold or token criterion
+is relaxed.
