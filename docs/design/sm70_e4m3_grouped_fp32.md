@@ -350,3 +350,31 @@ the residual scaling; it does not turn this failing bracket into a pass.
 Accumulation remains FP32. There is no production FP64 path, default-format
 promotion, or transfer of the private 60-TFLOP/s prefill acceptance to this
 small-query implementation.
+
+## Publication sync with current main
+
+The repair commit `52dcdc4d523d8e7331897f073bada070ad468cc1` is followed by a
+non-rewriting merge of main `95205a2d9952813aa7469f63ff65b8f2813c027a`.
+Main's independent sparse-page4 allocation-invariance changes are preserved.
+The fresh CUDA 12.8 extension hash is
+`76aa9a19f197fe805bb97b037f8a7934129ef0752b5c66922246c241a7e97b42`.
+
+The post-sync build passes 89 kernel checks and 138 routing-policy checks.
+All 200 retained real-input small-Q outputs are finite and bitwise identical
+to the archived scaled-residual library. The replay result hash is
+`eb187e7fea4c81e4f01bb5ebb3752c888e583b0d62fc3bd63dec37bf2cde73f9`.
+This is a source-integration regression, not a fresh performance/model gate.
+
+The additional `tests/kernels/test_sm70_qsa_page4_plan.py` run passes 30 native
+planner checks. Eight integration cases fail at import because this isolated
+source worktree lacks `vllm._C`; they do not reach numerical assertions. The
+setup-failure log is retained, and the full 38-case suite is not reported as
+passed. The archived 62-case sanitizer/model results above refer to the
+pre-sync library, not this new binary.
+
+The update remains in Draft PR #524 with the experimental flag off. The
+within-process token-77 failure and missing whole-model/human-review gates
+block merge and default promotion. No installed extension or service is
+replaced. Private FP32 long-prefill v18/v37 still require separate clean-source
+integration and admission; this small-Q patch does not publish those paths
+or replace the older stable 60/61T implementation already in main.

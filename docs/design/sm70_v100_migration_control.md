@@ -45766,47 +45766,6 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
-
-### 2026-09-06: default-off E4M3 grouped FP32 small-query integration
-
-- Base: `755baae1d075ee04fa9096b23fc0225b23589a86` (`onecat/main`).
-  Owned branch: `codex/v100-e4m3-fp32-integration-20260906-050258`.
-- [Design, contract and evidence](sm70_e4m3_grouped_fp32.md): dense single-request
-  q2–8/GQA6/D256, FP32 partial state, explicit device query lengths and graph
-  padding. `VLLM_FLASH_V100_E4M3_GROUPED_FP32` defaults off and checks native
-  capability. E5M2, sparse page4, prefill and B1 defaults are unchanged.
-- Fresh integration extension builds; 39 GPU regression tests pass, 12 new
-  tests pass memcheck with zero errors, and 138 routing-policy tests pass.
-  Private 24-group real-input replay remains below captured scalar L2, but
-  is not bitwise equivalent to the private prototype. No current-main model
-  speed or long-output quality acceptance is claimed.
-- Artifacts: owned worktree `.artifacts/e4m3-fp32/`; source and binary hashes
-  are in the linked report. Private captures and paper drafts stay out of Git.
-  No service was restarted, and all validation GPU processes exited.
-- Keep experimental/default-off pending current-main model gates and human
-  review. Do not count this as completing all E5M2 specializations; the slower
-  native paged SplitKV port remains excluded. PR #517 addresses a different
-  DFlash2 q8/logits/context-pipeline scope and is not replaced by this work.
-
-## 2026-09-06 E4M3 model promotion blocked by a repeated token difference
-
-- See [the grouped FP32 admission update](sm70_e4m3_grouped_fp32.md).
-  Original PR artifact `953924a...959f0`, Qwen3.8-27B-FP8, TP4/MTP4,
-  8K greedy natural-document input, 256 output tokens: dynamic-tuning
-  control--candidate--control was inconclusive because the controls diverged.
-- Under diagnostic-only fixed GEMM dispatch, six control runs agree, but
-  three candidate runs first differ at output token 102. Three same-KV
-  PyTorch FP64 small-Q counterfactual runs reproduce the control's 256 tokens.
-  Finite operator output and lower aggregate L2 do not authorize promotion.
-- Keep the new grouped entry disabled and the FP8 alias unchanged. Do not
-  claim a production speedup from the tune-off diagnostic or its changed
-  output sequence. Long-context acceptance remains pending; fix the local
-  counterexample before repeating broad tests.
-- The E4M3 prefill bridge native/Python conversion entry is added separately
-  as a prerequisite. It has exhaustive encoding/scale/page/graph coverage,
-  but the backend still does not select it. CUDA 12.8 build `c1ce414...b2003`
-  has 70 regression passes, 138 policy passes, and 42 memcheck cases with zero errors;
-  its model gate is not granted. No production service or default changed.
 - The exact down packet screen completed and is rejected. Same-source
   complete-HC control `1.989379 ms`, CUDA down plus separate gather
   `2.072549 ms`, fused down/gather `2.218926 ms`. All intermediate/final
@@ -46000,3 +45959,75 @@ Interpretation:
   code, including a warp-ordering attempt, so the intended lookahead was not
   established. Do not run these as purported prefetch variants or repeat the
   previously rejected ordinary CUDA128 down. No GPU startup for this screen.
+
+### 2026-09-06: default-off E4M3 grouped FP32 small-query integration
+
+- Base: `755baae1d075ee04fa9096b23fc0225b23589a86` (`onecat/main`).
+  Owned branch: `codex/v100-e4m3-fp32-integration-20260906-050258`.
+- [Design, contract and evidence](sm70_e4m3_grouped_fp32.md): dense single-request
+  q2–8/GQA6/D256, FP32 partial state, explicit device query lengths and graph
+  padding. `VLLM_FLASH_V100_E4M3_GROUPED_FP32` defaults off and checks native
+  capability. E5M2, sparse page4, prefill and B1 defaults are unchanged.
+- Fresh integration extension builds; 39 GPU regression tests pass, 12 new
+  tests pass memcheck with zero errors, and 138 routing-policy tests pass.
+  Private 24-group real-input replay remains below captured scalar L2, but
+  is not bitwise equivalent to the private prototype. No current-main model
+  speed or long-output quality acceptance is claimed.
+- Artifacts: owned worktree `.artifacts/e4m3-fp32/`; source and binary hashes
+  are in the linked report. Private captures and paper drafts stay out of Git.
+  No service was restarted, and all validation GPU processes exited.
+- Keep experimental/default-off pending current-main model gates and human
+  review. Do not count this as completing all E5M2 specializations; the slower
+  native paged SplitKV port remains excluded. PR #517 addresses a different
+  DFlash2 q8/logits/context-pipeline scope and is not replaced by this work.
+
+## 2026-09-06 E4M3 model promotion blocked by a repeated token difference
+
+- See [the grouped FP32 admission update](sm70_e4m3_grouped_fp32.md).
+  Original PR artifact `953924a...959f0`, Qwen3.8-27B-FP8, TP4/MTP4,
+  8K greedy natural-document input, 256 output tokens: dynamic-tuning
+  control--candidate--control was inconclusive because the controls diverged.
+- Under diagnostic-only fixed GEMM dispatch, six control runs agree, but
+  three candidate runs first differ at output token 102. Three same-KV
+  PyTorch FP64 small-Q counterfactual runs reproduce the control's 256 tokens.
+  Finite operator output and lower aggregate L2 do not authorize promotion.
+- Keep the new grouped entry disabled and the FP8 alias unchanged. Do not
+  claim a production speedup from the tune-off diagnostic or its changed
+  output sequence. Long-context acceptance remains pending; fix the local
+  counterexample before repeating broad tests.
+- The E4M3 prefill bridge native/Python conversion entry is added separately
+  as a prerequisite. It has exhaustive encoding/scale/page/graph coverage,
+  but the backend still does not select it. CUDA 12.8 build `c1ce414...b2003`
+  has 70 regression passes, 138 policy passes, and 42 memcheck cases with zero errors;
+  its model gate is not granted. No production service or default changed.
+
+## 2026-09-06 E4M3 precision repair publication remains experimental
+
+- Follow-up commit `52dcdc4d52` compensates QK summation and probability
+  residuals, keeps PV Tensor Core accumulation tile-local, carries online state
+  in FP32, and rejects stale extensions without the precision capability.
+  The scaled residual is paired with an exact inverse scale on E4M3-derived V.
+- The tested CUDA 12.8 binary `87ffc1fd...b325cd` passes 89 GPU checks and
+  62 memcheck cases with zero errors. Two negative controls reproduce the
+  previous biased-PV and residual-underflow errors before final FP16 rounding.
+  Actual-input replay reduces FP16 element disagreements from 2092 to 1872
+  across 200 inputs; four q5/page848 100-ABBA endpoint speed ratios are
+  1.0007/1.0000/1.0007/1.0007. These are not token counts or model speed.
+- The same-process 128K FP64-reference/candidate/FP64-reference bracket
+  completes, but the candidate first diverges at token 77 while both
+  references match all 256 tokens. Four TP ranks hit the native path; all
+  captured layer outputs are finite. Keep the failure in the linked report.
+  Near-ties do not waive the deterministic admission gate.
+- Publish this repair in existing Draft PR #524, not as a default promotion.
+  Merge current main `95205a2d99` into the owned branch without force-pushing;
+  preserve main's independent sparse-page4 allocation-invariance fix.
+  Fresh integration DSO `76aa9a19...e97b42` builds and passes 89 kernel plus
+  138 policy checks; all 200 retained small-Q outputs match archived R6
+  bitwise. Main's planner suite has 30 passes and 8 setup failures (missing
+  `vllm._C`, before numerical assertions); do not report the full suite as
+  passed. These checks are separate from the archived model/sanitizer
+  evidence. Human review and model admission remain outstanding.
+- Later private FP32 long-prefill v18/v37 are not silently included here.
+  Their separate clean-source integration, build dependency cleanup, runtime
+  routing, and whole-model acceptance remain unfinished. Original stable
+  60/61T prefill is already in main and is not replaced by this small-Q PR.
