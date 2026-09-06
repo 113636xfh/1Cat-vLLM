@@ -46226,3 +46226,19 @@ does not certify QAT-versus-BF16 quality, solve the 4.33% fixed-prefix
 repeatability issue, or establish recovery to 17.6–18 ms. Historical Draft
 notes describe the investigation at their recorded revisions. The remaining
 state/prefix and performance goals continue after implementation integration.
+
+## 2026-09-07 E4M3 FP32 integration alignment repair
+
+- Synchronize PR524 with main `099d9841f5` in commit `4d889d0c1d` and retain
+  both native capability registrations. Keep the explicit-row FP32 entry on
+  its 8-byte load contract; do not inherit main's dense-q8 16-byte paired
+  load for admitted 8-but-not-16-byte KV strides.
+- Fresh DSO `b65ee698...9132b3`: 98 kernel, 142 policy, 38 planner checks
+  pass. The planner runs with pinned archived core dependencies, not a newly
+  rebuilt core. All three new padded-stride graph cases pass memcheck with
+  zero errors. All 200 real-input outputs match the previous R6 bitwise;
+  four 100-ABBA q5 speed ratios remain within 0.26% of one.
+- The alignment issue is fixed in this tested source. The refreshed 128K
+  same-process model bracket is still running; the prior token-77 failure
+  remains a separate blocker. Do not promote the route, change defaults, or
+  transfer operator passes to model admission. See the linked E4M3 report.

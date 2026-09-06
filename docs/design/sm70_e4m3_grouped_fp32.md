@@ -378,3 +378,33 @@ block merge and default promotion. No installed extension or service is
 replaced. Private FP32 long-prefill v18/v37 still require separate clean-source
 integration and admission; this small-Q patch does not publish those paths
 or replace the older stable 60/61T implementation already in main.
+
+## 2026-09-07 integration repair
+
+Main `099d9841f542f1b71121b4aff49e3aa29053a489` adds E4M3 paired loads to
+the dense q8 verifier. The explicit-row FP32 entry still admits 8-byte KV
+strides, so inheriting that 16-byte loader would truncate physical offsets.
+For example, a valid token stride of 264 would address byte 256. Commit
+`4d889d0c1dde3589bced4211b984047a3d028609` merges main, retains both native
+capability entries, and keeps the original 8-byte loader for `ROW_SEQLENS`.
+The q8 E4M3 paired path and sparse-page4/E5M2 routes are preserved.
+
+Three new padded-stride cases cover token/block/both padding with changing
+row lengths in CUDA Graph replay. Each output is bitwise equal to its
+contiguous-layout control. The rebuilt extension hash is
+`b65ee698fa992b6ff933f495c3827390aef3376641464c399b27939a3f9132b3`.
+It passes 98 kernel tests, 142 routing tests, and all 38 planner tests.
+The planner's previously missing core dependency is now explicitly pinned
+to the archived native-base library; no full native-base rebuild is claimed.
+The three new stride cases also pass memcheck with zero errors.
+
+All 200 actual-input outputs match the previous R6 extension bitwise. The
+same-GPU, q5/page848, 20-warmup/100-ABBA speed ratios are
+1.00255/1.00029/1.00064/0.99990 at approximately 8K/64K/128K/256K. This is
+essentially unchanged operator speed, not model throughput admission.
+
+The refreshed 128K model bracket uses the same frozen prompt tokens and
+diagnostic launch settings, with the new Flash-V100 DSO and current Python
+source. Its result remains pending at this update. The archived token-77
+failure is not waived, and no default promotion or merge is authorized by
+the alignment fix alone.
