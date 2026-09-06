@@ -5470,6 +5470,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "selected (rows=%d, page=%d, explicit row lengths).",
                 query.shape[0],
                 key_cache.shape[1],
+                scope="process",
             )
             _record_route("prefill_smallq_e4m3_grouped_fp32")
             return

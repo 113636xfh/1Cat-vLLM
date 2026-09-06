@@ -60,4 +60,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FlashAttention split-KV prefill over paged KV cache (Volta)");
   m.def("fp8_e5m2_paged_kv_to_fp16", &flash_attention_fp8_e5m2_paged_kv_to_fp16,
         "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
+  m.def("fp8_e4m3_paged_kv_to_fp16", &flash_attention_fp8_e4m3_paged_kv_to_fp16,
+        "Expand paged FP8 E4M3 K/V into a preallocated FP16 paged workspace");
 }

@@ -1475,6 +1475,38 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def fp8_e4m3_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand explicit E4M3 bytes; this does not enable a backend route.
+
+    Positive sequence lengths and physical block IDs must be within the
+    supplied cache/table capacity. Only the live prefix and its 16-token
+    padding are written; the remaining workspace is untouched.
+    """
+    op = getattr(flash_attn_v100_cuda, "fp8_e4m3_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the explicit E4M3 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
 def fp8_e5m2_paged_kv_to_fp16(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,

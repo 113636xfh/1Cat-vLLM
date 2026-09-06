@@ -140,3 +140,68 @@ CUDA stream even when their tensors are on CPU.
   their own evidence; they are not covered by this single-request gate.
 - AI assistance was used. Human line-by-line review and confirmation of the
   relevant tests remain required before merging, per the repository policy.
+
+## Model admission update: a repeatable counterexample
+
+The original integration artifact (`953924a...959f0`, CUDA 12.0 compiler)
+has now been exercised in Qwen3.8-27B-FP8, TP4, native MTP4, explicit E4M3
+KV, FP16 activation/SSM cache, 262144 maximum length and CUDA graphs. At an
+8192-token prompt, an 11-token retrieval response matches across
+control--candidate--control, but this short smoke hides a longer-output
+counterexample. Greedy sampling is an explicit regression contract, not an
+official-sampling quality evaluation; EOS is not suppressed.
+
+Initially, the two controls themselves diverged at output token 177, while
+the candidate differed from the first control at token 229 (one-based).
+The unstable controls make that initial comparison inconclusive; per-start
+GEMM tuning is one possible confounder. With
+FP8/AWQ small-shape tuning and FP8 coordinated tuning disabled **only for
+diagnostic isolation**, two independent control processes reproduce all 256
+output tokens and MTP acceptance length in six runs including warmups. The
+FP32 candidate instead reproducibly differs at output token 102 in all
+three runs. All recorded top-five logprobs are finite and both texts remain
+coherent, but the no-token-divergence gate fails.
+
+A separate counterfactual replaces only admitted small-Q attention with
+PyTorch FP64 over the identical quantized KV, retaining FP16 output and all
+other model computation. Its three runs match the control's entire 256-token
+sequence. At the first divergence, the logprob margin for token `343` over
+token `5604` is +0.046875 in the control, -0.046875 in the candidate, and
++0.093750 in this reference. This is an attention-only reference, not a
+full-model FP64 or unquantized-KV oracle. The reference used GPU0--3; the
+fixed-dispatch native runs used GPU4--7. No absolute timings are pooled.
+
+This counterexample blocks promotion; lower aggregate operator L2 alone
+does not grant model acceptance. It is not evidence that E4M3 is worse than
+E5M2, nor a verdict on the private long-prefill implementation, which was not
+loaded. Do not expand to the long-context speed sweep or change defaults
+before localizing this repeatable failure. Raw bundle:
+`e4m3-mainline-model-gate-20260906`, indexed in the private handoff.
+
+## E4M3 bridge prerequisite, without default routing
+
+The backend's existing prefill bridge is still E5M2-only. The explicit
+`fp8_e4m3_paged_kv_to_fp16` entry adds the missing conversion building block,
+sharing the paged scheduling and unit-scale specialization with E5M2. It
+preserves signed zero, scales in FP32, rounds to FP16, and zeroes the live
+prefix's 16-token padding. It does not reinterpret E5M2 bytes, select a
+backend route, or change the global KV format. Old extensions fail with an
+explicit rebuild message when this new entry is requested.
+
+The bridge build uses CUDA 12.8.93/GCC12, Torch 2.10+cu128, SM70 and standard
+fast-math flags. Its native SHA256 is
+`c1ce4140fe82a94fba8c351e219e72ca6676f4ebb1fcc54fc7444679e08b2003`.
+The 30 bridge cases cover both formats, all 256 byte encodings, five page
+sizes, three scale pairs, relocated pages, signed zero and graph length
+changes. Together with 39 grouped/sparse regressions and one missing-native
+entry check, 70 tests pass; the routing-policy suite also passes 138 tests.
+Memcheck covers these 30 cases and 12 FP32 grouped cases with zero
+errors. The same 24-group activation replay has relative-L2
+0.0198771%--0.0224338%, all below the captured scalar control. These are
+operator results, **not model approval for this updated artifact**.
+
+Artifact directory: `.artifacts/e4m3-bridge-fp32/`. To reproduce the added
+conversion checks, run the ordinary GPU and memcheck workflows above with
+`tests/kernels/attention/test_sm70_fp8_bridge_formats.py`. The small-Q
+selection message is now process-scoped so future gates can check every TP
+rank rather than mistaking rank-zero-only logging for missing execution.
