@@ -4310,6 +4310,11 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "E4M3 grouped FP32 supports SM70 only");
+  // A contiguous FP16 view can start at a half-element storage offset.
+  // The shared-Q feed uses uint4 loads; only those exceptional views need
+  // an aligned, stream-local copy. Ordinary model Q keeps the original path.
+  const at::Tensor aligned_q =
+      reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 ? q : q.clone();
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto kernel = flash_attention_grouped_verify_e5m2_partial_kernel<
       8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
@@ -4325,8 +4330,8 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
-      reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
-      block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
+      reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
+      v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
       partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,

@@ -171,6 +171,50 @@ def test_eight_byte_kv_strides_match_contiguous_graph(padding):
         assert torch.equal(actual, reference)
 
 
+@pytest.mark.parametrize("offset", [1, 4, 7])
+def test_contiguous_unaligned_q_matches_aligned_graph(offset):
+    op = _native()
+    torch.manual_seed(20260907)
+    rows, page = 5, 848
+    shape = (rows, 6, 256)
+    backing = torch.full(
+        (rows * 6 * 256 + 16,), -17.0, dtype=torch.float16, device="cuda"
+    )
+    q = backing[offset : offset + rows * 6 * 256].view(shape)
+    assert q.is_contiguous() and q.data_ptr() % 16 != 0
+    aligned = torch.randn(shape, dtype=torch.float16, device="cuda")
+    q.copy_(aligned)
+    kv = torch.randn((2, 3, page, 1, 256), device="cuda").to(torch.float8_e4m3fn)
+    k, v = kv.view(torch.uint8).unbind(0)
+    table = torch.tensor([[2, 0, 1]], device="cuda", dtype=torch.int32)
+    lengths = torch.arange(3 * page - rows, 3 * page, dtype=torch.int32, device="cuda")
+    original_lengths = lengths.clone()
+    expected, actual = torch.empty_like(aligned), torch.empty_like(aligned)
+
+    def call(query, output):
+        op(query, k, v, table, lengths, out=output, softmax_scale=0.0625)
+
+    call(aligned, expected)
+    call(q, actual)
+    assert torch.equal(actual, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call(q, actual)
+    for zero_state in ("none", "tail", "all", "restore"):
+        aligned.normal_()
+        q.copy_(aligned)
+        lengths.copy_(original_lengths)
+        if zero_state == "tail":
+            lengths[-1] = 0
+        elif zero_state == "all":
+            lengths.zero_()
+        call(aligned, expected)
+        graph.replay()
+        assert torch.equal(actual, expected)
+        assert bool((backing[:offset] == -17).all())
+        assert bool((backing[offset + rows * 6 * 256 :] == -17).all())
+
+
 def test_scaled_residual_value_operand_is_exact_for_all_finite_e4m3():
     """The residual product's inverse scale must not re-quantize V."""
     values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).half()

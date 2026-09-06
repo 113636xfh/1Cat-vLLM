@@ -482,3 +482,43 @@ relative-L2 from about 2.0e-4 to 2.5e-6 versus FP64, with essentially unchanged
 projection latency. It is not real token-126 replay or model admission.
 Keep the failed FP16-head cohort; a changed output precision is a new
 explicit contract, not a retrospective pass of the old one.
+
+That FP32-head-only counterfactual also fails: at 128K, both references are
+stable, but candidate token 191 is `validation` instead of `scrutiny`.
+The reference top-two margin is about 0.018314; the candidate reverses it
+by about 0.006470. All four ranks confirm FP32 head output, and all recorded
+attention outputs are finite. The predeclared 128K gate stops expansion to
+256K. Result SHA256:
+`9571a0b77a2dfa161b8e8f0aa90097e3e6f9115b89c5eab06f295394113b043c`.
+Thus improving the final projection alone does not resolve model admission.
+
+The diagnostic launch explicitly retained FP16 GDN recurrent state. Current
+main's `gated_delta_net_state_dtype` instead resolves `auto` SSM state to
+FP32 for this model family; convolution state remains model-dtype. A new
+counterfactual will retain FP32 logits and change only SSM state to FP32 on
+both sides. The corresponding cache page size may change. This tests a
+plausible amplification mechanism and the current-main default, but does
+not erase either explicitly FP16-SSM failure or establish causality yet.
+
+### Contiguous Q does not imply an aligned vector-load base
+
+A continuous FP16 view can have a storage offset of 1/4/7 half elements,
+giving a byte-address remainder of 2/8/14 modulo 16. The native Q feed reads
+`uint4`, so contiguity alone did not satisfy its load contract. The native
+host entry now clones only such unaligned Q views after entering the correct
+device/stream context. Normal aligned Q retains its original Tensor and the
+same kernel launch. The exceptional q8 copy is at most 24 KiB; this is not
+a zero-overhead claim for deliberately unaligned callers. Kernel arithmetic,
+KV loaders, and workspace ABI are unchanged. Offset-Q tests update input
+values and row lengths during CUDA Graph replay and compare bitwise with
+aligned controls. This separate safety issue is not a demonstrated cause
+of the token-126 or token-191 failures.
+
+Fresh extension
+`c33a84443d42621060a90ff7ecdbe2af4910e7774317c44c74777a13d7b56aaf`
+passes 105 kernel checks and six targeted Q/KV-alignment memcheck cases with
+zero errors. All 200 aligned real-input outputs match revision 3 bitwise.
+The four 100-ABBA q5 speed ratios are 1.01834/1.00065/1.00036/1.00000;
+the short-point difference is not a new arithmetic speedup claim. Previous
+142 policy/38 planner/69 broader memcheck results retain their earlier
+artifact attribution. No model pass is transferred to this build.

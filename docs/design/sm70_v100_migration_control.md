@@ -46276,3 +46276,27 @@ state/prefix and performance goals continue after implementation integration.
   with unchanged operator latency, but does not establish the cause of token
   126 or approve model speed/quality. Avoid rerunning the same failed FP16
   cohort without a new hypothesis. Keep the route default-off and PR524 Draft.
+
+## 2026-09-07 E4M3 Q alignment and FP32-head counterfactual
+
+- The FP32-head-only counterfactual fails at 128K token 191 (`validation`
+  versus the stable references' `scrutiny`). Both sides really emit FP32
+  logits; all recorded attention outputs are finite. The prescribed gate
+  stops before 256K. Raw result SHA256:
+  `9571a0b77a2dfa161b8e8f0aa90097e3e6f9115b89c5eab06f295394113b043c`.
+  Do not keep rerunning FP16 SSM plus FP32 head as a claimed repair.
+- The diagnostic explicitly fixed SSM state to FP16. Current main's GDN
+  `auto` default is FP32. Test that single configuration change on both
+  reference and candidate while retaining FP32 logits, and record actual
+  cache dtype/page shape. Neither earlier FP16-SSM failure is erased.
+- Q views with half-element offsets 1/4/7 are contiguous but have base-byte
+  remainders 2/8/14 modulo 16. The new entry's host code now clones only
+  unaligned Q after its device guard, before the uint4 feed. Normal aligned
+  inputs, kernel arithmetic and workspace ABI are unchanged; no blind
+  fallback into another vector loader is used. This is not attributed to
+  the model's token counterexamples.
+- DSO `c33a8444...b56aaf`: 105 kernel passes, six targeted alignment memcheck
+  passes with zero errors, and all 200 aligned real inputs match the previous
+  revision-3 DSO bitwise. Four q5 100-ABBA speed ratios are
+  1.01834/1.00065/1.00036/1.00000. Model admission and human review remain
+  outstanding; keep PR524 Draft and production defaults unchanged.
