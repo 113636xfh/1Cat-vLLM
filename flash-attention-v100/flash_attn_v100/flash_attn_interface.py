@@ -503,13 +503,16 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor, *, partial_dtype: torch.dtype = torch.float16
+) -> _GroupedVerifyWorkspace:
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
         q.dtype,
+        partial_dtype,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
@@ -518,7 +521,7 @@ def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
                 (80, 8, 6, 256),
-                dtype=torch.float16,
+                dtype=partial_dtype,
                 device=q.device,
             ),
             partial_lse=torch.empty(
@@ -1038,6 +1041,48 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     if get_max_query_tokens is None:
         return 8
     return int(get_max_query_tokens())
+
+
+def flash_attn_grouped_e4m3_fp32_available() -> bool:
+    return hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+
+
+def flash_attn_grouped_e4m3_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Experimental E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+
+    Row lengths are authoritative GPU metadata, not inferred from padded Q.
+    Zero lengths produce zero outputs. All positive lengths must fit the
+    block table, whose entries must address valid physical pages. This is
+    not an independent-request batch API. QK/PV and partial storage are FP32;
+    Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    """
+    if not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError("Rebuild Flash-V100 for E4M3 grouped FP32 support")
+    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        float(k_scale),
+        float(v_scale),
+    )
 
 
 def flash_attn_grouped_verify_paged(
@@ -1688,6 +1733,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

@@ -445,6 +445,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
+    VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = False
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
@@ -2969,6 +2970,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
+    ),
+    # Experimental dense single-request small-Q route; not the DFlash2 q8 gate.
+    "VLLM_FLASH_V100_E4M3_GROUPED_FP32": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
