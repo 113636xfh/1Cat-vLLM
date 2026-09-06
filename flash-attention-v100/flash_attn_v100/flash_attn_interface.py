@@ -1044,7 +1044,12 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
 
 
 def flash_attn_grouped_e4m3_fp32_available() -> bool:
-    return hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+    version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
+    return (
+        hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+        and callable(version)
+        and int(version()) >= 2
+    )
 
 
 def flash_attn_grouped_e4m3_fp32_paged(
@@ -1066,9 +1071,12 @@ def flash_attn_grouped_e4m3_fp32_paged(
     block table, whose entries must address valid physical pages. This is
     not an independent-request batch API. QK/PV and partial storage are FP32;
     Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    Precision revision 2 compensates QK/P and keeps PV accumulation tile-local.
     """
     if not flash_attn_grouped_e4m3_fp32_available():
-        raise RuntimeError("Rebuild Flash-V100 for E4M3 grouped FP32 support")
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 2"
+        )
     workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
     return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
         q,

@@ -4371,6 +4371,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.flash_attn_grouped_e4m3_fp32_paged = (
             load_grouped_e4m3_fp32() if envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32 else None
         )
+        if (
+            envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            and self.flash_attn_grouped_e4m3_fp32_paged is None
+        ):
+            logger.warning_once(
+                "E4M3 grouped FP32 requires Flash-V100 precision revision 2; "
+                "using the existing attention fallback. Rebuild the extension "
+                "and restart workers to enable the repaired route.",
+                scope="process",
+            )
         self.dflash2_grouped_verify_max_query_tokens = (
             _flash_attn_grouped_verify_max_query_tokens
         )

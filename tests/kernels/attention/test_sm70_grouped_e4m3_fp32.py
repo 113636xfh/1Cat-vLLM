@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Same-quantized-KV FP64 oracle; these are not model-quality tests."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -13,6 +15,21 @@ def _native():
     if not module.flash_attn_grouped_e4m3_fp32_available():
         pytest.skip("rebuild native E4M3 FP32 entry")
     return module.flash_attn_grouped_e4m3_fp32_paged
+
+
+@pytest.mark.parametrize("has_entry", [False, True])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 3])
+def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, version):
+    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    native = SimpleNamespace()
+    if has_entry:
+        native.grouped_e4m3_fp32_paged_fwd = object()
+    if version is not None:
+        native.grouped_e4m3_fp32_precision_version = lambda: version
+    monkeypatch.setattr(interface, "flash_attn_v100_cuda", native)
+    assert interface.flash_attn_grouped_e4m3_fp32_available() is (
+        has_entry and version is not None and version >= 2
+    )
 
 
 @pytest.mark.parametrize(
@@ -83,6 +100,13 @@ def test_fp32_grouped_row_lengths_graph(rows, page, length):
         if state != "all_zero":
             relative_l2 = (out.double() - expected).norm() / expected.norm()
             assert float(relative_l2) < 0.001
+            # A loose aggregate L2 gate admitted single-half probabilities
+            # despite a repeatable model token flip. Bound the avoidable
+            # arithmetic error relative to the unavoidable FP16 output floor.
+            rounding_floor = (
+                expected.half().double() - expected
+            ).norm() / expected.norm()
+            assert float(relative_l2) <= 1.02 * float(rounding_floor) + 2e-6
         if state == "live":
             original = out.clone()
         elif state == "restore":
@@ -101,3 +125,96 @@ def test_fp32_workspace_is_separate_from_legacy_half_workspace():
     assert half.partial_out.data_ptr() != full.partial_out.data_ptr()
     assert _get_grouped_verify_workspace(q) is half
     assert _get_grouped_verify_workspace(q, partial_dtype=torch.float32) is full
+
+
+def test_scaled_residual_value_operand_is_exact_for_all_finite_e4m3():
+    """The residual product's inverse scale must not re-quantize V."""
+    values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).half()
+    values = values[torch.isfinite(values)]
+    assert torch.equal((values / 2048).double(), values.double() / 2048)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [2**-9, 1.0, 448.0, -(2**-9), -1.0, -448.0],
+    ids=["min", "unit", "max", "negative_min", "negative_unit", "negative_max"],
+)
+def test_small_probability_residual_survives_fp16_storage(value):
+    """Expose lost low-P residuals before final FP16 output rounding hides them."""
+    op = _native()
+    from flash_attn_v100.flash_attn_interface import _get_grouped_verify_workspace
+
+    rows, page, length = 5, 800, 5120
+    pages = (length + page - 1) // page
+    capacity = pages * page
+    q = torch.zeros((rows, 6, 256), device="cuda", dtype=torch.float16)
+    q[..., 0] = 1
+    keys = torch.zeros((capacity, 1, 256), device="cuda", dtype=torch.float16)
+    keys[..., 0] = -8
+    keys[::32, :, 0] = 0
+    values = torch.full_like(keys, value)
+    values[::32] = 0
+    backing = torch.empty((pages, 2, page, 1, 256), device="cuda", dtype=torch.uint8)
+    k, v = backing.unbind(1)
+    k.copy_(keys.to(torch.float8_e4m3fn).view(torch.uint8).reshape_as(k))
+    v.copy_(values.to(torch.float8_e4m3fn).view(torch.uint8).reshape_as(v))
+    table = torch.arange(pages, device="cuda", dtype=torch.int32)[None]
+    lengths = torch.full((rows,), length, device="cuda", dtype=torch.int32)
+    op(q, k, v, table, lengths, out=torch.empty_like(q), softmax_scale=1.0)
+    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    # All 80 partitions contain two identical N32 tiles. QK is exact here:
+    # one score is zero with V=0; the other 31 scores are -8 with V=value.
+    probability = torch.tensor(-8.0, dtype=torch.float64).exp()
+    expected = value * 31 * probability / (1 + 31 * probability)
+    actual = workspace.partial_out[:, :rows].double()
+    relative_error = (actual - expected).abs().max() / expected.abs()
+    assert bool(torch.isfinite(actual).all())
+    assert float(relative_error) < 3e-6
+
+
+@pytest.mark.parametrize("value_bias", [0.0, 4.0])
+def test_long_context_fp32_partials_before_output_rounding(value_bias):
+    """Do not let the final FP16 rounding floor hide long PV accumulation loss."""
+    op = _native()
+    from flash_attn_v100.flash_attn_interface import _get_grouped_verify_workspace
+
+    torch.manual_seed(20260908)
+    rows, length, page = 5, 262144, 3296
+    pages = (length + page - 1) // page
+    capacity = pages * page
+    q = torch.randn((rows, 6, 256), device="cuda", dtype=torch.float16) * 0.5
+    raw = torch.randn((2, capacity, 1, 256), device="cuda", dtype=torch.float16)
+    # Real V features can have a nonzero mean. Zero-mean random V alone
+    # hides the biased error from repeatedly feeding a large C back to MMA.
+    raw[1].add_(torch.linspace(-value_bias, value_bias, 256, device="cuda"))
+    encoded = raw.to(torch.float8_e4m3fn).view(torch.uint8)
+    backing = torch.empty((pages, 2, page, 1, 256), device="cuda", dtype=torch.uint8)
+    k, v = backing.unbind(1)
+    order = torch.randperm(pages, device="cuda")
+    k[order] = encoded[0].reshape_as(k)
+    v[order] = encoded[1].reshape_as(v)
+    table = order.int()[None].contiguous()
+    lengths = torch.arange(
+        length - rows + 1, length + 1, device="cuda", dtype=torch.int32
+    )
+    op(q, k, v, table, lengths, out=torch.empty_like(q), softmax_scale=0.0625)
+    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    actual = workspace.partial_out[:, :rows].double()
+    keys = encoded[0, :length, 0].view(torch.float8_e4m3fn).double()
+    values = encoded[1, :length, 0].view(torch.float8_e4m3fn).double()
+    scores = q.transpose(0, 1).double() @ keys.T * 0.0625
+    mask = torch.arange(length, device="cuda")[None] >= lengths[:, None]
+    scores.masked_fill_(mask[None], -torch.inf)
+    tiles = (length + 31) // 32
+    base, extra = divmod(tiles, 80)
+    expected = []
+    for split in range(80):
+        start = (split * base + min(split, extra)) * 32
+        end = min(length, start + (base + (split < extra)) * 32)
+        expected.append(
+            (scores[..., start:end].softmax(-1) @ values[start:end]).transpose(0, 1)
+        )
+    reference = torch.stack(expected)
+    relative_l2 = (actual - reference).norm() / reference.norm()
+    assert torch.isfinite(actual).all()
+    assert float(relative_l2) < 3e-6

@@ -65,6 +65,8 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
     float scale, float k_scale, float v_scale);
 
+int64_t flash_attention_grouped_e4m3_fp32_precision_version();
+
 int64_t flash_attention_grouped_sparse_page4_abi_version();
 
 at::Tensor flash_attention_grouped_sparse_page4(

@@ -1880,6 +1880,7 @@ __device__ __forceinline__ int grouped_verify_active_splits(
   return total_kv <= kGroupedVerifyShortContextMaxTokens ? 1 : active_splits;
 }
 
+template <bool COMPENSATE = false>
 __device__ __forceinline__ void grouped_verify_qk(
     const __half* __restrict__ shared_q, const __half* __restrict__ shared_k,
     float* __restrict__ shared_scores, const float qk_scale,
@@ -1900,6 +1901,7 @@ __device__ __forceinline__ void grouped_verify_qk(
       k_fragment;
   volta::fragment<volta::accumulator, 16, 16, 16, float> score_fragment;
   volta::fill_fragment(score_fragment, 0.0f);
+  float correction[8] = {};
 
 #pragma unroll
   for (int k_offset = 0; k_offset < kGroupedVerifyHeadDim; k_offset += 16) {
@@ -1911,7 +1913,24 @@ __device__ __forceinline__ void grouped_verify_qk(
     volta::load_matrix_sync(
         k_fragment, shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
         kGroupedVerifyKVStride);
-    volta::mma_sync(score_fragment, q_fragment, k_fragment, score_fragment);
+    if constexpr (COMPENSATE) {
+      // E4M3 x FP16 products fit comfortably in FP32, but a D256 Tensor
+      // Core accumulation can still lose low bits. Sum short K16 products
+      // with compensated FP32 additions; explicit RN operations preserve
+      // the correction under the standard fast-math build.
+      volta::fragment<volta::accumulator, 16, 16, 16, float> tile_fragment;
+      volta::fill_fragment(tile_fragment, 0.0f);
+      volta::mma_sync(tile_fragment, q_fragment, k_fragment, tile_fragment);
+#pragma unroll
+      for (int i = 0; i < score_fragment.num_elements; ++i) {
+        const float y = __fsub_rn(tile_fragment.x[i], correction[i]);
+        const float sum = __fadd_rn(score_fragment.x[i], y);
+        correction[i] = __fsub_rn(__fsub_rn(sum, score_fragment.x[i]), y);
+        score_fragment.x[i] = sum;
+      }
+    } else {
+      volta::mma_sync(score_fragment, q_fragment, k_fragment, score_fragment);
+    }
   }
 #pragma unroll
   for (int i = 0; i < score_fragment.num_elements; ++i) {
@@ -1937,6 +1956,21 @@ __device__ __forceinline__ void grouped_verify_scale_output_fragment(
   fragment.x[5] *= first_scale;
   fragment.x[6] *= second_scale;
   fragment.x[7] *= second_scale;
+}
+
+__device__ __forceinline__ void grouped_verify_add_output_tile(
+    volta::fragment<volta::accumulator, 16, 16, 16, float>& output,
+    const volta::fragment<volta::accumulator, 16, 16, 16, float>& tile,
+    const float* row_scale, const int tile_row_start) {
+  const int lane = threadIdx.x & 31;
+  const int row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
+  const float first_scale = row_scale[tile_row_start + row];
+  const float second_scale = row_scale[tile_row_start + row + 2];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float scale = (i & 2) ? second_scale : first_scale;
+    output.x[i] = fmaf(output.x[i], scale, tile.x[i]);
+  }
 }
 
 template <bool SPARSE_PAGE4, bool ROW_SEQLENS = false>
@@ -1968,7 +2002,7 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           bool STAGE_PARTITION_PAGE_IDS = false,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
           bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
-          bool ROW_SEQLENS = false>
+          bool ROW_SEQLENS = false, bool COMPENSATE_P = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_e5m2_partial_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
@@ -1984,6 +2018,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int num_groups = 1, const int* row_lengths = nullptr) {
   static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
                 "explicit row lengths apply to dense causal groups only");
+  static_assert(
+      !COMPENSATE_P || (!TWO_PASS && ROW_SEQLENS &&
+                        KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                        std::is_same_v<PARTIAL_T, float>),
+      "probability compensation is isolated to E4M3 FP32 groups");
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
@@ -2050,6 +2089,12 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   __half* shared_kv = smem.storage.compute.kv;
   float* shared_scores = smem.storage.compute.scores;
   __half* shared_probs = smem.storage.compute.probs;
+  // The compensated entry reserves one padded probability panel after the
+  // legacy layout. Match P's shared-memory stride without aliasing live QK
+  // rows. Legacy entries retain their existing shared-memory footprint.
+  __half* shared_prob_residual = reinterpret_cast<__half*>(
+      grouped_verify_smem_raw + sizeof(GroupedVerifySmem));
+  constexpr int kResidualStride = kGroupedVerifyProbStride;
   const int* page_ids =
       block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
   int split_page_offset = 0;
@@ -2238,6 +2283,13 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     __syncthreads();
 
     int active_m_tiles = 0x7;
+    if constexpr (COMPENSATE_P) {
+      // Native MTP4 supplies five rows: only 30 of the 48 packed rows are
+      // live. Avoid QK/PV for wholly padded M tiles to pay for the residual
+      // product without changing arithmetic in any live row.
+      active_m_tiles =
+          (1 << ((query_len * Traits::kHeadsPerCta + 15) / 16)) - 1;
+    }
     if constexpr (SPARSE_PAGE4) {
       uint32_t active_query_nibbles = 0;
 #pragma unroll
@@ -2255,8 +2307,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         }
       }
     }
-    grouped_verify_qk(shared_q, shared_kv, shared_scores, qk_scale,
-                      active_m_tiles);
+    grouped_verify_qk<COMPENSATE_P>(shared_q, shared_kv, shared_scores,
+                                    qk_scale, active_m_tiles);
     __syncthreads();
 
     if constexpr (TWO_PASS) {
@@ -2287,6 +2339,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 #pragma unroll
       for (int row = warp_id; row < kGroupedVerifyRows;
            row += kGroupedVerifyWarps) {
+        if constexpr (COMPENSATE_P) {
+          if ((active_m_tiles & (1 << (row / 16))) == 0) {
+            continue;
+          }
+        }
         const int token_idx = row / Traits::kHeadsPerCta;
         const int local_head = row % Traits::kHeadsPerCta;
         const int head_idx = head_start + local_head;
@@ -2310,6 +2367,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
         shared_probs[row * kGroupedVerifyProbStride + lane_id] =
             __float2half_rn(probability);
+        if constexpr (COMPENSATE_P) {
+          const float rounded = __half2float(__float2half_rn(probability));
+          shared_prob_residual[row * kResidualStride + lane_id] =
+              __float2half_rn((probability - rounded) * 2048.0f);
+        }
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {
             smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
@@ -2319,13 +2381,15 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         }
       }
       __syncthreads();
+      if constexpr (!COMPENSATE_P) {
 #pragma unroll
-      for (int fragment_idx = 0;
-           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-        const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-        const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-        grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
-                                             smem.row_scale, m_tile * 16);
+        for (int fragment_idx = 0;
+             fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+          const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
+          const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
+          grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
+                                               smem.row_scale, m_tile * 16);
+        }
       }
     }
 
@@ -2348,7 +2412,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
       const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
       const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
-      if constexpr (SPARSE_PAGE4) {
+      if constexpr (SPARSE_PAGE4 || COMPENSATE_P) {
         if ((active_m_tiles & (1 << m_tile)) == 0) {
           continue;
         }
@@ -2357,6 +2421,15 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
           probability_fragment;
       volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
           value_fragment;
+      volta::fragment<volta::accumulator, 16, 16, 16, float> tile_fragment;
+      if constexpr (COMPENSATE_P) {
+        // Keep Tensor Core accumulation local to N32. Carrying a large C
+        // through every KV tile loses small PV corrections at long contexts.
+        // The online state remains FP32 and is updated once per tile below.
+        volta::fill_fragment(tile_fragment, 0.0f);
+      }
+      auto& pv_fragment =
+          COMPENSATE_P ? tile_fragment : output_fragments[fragment_idx];
 #pragma unroll
       for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
         volta::load_matrix_sync(
@@ -2367,8 +2440,36 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             value_fragment,
             shared_kv + k_offset * kGroupedVerifyKVStride + d_tile * 16,
             kGroupedVerifyKVStride);
-        volta::mma_sync(output_fragments[fragment_idx], probability_fragment,
-                        value_fragment, output_fragments[fragment_idx]);
+        volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                        pv_fragment);
+        if constexpr (COMPENSATE_P) {
+          // Scale the residual up before its FP16 conversion so small
+          // corrections do not underflow. Every finite E4M3 value divided
+          // by 2048 is still exactly representable in FP16, so applying
+          // the inverse power of two to V introduces no operand rounding.
+          volta::load_matrix_sync(
+              probability_fragment,
+              shared_prob_residual + m_tile * 16 * kResidualStride + k_offset,
+              kResidualStride);
+#pragma unroll
+          for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
+            union {
+              uint32_t bits;
+              __half2 pair;
+            } packed_value;
+            packed_value.bits = value_fragment.x[i];
+            packed_value.pair =
+                __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
+            value_fragment.x[i] = packed_value.bits;
+          }
+          volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                          pv_fragment);
+        }
+      }
+      if constexpr (COMPENSATE_P) {
+        grouped_verify_add_output_tile(output_fragments[fragment_idx],
+                                       tile_fragment, smem.row_scale,
+                                       m_tile * 16);
       }
     }
     __syncthreads();
@@ -4127,20 +4228,24 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto kernel = flash_attention_grouped_verify_e5m2_partial_kernel<
       8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-      false, float, true>;
+      false, float, true, true>;
+  constexpr int kCompensatedSmemBytes =
+      sizeof(GroupedVerifySmem) +
+      kGroupedVerifyRows * kGroupedVerifyProbStride * sizeof(__half);
+  static_assert(kCompensatedSmemBytes <= 64 * 1024,
+                "compensated P must fit the SM70 shared-memory budget");
   C10_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           sizeof(GroupedVerifySmem)));
+                           kCompensatedSmemBytes));
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80), kGroupedVerifyThreads, sizeof(GroupedVerifySmem),
-           stream>>>(reinterpret_cast<const __half*>(q.data_ptr()),
-                     k.data_ptr(), v.data_ptr(), block_table.data_ptr<int>(),
-                     row_lengths.data_ptr<int>(), partial.data_ptr<float>(),
-                     lse.data_ptr<float>(), q.size(0), block_table.size(1),
-                     k.size(1), k.stride(0), k.stride(1), k.stride(2),
-                     v.stride(0), v.stride(1), v.stride(2), scale * k_scale,
-                     v_scale, nullptr, 1, row_lengths.data_ptr<int>());
+  kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
+      block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
+      block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
+      v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
+      1, row_lengths.data_ptr<int>());
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
       <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
@@ -4149,6 +4254,13 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
           row_lengths.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
+  // Revision 1 (without this query) kept FP32 partials but still rounded P
+  // once and carried long Tensor Core accumulators. Revision 2 compensates
+  // QK/P and uses tile-local PV with an FP32 online state.
+  return 2;
 }
 
 int64_t flash_attention_grouped_verify_max_query_tokens() {

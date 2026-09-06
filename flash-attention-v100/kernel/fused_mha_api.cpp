@@ -27,6 +27,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_paged_fwd", &flash_attention_grouped_e4m3_fp32_paged,
         "Opt-in E4M3 small-query attention with FP32 partials and explicit row "
         "lengths");
+  m.def("grouped_e4m3_fp32_precision_version",
+        &flash_attention_grouped_e4m3_fp32_precision_version,
+        "E4M3 grouped FP32 numerical implementation revision");
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,
         "Maximum query length supported by grouped DFlash2 verification");
