@@ -127,6 +127,48 @@ def test_fp32_workspace_is_separate_from_legacy_half_workspace():
     assert _get_grouped_verify_workspace(q, partial_dtype=torch.float32) is full
 
 
+@pytest.mark.parametrize("padding", ["token", "block", "both"])
+def test_eight_byte_kv_strides_match_contiguous_graph(padding):
+    """The explicit-row route must not inherit q8's 16-byte paired loader."""
+    op = _native()
+    torch.manual_seed(20260907)
+    rows, pages, page = 5, 3, 848
+    token_stride = 264 if padding in ("token", "both") else 256
+    block_stride = page * token_stride + (8 if padding in ("block", "both") else 0)
+    shape = (pages, page, 1, 256)
+    strides = (block_stride, token_stride, 256, 1)
+    caches = []
+    for _ in range(2):
+        encoded = torch.randn(shape, device="cuda").to(torch.float8_e4m3fn)
+        padded = torch.empty_strided(shape, strides, device="cuda", dtype=torch.uint8)
+        padded.copy_(encoded.view(torch.uint8))
+        assert padded.data_ptr() % 16 == 0
+        assert any(s % 16 == 8 for s in padded.stride()[:2])
+        caches.append(padded)
+    q = torch.randn((rows, 6, 256), device="cuda", dtype=torch.float16)
+    table = torch.tensor([[2, 0, 1]], device="cuda", dtype=torch.int32)
+    lengths = torch.arange(
+        pages * page - rows, pages * page, device="cuda", dtype=torch.int32
+    )
+    reference, actual = torch.empty_like(q), torch.empty_like(q)
+    contiguous = [cache.contiguous() for cache in caches]
+
+    def call(kv, output):
+        op(q, *kv, table, lengths, out=output, softmax_scale=0.0625)
+
+    call(contiguous, reference)
+    call(caches, actual)
+    assert torch.equal(actual, reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call(caches, actual)
+    for empty in (True, False):
+        lengths[-1] = 0 if empty else pages * page - 1
+        call(contiguous, reference)
+        graph.replay()
+        assert torch.equal(actual, reference)
+
+
 def test_scaled_residual_value_operand_is_exact_for_all_finite_e4m3():
     """The residual product's inverse scale must not re-quantize V."""
     values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).half()

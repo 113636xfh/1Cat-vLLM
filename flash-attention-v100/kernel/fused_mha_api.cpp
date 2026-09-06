@@ -30,6 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_precision_version",
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");
+  m.attr("grouped_verify_e4m3") = true;
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,
         "Maximum query length supported by grouped DFlash2 verification");
