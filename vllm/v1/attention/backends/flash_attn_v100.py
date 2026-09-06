@@ -4393,7 +4393,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.flash_attn_grouped_e4m3_fp32_paged is None
         ):
             logger.warning_once(
-                "E4M3 grouped FP32 requires Flash-V100 precision revision 2; "
+                "E4M3 grouped FP32 requires Flash-V100 precision revision 3; "
                 "using the existing attention fallback. Rebuild the extension "
                 "and restart workers to enable the repaired route.",
                 scope="process",

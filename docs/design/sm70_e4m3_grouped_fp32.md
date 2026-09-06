@@ -2,10 +2,11 @@
 
 ## Scope and admission
 
-**Do not merge for production or enable by default.** The latest
-scaled-residual candidate passes operator/sanitizer checks but fails the
-same-process 128K deterministic token gate described below. Human review and
-whole-model quality/performance admission remain outstanding.
+**Do not merge for production or enable by default.** The historical R6
+token-77 failure remains recorded. The main-synchronized revision-2 build
+passes its refreshed 128K bracket, but that does not establish the cause of
+the earlier difference or approve the new revision-3 state representation.
+Human review and complete model quality/performance admission remain pending.
 
 This change integrates the small-query part of a private E4M3 migration into
 `onecat/main`, based on `755baae1d075ee04fa9096b23fc0225b23589a86`.
@@ -16,7 +17,7 @@ the cache writer, B1 decode, or the default DFlash2 verifier route.
 explicit `fp8_e4m3` KV. The flag defaults to **off**. Older extensions without
 the new entry retain the ordinary backend route. Set the flag before worker
 initialization; rebuild and restart task-owned workers to change the route.
-The extension must report `grouped_e4m3_fp32_precision_version() >= 2`.
+The extension must report `grouped_e4m3_fp32_precision_version() >= 3`.
 Presence of the original forward symbol alone is insufficient: older builds
 contained the repeatable numerical counterexample described below. A stale
 binary retains the ordinary backend fallback and emits a rebuild warning
@@ -38,7 +39,7 @@ is not evidence that an inference used this entry.
 
 We reuse the existing grouped Tensor Core dataflow to scan KV once for a
 packed query/head group. The repaired precision revision keeps accumulation
-and normalized partition outputs in FP32, with three additional safeguards:
+and unnormalized partition numerators in FP32, with these safeguards:
 
 1. QK uses K16 Tensor Core products and compensated FP32 summation across D.
    Explicit round-to-nearest additions preserve the correction under the
@@ -54,6 +55,10 @@ and normalized partition outputs in FP32, with three additional safeguards:
    the longer-lived FP32 online state with one scalar FMA per output element,
    combining rescaling and addition. This avoids repeatedly feeding a large
    accumulator into Tensor Core products of increasingly small corrections.
+4. Revision 3 preserves separate FP32 max/sum statistics and the unnormalized
+   PV numerator until the final combine. It avoids rounding a normalized
+   partial and reconstructing its weight from `max + log(sum)`. This is a
+   representation change, not a new production FP64 path.
 
 Tensor Core operands and the final output remain FP16. These changes reduce
 arithmetic error on identical quantized KV; they do not remove FP8 quantization
@@ -73,7 +78,8 @@ The same captured graph can therefore replay after padding or length changes.
 
 The FP32 workspace is keyed separately from the old FP16 workspace, including
 device and stream. Its partial tensor is `[80, 8, 6, 256]` FP32 (3.75 MiB),
-plus `[80, 8, 6]` FP32 statistics (15 KiB). The legacy partial tensor is
+plus `[80, 8, 6, 2]` FP32 max/sum statistics (30 KiB). Revision 2 used 15 KiB
+of LSE statistics; old extensions require a rebuild for this ABI. The legacy partial tensor is
 1.875 MiB. Keeping a reference to an existing graph also keeps its workspace
 alive; this is not a claim of zero concurrent-memory cost.
 
@@ -405,6 +411,29 @@ essentially unchanged operator speed, not model throughput admission.
 
 The refreshed 128K model bracket uses the same frozen prompt tokens and
 diagnostic launch settings, with the new Flash-V100 DSO and current Python
-source. Its result remains pending at this update. The archived token-77
-failure is not waived, and no default promotion or merge is authorized by
-the alignment fix alone.
+source. All 256 tokens match across candidate and both stable references;
+all four TP ranks select the route and all 16 full-attention layers are
+recorded on rank zero with finite outputs. Result SHA256:
+`79001ddfa0517c2fc8d1cfb2f017d174f2e3648506905847da69f867f905c22b`.
+This bounded pass does not explain the previous cohort's token-77 failure.
+The alignment change leaves all 200 retained operator outputs unchanged, so
+it is not asserted to be the cause of the model difference.
+
+### Revision-3 state representation screen
+
+A private prototype retains separate max/sum and unnormalized PV numerators.
+For uniform attention over 128K/256K positions, with one E4M3 value 1.125 per
+256 positions and all others 1, the exact output is `1 + 2^-11`. The old
+normalized/LSE path rounds up; the prototype obeys FP16 round-to-nearest-even
+and returns 1. Both choices have the same max-absolute/L2 error at this
+midpoint. This is an operator regression, not a reconstruction of token 77.
+
+On 200 real inputs, FP16 disagreements with the FP64-rounded reference fall
+from 1872 to 1640: 125 groups improve, 45 worsen, and 30 tie. Aggregate L2 is
+dominated by final FP16 rounding; this is not uniform per-input improvement.
+Four 100-ABBA q5 speed ratios are 0.99964/1.00007/1.00039/1.00008, effectively
+unchanged. Prototype DSO:
+`df4a03dc6aafec7e1c6b2a47d4b9a5a706b98a98de9fc8a1542539ea8305661e`;
+result: `cd7ac6efed7068101e30e7a8bd98749089b6177128fa4a790a875bf27f109311`.
+The new representation requires its own integration and model admission;
+the revision-2 model pass is not transferred to it.

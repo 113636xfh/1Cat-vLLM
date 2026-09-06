@@ -2509,7 +2509,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int head_idx = head_start + local_head;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
       const float sum = smem.row_sum[row];
-      const float scale = sum > 0.0f ? v_scale / sum : 0.0f;
+      // Explicit-row FP32 groups retain the numerator until the final merge.
+      // Normalizing each partition and encoding its weight as m+log(sum)
+      // introduces avoidable rounding, including at FP16 output midpoints.
+      const float scale =
+          sum > 0.0f ? (ROW_SEQLENS ? v_scale : v_scale / sum) : 0.0f;
       int64_t output_idx;
       if constexpr (SPARSE_PAGE4) {
         const int64_t global_token_idx =
@@ -2549,8 +2553,13 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                 kGroupedVerifyHeads +
             head_idx;
       }
-      partial_lse[lse_idx] =
-          sum > 0.0f ? smem.row_max[tid] + logf(sum) : kXQANegInf;
+      if constexpr (ROW_SEQLENS) {
+        partial_lse[2 * lse_idx] = sum > 0.0f ? smem.row_max[tid] : kXQANegInf;
+        partial_lse[2 * lse_idx + 1] = sum;
+      } else {
+        partial_lse[lse_idx] =
+            sum > 0.0f ? smem.row_max[tid] + logf(sum) : kXQANegInf;
+      }
     }
   }
 }
@@ -2586,6 +2595,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   const int active_splits =
       grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
   __shared__ float split_lse[Traits::kSplits];
+  __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
   __shared__ float final_max;
   __shared__ float final_inv_sum;
 
@@ -2594,8 +2604,15 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         (static_cast<int64_t>(threadIdx.x) * MAX_QUERY_TOKENS + token_idx) *
             kGroupedVerifyHeads +
         head_idx;
-    split_lse[threadIdx.x] =
-        threadIdx.x < active_splits ? partial_lse[lse_idx] : kXQANegInf;
+    if constexpr (ROW_SEQLENS) {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx] : kXQANegInf;
+      split_sum[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx + 1] : 0.0f;
+    } else {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[lse_idx] : kXQANegInf;
+    }
   }
   __syncthreads();
 
@@ -2607,7 +2624,12 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     float sum = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
-        sum += __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        const float weight = __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        if constexpr (ROW_SEQLENS) {
+          sum = fmaf(weight, split_sum[split], sum);
+        } else {
+          sum += weight;
+        }
       }
     }
     final_max = max_lse;
@@ -4255,12 +4277,13 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
-  TORCH_CHECK(
-      partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
-          partial.is_contiguous() && partial.scalar_type() == at::kFloat &&
-          lse.sizes() == at::IntArrayRef({80, 8, 6}) && lse.is_contiguous() &&
-          lse.scalar_type() == at::kFloat,
-      "E4M3 grouped FP32 requires FP32 partial [80,8,6,256] and LSE [80,8,6]");
+  TORCH_CHECK(partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+                  partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat &&
+                  lse.sizes() == at::IntArrayRef({80, 8, 6, 2}) &&
+                  lse.is_contiguous() && lse.scalar_type() == at::kFloat,
+              "E4M3 grouped FP32 requires numerator [80,8,6,256] and max/sum "
+              "[80,8,6,2]");
   TORCH_CHECK(
       std::isfinite(scale) && std::isfinite(k_scale) &&
           std::isfinite(v_scale) && k_scale > 0 && v_scale > 0,
@@ -4319,10 +4342,9 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
 }
 
 int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
-  // Revision 1 (without this query) kept FP32 partials but still rounded P
-  // once and carried long Tensor Core accumulators. Revision 2 compensates
-  // QK/P and uses tile-local PV with an FP32 online state.
-  return 2;
+  // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
+  // Older normalized-partial/LSE workspaces are not ABI-compatible.
+  return 3;
 }
 
 int64_t flash_attention_grouped_verify_max_query_tokens() {

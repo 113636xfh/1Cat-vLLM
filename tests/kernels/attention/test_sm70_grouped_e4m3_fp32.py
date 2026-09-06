@@ -18,7 +18,7 @@ def _native():
 
 
 @pytest.mark.parametrize("has_entry", [False, True])
-@pytest.mark.parametrize("version", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 3, 4])
 def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, version):
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     native = SimpleNamespace()
@@ -28,7 +28,7 @@ def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, versi
         native.grouped_e4m3_fp32_precision_version = lambda: version
     monkeypatch.setattr(interface, "flash_attn_v100_cuda", native)
     assert interface.flash_attn_grouped_e4m3_fp32_available() is (
-        has_entry and version is not None and version >= 2
+        has_entry and version is not None and version >= 3
     )
 
 
@@ -122,6 +122,8 @@ def test_fp32_workspace_is_separate_from_legacy_half_workspace():
     full = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
     assert half.partial_out.dtype == torch.float16
     assert full.partial_out.dtype == torch.float32
+    assert half.partial_lse.shape == (80, 8, 6)
+    assert full.partial_lse.shape == (80, 8, 6, 2)
     assert half.partial_out.data_ptr() != full.partial_out.data_ptr()
     assert _get_grouped_verify_workspace(q) is half
     assert _get_grouped_verify_workspace(q, partial_dtype=torch.float32) is full
@@ -209,6 +211,7 @@ def test_small_probability_residual_survives_fp16_storage(value):
     probability = torch.tensor(-8.0, dtype=torch.float64).exp()
     expected = value * 31 * probability / (1 + 31 * probability)
     actual = workspace.partial_out[:, :rows].double()
+    actual = actual / workspace.partial_lse[:, :rows, :, 1].double()[..., None]
     relative_error = (actual - expected).abs().max() / expected.abs()
     assert bool(torch.isfinite(actual).all())
     assert float(relative_error) < 3e-6
@@ -242,6 +245,7 @@ def test_long_context_fp32_partials_before_output_rounding(value_bias):
     op(q, k, v, table, lengths, out=torch.empty_like(q), softmax_scale=0.0625)
     workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
     actual = workspace.partial_out[:, :rows].double()
+    actual = actual / workspace.partial_lse[:, :rows, :, 1].double()[..., None]
     keys = encoded[0, :length, 0].view(torch.float8_e4m3fn).double()
     values = encoded[1, :length, 0].view(torch.float8_e4m3fn).double()
     scores = q.transpose(0, 1).double() @ keys.T * 0.0625
@@ -260,3 +264,24 @@ def test_long_context_fp32_partials_before_output_rounding(value_bias):
     relative_l2 = (actual - reference).norm() / reference.norm()
     assert torch.isfinite(actual).all()
     assert float(relative_l2) < 3e-6
+
+
+@pytest.mark.parametrize("length", [131072, 262144])
+def test_uniform_attention_midpoint_has_one_final_normalization(length):
+    """Avoid partition-normalization drift at an exactly representable midpoint."""
+    op = _native()
+    rows, page = 5, 848
+    pages = (length + page - 1) // page
+    q = torch.zeros((rows, 6, 256), device="cuda", dtype=torch.float16)
+    cache = torch.zeros((pages, 2, page, 1, 256), device="cuda", dtype=torch.uint8)
+    k, v = cache.unbind(1)
+    values = torch.ones((pages * page, 1, 256), device="cuda", dtype=torch.float16)
+    values[::256] = 1.125
+    v.copy_(values.to(torch.float8_e4m3fn).view(torch.uint8).reshape_as(v))
+    table = torch.arange(pages, device="cuda", dtype=torch.int32)[None]
+    lengths = torch.full((rows,), length, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    op(q, k, v, table, lengths, out=out, softmax_scale=0.0625)
+    # Uniform scores, exactly 1/256 of values are 1.125: the mean is
+    # 1 + 2**-11. Round-to-nearest-even selects FP16 1, not 1 + 2**-10.
+    assert torch.equal(out, torch.ones_like(out))
