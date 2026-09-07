@@ -245,7 +245,10 @@ def test_balanced_chunks_and_fallback_respect_scratch_bound(cap):
         if _use_qwen38_chunked_w2(layer, tokens, True):
             chunks = (tokens + cap - 1) // cap
             base, extra = divmod(tokens, chunks)
-            sizes = [base + (chunk < extra) for chunk in range(chunks)]
+            if 0 < tokens % cap < 2048:
+                sizes = [base + (chunk < extra) for chunk in range(chunks)]
+            else:
+                sizes = [cap] * (chunks - 1) + [tokens - cap * (chunks - 1)]
             assert sum(sizes) == tokens
             assert 2048 <= min(sizes) <= max(sizes) <= cap
         else:

@@ -8590,6 +8590,9 @@ void awq_moe_chunked_w2_sm70_out(
   const int64_t num_chunks = (num_tokens + chunk_tokens - 1) / chunk_tokens;
   const int64_t base_chunk_tokens = num_tokens / num_chunks;
   const int64_t extra_tokens = num_tokens % num_chunks;
+  const int64_t tail_tokens = num_tokens % chunk_tokens;
+  const bool balance_chunks =
+      tail_tokens > 0 && tail_tokens < kMinIndexedChunkTokens;
   TORCH_CHECK(base_chunk_tokens >= kMinIndexedChunkTokens,
               "awq_moe_chunked_w2_sm70_out: a balanced chunk must contain at "
               "least 2048 tokens.");
@@ -8643,11 +8646,13 @@ void awq_moe_chunked_w2_sm70_out(
   // segment with a contiguous source-route interval therefore keeps the GEMM
   // expert-major while allowing the final reduction to replay route 0..top_k-1
   // in exactly the same FP32 order as moe_unpermute.
-  // Balanced partitions stay within the scratch cap and never have a tiny
-  // final tail. For caps >= 4096 and num_tokens > cap each has >= 2048 tokens.
+  // Preserve the existing schedule when its tail is safe. Only rebalance tiny
+  // tails, keeping every partition within [2048, chunk_tokens].
   int64_t token_begin = 0;
   for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
-    const int64_t current_tokens = base_chunk_tokens + (chunk < extra_tokens);
+    const int64_t current_tokens =
+        balance_chunks ? base_chunk_tokens + (chunk < extra_tokens)
+                       : std::min(chunk_tokens, num_tokens - token_begin);
     const int64_t current_slots = current_tokens * top_k;
     const int64_t source_begin = token_begin * top_k;
     const int64_t source_end = source_begin + current_slots;
