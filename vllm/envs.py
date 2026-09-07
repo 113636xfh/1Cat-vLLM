@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8: bool = False
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
+    VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -452,6 +453,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
+    VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
@@ -1804,6 +1806,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
     # opt-in until operator, token, task-quality, and matched speed gates pass.
+    # Copy-only optimization of the existing batched fused-input fallback.
+    # Does not opt a model into the separate FP16 GEMV arithmetic path.
+    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))
+    ),
     "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
     ),
@@ -3011,6 +3018,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
+    ),
+    # Experimental dense single-request small-Q route; not the DFlash2 q8 gate.
+    "VLLM_FLASH_V100_E4M3_GROUPED_FP32": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
