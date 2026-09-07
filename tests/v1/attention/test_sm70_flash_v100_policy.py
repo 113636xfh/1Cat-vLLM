@@ -3140,3 +3140,67 @@ def test_flash_v100_fp8_kv_route_summary_counts_repeated_hits(monkeypatch):
     assert mod._route_counts["fp8_kv_decode_scalar_paged"] == 2
     assert mod._route_counts["fp8_kv_prefill"] == 1
     assert mod._route_counts["fp8_kv_prefill_prefix"] == 1
+
+
+@pytest.mark.parametrize("mode", ["selected", "off", "batch2"])
+def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    calls = []
+    routes: list[str] = []
+
+    def grouped(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["out"].fill_(3)
+
+    def scalar(*args, **kwargs):
+        calls.append((args, kwargs))
+        kwargs["out"].fill_(2)
+
+    instance = SimpleNamespace(
+        flash_attn_grouped_e4m3_fp32_paged=None if mode == "off" else grouped,
+        kv_cache_dtype="fp8_e4m3",
+        use_smallq_decode_xqa=True,
+        scale=0.0625,
+        _flash_v100_window_size=lambda causal: (-1, -1),
+        _smallq_decode_xqa_allowed=lambda *args, **kwargs: False,
+        _call_flash_attn_decode_paged=scalar,
+    )
+    q = torch.empty((5, 6, 256), dtype=torch.float16)
+    k = torch.empty((1, 848, 1, 256), dtype=torch.uint8)
+    table = torch.zeros((5, 310), dtype=torch.int32)
+    lengths = torch.tensor([8193, 8194, 8195, 0, 0], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        block_table=table[:1],
+        seq_lens=torch.ones(2 if mode == "batch2" else 1, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=1.25)
+    out = torch.empty_like(q)
+    monkeypatch.setattr(mod, "_record_route", routes.append)
+    mod.FlashAttnV100Impl._call_flash_attn_smallq_decode_paged(
+        instance,
+        layer,
+        q,
+        k,
+        k,
+        table,
+        lengths,
+        metadata,
+        out=out,
+        max_seq_len_hint=8195,
+        workspace_seq_capacity_hint=262880,
+        partition_size_hint=None,
+    )
+    assert len(calls) == 1
+    assert calls[0][0][4] is lengths
+    assert calls[0][1]["k_scale"] == 0.5
+    assert calls[0][1]["v_scale"] == 1.25
+    if mode == "selected":
+        assert calls[0][0][3] is metadata.block_table
+        assert routes == ["prefill_smallq_e4m3_grouped_fp32"]
+        assert bool((out == 3).all())
+    else:
+        assert calls[0][0][3] is table
+        assert routes == ["prefill_smallq_decode_scalar"]
+        assert bool((out == 2).all())

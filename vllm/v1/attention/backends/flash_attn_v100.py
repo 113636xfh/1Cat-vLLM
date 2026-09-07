@@ -36,6 +36,10 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+    grouped_e4m3_fp32_allowed,
+    load_grouped_e4m3_fp32,
+)
 from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
@@ -4441,6 +4445,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_splitkv,
         ) = _get_flash_ops()
         self.flash_attn_grouped_verify_paged = _get_flash_grouped_verify_op()
+        use_e4m3_fp32 = (
+            envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            and self.kv_cache_dtype == "fp8_e4m3"
+            and current_platform.is_device_capability(70)
+        )
+        self.flash_attn_grouped_e4m3_fp32_paged = (
+            load_grouped_e4m3_fp32() if use_e4m3_fp32 else None
+        )
+        if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
+            logger.warning_once(
+                "E4M3 grouped FP32 requires Flash-V100 precision revision 3; "
+                "using the existing attention fallback. Rebuild the extension "
+                "and restart workers to enable the repaired route.",
+                scope="process",
+            )
         self.dflash2_grouped_verify_max_query_tokens = (
             _flash_attn_grouped_verify_max_query_tokens
         )
@@ -5567,6 +5586,40 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         partition_size_hint: int | None,
     ) -> None:
         global _logged_prefill_smallq_decode_xqa
+        grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+        if grouped_op is not None and grouped_e4m3_fp32_allowed(
+            self,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            attn_metadata,
+            out=out,
+            partition_size_hint=partition_size_hint,
+        ):
+            # Preserve the builder's device row lengths. In particular, padded
+            # rows must not move the causal boundary of the preceding queries.
+            grouped_op(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=self.scale,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+            )
+            logger.info_once(
+                "FLASH_ATTN_V100 experimental E4M3 grouped FP32 route "
+                "selected (rows=%d, page=%d, explicit row lengths).",
+                query.shape[0],
+                key_cache.shape[1],
+                scope="process",
+            )
+            _record_route("prefill_smallq_e4m3_grouped_fp32")
+            return
         window_size = self._flash_v100_window_size(causal=True)
         if self._smallq_decode_xqa_allowed(
             query,
