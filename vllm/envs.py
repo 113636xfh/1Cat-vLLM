@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8: bool = False
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
+    VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -1804,6 +1805,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
     # opt-in until operator, token, task-quality, and matched speed gates pass.
+    # Copy-only optimization of the existing batched fused-input fallback.
+    # Does not opt a model into the separate FP16 GEMV arithmetic path.
+    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))
+    ),
     "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
     ),
