@@ -10,6 +10,8 @@ from flash_attn_v100.flash_attn_interface import (
     flash_attn_decode_paged_xqa_available,
     flash_attn_decode_qk_scores,
     flash_attn_func,
+    flash_attn_grouped_e4m3_fp32_available,
+    flash_attn_grouped_e4m3_fp32_paged,
     flash_attn_grouped_verify_max_query_tokens,
     flash_attn_grouped_verify_paged,
     flash_attn_lse,
@@ -22,10 +24,12 @@ from flash_attn_v100.flash_attn_interface import (
     flash_attn_qk_scores,
     flash_attn_turboquant_decode_paged,
     flash_attn_turboquant_decode_paged_available,
+    fp8_e4m3_paged_kv_to_fp16,
     fp8_e5m2_paged_kv_to_fp16,
 )
 
 __all__ = [
+    "fp8_e4m3_paged_kv_to_fp16",
     "fp8_e5m2_paged_kv_to_fp16",
     "flash_attn_decode_qk_scores",
     "flash_attn_decode_paged",
@@ -34,6 +38,8 @@ __all__ = [
     "flash_attn_decode_paged_wmma",
     "flash_attn_grouped_verify_max_query_tokens",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_turboquant_decode_paged",
     "flash_attn_turboquant_decode_paged_available",
     "flash_attn_bhmd_func",

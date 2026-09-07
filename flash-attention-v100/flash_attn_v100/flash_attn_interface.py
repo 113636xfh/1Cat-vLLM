@@ -503,13 +503,16 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor, *, partial_dtype: torch.dtype = torch.float16
+) -> _GroupedVerifyWorkspace:
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
         q.dtype,
+        partial_dtype,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
@@ -518,11 +521,11 @@ def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
                 (80, 8, 6, 256),
-                dtype=torch.float16,
+                dtype=partial_dtype,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                (80, 8, 6, 2) if partial_dtype == torch.float32 else (80, 8, 6),
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -1040,6 +1043,57 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     return int(get_max_query_tokens())
 
 
+def flash_attn_grouped_e4m3_fp32_available() -> bool:
+    version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
+    return (
+        hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+        and callable(version)
+        and int(version()) >= 3
+    )
+
+
+def flash_attn_grouped_e4m3_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Experimental E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+
+    Row lengths are authoritative GPU metadata, not inferred from padded Q.
+    Zero lengths produce zero outputs. All positive lengths must fit the
+    block table, whose entries must address valid physical pages. This is
+    not an independent-request batch API. QK/PV and partial storage are FP32;
+    Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    Precision revision 3 retains FP32 numerators and separate max/sum until
+    the final normalization, as well as compensated QK/P and tile-local PV.
+    """
+    if not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 3"
+        )
+    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        float(k_scale),
+        float(v_scale),
+    )
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1436,6 +1490,38 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def fp8_e4m3_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand explicit E4M3 bytes; this does not enable a backend route.
+
+    Positive sequence lengths and physical block IDs must be within the
+    supplied cache/table capacity. Only the live prefix and its 16-token
+    padding are written; the remaining workspace is untouched.
+    """
+    op = getattr(flash_attn_v100_cuda, "fp8_e4m3_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the explicit E4M3 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
 def fp8_e5m2_paged_kv_to_fp16(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -1694,6 +1780,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",
