@@ -13,22 +13,26 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def w2_bank():
+@pytest.fixture(scope="module", params=[False, True], ids=["standard", "compact"])
+def w2_bank(request):
     from benchmarks.benchmark_sm70_turbomind_exactness import _awq_reference_weight
     from vllm import _sm70_ops as sm70
+
+    compact = request.param
 
     if hasattr(torch.ops.five_w2_audit, "chunked"):
         native = torch.ops.five_w2_audit
         ops = SimpleNamespace(
-            prepare=native.prepare,
+            prepare=native.prepare_compact if compact else native.prepare,
             ptrs=native.ptrs,
             baseline=native.baseline,
             chunked=native.chunked,
         )
     elif hasattr(torch.ops._C, "awq_moe_chunked_w2_sm70_out"):
         ops = SimpleNamespace(
-            prepare=sm70.awq_sm70_prepare,
+            prepare=(
+                sm70.awq_sm70_prepare_compact if compact else sm70.awq_sm70_prepare
+            ),
             ptrs=sm70.awq_moe_build_strided_ptrs,
             baseline=sm70.awq_moe_gemm_sm70_per_expert_dispatch_out,
             chunked=sm70.awq_moe_chunked_w2_sm70_out,
@@ -53,8 +57,7 @@ def w2_bank():
         weight, meta, strides = ops.prepare(raw, scale, zero, group, False)
         weights.append(weight)
         metadata.append(meta)
-        if expert in active:
-            decoded[expert] = _awq_reference_weight(raw, scale, zero, group)
+        decoded[expert] = _awq_reference_weight(raw, scale, zero, group)
     weights, metadata = torch.stack(weights), torch.stack(metadata)
     ptr_w, ptr_s = ops.ptrs(
         weights, metadata, int(strides[0]), int(strides[1]), experts
@@ -100,7 +103,11 @@ def test_balanced_w2_values_and_changing_route_graph(w2_bank, tokens, cap):
         route = torch.arange(top_k, device="cuda")[None, :]
         # Rotate the ten active experts, leaving 502 empty segments. Distinct
         # routes per token match production, and phase changes the stable sort.
-        ids.copy_(table[(token + route + phase) % top_k])
+        ids.copy_(
+            (token * 17 + route * 53 + phase) % experts
+            if phase == 7
+            else table[(token + route + phase) % top_k]
+        )
         order = torch.argsort(ids.flatten(), stable=True)
         permutation.copy_(order)
         inverse.view(-1)[order] = torch.arange(slots, dtype=torch.int32, device="cuda")
