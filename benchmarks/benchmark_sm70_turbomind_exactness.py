@@ -1544,21 +1544,15 @@ def _check_awq_moe(
     if actual_impl == "indexed_prefill_chunked_w2":
         assert inv_permuted_idx is not None
         assert permuted_idx is not None
-        if m < 8192:
+        chunk_tokens = 6144
+        if m <= chunk_tokens:
             raise ValueError(
-                "indexed_prefill_chunked_w2 requires at least 8192 tokens."
+                "indexed_prefill_chunked_w2 requires more than 6144 tokens."
             )
         topk_weights = _make_topk_weights(top_k, device).expand(m, -1).contiguous()
         final_output_actual = torch.empty(
             (m, hidden_size), dtype=torch.float16, device=device
         )
-        chunk_tokens = 6144
-        tail_tokens = m % chunk_tokens
-        if 0 < tail_tokens < 2048:
-            raise ValueError(
-                "indexed_prefill_chunked_w2 requires an empty or at least "
-                "2048-token tail."
-            )
         chunk_slots = chunk_tokens * top_k
         chunk_output = torch.empty(
             (chunk_slots, hidden_out), dtype=torch.float16, device=device

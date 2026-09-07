@@ -160,7 +160,7 @@ def _use_qwen38_chunked_w2(
     ):
         return False
 
-    # The native loop balances all chunks, avoiding a small tail that would
+    # The native loop rebalances short tails, avoiding a small tail that would
     # otherwise force a larger-than-profiled full-output allocation.
     top_k = int(layer._awq_moe_buf_top_k)
     chunk_slots = chunk_tokens * top_k
