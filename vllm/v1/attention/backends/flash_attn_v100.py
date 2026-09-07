@@ -1354,19 +1354,30 @@ def _get_sm70_d256_gqa_architecture_op():
 
     _sm70_d256_gqa_architecture_op_checked = True
     try:
+        op_name = (
+            "sm70_d256_gqa_v37_fwd"
+            if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            else "sm70_d256_gqa_architecture_fwd"
+        )
         # The Split-D loader also resolves an explicit source-overlay
         # sidecar. Calling it here keeps both operator families on one binary.
         if not hasattr(
             torch.ops._vllm_fa2_C,
-            "sm70_d256_gqa_architecture_fwd",
+            op_name,
         ):
             _get_sm70_splitd_d256_ops()
 
         _sm70_d256_gqa_architecture_op = getattr(
             torch.ops._vllm_fa2_C,
-            "sm70_d256_gqa_architecture_fwd",
+            op_name,
             None,
         )
+        if _sm70_d256_gqa_architecture_op is None:
+            logger.warning_once(
+                "Requested SM70 GQA operator %s is absent; rebuild FA2. "
+                "Using exact dense prefill, not relabelling the old kernel.",
+                op_name,
+            )
     except (AttributeError, ImportError, RuntimeError) as exc:
         _sm70_d256_gqa_architecture_op = None
         if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL:
@@ -1377,6 +1388,14 @@ def _get_sm70_d256_gqa_architecture_op():
                 exc,
             )
     return _sm70_d256_gqa_architecture_op
+
+
+def _get_sm70_v37_e4m3_bridge_op():
+    """Resolve the format-specific bridge from the same FA2 runtime."""
+    if not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+        return None
+    _get_sm70_splitd_d256_ops()
+    return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
 
 def _uniform_cu_seqlens(
@@ -1502,19 +1521,30 @@ def _should_use_prefill_d256_gqa_architecture(
     softmax_scale: float,
     architecture_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
-    """Gate the stable Q8000/KV16K..256K/Hq6/Hkv1/D256 family."""
+    """Use the v37 tile-aligned family or the original rollback shape gate."""
+    if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+        shape_allowed = (
+            64 <= max_seqlen_q <= 8192
+            and max_seqlen_q % 64 == 0
+            and max_seqlen_q < max_seqlen_k <= 262144
+            and max_seqlen_k % 32 == 0
+        )
+    else:
+        shape_allowed = (
+            max_seqlen_q == 8000
+            and 16000 <= max_seqlen_k <= 256000
+            and max_seqlen_k % 8000 == 0
+        )
     return (
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
         and architecture_op is not None
-        and query.shape == (1, 8000, 6, 256)
+        and shape_allowed
+        and query.shape == (1, max_seqlen_q, 6, 256)
         and key.ndim == 4
         and key.shape[0] == 1
         and key.shape[2:] == (1, 256)
         and value.shape == key.shape
-        and max_seqlen_q == 8000
         and max_seqlen_k == key.shape[1]
-        and 16000 <= max_seqlen_k <= 256000
-        and max_seqlen_k % 8000 == 0
         and query.dtype == torch.float16
         and key.dtype == query.dtype
         and value.dtype == query.dtype
@@ -1565,7 +1595,7 @@ def _try_sm70_fa2_d256_prefill(
         or query.shape[-1] != 256
         or key.shape[-1] != 256
         or value.shape[-1] != 256
-        or max_seqlen_q < 1024
+        or max_seqlen_q < 64
         or not causal
         or window_size != (-1, -1)
         or cu_seqlens_q.device != query.device
@@ -1574,6 +1604,19 @@ def _try_sm70_fa2_d256_prefill(
     ):
         return None
     paged_kv = block_table is not None
+    if max_seqlen_q < 1024:
+        if paged_kv or not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+            return None
+        if not _should_use_prefill_d256_gqa_architecture(
+            query,
+            key,
+            value,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            architecture_op=_get_sm70_d256_gqa_architecture_op(),
+        ):
+            return None
     if block_table is not None:
         if (
             seqused_k is None
@@ -1683,10 +1726,15 @@ def _try_sm70_fa2_d256_prefill(
                         if not _logged_prefill_d256_gqa_architecture:
                             logger.info(
                                 "FLASH_ATTN_V100 SM70 D256 GQA "
-                                "8K-by-16K..256K architecture route active."
+                                "long-prefill architecture route active (%s).",
+                                "v37 FP32"
+                                if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                                else "legacy",
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
+                        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+                            _record_route("prefill_dense_d256_gqa_v37")
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
@@ -1718,7 +1766,7 @@ def _try_sm70_fa2_d256_prefill(
                             )
                             _logged_prefill_dense_splitkv3 = True
                         _record_route("prefill_dense_splitd_d256_splitkv3_kernel")
-                if splitd_result is None:
+                if splitd_result is None and max_seqlen_k % 32 == 0:
                     splitd_result = dense_op(
                         query, key, value, splitd_out, softmax_scale, True
                     )
@@ -4385,6 +4433,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _flash_attn_grouped_verify_max_query_tokens
         )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
+        self.fp8_e4m3_paged_kv_to_fp16 = (
+            _get_sm70_v37_e4m3_bridge_op()
+            if self.kv_cache_dtype == "fp8_e4m3"
+            else None
+        )
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
         self.supports_quant_query_input = False
@@ -4418,9 +4471,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and not paged_prefill_disable
         )
         self.use_fp8_prefill_bridge = (
-            self.fp8_e5m2_paged_kv_to_fp16 is not None
-            and os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
-        )
+            self.fp8_e4m3_paged_kv_to_fp16 is not None
+            if self.kv_cache_dtype == "fp8_e4m3"
+            else self.fp8_e5m2_paged_kv_to_fp16 is not None
+        ) and os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
         self.use_flash_v100_prefill_splitkv = (
             self.flash_attn_prefill_paged_splitkv is not None
             and envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV
@@ -7348,10 +7402,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         causal: bool,
         window_size: tuple[int, int],
     ) -> bool:
+        # Eight-byte input loads and 16-byte output stores. Keep layouts
+        # outside the native bridge contract on their existing fallback.
+        if self.kv_cache_dtype == "fp8_e4m3" and not all(
+            tensor.ndim == 4
+            and tensor.stride(-1) == 1
+            and tensor.data_ptr() % 16 == 0
+            and all(stride % 8 == 0 for stride in tensor.stride()[:3])
+            for tensor in (key_cache, value_cache)
+        ):
+            return False
         return (
             self.use_fp8_prefill_bridge
             and self.use_flash_v100_prefill_paged
-            and self.kv_cache_dtype == "fp8_e5m2"
+            and self.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2")
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
             and key_cache.shape == value_cache.shape
@@ -7398,7 +7462,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if workspace is None:
             return None
         key_out, value_out, output_block_table = workspace
-        self.fp8_e5m2_paged_kv_to_fp16(
+        bridge = (
+            self.fp8_e4m3_paged_kv_to_fp16
+            if self.kv_cache_dtype == "fp8_e4m3"
+            else self.fp8_e5m2_paged_kv_to_fp16
+        )
+        if bridge is None:
+            return None
+        bridge(
             key_cache,
             value_cache,
             active_block_table,
@@ -8184,13 +8255,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         out_seq, out_is_destination = bridge_result
                         if not _logged_fp8_prefill_bridge:
                             logger.info(
-                                "FLASH_ATTN_V100 FP8 E5M2 prefill bridge "
+                                "FLASH_ATTN_V100 %s prefill bridge "
                                 "active (one-pass dequant, shared FP16 page-%d "
                                 "workspace).",
+                                self.kv_cache_dtype,
                                 _FP8_PREFILL_BRIDGE_PAGE_SIZE,
                             )
                             _logged_fp8_prefill_bridge = True
-                        _record_route("prefill_prefix_fp8_e5m2_bridge")
+                        _record_route(
+                            "prefill_prefix_fp8_e4m3_bridge"
+                            if self.kv_cache_dtype == "fp8_e4m3"
+                            else "prefill_prefix_fp8_e5m2_bridge"
+                        )
                     else:
                         out_seq = self.flash_attn_prefill_paged(
                             q_seq,
