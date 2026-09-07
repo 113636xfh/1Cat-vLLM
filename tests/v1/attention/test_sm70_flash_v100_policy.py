@@ -681,6 +681,14 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     )
     monkeypatch.setattr(flash_v100, "_try_sm70_fa2_d256_prefill", exact_dense)
     monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+    monkeypatch.setattr(
+        flash_v100,
+        "_uniform_cu_seqlens",
+        lambda *args, **kwargs: (
+            torch.tensor([0, query_len], dtype=torch.int32),
+            torch.tensor([0, seq_len], dtype=torch.int32),
+        ),
+    )
     impl.flash_attn_prefill_paged = unexpected_paged
 
     result = impl._flash_v100_prefill_with_prefix(
@@ -776,8 +784,11 @@ def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
     assert loaded == ["/tmp/stable-fa2.so"]
 
 
-def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
+@pytest.mark.parametrize("v37", [False, True])
+def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", str(int(v37)))
 
     fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
     fake_package = types.ModuleType("vllm.vllm_flash_attn")
@@ -793,6 +804,7 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
     fake_ops = SimpleNamespace(
         _vllm_fa2_C=SimpleNamespace(
             sm70_d256_gqa_architecture_fwd=architecture,
+            sm70_d256_gqa_v37_fwd=architecture,
         )
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
@@ -910,6 +922,7 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
     name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
     query = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
     key = torch.empty((1, 128000, 1, 256), dtype=torch.float16, device="meta")
@@ -2232,6 +2245,7 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
     impl = object.__new__(FlashAttnV100Impl)
+    impl.kv_cache_dtype = "fp8_e5m2"
     impl.scale = 256**-0.5
     bridge_calls = []
     exact_calls = []
@@ -2308,6 +2322,8 @@ def test_flash_v100_fp8_prefill_bridge_prefers_logical_dense_exact(monkeypatch):
 
 def test_flash_v100_fp8_prefill_bridge_workspace_oom_falls_back(monkeypatch):
     from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     key_cache = torch.zeros((1, 1568, 1, 33), dtype=torch.uint8)
     mod._fp8_prefill_bridge_workspaces.clear()
