@@ -46157,6 +46157,78 @@ passed; no fresh GPU run or performance claim accompanies this recheck.
   established. Do not run these as purported prefetch variants or repeat the
   previously rejected ordinary CUDA128 down. No GPU startup for this screen.
 
+### 2026-09-06: default-off E4M3 grouped FP32 small-query integration
+
+- Base: `755baae1d075ee04fa9096b23fc0225b23589a86` (`onecat/main`).
+  Owned branch: `codex/v100-e4m3-fp32-integration-20260906-050258`.
+- [Design, contract and evidence](sm70_e4m3_grouped_fp32.md): dense single-request
+  q2–8/GQA6/D256, FP32 partial state, explicit device query lengths and graph
+  padding. `VLLM_FLASH_V100_E4M3_GROUPED_FP32` defaults off and checks native
+  capability. E5M2, sparse page4, prefill and B1 defaults are unchanged.
+- Fresh integration extension builds; 39 GPU regression tests pass, 12 new
+  tests pass memcheck with zero errors, and 138 routing-policy tests pass.
+  Private 24-group real-input replay remains below captured scalar L2, but
+  is not bitwise equivalent to the private prototype. No current-main model
+  speed or long-output quality acceptance is claimed.
+- Artifacts: owned worktree `.artifacts/e4m3-fp32/`; source and binary hashes
+  are in the linked report. Private captures and paper drafts stay out of Git.
+  No service was restarted, and all validation GPU processes exited.
+- Keep experimental/default-off pending current-main model gates and human
+  review. Do not count this as completing all E5M2 specializations; the slower
+  native paged SplitKV port remains excluded. PR #517 addresses a different
+  DFlash2 q8/logits/context-pipeline scope and is not replaced by this work.
+
+## 2026-09-06 E4M3 model promotion blocked by a repeated token difference
+
+- See [the grouped FP32 admission update](sm70_e4m3_grouped_fp32.md).
+  Original PR artifact `953924a...959f0`, Qwen3.8-27B-FP8, TP4/MTP4,
+  8K greedy natural-document input, 256 output tokens: dynamic-tuning
+  control--candidate--control was inconclusive because the controls diverged.
+- Under diagnostic-only fixed GEMM dispatch, six control runs agree, but
+  three candidate runs first differ at output token 102. Three same-KV
+  PyTorch FP64 small-Q counterfactual runs reproduce the control's 256 tokens.
+  Finite operator output and lower aggregate L2 do not authorize promotion.
+- Keep the new grouped entry disabled and the FP8 alias unchanged. Do not
+  claim a production speedup from the tune-off diagnostic or its changed
+  output sequence. Long-context acceptance remains pending; fix the local
+  counterexample before repeating broad tests.
+- The E4M3 prefill bridge native/Python conversion entry is added separately
+  as a prerequisite. It has exhaustive encoding/scale/page/graph coverage,
+  but the backend still does not select it. CUDA 12.8 build `c1ce414...b2003`
+  has 70 regression passes, 138 policy passes, and 42 memcheck cases with zero errors;
+  its model gate is not granted. No production service or default changed.
+
+## 2026-09-06 E4M3 precision repair publication remains experimental
+
+- Follow-up commit `52dcdc4d52` compensates QK summation and probability
+  residuals, keeps PV Tensor Core accumulation tile-local, carries online state
+  in FP32, and rejects stale extensions without the precision capability.
+  The scaled residual is paired with an exact inverse scale on E4M3-derived V.
+- The tested CUDA 12.8 binary `87ffc1fd...b325cd` passes 89 GPU checks and
+  62 memcheck cases with zero errors. Two negative controls reproduce the
+  previous biased-PV and residual-underflow errors before final FP16 rounding.
+  Actual-input replay reduces FP16 element disagreements from 2092 to 1872
+  across 200 inputs; four q5/page848 100-ABBA endpoint speed ratios are
+  1.0007/1.0000/1.0007/1.0007. These are not token counts or model speed.
+- The same-process 128K FP64-reference/candidate/FP64-reference bracket
+  completes, but the candidate first diverges at token 77 while both
+  references match all 256 tokens. Four TP ranks hit the native path; all
+  captured layer outputs are finite. Keep the failure in the linked report.
+  Near-ties do not waive the deterministic admission gate.
+- Publish this repair in existing Draft PR #524, not as a default promotion.
+  Merge current main `95205a2d99` into the owned branch without force-pushing;
+  preserve main's independent sparse-page4 allocation-invariance fix.
+  Fresh integration DSO `76aa9a19...e97b42` builds and passes 89 kernel plus
+  138 policy checks; all 200 retained small-Q outputs match archived R6
+  bitwise. Main's planner suite has 30 passes and 8 setup failures (missing
+  `vllm._C`, before numerical assertions); do not report the full suite as
+  passed. These checks are separate from the archived model/sanitizer
+  evidence. Human review and model admission remain outstanding.
+- Later private FP32 long-prefill v18/v37 are not silently included here.
+  Their separate clean-source integration, build dependency cleanup, runtime
+  routing, and whole-model acceptance remain unfinished. Original stable
+  60/61T prefill is already in main and is not replaced by this small-Q PR.
+
 ## 2026-09-06 DFlash2 quality repair mainline integration
 
 The user explicitly requested that the existing output-quality repair
@@ -46200,3 +46272,105 @@ has launched no full model. Details and artifacts are in
   do not confuse it with changing numerical split-K grouping.
 - Ordinary output GEMV already uses64-bit vectorized loads in its PTX.
   Do not repeat speculative scalar-to-vector rewrites without new evidence.
+
+## 2026-09-07 E4M3 FP32 integration alignment repair
+
+- Synchronize PR524 with main `099d9841f5` in commit `4d889d0c1d` and retain
+  both native capability registrations. Keep the explicit-row FP32 entry on
+  its 8-byte load contract; do not inherit main's dense-q8 16-byte paired
+  load for admitted 8-but-not-16-byte KV strides.
+- Fresh DSO `b65ee698...9132b3`: 98 kernel, 142 policy, 38 planner checks
+  pass. The planner runs with pinned archived core dependencies, not a newly
+  rebuilt core. All three new padded-stride graph cases pass memcheck with
+  zero errors. All 200 real-input outputs match the previous R6 bitwise;
+  four 100-ABBA q5 speed ratios remain within 0.26% of one.
+- The alignment issue is fixed in this tested source. The refreshed 128K
+  same-process model bracket is still running; the prior token-77 failure
+  remains a separate blocker. Do not promote the route, change defaults, or
+  transfer operator passes to model admission. See the linked E4M3 report.
+
+## 2026-09-07 E4M3 revision-3 state precision repair
+
+- Main7 revision 2 completed its refreshed 128K bracket: candidate and both
+  stable references match all 256 tokens, with native route hits on all four
+  TP ranks. This does not establish why the prior cohort differed at token
+  77; keep the old failure and the source/binary boundaries in the report.
+- Revision 3 (`beb172ebd0`) retains max/sum and unnormalized FP32 PV until
+  the final combine. Version-gate the changed workspace so old extensions
+  cannot consume the new layout. FP16-midpoint tests expose a round-up error
+  in the old normalized/LSE path at 128K/256K; the new state returns the
+  correct ties-to-even value without introducing production FP64.
+- Fresh DSO `8880b040...a9d49`: 102 kernel, 142 policy, 38 planner, and 69
+  memcheck passes with zero memory errors. All 200 real-input outputs match
+  the screened prototype. Their FP16 disagreements fall from 1872 to 1640,
+  but 45/200 groups worsen; do not claim uniform per-input L2 improvement.
+  Four 100-ABBA q5 speed ratios are within 0.08% of one.
+- The frozen-driver model run passes the 128K 256-token bracket, then fails
+  261888+256 at one-based token 126: both FP64-attention references choose
+  `speed`, candidate chooses `benchmark`. References are stable, four TP
+  ranks hit the route, and all captured attention outputs are finite. A
+  reference top-two tie is not a waiver. Result SHA256 is
+  `a94d356ce29273fba3a202428ea77c737e7f51bd5152be1885d3ed46b6fb700e`.
+- The length-boundary broadcast wait eventually recovers; all eight model
+  requests complete. A q5-only summarizer assertion failed on valid late q3
+  rows; its width-aware replacement preserves strict token/finite checks.
+  Retain both the original summary failure and the earlier aborted startup
+  with a changed driver hash. Neither is mislabeled as a model pass.
+- A new counterfactual tests main's existing FP32 LM-head flag identically
+  in reference and candidate; the failing cohort used FP16 logits and SSM
+  state. The same-shape synthetic head screen improves arithmetic precision
+  with unchanged operator latency, but does not establish the cause of token
+  126 or approve model speed/quality. Avoid rerunning the same failed FP16
+  cohort without a new hypothesis. Keep the route default-off and PR524 Draft.
+
+## 2026-09-07 E4M3 Q alignment and FP32-head counterfactual
+
+- The FP32-head-only counterfactual fails at 128K token 191 (`validation`
+  versus the stable references' `scrutiny`). Both sides really emit FP32
+  logits; all recorded attention outputs are finite. The prescribed gate
+  stops before 256K. Raw result SHA256:
+  `9571a0b77a2dfa161b8e8f0aa90097e3e6f9115b89c5eab06f295394113b043c`.
+  Do not keep rerunning FP16 SSM plus FP32 head as a claimed repair.
+- The diagnostic explicitly fixed SSM state to FP16. Current main's GDN
+  `auto` default is FP32. Test that single configuration change on both
+  reference and candidate while retaining FP32 logits, and record actual
+  cache dtype/page shape. Neither earlier FP16-SSM failure is erased.
+- Q views with half-element offsets 1/4/7 are contiguous but have base-byte
+  remainders 2/8/14 modulo 16. The new entry's host code now clones only
+  unaligned Q after its device guard, before the uint4 feed. Normal aligned
+  inputs, kernel arithmetic and workspace ABI are unchanged; no blind
+  fallback into another vector loader is used. This is not attributed to
+  the model's token counterexamples.
+- DSO `c33a8444...b56aaf`: 105 kernel passes, six targeted alignment memcheck
+  passes with zero errors, and all 200 aligned real inputs match the previous
+  revision-3 DSO bitwise. Four q5 100-ABBA speed ratios are
+  1.01834/1.00065/1.00036/1.00000. Model admission and human review remain
+  outstanding; keep PR524 Draft and production defaults unchanged.
+
+## 2026-09-07 final FP32-SSM counterfactual remains unadmitted
+
+- Guarded-Q source `0c34be5d60` / DSO `c33a8444...b56aaf`, actual FP32 SSM
+  (48 GDN layers on all four ranks), FP16 conv, FP32 logits, page1616:
+  128K reference/native/reference matches all 256 tokens, but 261888+256
+  first differs at token 26 (`-level` vs `-`). Both references are stable.
+  Raw result SHA256:
+  `452a5a1845cae49b8aa26470a2fffacc4e8009a715ebb7625ec3b0e990c3a722`.
+- All captured attention outputs are finite and near the final FP16 rounding
+  floor. This does not waive the deterministic gate. Both prose outputs are
+  coherent; do not portray the local counterexample as universal semantic
+  degradation or claim that an earlier/later divergence ranks configurations.
+- The FP32-SSM configuration does not solve all failures. Do not repeat this
+  unchanged long cohort; next capture/replay the first-divergence prefix to
+  separate local arithmetic error from downstream/MTP-state propagation.
+- Two private dtype-recording setup failures preceded the successful run:
+  a Dynamo graph-break hook and a subclass filter mistake. Both occurred
+  before accepted generation; keep their logs separate from numerical gates.
+- The boundary wait coincides with on-demand compilation of this worktree's
+  strided FlashQLA GDN module, followed by recovery. That dependency uses
+  CUDA 12.0.140, with DSO SHA256
+  `89337e7055cc8ba8f9bd972341f43010ce23a5a7cb991a84eb48e60bc5bbfaf9`.
+  Prebuild/warm it before production timing. Do not label this diagnostic
+  elapsed time as a prefill/decode benchmark or mix its build provenance
+  with the CUDA-12.8 Flash-V100 extension.
+- Model admission and human review remain outstanding. PR524 stays Draft;
+  no auto-merge, production default change, or private long-prefill promotion.
