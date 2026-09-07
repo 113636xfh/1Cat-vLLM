@@ -693,17 +693,77 @@ STRICT_ROLE_TEMPLATE = (
     "{% endif %}"
 )
 
+COMMENT_ONLY_DEVELOPER_TEMPLATE = "{# role == 'developer' #}" + STRICT_ROLE_TEMPLATE
+
+REJECT_DEVELOPER_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'developer' %}"
+    "{{ raise_exception('developer role is unsupported') }}"
+    "{% else %}"
+    "{{ message['content'] }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+ROLE_LIST_DEVELOPER_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] in ('system', 'developer') %}"
+    "{{ message['content'] }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+CONDITIONAL_DEVELOPER_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'developer' and enable_developer %}"
+    "{{ message['content'] }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+NESTED_CONDITIONAL_DEVELOPER_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if enable_developer %}"
+    "{% if message['role'] == 'developer' %}{{ message['content'] }}{% endif %}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+UNREACHABLE_DEVELOPER_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] in ('user', 'developer') %}"
+    "{{ raise_exception('developer role is unsupported') }}"
+    "{% elif message['role'] == 'developer' %}"
+    "{{ message['content'] }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+OUTER_CONDITIONAL_DEVELOPER_TEMPLATE = (
+    "{% if enable_developer %}"
+    "{% for message in messages %}"
+    "{% if message['role'] == 'developer' %}{{ message['content'] }}{% endif %}"
+    "{% endfor %}"
+    "{% endif %}"
+)
+
+FILTERED_DEVELOPER_LOOP_TEMPLATE = (
+    "{% for message in messages if message['role'] != 'developer' %}"
+    "{% if message['role'] == 'developer' %}{{ message['content'] }}{% endif %}"
+    "{% endfor %}"
+)
+
 
 class TestDetectDeveloperRoleSupport:
     def test_absent_in_chatml(self):
         assert _detect_developer_role_support(CHATML_TEMPLATE) is False
 
     def test_present_double_quotes(self):
-        assert _detect_developer_role_support(TEMPLATE_WITH_DEVELOPER) is True
+        template = TEMPLATE_WITH_DEVELOPER.replace("'developer'", '"developer"')
+        assert _detect_developer_role_support(template) is True
 
     def test_present_single_quotes(self):
-        template = TEMPLATE_WITH_DEVELOPER.replace('"developer"', "'developer'")
-        assert _detect_developer_role_support(template) is True
+        assert _detect_developer_role_support(TEMPLATE_WITH_DEVELOPER) is True
 
     def test_absent_in_strict_template(self):
         assert _detect_developer_role_support(STRICT_ROLE_TEMPLATE) is False
@@ -730,6 +790,36 @@ class TestDetectDeveloperRoleSupport:
             "{% endif %}{% endfor %}"
         )
         assert not _detect_developer_role_support(template)
+
+    def test_absent_when_only_jinja_comment_mentions_developer(self):
+        assert _detect_developer_role_support(COMMENT_ONLY_DEVELOPER_TEMPLATE) is False
+
+    def test_rejecting_developer_branch_is_not_support(self):
+        assert _detect_developer_role_support(REJECT_DEVELOPER_TEMPLATE) is False
+
+    def test_role_membership_branch_is_support(self):
+        assert _detect_developer_role_support(ROLE_LIST_DEVELOPER_TEMPLATE) is True
+
+    def test_conditionally_enabled_developer_branch_is_not_support(self):
+        assert _detect_developer_role_support(CONDITIONAL_DEVELOPER_TEMPLATE) is False
+
+    def test_nested_conditionally_enabled_branch_is_not_support(self):
+        assert (
+            _detect_developer_role_support(NESTED_CONDITIONAL_DEVELOPER_TEMPLATE)
+            is False
+        )
+
+    def test_unreachable_developer_branch_is_not_support(self):
+        assert _detect_developer_role_support(UNREACHABLE_DEVELOPER_TEMPLATE) is False
+
+    def test_outer_conditional_loop_is_not_support(self):
+        assert (
+            _detect_developer_role_support(OUTER_CONDITIONAL_DEVELOPER_TEMPLATE)
+            is False
+        )
+
+    def test_loop_filter_excluding_developer_is_not_support(self):
+        assert _detect_developer_role_support(FILTERED_DEVELOPER_LOOP_TEMPLATE) is False
 
 
 class TestSafeApplyChatTemplateDeveloperRole:
@@ -837,6 +927,28 @@ class TestSafeApplyChatTemplateDeveloperRole:
         assert "Be concise." in result
         assert "What is 2+2?" in result
 
+    def test_codex_system_and_multiple_developer_messages_consolidated(
+        self, model_config, tokenizer
+    ):
+        conversation = [
+            {"role": "system", "content": "Base instructions."},
+            {"role": "developer", "content": "Follow AGENTS.md."},
+            {"role": "developer", "content": "Use the sandbox policy."},
+            {"role": "user", "content": "Fix the issue."},
+        ]
+        result = safe_apply_chat_template(
+            model_config,
+            tokenizer,
+            conversation,
+            chat_template=SYSTEM_FIRST_TEMPLATE,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert result.count("<|im_start|>system") == 1
+        assert "Base instructions.\n\nFollow AGENTS.md." in result
+        assert "Follow AGENTS.md.\n\nUse the sandbox policy." in result
+        assert "<|im_start|>developer" not in result
+
     def test_developer_only_no_prior_system(self, model_config, tokenizer):
         conversation = [
             {"role": "user", "content": "Hello"},
@@ -917,20 +1029,51 @@ class TestConsolidateSystemMessages:
         assert result[1]["role"] == "user"
 
     def test_list_content_handled(self):
+        system_content = [
+            {"type": "text", "text": "Rule 1."},
+            {"type": "text", "text": "Rule 2."},
+        ]
         conversation: list[dict] = [
             {"role": "user", "content": "Hello"},
             {
                 "role": "system",
-                "content": [
-                    {"type": "text", "text": "Rule 1."},
-                    {"type": "text", "text": "Rule 2."},
-                ],
+                "content": system_content,
             },
         ]
         result = _consolidate_system_messages(conversation)
         assert result[0]["role"] == "system"
-        assert result[0]["content"] == conversation[1]["content"]
+        assert result[0]["content"] == system_content
         assert result[1]["role"] == "user"
+
+    def test_structured_content_preserved_when_merged(self):
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+        }
+        conversation = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "Inspect this image."},
+                    image_part,
+                ],
+            },
+            {"role": "user", "content": "Start."},
+            {"role": "developer", "content": "Be concise."},
+        ]
+        result = _consolidate_system_messages(
+            _convert_developer_to_system(conversation)
+        )
+        assert result[0] == {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Inspect this image."},
+                image_part,
+                {"type": "text", "text": "\n\n"},
+                {"type": "text", "text": "Be concise."},
+            ],
+        }
+        assert result[1] == {"role": "user", "content": "Start."}
 
     def test_does_not_mutate_original(self):
         conversation = [
@@ -959,7 +1102,11 @@ class TestConsolidateSystemMessages:
         original = copy.deepcopy(conversation)
         result = _consolidate_system_messages(conversation)
         assert result[0]["name"] == "policy"
-        assert result[0]["content"] == [*parts, {"type": "text", "text": "Be concise"}]
+        assert result[0]["content"] == [
+            *parts,
+            {"type": "text", "text": "\n\n"},
+            {"type": "text", "text": "Be concise"},
+        ]
         assert conversation == original
 
     def test_conflicting_metadata_is_not_silently_lost(self):

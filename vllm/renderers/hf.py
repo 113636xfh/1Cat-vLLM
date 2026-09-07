@@ -542,10 +542,19 @@ def _consolidate_system_messages(
                     )
                 merged[key] = value
     if any(isinstance(content, list) for content in contents):
-        parts = []
+        parts: list[dict[str, Any]] = []
         for content in contents:
+            if not content:
+                continue
+            if parts:
+                parts.append({"type": "text", "text": "\n\n"})
             if isinstance(content, list):
-                parts.extend(content)
+                parts.extend(
+                    {"type": "text", "text": part}
+                    if isinstance(part, str)
+                    else copy.deepcopy(part)
+                    for part in content
+                )
             elif content:
                 parts.append({"type": "text", "text": content})
         merged["content"] = parts
