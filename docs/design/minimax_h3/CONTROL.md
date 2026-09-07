@@ -1,0 +1,94 @@
+# Native MiniMax H3 migration control
+
+Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
+
+## Fixed scope
+
+- Base: onecat/main 56f534e672657a6c7599afd6c0dcb2e2c211b2e3.
+- Native model/pipeline/service; no vllm-omni runtime dependency.
+- Model sources, licenses and revisions: see
+  `vllm/model_executor/models/minimax_h3/UPSTREAM.md`.
+- FL2VA and Ref2VA, original BF16 checkpoint and Comfy INT8 ConvRot AdaLN-pruned checkpoint.
+- Four V100-SXM2-32GB, TP4 DiT/text encoder, native four-rank VAE tile parallel.
+- FP16 compute with FP32 latent projections, timestep computation, pruned AdaLN and output heads.
+- Acceptance: 1344x768, 243 frames, 24 FPS, seed 42, 50 sigma positions,
+  no LoRA/step skipping/approximate cache; record actual DiT forwards.
+- Each rank median useful model FLOPs / complete-denoise wall time >80 TFLOPS;
+  warmup once, then three unprofiled measurements; denoise CV <=5%.
+- Two attention backends must pass quality. Fastest qualified backend carries
+  performance acceptance. BF16 checkpoint performance is reported separately.
+
+## Implementation evidence
+
+- Created isolated owned worktree and branch; canonical checkout left untouched.
+- Native H3 packed layouts, reference processing, scheduler, transformer, Qwen3VL
+  encoder and VAE adapter ports in progress. Omni framework, sequence-parallel,
+  LoRA and approximate cache dependencies removed from native execution path.
+- Signed INT8/FP32 scales, runtime QKV order, fused FFN shard loading and
+  pruned AdaLN interpolation ported from open PR 6894.
+- W8A16 currently has an explicit PyTorch numerical reference. This is not
+  TurboMind kernel completion or a performance result.
+- Flash-V100 path connected; FlashInfer D128 non-causal path must be implemented
+  before backend support or qualification is claimed.
+
+## Environment and failed paths
+
+- Owned Python 3.12 environment uses Torch 2.10.0+cu128, Transformers 5.15.1,
+  Diffusers 0.40.0. System nvcc is 12.0; owned CUDA 12.8 toolkit pending.
+- Initial dependency resolution tried to upgrade Torch/CUDA; interrupted before
+  installation and used pinned packages without replacing the shared environment.
+- Bootstrap vLLM binaries are read-only links from the local 1Cat 1.5.0 environment;
+  hashes are recorded in task artifacts. They are not a new source-build result.
+- Upstream modulation and QK/RoPE kernels contain explicit BF16 roundings. These
+  require FP16 adaptation and numerical tests on SM70 before performance use.
+
+## Remaining gates
+
+1. Targeted format, packing, TP/shard, FP16 numeric, padding and reference tests.
+2. Native serial CLI/API, dependency installation, media export and job lifecycle.
+3. TurboMind signed W8A16, bounded cache and real FlashInfer-SM70 non-causal D128.
+4. Actual checkpoint loading and both-partition GPU functional generation.
+5. Full video quality, fixed-shape performance measurements and profiler evidence.
+6. Three review scopes/Draft PRs with signed commits and reproducible artifacts.
+
+Every failed GPU experiment must record configuration, result and the resulting
+implementation decision here or in linked benchmark evidence. Do not repeat an
+unchanged experiment. No acceptance result may be inferred from route imports,
+GPU utilization, synthetic operator peaks, or estimated hardware capabilities.
+
+## 2026-09-08 native and operator checkpoint
+
+- `tests/video`: 14 passed, including signed INT8/row-scale restoration,
+  Kronecker ConvRot256/inverse, original QKV reorder, curve interpolation,
+  partition metadata, 243-frame/49-forward schedule, poisoned padding,
+  both non-causal attention backends on V100, W8A16 FP32 reduction, encoder
+  causal GQA, and serial HTTP job lifecycle.
+- Synthetic two-block INT8 curve DiT: TP1 versus TP4 on GPU 0–3 passed on every
+  rank. Repeated after replacing reference linear execution with native W8A16;
+  all four ranks passed (atol 0.0005, rtol 0.02). This is a correctness test,
+  not full-model or performance acceptance.
+- Native W8A16 decodes signed INT8 with original FP32 per-row scales, rotates
+  activations in FP32 with FP16 output and calls cuBLAS FP16 GEMM from the
+  TurboMind SM70 operator module. Uses explicit FP32 compute and disables
+  reduced-precision reductions. Initial cuBLAS math-mode comparison failed;
+  explicitly disabling reduced-precision reductions fixed the mismatch.
+- FlashInfer-SM70 now owns a D128 non-causal online-softmax WMMA operator using
+  the repository's Volta QK/PV primitives. Lengths 1,17,63,64,65,243,1025 passed
+  the FP32 reference (largest observed absolute error 0.0009765625). No
+  Flash-V100 delegation occurs in this route. Large-sequence optimization and
+  full-video quality remain pending.
+- CLI `vllm video generate/serve`, serial worker engine, HTTP jobs, optional
+  video dependencies, fixed-list FP16 cache, useful-FLOP hooks, NVML sampling,
+  media export and automated video checks are implemented. Runtime validation
+  with actual full checkpoints remains pending while weights download.
+- CUDA Toolkit 12.8.93 nvcc installed in the task artifact directory; independent
+  extension builds passed against Torch 2.10.0+cu128. Wheel targets added, but
+  complete wheel build has not yet been validated.
+- Nsight Compute on GPU 0 returned `ERR_NVGPUCTRPERM`. No counters were collected.
+  Do not claim Tensor Core activity/occupancy from this run. Nsight Systems
+  tracing is being checked separately. No global driver settings were changed.
+
+Raw evidence (not committed): task artifact directory
+`/data/minimax-h3/native-h3-20260908/`, including `native-tests.log`,
+`tp1-smoke.log`, `tp4-smoke.log`, `tp4-w8a16-smoke.log`,
+`build-owned-extensions.log`, `flashinfer-numerics.log`, and `profiles/`.
