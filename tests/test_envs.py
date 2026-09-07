@@ -162,12 +162,24 @@ def test_sm70_concurrency_tuning_envs(
     names = (
         "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING",
         "VLLM_SM70_TOPK_TOPP_8_WARPS",
+        "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
         assert environment_variables[name]() is False
         monkeypatch.setenv(name, "1")
         assert environment_variables[name]() is True
+
+    for name in (
+        "VLLM_SM70_FP8_QPN8_M16",
+        "VLLM_SM70_FP8_QPN8_M32_CHUNKED",
+        "VLLM_SM70_FP8_QPN8_M32_NATIVE",
+        "VLLM_SM70_NVFP4_QPN2_M16_NATIVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
 
     name = "VLLM_SM70_MTP_MOE_TUNED_CONFIG"
     monkeypatch.delenv(name, raising=False)

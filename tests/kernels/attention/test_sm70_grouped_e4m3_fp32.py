@@ -129,6 +129,21 @@ def test_fp32_workspace_is_separate_from_legacy_half_workspace():
     assert _get_grouped_verify_workspace(q, partial_dtype=torch.float32) is full
 
 
+def test_precision_workspace_is_separate_from_request_major_batch():
+    _native()
+    from flash_attn_v100.flash_attn_interface import _get_grouped_verify_workspace
+
+    q = torch.zeros((16, 6, 256), dtype=torch.float16, device="cuda")
+    batched = _get_grouped_verify_workspace(q, 2)
+    wide = _get_grouped_verify_workspace(q, 1)
+    precise = _get_grouped_verify_workspace(q[:5], partial_dtype=torch.float32)
+    assert batched.partial_out.shape == (2, 80, 8, 6, 256)
+    assert wide.partial_out.shape == (40, 16, 6, 256)
+    assert precise.partial_out.shape == (80, 8, 6, 256)
+    assert precise.partial_lse.shape == (80, 8, 6, 2)
+    assert len({item.partial_out.data_ptr() for item in (batched, wide, precise)}) == 3
+
+
 @pytest.mark.parametrize("padding", ["token", "block", "both"])
 def test_eight_byte_kv_strides_match_contiguous_graph(padding):
     """The explicit-row route must not inherit q8's 16-byte paired loader."""
