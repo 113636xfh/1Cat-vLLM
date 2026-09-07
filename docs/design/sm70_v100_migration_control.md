@@ -2,6 +2,29 @@
 
 Date: 2026-05-30
 
+## v37 prefill integration: model-parity hold, 2026-09-07
+
+Draft [PR548](https://github.com/1CatAI/1Cat-vLLM/pull/548) integrates the
+FP32 v37 prefill route and exact E4M3 bridge, independently of grouped/MTP
+PR524. See [the integration audit](sm70_flash_v37_prefill.md) for admission,
+rollback and the explicit E4M3 wave-decode launch recipe. Global KV encoding
+and decode kernels are unchanged; every model run has MTP disabled.
+
+The port preserves bitwise operator output and latency, including17
+real-derived dynamic-shape comparisons. CPU141-pass/1-skip, GPU33-pass,
+CMake build and memory-safety checks are recorded. In the controlled TP4
+comparison,256000-input decode is43.136 versus43.109tok/s and prefill is
+106.985 versus107.000s. This is not a NVFP4-weight50.38tok/s baseline.
+
+Do not merge yet: with non-FA2 native binaries held identical, five of six
+natural-EOS outputs match exactly, but the256K summary differs from token109
+(157 versus158 tokens). Both answers remain coherent and retrieval-correct;
+the cause of the identity failure is not established. An earlier
+multi-library comparison also differed on a72-input-token reasoning prompt,
+which cannot enter v37. Preserve both failed comparisons. Do not repeat
+kernel-only checks as a substitute for localizing model-level variation,
+or use forced post-EOS continuations as quality evidence.
+
 ## QUASAR E4M3 KV and FP32 logits, 2026-09-06
 
 The [precision follow-up](sm70_quasar_e4m3_fp32_logits.md) adds explicit

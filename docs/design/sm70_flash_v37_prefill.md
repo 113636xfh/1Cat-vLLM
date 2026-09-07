@@ -31,6 +31,34 @@ the old architecture loader and disable the new E4M3 bridge. Runtime
 environment mutation in an already initialized engine is not a rollback
 mechanism.
 
+### Preserve the E4M3 decode launch contract
+
+For the measured no-MTP TP4 E4M3/page1568 route, set these existing switches
+before starting the engine or any worker:
+
+```bash
+export VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1
+export VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO=1
+export VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS=1
+export VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH=1
+```
+
+Use explicit `kv_cache_dtype="fp8_e4m3"`, `speculative_config=None`, TP4,
+`attention_backend="FLASH_ATTN_V100"`, `max_model_len=262144`,
+`max_num_batched_tokens=8192`, `max_num_seqs=1` and
+`gpu_memory_utilization=0.8`. The measured activation
+and convolution state are FP16; the resolved SSM state is FP32. Keep prefix
+caching off when reproducing the reported prefill timing.
+
+The wave switches remain opt-in and obey their existing native shape/layout
+gates. This PR does not globally enable them or reinterpret the `fp8` alias.
+The `decode_xqa_p64_page1568` counter records a planning hint, not the final
+device-selected partition. To verify the native route, additionally set
+`VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE=1` and check both the native
+`merged_long=1, converter=shared-lut` message and the worker's long-context
+CUDA Graph dispatch message. Setting a switch without seeing the relevant
+execution is not a performance qualification.
+
 ## Operator evidence
 
 The fixed-shape port matches the private v37 output bitwise on 12 complete
@@ -104,6 +132,75 @@ historical performance parity nor decode-speed admission. The earlier
 PR285 result of 50.376 tok/s at final context 262144 used this long-wave
 route, with NVFP4 rather than the FP8 model weights used here. Promotion is
 paused while a same-contract FP8 comparison isolates the missing dispatch.
+
+## Final runtime audit: model-parity hold
+
+PR [548](https://github.com/1CatAI/1Cat-vLLM/pull/548) remains in Draft.
+Operator precision, port latency and memory-safety checks pass, but the
+strict natural-output token-parity gate does not. Do not describe this as
+a completed model-quality promotion.
+
+The final attention components are the CMake-built FA2 target and a clean
+native Flash rebuild, both CUDA12.8/GCC12. Shared core/stable dependencies
+remain pinned; this is not a complete newly built wheel. The matched model
+uses the explicit launch contract above, Torch2.10.0+cu128, FP8 weights,
+deterministic temperature0 and top-5 logprob recording. Timing requests
+generate64 tokens; natural-quality requests respect EOS with a512-token cap.
+
+The first full comparison also changed native dependencies and found a
+near-tie wording divergence at reasoning token279. The prompt has72 input
+tokens, with no prefix, so that request cannot enter the v37 operator.
+Both reasoning answers give the correct9 red/13 blue counts and explain
+why6.5 whole balls cannot be moved. This observation is retained, not
+relabelled as a passing strict-parity result or proof of degraded semantics.
+
+A third run holds the native Flash and paged-helper binaries identical and
+compares retained FA2/JIT-v37 against the parent-owned FA2/v37 port. This is
+the relevant single-library integration comparison:
+
+| Input tokens | Retained / release prefill s | Retained / release decode tok/s |
+| ---: | ---: | ---: |
+| 8192 | 1.705 / 1.699 | 58.918 / 59.001 |
+| 65536 | 16.811 / 16.808 | 55.623 / 55.493 |
+| 128000 | 39.747 / 39.779 | 50.447 / 50.505 |
+| 256000 | 106.985 / 107.000 | 43.136 / 43.109 |
+| 262080 +64 output | 110.551 / 110.560 | 42.904 / 42.941 |
+
+These remain single post-warmup model observations, not statistical paired
+model measurements. The exact262144 final-context request completes without
+non-finite recorded logprobs or a corruption flag. All timing-request
+natural prefixes match; forced post-EOS tokens are excluded from quality.
+
+| Natural-EOS task | Retained / release output tokens | Exact token parity |
+| --- | ---: | --- |
+| Arithmetic | 4 / 4 | yes |
+| Chinese explanation | 72 / 72 | yes |
+| Reasoning | 394 / 394 | yes |
+| Python function | 129 / 129 | yes |
+| 128000-input summary | 180 / 180 | yes |
+| 256000-input summary | 157 / 158 | **no** |
+
+The matched-native256K summary first differs at token109, changing a phrase
+equivalent to "this unique phrase" versus "this verification phrase".
+Both summaries are coherent and retrieve the required phrase, but they do
+not satisfy the strict identity gate. Common top-5 logprobs are not bitwise
+equal either; their maximum difference is0.203125 on the matched reasoning
+stream. This is not full-vocabulary KL or a perplexity result.
+
+Further isolation finds bitwise-identical v37 outputs on17 real-derived
+dynamic shapes, including Q64/384/1600/8192 with KV16K–256K. Queries beyond
+the8000-row capture repeat recorded rows; these are derived operator tests,
+not live model activation captures. The eight native D256 dense-prefill
+kernel instruction dumps match, and six real no-MTP decode replays have
+identical numerical metrics across native builds. These negative findings
+do not establish the cause of the model-level divergence. Resolving it,
+including possible independent-process variability, remains a merge gate.
+
+Post-rebase checks:141 CPU tests passed/1 GPU-only skip;33 GPU tests passed
+(25 v37 and8 wave-route cases). The earlier CMake/OOM suite passed26 tests;
+Compute Sanitizer reported zero errors. The reviewed Python output passes
+its three emitted assertions and six additional cases. All model workers
+assert no speculative configuration and no drafter. Only GPUs0–3 were used.
 
 ## Rejected paths and remaining admission work
 
