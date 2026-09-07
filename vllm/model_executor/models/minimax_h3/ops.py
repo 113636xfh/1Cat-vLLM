@@ -12,12 +12,16 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.variance_epsilon = eps
 
-    def forward(self, x):
+    def forward(self, x, residual=None):
+        if residual is not None:
+            residual = residual + x
+            x = residual
         value = x.float()
         value = value * torch.rsqrt(
             value.square().mean(-1, keepdim=True) + self.variance_epsilon
         )
-        return (value * self.weight.float()).to(x.dtype)
+        output = (value * self.weight.float()).to(x.dtype)
+        return output if residual is None else (output, residual)
 
 
 class RotaryEmbedding(nn.Module):

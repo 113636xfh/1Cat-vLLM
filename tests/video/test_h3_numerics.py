@@ -195,3 +195,18 @@ def test_encoder_causal_gqa_matches_fp32():
         is_causal=True,
     ).half()
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
+
+
+def test_encoder_residual_rmsnorm_preserves_residual_rounding():
+    from vllm.model_executor.models.minimax_h3.ops import RMSNorm
+
+    norm = RMSNorm(128, eps=1e-6, dtype=torch.float16)
+    x, residual = [torch.randn(3, 128, dtype=torch.float16) for _ in range(2)]
+    expected_residual = residual + x
+    value = expected_residual.float()
+    expected = (
+        value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+    ).half()
+    output, updated = norm(x, residual)
+    torch.testing.assert_close(updated, expected_residual, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected)

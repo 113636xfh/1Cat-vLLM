@@ -92,3 +92,18 @@ Raw evidence (not committed): task artifact directory
 `/data/minimax-h3/native-h3-20260908/`, including `native-tests.log`,
 `tp1-smoke.log`, `tp4-smoke.log`, `tp4-w8a16-smoke.log`,
 `build-owned-extensions.log`, `flashinfer-numerics.log`, and `profiles/`.
+
+### Actual components and loader recovery
+
+The first real TP4 Qwen3VL encode exposed a missing optional residual argument
+in the native RMSNorm adapter. Restored the reference residual-add/FP16 rounding
+contract and added a focused regression; full TP4 encode is being repeated to
+validate that fix. The VAE component checks produced finite 22-frame 64x64 video
+(15,278,413,824 peak allocated bytes on GPU 0) and finite 32-kHz mono audio. T=2
+was rejected by the VAE streaming decoder; the valid component smoke uses T=7.
+The original text-encoder shard 10 stalled in Xet reconstruction. Recovered it
+through HTTP, verified SHA256 `aded5a4d1d5e22dbd8b6f79266b6eb88c840411b09527c53917a1419ace22e2f`,
+and stopped only the owned stalled downloader. INT8 downloads continue separately.
+Nsight Systems 2025.1 CLI produced a usable trace; the W8A16 projection launched
+`cutlass_70_tensorop_f16_s884gemm_relu_f16_128x128_tn_align8`. This confirms the
+Tensor Core kernel route, not measured Tensor Core activity or full-denoise speed.
