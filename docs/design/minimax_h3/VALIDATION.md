@@ -6,45 +6,53 @@ is the user-selected mainline and the default denoiser. Keep profiler
 diagnostics separate from the three formal timing runs.
 
 The current short-development target is **under 50 seconds for 20 actual DiT
-updates**, retaining 1344x768, 39 frames, seed42, INT8 ConvRot, TP4 GPU0-3 and
-output quality, without a substantial memory increase. The latest native
-FlashAttention V-prefetch route measures **69.062335 s**, or 3.453117 s/update
-and 50.154018 useful TFLOPS/card. The prior full-tile/column-major INT8 route
-measured 69.923404 s; this is a 1.23% reduction. Both use zero persistent
-FP16 cache and zero Lt workspace. Peak allocated denoise memory remains
-6.647851467 GiB on all four cards; NVML peak device-used memory is 8.583496 GiB.
+updates**, retaining 1344x768, 39 frames/24 FPS, seed42, INT8 ConvRot FL2VA,
+TP4 GPU0-3 and output quality, without a substantial memory increase. The
+latest native wide-QK plus fused MLP route measures **62.804019 s**, or
+**3.140201 s/update and 55.151783 useful model TFLOPS/card**, compared with
+69.062335 s previously (9.06% reduction). Cache and Lt workspace are zero.
+Peak Torch denoise allocation is **6.566735744 GiB/card**, down from
+6.647851467; NVML peak device-used memory is 8.419433594 GiB/card.
 
-Video and audio latents are bitwise equal to the prior route. The baseline
-decode is explicitly reused: MP4 SHA256 remains
-`17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
-The identical media retains the automatic checks; human audiovisual scoring
-remains pending. Earlier timing/decoder experiments remain in CONTROL.md.
+The main gain reuses Q operands across a wider K tile and fixes softmax's
+incorrect inferred warp count. A second change fuses FP32 SiLU/product with
+power-of-two FP16 input preparation and releases the gate buffer before GEMM.
+The native B1/N12323/H14/D128 attention paired control is 25.572351 ->20.110336
+ms (42.565744 ->54.126701 useful TFLOPS). The **60 TFLOPS attention** milestone
+requires <=18.141769 ms. A larger-Q prototype improves only 1.48% against the
+new native path and is not enabled. Preserve the arithmetic/data-movement
+focus identified in the earlier NCU/SASS evidence in CONTROL.md.
 
-This is one unprofiled complete native run after a one-call warmup, with
-prompt-verified cached text. The separate V-prefetch prototype measured
-68.980006 s. Do not combine different builds into a formal median or present
-these as end-to-end generation / three-run 243-frame acceptance.
+Wide attention changes online reduction and FP16 probability rounding; its
+64.284648-second native run was freshly decoded. Video/audio latent relative
+RMS deltas against the previous K64 implementation are 10.5741% /1.8484%.
+Automatic media checks pass, and eight sampled frames show no obvious count,
+color or geometry regression. Human audiovisual scoring is still pending.
+The subsequent MLP fusion (62.852804 s) and buffer release (62.804019 s) are
+bitwise equal to the wide-attention latents; their decoder reuse is explicit.
+The output MP4 SHA256 is
+`97b9196c49a8e1bf61cb8368f4db7d7013e99bc107650945dbe92b4b59b0184a`.
 
-The user's next operator milestone is **60 useful TFLOPS for D128 attention**.
-The current workload's B1/N12323/H14/D128 attention requires 18.141769 ms to
-meet that milestone. The native helper's paired microbenchmark measures
-24.522753 ms (44.387601 TFLOPS), so this milestone is also incomplete.
-The old baseline's two-update trace separates GEMM service at 94.413296
-TFLOPS from attention service at 42.179368 TFLOPS. NCU and SASS samples locate
-operand-load/shared-store/HMMA dependencies inside attention; retain the
-arithmetic/data-movement focus. See CONTROL.md for the full evidence and
-failed wider-QK paths.
+There are **103 passing targeted tests** for attention, fused activation,
+INT8 layout/Lt and model numerics. After repository formatting and rebuilding,
+the resulting SASS is byte-for-byte identical and the 41 affected attention
+and activation tests pass again; this is a repeated subset, not 144 distinct
+tests. Isolated CUDA12.8 memcheck, racecheck and synccheck each pass 25
+attention cases with zero errors/hazards. Ordinary pytest covers graph
+replay; isolated sanitizers do not capture graphs. N73483 uses sampled FP32
+reference rows, avoiding a full quadratic allocation. Sixteen lengths retain
+bitwise K64 primitive rollback. Two earlier same-module-name control probes
+are explicitly invalidated because Python reused the candidate extension;
+only `native-verified-results.json` is valid native paired-control evidence.
 
-The standard CMake FlashAttention component builds; 18 native GPU tests pass,
-including the new 32/33/96/97-key residual boundaries, poisoned padding,
-noncontiguous storage, online rescaling and CUDA Graph replay. Isolated CUDA12.8 memcheck, racecheck and synccheck each pass
-thirteen cases without errors/hazards. The full-environment memcheck loader
-error and isolated harness limits are retained in CONTROL.md. Previous INT8
-layout/Lt validation remains recorded. Evidence is in `flashattention-warp50/`;
-media and NVML reports are in
-`outputs/quality39-int8-flashattn-native-prefetch-20steps/FLASH_ATTN_V100/`.
-**Neither 60 TFLOPS attention, 50-second denoise nor >80 TFLOPS/card model
-acceptance is achieved.**
+These are separate single unprofiled development runs after a one-call warmup,
+with prompt-verified cached text. Do not pool different builds into a formal
+median or present this as end-to-end / three-run 243-frame acceptance.
+Evidence and NVML plots are in `flashattention-qk50/`; media and raw rank/NVML
+reports are in
+`outputs/quality39-int8-flashattn-native-wide-silu-release-20steps/FLASH_ATTN_V100/`.
+**Attention 60 TFLOPS, under-50-second denoise, formal >80 TFLOPS/card and human
+quality gates remain incomplete.**
 
 ## Short development checks
 
