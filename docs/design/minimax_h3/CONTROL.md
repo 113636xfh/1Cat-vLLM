@@ -63,6 +63,55 @@ attempt lacked GPU counter permission; it produced no counters. Complete
 short-denoise measurements and the privileged profile are recorded below
 when completed. Use `FLASHINFER_SM70` as the measured rollback path.
 
+### Complete short-denoise and counter evidence
+
+GPU0-3 INT8 FL2VA, 1344x768, 39 frames, seed42 and 20 actual updates completes
+in **77.342982236 s** (3.867149112 s/update). Each rank performs
+3,463,753,579,661,312 useful FLOPs and achieves **44.784329224 TFLOPS** against
+the slowest rank's complete denoise time. The same retained W8A16 binary and
+cache-off settings were used; the prior FlashInfer checkpoint took 86.200372206 s
+and achieved 40.182582639 TFLOPS. The throughput gain is 11.4521%. This is one
+unprofiled development measurement after a one-call warmup, with cached,
+prompt-verified real text encoding; it is not the formal primary three-run gate.
+DiT peak allocation is 6.647851467 GiB/card, not whole-pipeline memory acceptance.
+
+The VAE was freshly loaded and decoded this candidate: load 35.935474 s,
+decode 5.650908 s. All automatic media checks pass. The 39-frame MP4 SHA256 is
+`17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
+First/last frames show one red paper boat and one yellow duck; complete temporal
+and audio review remains pending. Compared with FlashInfer, final video/audio
+latents have relative L2 differences 0.107541/0.018019. They are not bitwise equal,
+so no decode reuse or final quality equivalence is claimed.
+
+The privileged NCU run records the actual `h3_flash_v100_d128` kernel:
+Tensor pipe active 34.64%, 232 registers/thread, 26,128 bytes shared and maximum
+active-warps fraction 12.5%. Long/short-scoreboard stalls are 15.43%/12.91%.
+The profile used `--clock-control none` and is excluded from timing. Register
+pressure and memory-latency hiding remain concrete optimization targets;
+these counter percentages do not establish full-model throughput. NVML during
+denoise reports mean GPU utilization above 99% but only 44.78 useful TFLOPS/card.
+
+A post-profile register-limit probe requested three resident CTAs. It reduced
+registers from 232 to 168 but introduced a 232-byte stack with 260/356 bytes of
+spill stores/loads. Outputs remain bitwise equal to the new FlashAttention
+control, but the exact N12323 operator slows from 26.385 to 47.712 ms. It is
+rejected and retained as `reg3.cu`, `reg3-build.log` and `reg3-results.json`.
+Do not repeat a register-cap-only change as an occupancy optimization.
+
+The first two short-run launch attempts found another H3 task's GPU0-3 lease;
+no timing/model run started. That independently owned FlashInfer task completed
+before the FlashAttention run acquired the group. Its source and result were
+not used as this change's matched baseline. No other job was terminated.
+The initial privileged NCU wrapper hit Linux's protected `/tmp` lock-file
+policy; the working wrapper holds the GPU lease as the user and elevates only
+the profiling child. No global driver or power settings were changed.
+
+Artifacts: `flashattention-mainline/report.json`, `native-ncu-summary.json`,
+`native-ncu-privileged.ncu-rep`, `quality3.log`, and
+`outputs/quality39-int8-flashattn-fused-20steps/FLASH_ATTN_V100/` under the task
+artifact root. The output directory includes regenerated video/audio, latents,
+rank/phase CSV, NVML JSONL and plots. **80 TFLOPS/card remains unmet.**
+
 ## Fixed scope
 
 - Base: onecat/main 56f534e672657a6c7599afd6c0dcb2e2c211b2e3.
