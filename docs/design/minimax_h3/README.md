@@ -90,6 +90,13 @@ a persistent FP16 cache. Unsupported plans use the original GEMM; warm up a
 shape before CUDA graph capture. Use `--int8-weight-layout row` to restore the
 original weight layout and GEMM route. Original BF16 checkpoints are unaffected.
 
+For INT8 MLPs, the native path combines FP32 SiLU/product evaluation and
+power-of-two FP16 input preparation in one kernel. The following projection
+restores the scale in FP32 before the normal TP reduction. This removes the
+large FP32 activation intermediate without lowering arithmetic precision or
+adding a persistent cache. CPU, unquantized and FP32-input paths keep their
+existing implementation.
+
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not
 replace the five-axis human quality review. Useful TFLOPS use actual local

@@ -18,39 +18,48 @@ namespace {
 using Half = cutlass::half_t;
 constexpr int kHeadDim = 128;
 constexpr int kQueries = 64;
-using Kernel =
-    typename cutlass::gemm::kernel::H3FMHA<Half, cutlass::arch::Sm70, true,
-                                           kQueries, 64, kHeadDim>::FMHAKernel;
+template <int Keys>
+using KernelFor = typename cutlass::gemm::kernel::H3FMHA<
+    Half, cutlass::arch::Sm70, true, kQueries, Keys, kHeadDim>::FMHAKernel;
 
-// Keep pointer and shape preparation on the caller's CUDA stream, including
-// graph replay. Each independent MHA head is a separate grouped GEMM problem.
-__global__ void prepare_metadata(int64_t* meta, Half* q, Half* k, Half* v,
-                                 Half* out, int queries, int keys, int heads,
-                                 int groups) {
-  int group = blockIdx.x * blockDim.x + threadIdx.x;
-  if (group >= groups) return;
-  int batch = group / heads;
-  int head = group % heads;
-  int64_t q_offset = (int64_t(batch) * queries * heads + head) * kHeadDim;
-  int64_t kv_offset = (int64_t(batch) * keys * heads + head) * kHeadDim;
-  meta[group] = reinterpret_cast<int64_t>(q + q_offset);
-  meta[groups + group] = reinterpret_cast<int64_t>(k + kv_offset);
-  meta[2 * groups + group] = 0;  // No global probability matrix.
-  meta[3 * groups + group] = reinterpret_cast<int64_t>(v + kv_offset);
-  meta[4 * groups + group] = reinterpret_cast<int64_t>(out + q_offset);
-  meta[5 * groups + group] = 0;  // FP32 output state stays in registers.
-  for (int slot = 6; slot < 10; ++slot)
-    meta[slot * groups + group] = int64_t(heads) * kHeadDim;
-  auto sizes = reinterpret_cast<cutlass::gemm::GemmCoord*>(meta + 10 * groups);
-  sizes[group] = cutlass::gemm::GemmCoord(queries, keys, kHeadDim);
-  sizes[groups + group] = cutlass::gemm::GemmCoord(queries, kHeadDim, keys);
+template <int Keys, bool Fixed>
+__global__ __launch_bounds__(128, 1) void h3_flash_v100_d128(
+    typename KernelFor<Keys>::DirectParams params) {
+  extern __shared__ __align__(16) unsigned char storage[];
+  if constexpr (Fixed) {
+    params.heads = 14;
+    params.queries = 12323;
+    params.keys = 12323;
+  }
+  KernelFor<Keys> kernel;
+  kernel(params,
+         *reinterpret_cast<typename KernelFor<Keys>::SharedStorage*>(storage));
 }
 
-__global__ __launch_bounds__(Kernel::kThreadCount,
-                             1) void h3_flash_v100_d128(Kernel::Params params) {
-  extern __shared__ __align__(16) unsigned char storage[];
-  Kernel kernel;
-  kernel(params, *reinterpret_cast<Kernel::SharedStorage*>(storage));
+template <int Keys, bool Fixed = false>
+void launch_attention(at::Tensor const& q, at::Tensor const& k,
+                      at::Tensor const& v, at::Tensor& output, float scale) {
+  using Kernel = KernelFor<Keys>;
+  typename Kernel::DirectParams params{
+      reinterpret_cast<Half*>(q.data_ptr()),
+      reinterpret_cast<Half*>(k.data_ptr()),
+      reinterpret_cast<Half*>(v.data_ptr()),
+      reinterpret_cast<Half*>(output.data_ptr()),
+      int(q.size(1)),
+      int(k.size(1)),
+      int(q.size(2)),
+      scale};
+  if constexpr (Keys == 128) {
+    // 34,304 bytes/block: allow two resident blocks without extra global
+    // storage.
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        h3_flash_v100_d128<Keys, Fixed>,
+        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  }
+  h3_flash_v100_d128<Keys, Fixed>
+      <<<dim3((q.size(1) + kQueries - 1) / kQueries, q.size(0) * q.size(2)),
+         Kernel::kThreadCount, sizeof(typename Kernel::SharedStorage),
+         at::cuda::getCurrentCUDAStream()>>>(params);
 }
 
 at::Tensor aligned_contiguous(const at::Tensor& tensor) {
@@ -63,7 +72,7 @@ at::Tensor aligned_contiguous(const at::Tensor& tensor) {
 }  // namespace
 
 at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
-                                      double scale) {
+                                      double scale, int key_tile) {
   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.scalar_type() == at::kHalf,
               "H3 FlashAttention-V100 requires CUDA FP16 BSND tensors");
   TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -80,6 +89,8 @@ at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
               "H3 attention scale must be finite and positive");
   TORCH_CHECK(!q.requires_grad() && !k.requires_grad() && !v.requires_grad(),
               "H3 FlashAttention-V100 is an inference-only operator");
+  TORCH_CHECK(key_tile == 0 || key_tile == 64 || key_tile == 128,
+              "H3 attention key tile must be 0, 64 or 128");
   const c10::cuda::CUDAGuard guard(q.device());
   auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -87,55 +98,29 @@ at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
   int64_t groups64 = q.size(0) * q.size(2);
   int64_t blocks64 = ((q.size(1) + kQueries - 1) / kQueries) * groups64;
   TORCH_CHECK(q.size(1) <= INT_MAX && k.size(1) <= INT_MAX &&
-                  groups64 <= INT_MAX / 16 && blocks64 <= INT_MAX,
+                  groups64 <= 65535 && blocks64 <= INT_MAX,
               "H3 attention shape exceeds kernel index limits");
   q = aligned_contiguous(q);
   k = aligned_contiguous(k);
   v = aligned_contiguous(v);
   auto output = at::empty_like(q);
-  int groups = groups64;
-  auto metadata =
-      at::empty({int64_t(groups) * 16}, q.options().dtype(at::kLong));
-  auto* ptr = metadata.data_ptr<int64_t>();
-  auto stream = at::cuda::getCurrentCUDAStream();
-  prepare_metadata<<<(groups + 127) / 128, 128, 0, stream>>>(
-      ptr, reinterpret_cast<Half*>(q.data_ptr()),
-      reinterpret_cast<Half*>(k.data_ptr()),
-      reinterpret_cast<Half*>(v.data_ptr()),
-      reinterpret_cast<Half*>(output.data_ptr()), q.size(1), k.size(1),
-      q.size(2), groups);
-  Kernel::Arguments args;
-  args.problem_sizes0 =
-      reinterpret_cast<cutlass::gemm::GemmCoord*>(ptr + 10 * groups);
-  args.problem_sizes1 = args.problem_sizes0 + groups;
-  args.problem_count = groups;
-  args.threadblock_count = blocks64;
-  args.ptr_Q = reinterpret_cast<Half**>(ptr);
-  args.ptr_K = reinterpret_cast<Half**>(ptr + groups);
-  args.ptr_P = reinterpret_cast<float**>(ptr + 2 * groups);
-  args.ptr_V = reinterpret_cast<Half**>(ptr + 3 * groups);
-  args.ptr_O = reinterpret_cast<Half**>(ptr + 4 * groups);
-  args.ptr_O_accum = reinterpret_cast<float**>(ptr + 5 * groups);
-  args.ldq = ptr + 6 * groups;
-  args.ldk = ptr + 7 * groups;
-  args.ldv = ptr + 8 * groups;
-  args.ldo = ptr + 9 * groups;
-  args.causal = false;
-  args.scale = static_cast<float>(scale);
-  Kernel::Params params(args, nullptr, args.threadblock_count);
-  // The D128 tile fits the default shared-memory limit (26,128 bytes).
-  // Only larger future specializations need the dynamic-memory opt-in.
-  if constexpr (sizeof(Kernel::SharedStorage) > 48 * 1024) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        h3_flash_v100_d128, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        sizeof(Kernel::SharedStorage)));
-  }
-  h3_flash_v100_d128<<<args.threadblock_count, Kernel::kThreadCount,
-                       sizeof(Kernel::SharedStorage), stream>>>(params);
+  // Keep small/refiner requests on the previous arithmetic path. Large
+  // self-attention reuses each Q fragment across twice as many keys.
+  int selected =
+      key_tile ? key_tile : (q.size(1) >= 1024 && k.size(1) >= 1024 ? 128 : 64);
+  if (selected == 128) {
+    if (q.size(1) == 12323 && k.size(1) == 12323 && q.size(2) == 14)
+      launch_attention<128, true>(q, k, v, output, float(scale));
+    else
+      launch_attention<128>(q, k, v, output, float(scale));
+  } else
+    launch_attention<64>(q, k, v, output, float(scale));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward", &h3_flash_attention_forward);
+  m.def("forward", &h3_flash_attention_forward, pybind11::arg("q"),
+        pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("scale"),
+        pybind11::arg("key_tile") = 0);
 }
