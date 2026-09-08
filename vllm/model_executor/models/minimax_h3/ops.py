@@ -37,6 +37,25 @@ class RotaryEmbedding(nn.Module):
 
 
 def fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps):
+    if (
+        q.is_cuda
+        and not torch.is_grad_enabled()
+        and q.dtype == k.dtype == rope_table.dtype == torch.float16
+        and q.ndim == k.ndim == 3
+        and q.shape[-1] == k.shape[-1] == 128
+        and q.shape[0] == k.shape[0]
+        and rope_table.shape == (q.shape[0], 96)
+        and q_weight.shape == k_weight.shape == (128,)
+        and all(t.device == q.device for t in (k, q_weight, k_weight, rope_table))
+        and all(t.stride(-1) == 1 for t in (q, k, q_weight, k_weight, rope_table))
+    ):
+        from .qk_norm_rope import qk_norm_rope
+
+        return qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps)
+    return qk_norm_rope_reference(q, k, q_weight, k_weight, rope_table, eps)
+
+
+def qk_norm_rope_reference(q, k, q_weight, k_weight, rope_table, eps):
     # This reference retains the normalized FP16 rounding boundary. The CUDA
     # implementation must preserve it, including partial (96/128) rotation.
     def apply(x, weight):

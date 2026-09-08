@@ -11,6 +11,89 @@ the existing D256 TensorOp architecture; padding never increases useful FLOPs.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Feeding diagnosis and exact QK/RoPE fusion follow-up
+
+The current development target is **under 50 seconds for 20 actual updates**
+at the unchanged 1344x768, 39-frame, seed42, INT8 ConvRot, TP4 GPU0-3 workload,
+with output quality retained. The primary 243-frame >80 TFLOPS/card acceptance
+is separate and remains incomplete.
+
+Before QK/RoPE fusion, a four-rank Nsight Systems trace of the first two updates
+from the unchanged 20-update schedule gives the following exclusive GPU wall
+breakdown. The traced intervals include synchronized denoise boundaries; they
+are profiling evidence, not unprofiled acceptance timing.
+
+| Rank | Wall | Attention | GEMM | TP transfer + waiting | Other GPU work | No GPU activity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 7.744 s | 2.795 s | 2.716 s | 1.058 s | 1.125 s | 0.049 s |
+| 1 | 7.744 s | 2.612 s | 2.651 s | 1.332 s | 1.108 s | 0.041 s |
+| 2 | 7.744 s | 2.645 s | 2.641 s | 1.275 s | 1.128 s | 0.053 s |
+| 3 | 7.744 s | 2.641 s | 2.655 s | 1.268 s | 1.131 s | 0.049 s |
+
+Other GPU work includes normalization, conversion, ConvRot, INT8 decode and
+copies. Rank0 performs 108,850,886,402,048 attention FLOPs and
+237,524,454,107,136 linear FLOPs in these two updates. GEMM service throughput
+is 87.46 TFLOPS and attention service throughput is 38.94 TFLOPS; neither is
+complete-denoise throughput. Less than 1% is unoccupied GPU time. INT8 weight
+decode is only 0.063 s, so weight caching and host launch optimization are not
+the first targets. Faster ranks spend longer in NCCL: kernel duration includes
+waiting for rank0 and must not all be attributed to network transfer.
+
+With every other traced cost held constant, making attention take zero time
+would yield only 69.99 TFLOPS for this short shape. This is an Amdahl illustration,
+not a hardware limit or achieved result. The long primary shape has a different
+compute/communication balance. NCCL auto versus forced Simple at real FP32
+payloads gives approximately 5.44 ms for 264,993,792 bytes and 31 ms for
+1,580,178,432 bytes; forcing the protocol is not promoted.
+
+The retained fix fuses Q/K RMSNorm and 96-of-128-channel RoPE into two Triton
+launches, replacing 32 PyTorch kernels per DiT attention block. Normalization
+and both rotary products retain the reference FP16 rounding boundaries; FP32
+arithmetic fusion is disabled. Unsupported shapes and autograd keep the
+reference path. On N12323/H14, paired Q/K preparation drops from 3.44 ms to
+0.30 ms, with bitwise-equal outputs at normal and high input amplitudes.
+
+An unprofiled complete 20-update run now takes **74.411058897 s**, or
+**3.720552945 s/update** and **46.548908603 useful TFLOPS/card**. The prior
+77.342982236 s control uses the same attention/W8A16 binaries, prompt, seed,
+weights and cache-off settings. The speedup is 3.94%; this is one development
+measurement with a one-call warmup, not the formal three-run gate. DiT peak
+allocation remains 6.647851467 GiB/card. Both final video/audio latents are
+bitwise equal to the control. Fresh VAE decoding produces the identical MP4
+SHA256 `17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
+Automatic media checks pass; human audiovisual quality review is still pending.
+
+Validation: 24 targeted tests pass, including 10 QK/RoPE cases for real length,
+strided projection views, FP32 weights, high-range/zero inputs, rotary tails,
+reference fallback and changed-input CUDA Graph replay. Three isolated
+offset/tail cases pass CUDA12.8 memcheck, racecheck and synccheck. The first
+model launcher failed during NCCL initialization with CUDA_MODULE_LOADING=EAGER,
+before model inference. The successful model run uses the prior LAZY mode;
+that single failure does not establish EAGER as its cause.
+
+Rejected attention probes, each against an interleaved unchanged control:
+direct fixed-D128 dispatch 27.189 vs 26.739 ms (209 registers); Q32/K128
+30.757 vs 27.088 ms (198 registers); Q64/K128 30.810 vs 26.655 ms
+(190 registers); warp-reduced max 27.237 vs 26.797 ms. All passed sampled
+FP32 references; none is installed. Lower register count alone did not improve
+throughput. Preserve these results instead of repeating unchanged tile sweeps.
+
+Artifacts: `/data/minimax-h3/native-h3-20260908/flashattention-feeding-round2/`,
+including `denoise-steps.nsys-rep`, its SQLite export, `breakdown.csv`,
+`module-kernels.json`, `rootcause.json`, `denoise-breakdown.png`, prototype
+sources/build logs, tests and sanitizers. The new media and NVML/phase reports
+are under `outputs/quality39-int8-flashattn-rope-20steps/FLASH_ATTN_V100/`.
+Reproduce the retained change with `run_rope_quality.py`; source and environment
+are recorded in the task handoff. Roll back only QK/RoPE fusion by using
+`qk_norm_rope_reference` at its dispatch point; attention and weights remain fixed.
+
+GPU0-3 jobs were preempted under the user's explicit priority authorization.
+One subsequent cleanup mistakenly targeted a GPU4-7 audit process before
+checking its GPU UUID. This was outside that scope. The incident and recovery
+are recorded in `preemption-followup.json`: the original supervisor relaunched
+the same audit configuration with an independent recovery output label.
+Always verify physical GPU UUIDs and process environment before any signal.
+
 The new `_h3_flashattn_C` extension selects a dedicated CUTLASS SM70 fused
 kernel under `FLASH_ATTN_V100`. Its QK tile is 64x64 and PV tile is 64x128;
 all 128 output channels remain in FP32 registers across online-softmax updates.
