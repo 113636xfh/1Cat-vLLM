@@ -1404,7 +1404,18 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
-        "video": [],  # Kept for backwards compatibility
+        "video": [
+            "diffusers==0.40.0",
+            "av>=14",
+            "imageio>=2.37.2",
+            "imageio-ffmpeg>=0.6",
+            "soundfile>=0.13",
+            "scipy",
+            "einops",
+            "omegaconf",
+            "accelerate>=1.12",
+            "nvidia-ml-py",
+        ],
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:
