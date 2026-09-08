@@ -33,10 +33,13 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--attention-backend",
                 choices=("FLASH_ATTN_V100", "FLASHINFER_SM70", "TORCH_SDPA"),
-                default="FLASHINFER_SM70",
+                default="FLASH_ATTN_V100",
             )
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument("--fp16-cache-layer", action="append", default=[])
+            mode.add_argument(
+                "--int8-weight-layout", choices=["row", "column"], default="column"
+            )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             if name == "generate":
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -73,6 +76,7 @@ class VideoSubcommand(CLISubcommand):
             attention_backend=args.attention_backend,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
+            int8_weight_layout=args.int8_weight_layout,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

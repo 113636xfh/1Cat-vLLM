@@ -1,7 +1,7 @@
 # H3 FlashInfer: exact weight cache and the 50-second milestone
 
 The current source completes the unchanged 39-frame, 1344x768, 24-FPS,
-seed-42 workload in **70.819016 seconds for 20 actual updates**. It uses TP4
+seed-42 workload in **70.828264 seconds for 20 actual updates**. It uses TP4
 on GPUs 0–3, Comfy INT8 ConvRot, the original prompt and video/audio shifts
 12/3. Twenty updates require 21 sigma positions in the existing scheduler.
 The below-50-second milestone and the per-card 80-TFLOPS gate remain incomplete.
@@ -22,10 +22,11 @@ No frames, steps, model operations or quality requirements were removed.
 - Cached projections use native cuBLASLt descriptors from the TurboMind H3
   extension: FP16 inputs, FP32 compute, no split-K reduction and no workspace.
   A bounded cache reuses descriptors per shape, output type and device. The
-  measured algorithm 21/tile 24 is preferred only when the runtime heuristic
-  reports it supported; other supported shapes retain a workspace-free,
-  non-split algorithm. Plans validate device, layout, shape and alignment.
-  Uncached projections retain the existing cuBLAS path.
+  measured algorithm 21/tile 24 is used only when the runtime heuristic
+  reports it supported; unsupported shapes use the original row-major GEMM.
+  Plans validate device, layout, shape and alignment. After dependency
+  reconciliation, cached and uncached column-major weights share the same
+  dispatch helper; no second cuBLASLt implementation is retained.
 
 The fixed cache list is the four projections `attn.qkv_proj`, `attn.out_proj`,
 `mlp.fc1`, `mlp.fc2` in each of the 50 main blocks. It holds 200 weights,
@@ -41,29 +42,29 @@ acceptance protocol.
 
 | Same workload | Previous source | Current source |
 | --- | ---: | ---: |
-| Full denoise seconds | 75.140751 | 70.819016 |
-| Seconds per update | 3.757038 | 3.540951 |
-| Useful TFLOPS per rank | 46.096872 | 48.909937 |
+| Full denoise seconds | 75.140751 | 70.828264 |
+| Seconds per update | 3.757038 | 3.541413 |
+| Useful TFLOPS per rank | 46.096872 | 48.903550 |
 | Useful FLOPs per rank | 3,463,753,579,661,312 | 3,463,753,579,661,312 |
 
 The video and audio latents are bitwise equal to the preceding source.
-Fresh VAE decode takes 5.469254 seconds and produces the same MP4 SHA256:
+Fresh VAE decode takes 6.158398 seconds and produces the same MP4 SHA256:
 `02ee9057bfa997ac578d8fdda11acd9770d99b86022207d1674a9dbc65eb50cb`.
 All automatic video/audio checks pass. Human five-axis quality review remains
 pending; output equality establishes no regression for this fixed test.
 
-Weight staging/cache preparation takes 1.131–1.140 seconds, reported separately
+Weight staging/cache preparation takes 1.078–1.105 seconds, reported separately
 from denoise. The earlier development proxy took 70.826228 seconds but retained
 four unused 64-MiB cuBLASLt workspaces per rank. Native descriptors remove them:
-DiT Torch peak allocation is 15.675096 GiB and NVML peak is 17.741699 GiB per
+DiT Torch peak allocation is 15.650796 GiB and NVML peak is 17.763184 GiB per
 card. These are DiT measurements, not whole-pipeline peak-memory acceptance.
 
 | NVML median during the current run | GPU 0 | GPU 1 | GPU 2 | GPU 3 |
 | --- | ---: | ---: | ---: | ---: |
 | GPU utilization (%) | 100 | 100 | 100 | 100 |
-| SM clock (MHz) | 1402 | 1500 | 1507 | 1492 |
-| Power (W) | 275.445 | 264.744 | 267.656 | 268.720 |
-| Maximum temperature (C) | 56 | 60 | 56 | 64 |
+| SM clock (MHz) | 1402 | 1500 | 1515 | 1496 |
+| Power (W) | 277.686 | 266.494 | 269.139 | 270.527 |
+| Maximum temperature (C) | 55 | 60 | 56 | 64 |
 
 Throttle reason masks are 0 or 4; no clock/power settings changed. Utilization
 does not establish Tensor Core saturation. The older detailed instruction
@@ -108,8 +109,13 @@ padding. The earlier communication table has been corrected accordingly.
   256 threads, 37,120 shared bytes) but takes 51.3116 versus 26.6527 ms at
   identical 1530-MHz clocks. Its 13-length reference check passes. Neither
   path justifies a full video experiment.
+- Packing probability writes into FP16 pairs preserves bits, but has no
+  measurable short-shape benefit: 25.0798 versus 25.0788 ms at 1530 MHz.
+  Additional P swizzling with reduced loop unrolling removes spills (126
+  registers) but regresses from 25.0808 to 28.2798 ms, also at 1530 MHz.
+  Both pass 13-length reference checks and preserve bits; neither is installed.
 
-The remaining gap is 20.819 seconds, about 29.4% of the current denoise time.
+The remaining gap is 20.828 seconds, about 29.4% of the current denoise time.
 Attention feeding and time spent outside matrix operations both need further
 work; graph launch reduction alone cannot meet this gap. No standalone peak,
 NVML utilization or extrapolated rate is counted as a milestone result.
@@ -133,29 +139,41 @@ for h3_block in {0..49}; do
 done
 vllm video generate --model "$H3_MODEL_PATH" --partition fl2va \
   --transformer-path "$H3_INT8_PATH" --tensor-parallel-size 4 \
-  --attention-backend FLASHINFER_SM70 --width 1344 --height 768 \
+  --attention-backend FLASHINFER_SM70 --int8-weight-layout column --width 1344 --height 768 \
   --num-frames 39 --num-inference-steps 21 --seed 42 \
   "${h3_cache_args[@]}" --output-dir h3-flashinfer-cached
 ```
 
-The current native suite passes **85 tests**, excluding the single parallel
-FlashAttention backend case. Memcheck, racecheck and synccheck each pass 14
+Dependency `22d784475e` contributes the shared column-major decode/GEMM helper;
+this branch retains its own FlashInfer attention and QK fusion. The duplicate
+cached GEMM class was removed. The shared heuristic now explicitly advertises
+the same 16-byte operand alignment checked by `run()`, with an offset-view
+regression. Unsupported algorithms/layouts fall back to the original GEMM.
+The dependency's FlashAttention sources are unchanged by this reconciliation.
+The earlier independent cache implementation took 70.819016 seconds; the
+reconciled run above preserves the same latents and video. This comparison
+checks integration, not an additional performance improvement.
+
+The current native suite passes **105 tests**, excluding the parallel FlashAttention test file and backend case. Before reconciliation, memcheck, racecheck and synccheck each passed 14
 targeted tail, query-group, cache-failure, FP32-overflow and graph cases, with
-zero errors or hazards. Commands use the owned environment:
+zero errors or hazards. The FlashInfer binary is unchanged; an additional
+post-merge memcheck passes seven column-decode, cache-lifetime and 16-byte
+alignment cases with zero errors. Commands use the owned environment:
 
 ```bash
-.venv/bin/python -m pytest tests/video -q -k 'not FLASH_ATTN_V100'
+.venv/bin/python -m pytest tests/video -q \
+  --ignore=tests/video/test_h3_flashattn.py -k 'not FLASH_ATTN_V100'
 compute-sanitizer --tool memcheck --error-exitcode 1 \
   .venv/bin/python -m pytest -q tests/video/test_h3_numerics.py \
   tests/video/test_h3_weight_cache.py \
-  -k 'prefetch_tail or query_groups or cached_gemm_fp32_output or cached_gemm_rejects or cache_preserves'
+  -k 'prefetch_tail or query_groups or cached_gemm_fp32_output or cache_preserves'
 ```
 
 Repeat the sanitizer command with `racecheck` and `synccheck`. Raw evidence is
-under the campaign artifact directory's `feeding-to50/`: `native-manifest.json`,
-`native-tests.log`, sanitizer logs, `native-quality-summary.json`,
-`native-nvml-summary.json`, operator results and
-`outputs/native39-20steps/FLASHINFER_SM70/` (MP4, WAV, latents, screenshots,
+under the campaign artifact directory's `feeding-to50/`: `reconcile-manifest.json`,
+`reconcile-tests.log`, sanitizer logs, `reconciled-quality-summary.json`,
+`reconciled-nvml-summary.json`, operator results and
+`outputs/reconciled39-20steps/FLASHINFER_SM70/` (MP4, WAV, latents, screenshots,
 NVML curves and exact run configuration). Build products and weights are not
 committed. Roll back cached GEMM by omitting the cache flags; roll back the
 entire change by using parent `ebec83fbd4526d73b5c8bd8b437104f93c0bd632` and

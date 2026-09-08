@@ -153,8 +153,12 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
         quantized_layers: list[str] | None = None,
         convrot_groupsize: int = 256,
         ignored_layers: list[str] | None = None,
+        weight_layout: str = "column",
     ) -> None:
         super().__init__()
+        if weight_layout not in ("row", "column"):
+            raise ValueError("H3 INT8 weight layout must be row or column")
+        self.weight_layout = weight_layout
         self.ignored_layers = ignored_layers or []
         self.layer_configs: dict[str, Int8ConvRotLayerConfig] = {}
         self.is_checkpoint_quantized = True
@@ -197,6 +201,7 @@ class DiffusionInt8ConvRotConfig(QuantizationConfig):
             quantized_layers=config.get("quantized_layers"),
             convrot_groupsize=config.get("convrot_groupsize", 256),
             ignored_layers=config.get("ignored_layers"),
+            weight_layout=config.get("weight_layout", "column"),
         )
 
     def configure_layers(
@@ -349,7 +354,15 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             raise ValueError(
                 f"{self.prefix} contains non-finite or non-positive INT8 weight scales."
             )
-        layer.weight.data = layer.weight.data.contiguous()
+        # Preserve logical [N,K] coordinates and every signed INT8 byte. The
+        # CPU stager keeps strides, so this costs no additional GPU residency.
+        # Limit the new layout to DiT projections validated with TP4.
+        if self.quant_config.weight_layout == "column" and self.prefix.startswith(
+            "blocks."
+        ):
+            layer.weight.data = layer.weight.data.t().contiguous().t()
+        else:
+            layer.weight.data = layer.weight.data.contiguous()
         layer.weight_scale.data = scale.data.reshape(-1).contiguous()
 
     def apply(
@@ -358,7 +371,7 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         if x.dtype not in (torch.float16, torch.float32):
             raise ValueError("H3 W8A16 requires FP16 or FP32 activations")
         if x.is_cuda:
-            from .cuda_ops import w8a16_extension
+            from .cuda_ops import fp16_gemm, w8a16_extension
 
             ops = w8a16_extension()
             shape = x.shape
@@ -368,21 +381,11 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
                     raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
                 x = ops.rotate(x)
             weight = getattr(layer, "h3_fp16_weight", None)
-            output_fp32 = getattr(layer, "h3_output_fp32", False) or scale is not None
             if weight is None:
                 weight = ops.dequantize(layer.weight, layer.weight_scale)
-                output = ops.gemm(x, weight, output_fp32)
-            else:
-                from .cuda_ops import cached_weight_gemm_plan
-
-                plan = cached_weight_gemm_plan(
-                    x.shape[0],
-                    weight.shape[0],
-                    weight.shape[1],
-                    output_fp32,
-                    x.get_device(),
-                )
-                output = plan.run(x, weight.t())
+            output = fp16_gemm(
+                x, weight, getattr(layer, "h3_output_fp32", False) or scale is not None
+            )
             if scale is not None:
                 output = output * scale
             output = output.reshape(*shape[:-1], layer.weight.shape[0])
