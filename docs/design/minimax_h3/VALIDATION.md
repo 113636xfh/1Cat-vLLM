@@ -1,7 +1,8 @@
 # H3 reproducible validation
 
 This draft has not passed the full-video quality or per-GPU 80 TFLOPS gates.
-Component numerics and a short end-to-end route are working. Keep profiler
+Component numerics and short cached-text generation are working. FlashInfer-SM70
+is the user-selected mainline and the default denoiser. Keep profiler
 diagnostics separate from the three formal timing runs.
 
 ## Short development checks
@@ -37,12 +38,12 @@ python tools/minimax_h3/fixtures.py --model-root /path/to/MiniMax-H3 \
   --output-dir /path/to/reference-fixtures
 python tools/minimax_h3/benchmark.py --model /path/to/MiniMax-H3 \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  --attention-backend FLASH_ATTN_V100 --output-dir /path/to/acceptance
+  --attention-backend FLASHINFER_SM70 --output-dir /path/to/acceptance
 ```
 
 The runner performs one warmup and three unprofiled requests in one engine.
 The warmup's automatic media checks must pass before formal timing starts.
-Use `FLASHINFER_SM70` for the independent Volta attention path. A nonzero FP16
+Use `FLASH_ATTN_V100` for an explicit comparison or rollback. A nonzero FP16
 weight-cache budget requires an explicit measured list of `--fp16-cache-layer`
 arguments. The default budget is zero.
 
@@ -83,8 +84,9 @@ following, subject consistency, temporal continuity, detail and audio at least
 - Real 50-block INT8 DiT single-forward checks pass after preserving large
   condition projections, residuals, gated products and row-projection outputs
   in FP32. The matrix inputs/weights remain FP16 for Tensor Core execution.
-- The current numerical/service suite passes 38 tests, including short clips
-  and the optimized FlashInfer kernel. Seven acceptance-contract tests pass, including excluded timing.
+- The current numerical/service suite passes 47 tests, including short clips,
+  the optimized FlashInfer kernel, prefetch tails and unaligned storage views.
+  Seven acceptance-contract tests pass, including excluded timing.
 - A 256x256, 107-frame, one-DiT-call route exported finite video and audio and
   passed the automatic media checks. It is not a quality/performance baseline.
 - The earlier full primary video was interrupted before completion and is
@@ -93,8 +95,10 @@ following, subject consistency, temporal continuity, detail and audio at least
   with Flash-V100 and 10.55566 s with the FlashInfer candidate: 30.6664 versus
   32.8142 useful TFLOPS on each rank. Both produced finite, rank-identical
   latents. These are development results, not full-schedule acceptance.
-- Full quality, original BF16 comparisons, mixed references, extra seeds and
-  formal three-run timing remain pending.
+- Original BF16 FL2VA text-to-video completed 20 updates at 39 frames through
+  Flash-V100 with FP16/FP32 computation. All automatic checks pass; denoise took
+  110.569167 s. Other original-checkpoint backend/partition combinations, mixed
+  references, extra seeds, full quality and formal three-run timing remain pending.
 - Standard CMake configuration, build and component installation of both H3
   extensions pass. Complete release-wheel validation remains pending.
 
@@ -110,3 +114,19 @@ longer show the severe two-forward artifacts. Flash-V100 took 113.459387 s
 (5.672969 s/call); FlashInfer took 105.642574 s (5.282129 s/call). Both used the
 same INT8 checkpoint, prompt, seed, 39 frames, cached text and shift rules.
 Full primary acceptance and human audiovisual review remain pending.
+
+The subsequent FlashInfer V-layout/KV-prefetch optimization completes the same
+20-update short request in 90.880784 s (4.544039 s/update), with 38.113157 useful
+TFLOPS on each rank. Video/audio latents and the exported MP4 are bitwise
+identical to the previous FlashInfer result; automatic media checks pass.
+CUDA 12.8 memcheck/synccheck each pass the six new tail/unaligned cases with
+zero errors. The standard CMake FlashInfer component builds successfully.
+The 6.647851 GiB Torch peak is measured during DiT only and must not be treated
+as the full pipeline's memory gate. This single short run does not satisfy the
+primary three-run timing contract or the >80 TFLOPS threshold.
+
+The profiler-only run uses the first two updates of the unchanged 20-update
+schedule. Its critical-rank trace attributes about 52% of the synchronized
+span to attention, 25% to GEMM and 10% to communication before this optimization.
+Explicit wall coverage and kernel service are retained separately. Profiling
+results never replace unprofiled timing.
