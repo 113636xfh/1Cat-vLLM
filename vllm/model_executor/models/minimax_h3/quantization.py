@@ -69,6 +69,10 @@ def fp16_gemm_input(x):
         return flat, None
     if flat.dtype != torch.float32:
         raise ValueError("H3 GEMM activations must be FP16 or FP32")
+    if flat.is_cuda:
+        from .cuda_ops import w8a16_extension
+
+        return w8a16_extension().prepare_fp16(flat)
     maximum = flat.abs().amax(-1, keepdim=True)
     _, exponent = torch.frexp(maximum)
     scale = torch.ldexp(torch.ones_like(maximum), (exponent - 11).clamp_min(0))
