@@ -24,7 +24,7 @@ completed workflow. Pending items below remain authorized work.
 | Remote API inputs | JSON, multipart, HTTP(S), data URLs implemented with CPU coverage | GPU generation through the actual public API |
 | Video task lifecycle | Async/sync, polling/list/download/delete, multi-output, OpenAPI | Native engine integration and frontend-facing error validation |
 | LightX2V four/eight-step family | Eight artifact contracts; two four-step FL2V real cases | Ref2V, eight-step, artifact and original-base coverage |
-| FlashGen four-step T2VA | Audited separate layout/schedule | Native loader, pruned AdaLN compatibility and GPU quality |
+| FlashGen four-step T2VA | Native 259-target loader, DMD2 schedule and original AdaLN restoration; CPU tests | Real GPU generation, measured residency and quality, including restored INT8 base |
 | FastH3 Dense four-step T2VA | Audited full-rank fusion/schedule | Native base/fusion support and GPU quality |
 | FastH3 VSA | Audited learned gates and sparse attention | SM70 execution strategy, numerical and quality validation |
 | Dynamic adapter selection | One loaded adapter and request scale | Multi-adapter loading, eviction, stage/partition binding |

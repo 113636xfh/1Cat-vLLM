@@ -11,9 +11,13 @@ The initial scope excluded LoRA. Native LightX2V Turbo support now follows the
 artifact contracts in Omni `b58ff5cb8b17250b76f9cdf9b9b46385cdda4376`
 (`diffusion/models/minimax_h3/lora.py`, unchanged from the initial port's
 reference). Native execution uses registered, staged A/B buffers and H3 SM70
-GEMMs instead of Omni's generic LoRA manager. Approximate diffusion caches,
-step batching, Ulysses/Ring parallelism, FlashGen/FastH3 adapters, and other
-model families remain outside this implementation. Model weights and checkpoint
+GEMMs instead of Omni's generic LoRA manager. FlashGen's native grouped-QKV
+layout and metadata schedule follow `diffusion/models/minimax_h3/npu/lora.py`
+at the initial pinned Omni revision. The export is device-independent; native
+execution uses the same SM70 staged delta path. The pruned INT8 integration
+restores original dense AdaLN/time tensors, preserving backbone INT8 data.
+Approximate diffusion caches, step batching, Ulysses/Ring parallelism, FastH3,
+and other model families remain outside this implementation. Model weights and checkpoint
 remote code retain their respective upstream terms; they are not vendored here.
 
 Frozen model revisions:
@@ -21,3 +25,8 @@ Frozen model revisions:
 - MiniMaxAI/MiniMax-H3: `42ed227ee7df40d41602854ae760620d6eb651fe`.
 - Comfy-Org/MiniMax-H3: `a98869194787969724c7425d95d0ed73ce9202af`.
 - lightx2v/Minimax-h3-Turbo: `2f015e66b37c585cea9dc4ae6f1850ea8788e742`.
+- ModelScope FlashGen/Minimax-H3-4step-lora-flashgen, file revision:
+  `11ccc3e67cbe0a4b83ae0b6d95a55a5eb27008ee`.
+  File: `minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors`;
+  size 1,258,539,599 bytes;
+  SHA256 `0e17fff71d76db497707328a49d61dd7bcd0a375beabef5ae7e93234d15dff00`.

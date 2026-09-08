@@ -148,10 +148,10 @@ class VideoRequest(BaseModel):
             path = self.lora.path or self.lora.local_path
             if not path or not config.lora_path:
                 raise H3InputError("request LoRA requires a preloaded adapter path")
-            from vllm.model_executor.models.minimax_h3.lora import select_turbo_file
+            from vllm.model_executor.models.minimax_h3.lora import select_adapter_file
 
-            deployed = select_turbo_file(config.lora_path)
-            requested = select_turbo_file(path)
+            deployed = select_adapter_file(config.lora_path)
+            requested = select_adapter_file(path)
             if deployed.resolve() != requested.resolve():
                 raise H3InputError("requested LoRA is not loaded on this server")
             if scale is not None and scale != self.lora.scale:

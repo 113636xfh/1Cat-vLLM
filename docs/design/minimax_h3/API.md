@@ -164,6 +164,16 @@ The example assumes FL2V four-step 768p Turbo. Ref2V and other artifacts need
 their own task and sampling contract. Four-step LightX2V means five sigma points;
 eight-step means nine. Unsupported adapters or mismatched settings are rejected.
 
+On a server started with the official FlashGen adapter, use `task=t2va` and
+`num_inference_steps=4`, with video/audio shifts 12/3, or omit steps/shifts to
+select these defaults. Its four intervals use the schedule stored in adapter
+metadata. Active FlashGen rejects FL2VA keyframes and Ref2VA references.
+For FlashGen over pruned INT8, scale zero keeps the restored original AdaLN/time
+modules; restart without the adapter to return to the pruned base. See
+[FlashGen deployment requirements](WORKFLOWS.md#flashgen-four-step-t2va) for
+original-weight and memory requirements. CPU validation has passed; actual
+FlashGen GPU generation and quality acceptance remain pending.
+
 ## Scope and validation
 
 The interface changes have CPU coverage for real media parsing and fake-engine
@@ -172,7 +182,7 @@ seeds and OpenAPI. These tests do not establish GPU generation or video quality.
 Current model evidence and pending acceptance are recorded in [CONTROL.md](CONTROL.md).
 
 `quality=lossless` selects the existing reference path. `high`, cache policies,
-FlashGen/FastH3, combined partition routing and additional execution modes remain
+FastH3, combined partition routing and additional execution modes remain
 tracked implementation work in [ADAPTATION.md](ADAPTATION.md), not accepted
 no-op parameters. Generic neutral CFG fields are accepted at 1; H3 has no
 negative CFG branch. Native VAE tiling remains deployment-controlled.

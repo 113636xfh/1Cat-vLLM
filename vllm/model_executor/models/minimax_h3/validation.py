@@ -27,10 +27,10 @@ def validate_request(config: H3Config, request: H3Request) -> None:
         deployment, request.sampling.extra_args.get("task"), request.media
     )
     if config.lora_path:
-        from .lora import inspect_turbo_lora, validate_turbo_sampling
+        from .lora import inspect_adapter, validate_adapter_sampling
 
-        validate_turbo_sampling(
-            inspect_turbo_lora(config.lora_path, config.partition),
+        validate_adapter_sampling(
+            inspect_adapter(config.lora_path, config.partition),
             task,
             request.sampling,
         )

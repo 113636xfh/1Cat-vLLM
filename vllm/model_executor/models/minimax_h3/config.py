@@ -140,15 +140,15 @@ def sampling_for_deployment(
     """
     spec = None
     if config.lora_path and lora_scale != 0:
-        from .lora import inspect_turbo_lora
+        from .lora import inspect_adapter
 
-        spec = inspect_turbo_lora(config.lora_path, config.partition)
+        spec = inspect_adapter(config.lora_path, config.partition)
         extra = dict(kwargs.get("extra_args") or {})
         extra.setdefault("flow_shift", spec.video_shift)
         extra.setdefault("audio_flow_shift", spec.audio_shift)
         kwargs["extra_args"] = extra
     if num_inference_steps is None:
-        num_inference_steps = spec.sigma_points if spec is not None else 50
+        num_inference_steps = spec.api_steps if spec is not None else 50
     return H3SamplingParams(
         num_inference_steps=num_inference_steps, lora_scale=lora_scale, **kwargs
     )

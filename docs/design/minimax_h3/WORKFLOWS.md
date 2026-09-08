@@ -65,9 +65,10 @@ with LightX2V's reference default 8 when metadata omits it.
 | `ref2v_turbo_8step_v1.0_768p_bf16` | Ref2VA | 8 | 9 | 6 | 8 |
 
 `--lora-path` accepts one local file, or a directory containing exactly one
-recognized artifact. ComfyUI fused exports, renamed files, FlashGen native
-adapters and FastH3 bundles are refused instead of being interpreted as this
-layout. FL2V and Ref2V adapters require their matching base partition.
+recognized artifact. ComfyUI fused exports, renamed files and FastH3 bundles
+are refused instead of being interpreted as this layout. FlashGen uses the
+separate native loader described below. FL2V and Ref2V adapters require their
+matching base partition.
 
 One immutable adapter is loaded at engine startup. Requests apply a multiplier
 `--lora-scale` / `lora_scale` (default 1) to `alpha / rank`. Setting it to zero
@@ -120,9 +121,49 @@ on a Ref2VA server with its matching Turbo adapter:
 }
 ```
 
+## FlashGen four-step T2VA
+
+The native loader accepts the official
+[FlashGen artifact](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen)
+named `minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors`.
+Retain that filename and use the FL2VA base partition with `task=t2va`.
+Active FlashGen rejects keyframe and reference tasks. Its rank and alpha are
+both 64; metadata supplies the DMD2 schedule `[1, 0.7, 0.4, 0.15, 0]`.
+Video/audio flow shifts are 12/3. **FlashGen uses `num_inference_steps=4`**,
+counting intervals, unlike LightX2V's five-point API convention. Omitting the
+steps and shifts selects these defaults.
+
+```bash
+vllm video serve \
+  --model /path/to/MiniMax-H3 --partition fl2va \
+  --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --tensor-parallel-size 4 --attention-backend FLASHINFER_SM70 \
+  --lora-path ./h3-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+```
+
+The adapter has 518 tensors / 259 A/B pairs, including dense AdaLN targets.
+The loader converts fused grouped QKV rows to the native TP layout; native
+FC1 already has `[gate, up]` order. Every tensor is validated and consumed.
+Runtime deltas reuse registered staged buffers and the unrotated-activation
+SM70 path below. No dense shortcut can bypass them.
+
+For an AdaLN-pruned INT8 checkpoint, startup restores 106 original AdaLN and
+time-embedder tensors before applying FlashGen. The original FL2VA transformer
+shards must therefore be present under the model directory. A remote model ID
+downloads those shards as well as the shared components. Only restoration
+tensors are read from them; backbone INT8 weights and FP32 scales are retained.
+This adds approximately **6.1 GiB of weight storage per TP4 rank**, excluding
+adapter buffers, activations and other components. This is a tensor-size budget,
+not a measured peak. GPU memory and output quality remain unvalidated.
+
+`lora_scale=0` bypasses FlashGen and restores base sampling defaults, but keeps
+the restored dense AdaLN/time modules. It does not return to the earlier pruned
+base bit for bit. Restart without `--lora-path` to recover that exact deployment.
+Original-checkpoint deployments do not need AdaLN restoration.
+
 ## Numerical and memory contract
 
-The loader consumes all 624 tensors / 312 A/B pairs, covering 50 DiT blocks
+The LightX2V loader consumes all 624 tensors / 312 A/B pairs, covering 50 DiT blocks
 and two token-refiner blocks. They bind to 208 native linears because Q/K/V
 share one base projection. Q/K/V keep independent A/B pairs and local output
 slices. MLP B rows are converted from `[value, gate]` to native `[gate, value]`
@@ -151,10 +192,10 @@ measured results and evidence paths. Passing a parser or synthetic shape test
 is not an end-to-end generation result. Each artifact/partition/quantization
 combination requires its own evidence before being promoted.
 
-FlashGen's fused native QKV/AdaLN tensors and pinned DMD2 schedule need a
-separate loader; its target AdaLN shape also conflicts with pruned checkpoints.
+FlashGen's loader, schedule and AdaLN restoration have CPU validation, including
+production-sized adapter binding; completed GPU generation remains pending.
 FastH3 adds full-rank deltas and sampling/attention requirements, so it cannot
-be accepted by renaming a LightX2V file. These two families, combined-partition
-serving, step batching, DLO and approximate caches remain pending in the
-authorized [adaptation tracker](ADAPTATION.md). Multipart input and the broader
-video task API have now been implemented, with GPU acceptance tracked separately.
+be accepted by renaming a LightX2V file. FastH3, combined-partition serving,
+step batching, DLO and approximate caches remain pending in the authorized
+[adaptation tracker](ADAPTATION.md). Multipart input and the broader video task
+API are implemented, with GPU acceptance tracked separately.

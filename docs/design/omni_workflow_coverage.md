@@ -63,12 +63,11 @@ weights. Human audio/temporal review and full 243-frame acceptance remain open.
 
 ## Current expansion
 
-[H3 workflows and Turbo](minimax_h3/WORKFLOWS.md) documents the executable
-CLI/JSON API contracts and eight LightX2V artifacts. This branch is stacked on
-
-PR #557 and changes workflow/LoRA code, leaving kernel optimization to the other
-
-tasks. It adds strict full-layout adapter loading, TP-aware runtime deltas,
+[H3 workflows and distilled LoRA](minimax_h3/WORKFLOWS.md) documents the executable
+CLI/API contracts, eight LightX2V artifacts and the native FlashGen loader.
+FlashGen has CPU binding/schedule validation; its GPU acceptance remains pending.
+This branch is stacked on PR #557 and changes workflow/LoRA code, leaving kernel
+optimization to the other tasks. It adds strict full-layout loading, TP-aware deltas,
 artifact-specific sampling defaults, request-scale bypass, explicit task/shift
 controls, reference-video offsets, and media validation before dispatch.
 
@@ -92,8 +91,9 @@ not counted as ported by the native generator.
 This is a proposed sequence based on reuse of the current code and the user's
 H3-first priority, not a hardware-support assertion:
 
-1. Finish H3 artifact/partition quality coverage; add FlashGen and FastH3 through
-   their own weight/schedule contracts. Add combined-partition serving only with
+1. Finish H3 artifact/partition quality coverage, including FlashGen's dense
+   AdaLN restoration; add FastH3 through its own weight/schedule contract.
+   Add combined-partition serving only with
    a demonstrated host/GPU residency budget.
 2. Extend diffusion coverage to Wan T2V/I2V and Qwen-Image/Edit with their official
    preprocessing and schedulers. Validate FP16 range and SM70 operator routing

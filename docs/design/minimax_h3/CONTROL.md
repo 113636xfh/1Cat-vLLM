@@ -483,3 +483,56 @@ It exited with status 75 before model loading because neither GPU group was
 free and unleased. Record: `api-ref2va.log`. No GPU generation result is claimed
 for this API revision; no owned workers, service ports or GPU leases remain.
 Retry only after resource ownership changes. The other tasks were not stopped.
+
+### FlashGen native four-step adapter and AdaLN restoration (2026-09-08)
+
+Continues the owned PR #565 branch from
+`79398b0b5a08e0ea6ed7cac37358f55624b651a7`, with the same base, Python/Torch
+environment and direct native API scope.
+
+- Added the official FlashGen rank-64/alpha-64 T2VA artifact as a separate
+  native layout. The loader validates all 518 tensors / 259 pairs, including
+  grouped QKV, native gate/up FFN and dense AdaLN targets. Runtime deltas use
+  staged FP16 A/B buffers, FP32 intermediates and the unrotated input basis.
+- Metadata supplies `[1, 0.7, 0.4, 0.15, 0]`; shifts are 12/3. CLI/HTTP defaults
+  select four intervals (`num_inference_steps=4`). LightX2V's five/nine-point
+  convention is unchanged. Wrong active tasks, layouts and schedules fail.
+- A pruned INT8 base restores 106 original AdaLN/time tensors; all backbone
+  signed INT8 weights and FP32 scales remain unchanged. Original transformer
+  shards are required. Restored weights add about 6.1 GiB per TP4 rank before
+  adapter/activation costs. This is a weight-size estimate; actual GPU peak
+  remains pending. Scale zero retains restored AdaLN/time components; omit the
+  adapter and restart to recover the exact earlier pruned deployment.
+- The downloaded official artifact's revision, byte size and verified SHA256
+  are recorded in `UPSTREAM.md`. Production TP4 meta-model binding consumed all
+  259 targets with 518 actual CPU buffers, totaling 435,126,272 bytes per rank.
+  This verifies real checkpoint shapes and FP16 representability, not GPU
+  execution. The CPU audit explicitly simulates TP configuration and groups.
+
+The same CPU test command now passes **142 tests**, with 8 GPU-only tests
+skipped. Thirty-two FlashGen tests cover metadata errors, exact schedule/task
+semantics, TP1/2/4 projection algebra, complete binding, missing original
+restoration tensors, INT8 tensor preservation, scale-zero bypass and HTTP
+defaults. All changed-file pre-commit checks pass. The first standalone binding
+audit needed the owned worktree on `PYTHONPATH` and explicit simulated TP config;
+those setup-only failures are retained separately from the successful audit.
+
+Evidence under `/data/minimax-h3/workflows-lora-20260908/flashgen/`:
+`manifest.json`, `files.json`, `cpu-all.log`, `precommit.log`,
+`inspect_binding.py`, `production-binding-tp4.log`, and `production-binding.json`.
+No FlashGen GPU result or output-quality acceptance is claimed.
+
+The real native-engine API mixed-Ref2VA test was retried after an idle snapshot
+and successful native GPU lease acquisition. INT8 TP4, Ref2V four-step v0.1,
+actual image/video/audio uploads, 1344x768, 107 frames at 24 FPS, seed 42 and
+shifts 12/3 reached startup (107.824344 s), all-rank binding and 10,266-token
+Qwen media encoding. The process then received SIGTERM (exit 143), at the
+start of the four-call denoise loop. There is no completed media or valid
+generation timing. The sender was not identified. `api-ref2va-run2.log` retains
+the record; no owned workers or GPU leases remain. Do not repeat this unchanged
+GPU run without a resource-ownership change or coordinated validation window.
+
+Next acceptance: uninterrupted mixed-reference API generation and FlashGen
+T2VA, with measured restoration residency, every-rank call counts, output decode
+and video/audio review. FastH3 and the rest of the authorized workflow tracker
+remain outstanding; this checkpoint is not full workflow completion.

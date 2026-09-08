@@ -428,7 +428,18 @@ class MiniMaxH3Pipeline(nn.Module):
         self.config = config
         self.partition = config.partition
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
-        self.model_root = resolve_model_root(config)
+        from .flashgen import FlashGenSpec, restore_dense_adaln_weights
+        from .lora import inspect_adapter
+
+        adapter_spec = (
+            inspect_adapter(config.lora_path, config.partition)
+            if config.lora_path
+            else None
+        )
+        self.model_root = resolve_model_root(
+            config,
+            require_original_transformer=isinstance(adapter_spec, FlashGenSpec),
+        )
         path = self.model_root / ("FL2VA" if self.partition == "fl2va" else "Ref2VA")
         shared = self.model_root / "FL2VA"
         if not shared.is_dir():
@@ -450,12 +461,19 @@ class MiniMaxH3Pipeline(nn.Module):
         transformer_path = path / "transformer"
         quant = None
         overrides = None
+        restore_adaln = False
         if config.transformer_path:
             transformer_path = resolve_comfy_checkpoint_path(config.transformer_path)
             checkpoint = inspect_comfy_checkpoint(
                 transformer_path, expected_partition=self.partition
             )
             overrides = checkpoint.arch_overrides
+            restore_adaln = (
+                isinstance(adapter_spec, FlashGenSpec)
+                and checkpoint.adaln_curve_grid is not None
+            )
+            if restore_adaln:
+                overrides = None
             quant = DiffusionInt8ConvRotConfig(layer_configs=checkpoint.layer_configs)
         architecture = json.loads((path / "transformer/config.json").read_text())
         token = attention_backend.set(config.attention_backend)
@@ -465,9 +483,10 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         finally:
             attention_backend.reset(token)
-        loaded = self.transformer.load_weights(
-            iter_checkpoint_weights(transformer_path)
-        )
+        weights = iter_checkpoint_weights(transformer_path)
+        if restore_adaln:
+            weights = restore_dense_adaln_weights(weights, path / "transformer")
+        loaded = self.transformer.load_weights(weights)
         required = set(dict(self.transformer.named_parameters()))
         required.update(dict(self.transformer.named_buffers()))
         missing = required - loaded
@@ -480,13 +499,13 @@ class MiniMaxH3Pipeline(nn.Module):
         self.transformer.post_load_weights()
         self.turbo_spec = None
         if config.lora_path:
-            from .lora import install_turbo_lora
+            from .lora import install_adapter
 
             if self._base_schedule_by_partition[self.partition] is not None:
                 raise H3InputError(
-                    "Turbo cannot overlay an already distilled base_schedule"
+                    "H3 LoRA cannot overlay an already distilled base_schedule"
                 )
-            self.turbo_spec = install_turbo_lora(
+            self.turbo_spec = install_adapter(
                 self.transformer, config.lora_path, self.partition
             )
         self._dit_stager = PinnedModuleStager(self.transformer, self.device)
@@ -532,10 +551,10 @@ class MiniMaxH3Pipeline(nn.Module):
 
     def _resolve_sigma_positions(self, task, sampling):
         if getattr(self, "turbo_spec", None) is not None and sampling.lora_scale != 0:
-            from .lora import validate_turbo_sampling
+            from .lora import validate_adapter_sampling
 
-            validate_turbo_sampling(self.turbo_spec, task, sampling)
-            return None, self.turbo_spec.sigma_points
+            validate_adapter_sampling(self.turbo_spec, task, sampling)
+            return self.turbo_spec.base_schedule, self.turbo_spec.api_steps
         schedule = self._base_schedule_for_task(task)
         if schedule is None:
             return None, sampling.num_inference_steps
@@ -1564,9 +1583,9 @@ class MiniMaxH3Pipeline(nn.Module):
         task = self._resolve_task(extra.get("task"), multi_modal_data)
         turbo = getattr(self, "turbo_spec", None)
         if turbo is not None:
-            from .lora import validate_turbo_sampling
+            from .lora import validate_adapter_sampling
 
-            validate_turbo_sampling(turbo, task, sampling)
+            validate_adapter_sampling(turbo, task, sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")

@@ -30,7 +30,7 @@ class VideoSubcommand(CLISubcommand):
             )
             mode.add_argument("--transformer-path")
             mode.add_argument(
-                "--lora-path", help="LightX2V Turbo Diffusers safetensors"
+                "--lora-path", help="LightX2V Turbo or native FlashGen safetensors"
             )
             mode.add_argument("--tensor-parallel-size", "-tp", type=int, default=4)
             mode.add_argument(
@@ -51,7 +51,7 @@ class VideoSubcommand(CLISubcommand):
                 mode.add_argument(
                     "--num-inference-steps",
                     type=int,
-                    help="Sigma points; default 50, or adapter steps + 1",
+                    help="Default 50; LightX2V uses 5/9 sigma points, FlashGen uses 4",
                 )
                 mode.add_argument(
                     "--lora-scale",

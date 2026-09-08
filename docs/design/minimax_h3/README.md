@@ -5,8 +5,8 @@ four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation
 is required.
 
-For explicit workflow selection, reference-video offsets and four/eight-step
-LightX2V Turbo LoRA, see [Workflows and distilled LoRA](WORKFLOWS.md).
+For explicit workflow selection, reference-video offsets, four/eight-step
+LightX2V Turbo and four-step FlashGen, see [Workflows and distilled LoRA](WORKFLOWS.md).
 The application frontend calls the [native video API](API.md) directly.
 The [adaptation tracker](ADAPTATION.md) records the remaining official workflows.
 

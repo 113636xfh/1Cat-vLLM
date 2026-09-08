@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
 
 from .config import H3InputError
+from .flashgen import FLASHGEN_FILENAME, FlashGenSpec
 from .quantization import fp16_gemm_input
 
 logger = init_logger(__name__)
@@ -62,6 +63,11 @@ class TurboSpec:
     audio_shift: float = 3.0
     rank: int = 128
     alpha: float = 8.0
+    base_schedule: tuple[float, ...] | None = None
+
+    @property
+    def api_steps(self) -> int:
+        return self.sigma_points
 
     @property
     def sigma_points(self) -> int:
@@ -103,6 +109,40 @@ def select_turbo_file(artifact: str | Path) -> Path:
             "ComfyUI, FlashGen and FastH3 exports have different layouts"
         )
     return path
+
+
+def select_adapter_file(artifact: str | Path) -> Path:
+    path = Path(artifact)
+    if path.is_dir():
+        candidates = sorted(
+            file
+            for file in path.glob("*.safetensors")
+            if file.name == FLASHGEN_FILENAME or parse_turbo_filename(file.name)
+        )
+        if len(candidates) != 1:
+            raise H3InputError("--lora-path must select exactly one H3 adapter")
+        path = candidates[0]
+    if path.is_file() and path.name == FLASHGEN_FILENAME:
+        return path
+    return select_turbo_file(path)
+
+
+def inspect_adapter(artifact: str | Path, partition: str) -> TurboSpec | FlashGenSpec:
+    path = select_adapter_file(artifact)
+    if path.name == FLASHGEN_FILENAME:
+        from .flashgen import inspect_flashgen_lora
+
+        return inspect_flashgen_lora(path, partition)
+    return inspect_turbo_lora(path, partition)
+
+
+def install_adapter(model, artifact: str | Path, partition: str):
+    path = select_adapter_file(artifact)
+    if path.name == FLASHGEN_FILENAME:
+        from .flashgen import install_flashgen_lora
+
+        return install_flashgen_lora(model, path, partition)
+    return install_turbo_lora(model, path, partition)
 
 
 def inspect_turbo_lora(artifact: str | Path, partition: str) -> TurboSpec:
@@ -152,15 +192,21 @@ def inspect_turbo_lora(artifact: str | Path, partition: str) -> TurboSpec:
 
 
 def validate_turbo_sampling(spec: TurboSpec, task: str, sampling) -> None:
+    validate_adapter_sampling(spec, task, sampling)
+
+
+def validate_adapter_sampling(
+    spec: TurboSpec | FlashGenSpec, task: str, sampling
+) -> None:
     if sampling.lora_scale == 0:
         return
     if task not in spec.supported_tasks:
         raise H3InputError(
             f"{spec.filename} supports {sorted(spec.supported_tasks)}, got {task}"
         )
-    if sampling.num_inference_steps != spec.sigma_points:
+    if sampling.num_inference_steps != spec.api_steps:
         raise H3InputError(
-            f"{spec.filename} requires num_inference_steps={spec.sigma_points} "
+            f"{spec.filename} requires num_inference_steps={spec.api_steps} "
             f"({spec.denoise_steps} actual denoiser calls)"
         )
     for key, expected in (
