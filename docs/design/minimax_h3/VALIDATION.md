@@ -147,3 +147,17 @@ reports 25.091% tensor-pipe activity, up from 16.976% before prefetch. This
 counter is diagnostic, not effective model throughput. The 39-frame result
 remains below 80 TFLOPS/card; primary-load quality, three formal timing runs
 and the full-pipeline memory gate remain incomplete.
+
+Fused FP32 input preparation and warp-shuffle ConvRot subsequently reduce the
+same 20-update denoise to 86.200372 s (4.310019 s/update), or 40.182583 useful
+TFLOPS on every rank. Final video/audio latents remain bitwise identical;
+the run retains explicit cached-text/decoder-reuse labels. The video suite
+passes 58 tests, with a subsequently added nonfinite-input test passing
+separately. All eleven new rotation/scaling cases pass memcheck, racecheck
+and synccheck, and the W8A16 CMake component builds.
+
+A recovered ComfyUI V100 attention source was also audited. On aligned D128
+controls it is about 1.9 times slower than current FlashInfer, and its raw
+unaligned path has query-tail synchronization and numerical failures. Those
+controls do not replace H3 quality or performance acceptance. The mainline
+and >80 TFLOPS/card target remain unchanged; see CONTROL.md for evidence.
