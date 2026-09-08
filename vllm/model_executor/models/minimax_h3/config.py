@@ -59,13 +59,15 @@ class H3Config:
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
         if self.residual_sequence_parallel and (
             self.tensor_parallel_size != 4
-            or self.attention_backend != "FLASHINFER_SM70"
+            or self.attention_backend not in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
             or self.partition != "fl2va"
             or not self.transformer_path
+            or self.lora_path is not None
         ):
             raise H3InputError(
                 "experimental residual sequence parallelism requires TP4, "
-                "FLASHINFER_SM70 and an FL2VA INT8 ConvRot checkpoint"
+                "FLASH_ATTN_V100 or FLASHINFER_SM70 and an FL2VA INT8 "
+                "ConvRot checkpoint without an adapter"
             )
         if (
             not math.isfinite(self.fp16_weight_cache_gib)

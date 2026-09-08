@@ -47,9 +47,7 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--residual-sequence-parallel",
                 action="store_true",
-                help=(
-                    "Experimental FP32 residual sharding for TP4 FL2VA INT8 FlashInfer"
-                ),
+                help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
             )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             if name == "generate":

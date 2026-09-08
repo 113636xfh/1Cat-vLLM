@@ -14,6 +14,16 @@ from vllm.model_executor.models.minimax_h3.config import H3Config, H3InputError
 from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTBlock
 
 
+@pytest.mark.parametrize("backend", ["FLASH_ATTN_V100", "FLASHINFER_SM70"])
+def test_residual_parallel_accepts_native_sm70_backends(backend):
+    config = H3Config(
+        transformer_path="int8.safetensors",
+        attention_backend=backend,
+        residual_sequence_parallel=True,
+    )
+    assert config.residual_sequence_parallel
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -22,6 +32,7 @@ from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTBlock
         {"attention_backend": "TORCH_SDPA"},
         {"partition": "ref2va"},
         {"transformer_path": None},
+        {"lora_path": "adapter.safetensors"},
     ],
 )
 def test_residual_parallel_rejects_unvalidated_deployments(change):
@@ -108,10 +119,11 @@ def test_gpu_residual_parallel_matches_replicated_blocks(tp4_group):
     # The repository's autouse fixture tears down distributed state after each
     # test. Keep all collective shapes inside the same torchrun lifetime.
     for valid in (32, 33, 131):
-        _check_replicated_blocks(tp4_group, valid)
+        for backend in ("FLASH_ATTN_V100", "FLASHINFER_SM70"):
+            _check_replicated_blocks(tp4_group, valid, backend)
 
 
-def _check_replicated_blocks(group, valid):
+def _check_replicated_blocks(group, valid, backend):
     from vllm.model_executor.models.minimax_h3.attention import attention_backend
     from vllm.model_executor.models.minimax_h3.transformer import (
         MiniMaxH3DiTArchConfig,
@@ -124,7 +136,7 @@ def _check_replicated_blocks(group, valid):
         adaln_curve_grid=2,
         adaln_out_features=18 * 512,
     )
-    token = attention_backend.set("FLASHINFER_SM70")
+    token = attention_backend.set(backend)
     try:
         baseline = MiniMaxH3DiTBlock(arch, None, prefix="blocks.0").cuda().eval()
         candidate = (

@@ -34,6 +34,13 @@ def test_cpu_rotation_preserves_original_path_and_rejects_pre_rotated_input():
 
 @torch.inference_mode()
 def test_gpu_local_rotation_preserves_tp4_blocks_and_hooks(tp4_group, monkeypatch):
+    # Keep both backends in one distributed fixture lifetime, as with the
+    # residual regression: repository fixtures tear down state after each test.
+    for backend in ("FLASH_ATTN_V100", "FLASHINFER_SM70"):
+        _check_local_rotation(tp4_group, monkeypatch, backend)
+
+
+def _check_local_rotation(tp4_group, monkeypatch, backend):
     from vllm.model_executor.models.minimax_h3.attention import attention_backend
     from vllm.model_executor.models.minimax_h3.cuda_ops import w8a16_extension
     from vllm.video.metrics import DenoiseWorkCounter
@@ -53,7 +60,7 @@ def test_gpu_local_rotation_preserves_tp4_blocks_and_hooks(tp4_group, monkeypatc
         adaln_curve_grid=2,
         adaln_out_features=18 * 512,
     )
-    token = attention_backend.set("FLASHINFER_SM70")
+    token = attention_backend.set(backend)
     try:
         block = (
             transformer.MiniMaxH3DiTBlock(
