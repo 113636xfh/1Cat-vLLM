@@ -73,7 +73,7 @@ GPU utilization can read 100% while Tensor Core activity is much lower.
 ## Communication control
 
 A separate probe initializes the same TP4 vLLM groups on GPUs 0–3. Runtime
-dispatch logs confirm `pynccl` for the actual FP32 row-projection payloads.
+dispatch logs confirm `pynccl` for FP32 row-projection controls.
 CPU-group barriers precede CUDA-event timing; three warmups and five measured
 calls are used. All output elements exactly equal the expected four-rank sum.
 
@@ -81,6 +81,12 @@ calls are used. All output elements exactly equal the expected four-rank sum.
 | --- | ---: | ---: | ---: |
 | 12323 x 5376 FP32, 264,993,792 bytes | 5.486 ms | 5.417–5.454 ms | 72.46–73.38 GB/s |
 | 73483 x 5376 FP32, 1,580,178,432 bytes | 31.905 ms | 31.767–31.898 ms | 74.29–74.62 GB/s |
+
+Subsequent GEMM route instrumentation found that the short model pads 12,323
+valid tokens to 12,352 rows for linear layers and all-reduce. Its actual short
+payload is 265,617,408 bytes. These standalone controls use valid-token rows,
+so the short control is 0.235% smaller; it is not an exact physical-shape
+benchmark. The model useful-FLOP ledger intentionally excludes that padding.
 
 Bus bandwidth uses `1.5 * payload_bytes / elapsed_seconds` for a four-rank
 ring. It is not model FLOPS. The standalone short payload time is similar to
@@ -128,7 +134,7 @@ Rejected or unpromoted experiments:
   bitwise equal on the 13-length control. Combining it with the new transpose
   takes 26.8483 ms, worse than either change alone. Do not combine the changes
   on the assumption that isolated gains add together.
-- Chunked GEMM/FP32 all-reduce overlap, exact M12323/N5376 projections:
+- Chunked GEMM/FP32 all-reduce overlap, M12323/N5376 controls:
   two chunks usually regress. Four chunks reduce rank 0 medians from 8.3528
   to 7.8387 ms (K1792), and 10.6076 to 9.4966 ms (K3584), with noticeable
   variability. Maximum numerical difference is 6.10352e-5, relative L2 below

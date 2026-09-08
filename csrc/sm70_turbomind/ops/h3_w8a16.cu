@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include "h3_gemm_plan.h"
 
 namespace {
 __global__ void prepare_fp16_rows(const float* input, half* output,
@@ -222,6 +223,10 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  pybind11::class_<h3::FP16GemmPlan>(m, "FP16GemmPlan")
+      .def(pybind11::init<int64_t, int64_t, int64_t, bool, int>())
+      .def("algorithm_info", &h3::FP16GemmPlan::algorithm_info)
+      .def("run", &h3::FP16GemmPlan::run);
   m.def("prepare_fp16", &h3_prepare_fp16);
   m.def("dequantize", &h3_dequantize);
   m.def("rotate", &h3_rotate);

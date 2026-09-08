@@ -23,7 +23,7 @@ static_assert(THREADS * PREFETCH_VECTORS * 8 == BK * D);
 static_assert(BQ / 16 < 16);  // Barrier 0 joins the CTA; 1..8 join query pairs.
 constexpr int shared_bytes() {
   constexpr int QLD = D + 8, PLD = BK + 8;
-  return (BQ * QLD + BK * QLD + D * VLD + BQ * PLD) * 2 +
+  return (BQ * D + BK * QLD + D * VLD + BQ * PLD) * 2 +
          (BQ * KEY_WARPS * 2 + BQ * 2) * 4;
 }
 
@@ -31,6 +31,22 @@ constexpr int shared_bytes() {
 // Keep CTA-wide barriers around K/V staging and shared scratch reuse.
 __device__ __forceinline__ void sync_query_pair(int query_group) {
   asm volatile("bar.sync %0, 64;" ::"r"(query_group + 1) : "memory");
+}
+
+__device__ __forceinline__ int q_swizzle(int row) {
+  return ((row & 3) << 3) | ((row & 8) << 2);
+}
+__device__ __forceinline__ void load_q_fragment(fi::AFragment& fragment,
+                                                const half* source, int row,
+                                                int col) {
+  const int lane = threadIdx.x & 31;
+  const int physical_row =
+      row + (lane & 3) + ((lane & 16) >> 2) + ((lane & 4) << 1);
+  auto* values = reinterpret_cast<uint4*>(fragment.x);
+  const half* base = source + physical_row * D;
+  const int mask = q_swizzle(physical_row);
+  values[0] = *reinterpret_cast<const uint4*>(base + (col ^ mask));
+  values[1] = *reinterpret_cast<const uint4*>(base + ((col + 8) ^ mask));
 }
 
 __global__ __launch_bounds__(THREADS,
@@ -41,7 +57,7 @@ __global__ __launch_bounds__(THREADS,
   constexpr int QLD = D + 8, PLD = BK + 8;
   extern __shared__ __align__(32) unsigned char raw[];
   half* qs = reinterpret_cast<half*>(raw);
-  half* ks = qs + BQ * QLD;
+  half* ks = qs + BQ * D;
   half* vs = ks + BK * QLD;
   half* probabilities = vs + D * VLD;
   float* scores = reinterpret_cast<float*>(probabilities + BQ * PLD);
@@ -66,9 +82,9 @@ __global__ __launch_bounds__(THREADS,
   const int64_t base = int64_t(batch) * length * heads * D + head * D;
   for (int i = tid; i < BQ * D; i += blockDim.x) {
     const int row = q_start + i / D;
-    qs[(i / D) * QLD + i % D] = row < length
-                                    ? q[base + int64_t(row) * heads * D + i % D]
-                                    : __float2half(0.f);
+    qs[(i / D) * D + ((i % D) ^ q_swizzle(i / D))] =
+        row < length ? q[base + int64_t(row) * heads * D + i % D]
+                     : __float2half(0.f);
   }
   if (tid < BQ) {
     maximum[tid] = -INFINITY;
@@ -95,7 +111,7 @@ __global__ __launch_bounds__(THREADS,
 #pragma unroll 2
     for (int dim = 0; dim < D; dim += 16) {
       fi::AFragment qa;
-      fi::load_a_fragment(qa, qs + warp_q * 16 * QLD + dim, QLD);
+      load_q_fragment(qa, qs, warp_q * 16, dim);
 #pragma unroll
       for (int n = 0; n < KEY_FRAGMENTS; ++n) {
         fi::QKBFragment kb;

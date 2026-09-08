@@ -762,7 +762,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     SOURCES "csrc/sm70_turbomind/ops/h3_w8a16.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES "70"
-    LIBRARIES CUDA::cublas "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    LIBRARIES CUDA::cublas CUDA::cublasLt "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
     _h3_flashinfer_C DESTINATION vllm LANGUAGE CUDA

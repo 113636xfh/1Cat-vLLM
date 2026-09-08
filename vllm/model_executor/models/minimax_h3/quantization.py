@@ -368,11 +368,21 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
                     raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
                 x = ops.rotate(x)
             weight = getattr(layer, "h3_fp16_weight", None)
+            output_fp32 = getattr(layer, "h3_output_fp32", False) or scale is not None
             if weight is None:
                 weight = ops.dequantize(layer.weight, layer.weight_scale)
-            output = ops.gemm(
-                x, weight, getattr(layer, "h3_output_fp32", False) or scale is not None
-            )
+                output = ops.gemm(x, weight, output_fp32)
+            else:
+                from .cuda_ops import cached_weight_gemm_plan
+
+                plan = cached_weight_gemm_plan(
+                    x.shape[0],
+                    weight.shape[0],
+                    weight.shape[1],
+                    output_fp32,
+                    x.get_device(),
+                )
+                output = plan.run(x, weight.t())
             if scale is not None:
                 output = output * scale
             output = output.reshape(*shape[:-1], layer.weight.shape[0])

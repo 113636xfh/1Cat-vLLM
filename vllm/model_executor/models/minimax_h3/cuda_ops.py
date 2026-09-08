@@ -24,9 +24,15 @@ def w8a16_extension():
         name="onecat_h3_w8a16",
         sources=[str(source)],
         extra_cuda_cflags=["-O3", "-gencode=arch=compute_70,code=sm_70"],
-        extra_ldflags=["-lcublas"],
+        extra_ldflags=["-lcublas", "-lcublasLt"],
         verbose=False,
     )
+
+
+@lru_cache(maxsize=32)
+def cached_weight_gemm_plan(m, n, k, output_fp32, device):
+    """Reuse shape/device descriptors without retaining weights or workspace."""
+    return w8a16_extension().FP16GemmPlan(m, n, k, output_fp32, device)
 
 
 @lru_cache(maxsize=1)

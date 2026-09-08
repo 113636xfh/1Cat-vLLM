@@ -77,6 +77,9 @@ budget with `--fp16-weight-cache-gib` and repeat `--fp16-cache-layer` for the
 fixed layer list. Cached weights retain ConvRot coordinates. Cache/staging
 preparation is separately timed; dequantization remains inside denoise timing
 for uncached weights. Both original INT8 tensors and FP32 scales are retained.
+The measured 39-frame/20-update cache list and native cuBLASLt configuration
+are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
+commands, output comparison and the still-incomplete 50-second target.
 
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not

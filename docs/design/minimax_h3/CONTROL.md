@@ -1,5 +1,12 @@
 # Native MiniMax H3 migration control
 
+Latest retained FlashInfer change: [FLASHINFER_TO50.md](FLASHINFER_TO50.md).
+Q shared-memory swizzling and an exact transposed FP16/cuBLASLt weight cache
+reduce the unchanged 39-frame/20-update denoise to 70.819016 seconds,
+48.909937 useful TFLOPS per rank. Video/audio latents and fresh MP4 remain
+bitwise equal. 85 tests and three focused sanitizer tools pass. The below-50s
+milestone, human quality review and per-card >80-TFLOPS acceptance remain open.
+
 Latest FlashInfer investigation: [FLASHINFER_ROOT_CAUSE.md](FLASHINFER_ROOT_CAUSE.md).
 Fused QK preparation and an 8x8 V transpose reduce the same 39-frame/20-update
 denoise to 75.140751 seconds, or 46.096872 useful TFLOPS per rank. Video/audio
