@@ -7,33 +7,44 @@ diagnostics separate from the three formal timing runs.
 
 The current short-development target is **under 50 seconds for 20 actual DiT
 updates**, retaining 1344x768, 39 frames, seed42, INT8 ConvRot, TP4 GPU0-3 and
-output quality, without a substantial memory increase. Exact full-tile
-FlashAttention specialization and column-major INT8/Lt now complete this workload
-in **69.923404 s**, or 3.496170 s/update and 49.536398 useful TFLOPS/card.
-The preceding QK/RoPE baseline took 74.411059 s; the new route reduces that time
-by 6.03%. Both use zero persistent FP16 cache. New Lt workspace is also zero.
-Peak allocated denoise memory remains exactly 6.647851467 GiB on all four cards;
-NVML peak device-used memory, including runtime allocations, is 8.583496 GiB.
+output quality, without a substantial memory increase. The latest native
+FlashAttention V-prefetch route measures **69.062335 s**, or 3.453117 s/update
+and 50.154018 useful TFLOPS/card. The prior full-tile/column-major INT8 route
+measured 69.923404 s; this is a 1.23% reduction. Both use zero persistent
+FP16 cache and zero Lt workspace. Peak allocated denoise memory remains
+6.647851467 GiB on all four cards; NVML peak device-used memory is 8.583496 GiB.
 
-Both video and audio latents are bitwise equal to the prior FlashAttention
-baseline. Fresh VAE decoding produces identical PCM samples and MP4 bytes;
-MP4 SHA256 is `17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
-All automatic media checks pass. Human audiovisual quality scoring remains
-pending. Earlier FlashInfer comparisons remain recorded in CONTROL.md.
+Video and audio latents are bitwise equal to the prior route. The baseline
+decode is explicitly reused: MP4 SHA256 remains
+`17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
+The identical media retains the automatic checks; human audiovisual scoring
+remains pending. Earlier timing/decoder experiments remain in CONTROL.md.
 
-These are individual unprofiled development measurements after a one-invocation
-warmup with prompt-verified cached text embeddings. Do not interpret them as
-end-to-end generation or the formal three-measurement 243-frame acceptance.
-The separate low-memory prototype took 69.868952 s; combining different builds
-into a formal median is not permitted.
+This is one unprofiled complete native run after a one-call warmup, with
+prompt-verified cached text. The separate V-prefetch prototype measured
+68.980006 s. Do not combine different builds into a formal median or present
+these as end-to-end generation / three-run 243-frame acceptance.
 
-The standard CMake components build. 86 targeted GPU/CPU tests pass, including
-INT8 offsets/scales, padded-M12352 projection equality, fallback and CUDA Graph
-replay. Isolated CUDA12.8 memcheck/racecheck/synccheck pass without errors or
-hazards. Evidence is under `flashattention-lowmem50/`; serialized GPU test logs
-are under `flashattention-under50/`. Media and NVML reports are under
-`outputs/quality39-int8-flashattn-lowmem-native-20steps/FLASH_ATTN_V100/` in the
-recorded artifact root. **Neither 50 seconds nor >80 TFLOPS/card is achieved.**
+The user's next operator milestone is **60 useful TFLOPS for D128 attention**.
+The current workload's B1/N12323/H14/D128 attention requires 18.141769 ms to
+meet that milestone. The native helper's paired microbenchmark measures
+24.522753 ms (44.387601 TFLOPS), so this milestone is also incomplete.
+The old baseline's two-update trace separates GEMM service at 94.413296
+TFLOPS from attention service at 42.179368 TFLOPS. NCU and SASS samples locate
+operand-load/shared-store/HMMA dependencies inside attention; retain the
+arithmetic/data-movement focus. See CONTROL.md for the full evidence and
+failed wider-QK paths.
+
+The standard CMake FlashAttention component builds; 18 native GPU tests pass,
+including the new 32/33/96/97-key residual boundaries, poisoned padding,
+noncontiguous storage, online rescaling and CUDA Graph replay. Isolated CUDA12.8 memcheck, racecheck and synccheck each pass
+thirteen cases without errors/hazards. The full-environment memcheck loader
+error and isolated harness limits are retained in CONTROL.md. Previous INT8
+layout/Lt validation remains recorded. Evidence is in `flashattention-warp50/`;
+media and NVML reports are in
+`outputs/quality39-int8-flashattn-native-prefetch-20steps/FLASH_ATTN_V100/`.
+**Neither 60 TFLOPS attention, 50-second denoise nor >80 TFLOPS/card model
+acceptance is achieved.**
 
 ## Short development checks
 
