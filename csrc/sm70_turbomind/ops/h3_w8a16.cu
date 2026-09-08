@@ -91,7 +91,8 @@ torch::Tensor h3_rotate(torch::Tensor input) {
   return output;
 }
 
-torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight) {
+torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight,
+                           bool output_fp32) {
   validate_cuda(input);
   validate_cuda(weight);
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 &&
@@ -104,7 +105,9 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight) {
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX,
               "GEMM dimension overflow");
-  auto output = torch::empty({m, n}, input.options());
+  auto output = torch::empty(
+      {m, n},
+      input.options().dtype(output_fp32 ? torch::kFloat32 : torch::kFloat16));
   if (!m || !n) return output;
   // cuBLAS is an existing TurboMind SM70 dispatch option. Explicit 32F compute
   // prevents reduced-precision accumulation; W8 decode is outside the GEMM.
@@ -120,10 +123,11 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight) {
           CUBLAS_STATUS_SUCCESS,
       "cannot enable FP32 GEMM reductions");
   float alpha = 1.f, beta = 0.f;
-  auto status = cublasGemmEx(
-      handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, weight.data_ptr(),
-      CUDA_R_16F, k, input.data_ptr(), CUDA_R_16F, k, &beta, output.data_ptr(),
-      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  auto status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
+                             weight.data_ptr(), CUDA_R_16F, k, input.data_ptr(),
+                             CUDA_R_16F, k, &beta, output.data_ptr(),
+                             output_fp32 ? CUDA_R_32F : CUDA_R_16F, n,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   auto restored = cublasSetMathMode(handle, saved_math);
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS,
               "H3 FP16 GEMM failed: ", int(status));
@@ -135,5 +139,6 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dequantize", &h3_dequantize);
   m.def("rotate", &h3_rotate);
-  m.def("gemm", &h3_fp16_gemm);
+  m.def("gemm", &h3_fp16_gemm, pybind11::arg("input"), pybind11::arg("weight"),
+        pybind11::arg("output_fp32") = false);
 }

@@ -254,3 +254,101 @@ def test_encoder_uses_functional_all_reduce_return():
     projection.quant_method = SimpleNamespace(apply=lambda layer, value: value * 2)
     value = torch.ones(2, 4, dtype=torch.float16)
     torch.testing.assert_close(projection(value), value * 5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_staging_preserves_aliased_weights_across_repeated_transfers():
+    from torch import nn
+
+    from vllm.model_executor.models.minimax_h3.residency import PinnedModuleStager
+
+    module = nn.Module()
+    backing = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+    module.weight = nn.Parameter(backing)
+    module.register_buffer("view", backing[3:7, 1:5])
+    expected = module.view.clone()
+    stager = PinnedModuleStager(module, torch.device("cuda"))
+    for _ in range(2):
+        stager.load()
+        assert module.weight.is_cuda and module.view.is_cuda
+        assert (
+            module.weight.untyped_storage().data_ptr()
+            == module.view.untyped_storage().data_ptr()
+        )
+        torch.testing.assert_close(module.view.cpu(), expected)
+        stager.offload()
+        assert module.weight.is_pinned() and module.view.is_pinned()
+        torch.testing.assert_close(module.view, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_fp32_residual_is_not_rounded_through_fp16_before_normalization():
+    from vllm.model_executor.models.minimax_h3.modulation import (
+        indexed_gate_rms_norm_scale_shift,
+    )
+
+    torch.manual_seed(42)
+    residual = torch.randn(17, 256, device="cuda") * 100000
+    branch = torch.randn_like(residual) * 10000
+    gate = torch.randn(3, 256, device="cuda")
+    weight = torch.ones(256, device="cuda", dtype=torch.float16)
+    shift, scale = [torch.randn_like(gate) * 0.1 for _ in range(2)]
+    indices = torch.arange(17, device="cuda") % 3
+    expected = residual + gate[indices] * branch
+    normalized = expected * torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-5)
+    modulated = (normalized * (1 + scale[indices]) + shift[indices]).half()
+    actual, actual_modulated = indexed_gate_rms_norm_scale_shift(
+        residual,
+        gate,
+        branch,
+        weight,
+        shift,
+        scale,
+        indices,
+        1e-5,
+        output_dtype=torch.float16,
+    )
+    assert actual.dtype == torch.float32
+    assert torch.isfinite(actual).all() and torch.isfinite(actual_modulated).all()
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=0.02)
+    torch.testing.assert_close(actual_modulated, modulated, rtol=0.002, atol=0.002)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_tensor_core_projection_can_return_values_above_fp16_range():
+    from vllm.model_executor.models.minimax_h3.cuda_ops import w8a16_extension
+
+    x = torch.full((17, 512), 300.0, device="cuda", dtype=torch.float16)
+    weight = torch.ones(256, 512, device="cuda", dtype=torch.float16)
+    output = w8a16_extension().gemm(x, weight, True)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, x.float() @ weight.float().T, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_convrot_projection_restores_wide_activation_row_scales():
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.minimax_h3.quantization import (
+        DiffusionInt8ConvRotConfig,
+        Int8ConvRotLayerConfig,
+        Int8ConvRotLinearMethod,
+    )
+
+    torch.manual_seed(42)
+    layer = SimpleNamespace(
+        weight=torch.randint(-3, 4, (256, 512), device="cuda", dtype=torch.int8),
+        weight_scale=torch.full((256,), 1 / 128, device="cuda"),
+        h3_output_fp32=True,
+    )
+    x = torch.randint(-16, 17, (17, 512), device="cuda").float() * 8192
+    method = Int8ConvRotLinearMethod(
+        DiffusionInt8ConvRotConfig(),
+        Int8ConvRotLayerConfig(convrot=True),
+        prefix="blocks.0.mlp.fc2",
+    )
+    output = method.apply(layer, x)
+    weight = dequantize_int8_reference(layer.weight, layer.weight_scale)
+    expected = convrot_reference(x) @ weight.float().T
+    assert output.dtype == torch.float32 and torch.isfinite(output).all()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
