@@ -197,6 +197,27 @@ def test_flashinfer_online_softmax_across_tiles_and_batches(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65])
+def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(42)
+    shape = (2, length, 2, 128)
+    count = 2 * length * 2 * 128
+    q, k, v = [
+        torch.randn(count + offset, device="cuda", dtype=torch.float16)[
+            offset:
+        ].reshape(shape)
+        for offset in (1, 3, 5)
+    ]
+    # The next K/V tile can be absent, partial or complete. Storage offsets
+    # also exercise the scalar load path without changing contiguous layout.
+    expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("backend", ["FLASH_ATTN_V100", "FLASHINFER_SM70"])
 def test_noncausal_backend_matches_fp32_reference(backend):
     token = attention_backend.set(backend)

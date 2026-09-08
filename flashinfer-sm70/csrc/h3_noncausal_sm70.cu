@@ -11,20 +11,26 @@ namespace {
 constexpr int D = 128;
 constexpr int BQ = 128;
 constexpr int BK = 32;
+constexpr int VLD = BK + 8;
+constexpr int THREADS = (BQ / 16) * (BK / 16) * 32;
+static_assert(THREADS * 8 == BK * D);
 constexpr int shared_bytes() {
   constexpr int QLD = D + 8, PLD = BK + 8;
-  return (BQ * QLD + 2 * BK * QLD + BQ * PLD) * 2 +
+  return (BQ * QLD + BK * QLD + D * VLD + BQ * PLD) * 2 +
          (BQ * (BK / 16) * 2 + BQ * 2) * 4;
 }
 
-__global__ void h3_noncausal(const half* q, const half* k, const half* v,
-                             half* output, int length, int heads, float scale) {
+__global__ __launch_bounds__(THREADS,
+                             1) void h3_noncausal(const half* q, const half* k,
+                                                  const half* v, half* output,
+                                                  int length, int heads,
+                                                  float scale) {
   constexpr int QLD = D + 8, PLD = BK + 8;
   extern __shared__ __align__(32) unsigned char raw[];
   half* qs = reinterpret_cast<half*>(raw);
   half* ks = qs + BQ * QLD;
   half* vs = ks + BK * QLD;
-  half* probabilities = vs + BK * QLD;
+  half* probabilities = vs + D * VLD;
   float* scores = reinterpret_cast<float*>(probabilities + BQ * PLD);
   float* maximum = scores + BQ * (BK / 16) * 2;
   float* denominator = maximum + BQ;
@@ -57,14 +63,17 @@ __global__ void h3_noncausal(const half* q, const half* k, const half* v,
   }
   __syncthreads();
   for (int start = 0; start < length; start += BK) {
-    for (int i = tid; i < BK * D; i += blockDim.x) {
-      const int row = start + i / D;
-      const int64_t position = base + int64_t(row) * heads * D + i % D;
-      ks[(i / D) * QLD + i % D] =
-          row < length ? k[position] : __float2half(0.f);
-      vs[(i / D) * QLD + i % D] =
-          row < length ? v[position] : __float2half(0.f);
+    if (start == 0) {
+      for (int i = tid; i < BK * D; i += blockDim.x) {
+        const int row = start + i / D;
+        const int64_t position = base + int64_t(row) * heads * D + i % D;
+        ks[(i / D) * QLD + i % D] =
+            row < length ? k[position] : __float2half(0.f);
+        vs[(i % D) * VLD + i / D] =
+            row < length ? v[position] : __float2half(0.f);
+      }
     }
+    // Join both the initial loads and the previous iteration's prefetch.
     __syncthreads();
     fi::AccumulatorFragment qk;
     fi::init_accumulator_fragment(qk);
@@ -141,6 +150,37 @@ __global__ void h3_noncausal(const half* q, const half* k, const half* v,
         }
       }
     }
+    // Issue the next K/V global loads while the current V tile is consumed.
+    union StagedVector {
+      uint4 packed;
+      half values[8];
+    } next_k, next_v;
+    const int next_row = start + BK + tid / (D / 8);
+    const int next_col = (tid % (D / 8)) * 8;
+    if (next_row < length) {
+      const int64_t position = base + int64_t(next_row) * heads * D + next_col;
+      if ((reinterpret_cast<uintptr_t>(k) % 16 == 0) &&
+          (reinterpret_cast<uintptr_t>(v) % 16 == 0)) {
+        asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(next_k.packed.x), "=r"(next_k.packed.y),
+                       "=r"(next_k.packed.z), "=r"(next_k.packed.w)
+                     : "l"(k + position));
+        asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(next_v.packed.x), "=r"(next_v.packed.y),
+                       "=r"(next_v.packed.z), "=r"(next_v.packed.w)
+                     : "l"(v + position));
+      } else {
+        // Contiguous storage-offset views need scalar global loads.
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          next_k.values[j] = k[position + j];
+          next_v.values[j] = v[position + j];
+        }
+      }
+    } else {
+      next_k.packed = make_uint4(0, 0, 0, 0);
+      next_v.packed = make_uint4(0, 0, 0, 0);
+    }
 #pragma unroll
     for (int part = 0; part < D / BK; ++part) {
       const int col = warp_k * (D * 16 / BK) + part * 16;
@@ -152,13 +192,20 @@ __global__ void h3_noncausal(const half* q, const half* k, const half* v,
 #pragma unroll
       for (int kv = 0; kv < BK; kv += 16) {
         fi::AFragment pa;
-        fi::PVBFragment vb;
+        fi::QKBFragment vb;
         fi::load_a_fragment(pa, probabilities + row * PLD + kv, PLD);
-        fi::load_pv_b_fragment(vb, vs + kv * QLD + col, QLD);
-        fi::mma_sync_m16n16k16_row_row_f16f16f32(pv, pa, vb);
+        fi::load_qk_b_fragment(vb, vs + col * VLD + kv, VLD);
+        fi::mma_sync_m16n16k16_row_col_f16f16f32(pv, pa, vb);
       }
     }
     __syncthreads();
+    if (start + BK < length) {
+      *reinterpret_cast<uint4*>(ks + (tid / (D / 8)) * QLD + next_col) =
+          next_k.packed;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        vs[(next_col + j) * VLD + tid / (D / 8)] = next_v.values[j];
+    }
   }
   {
 #pragma unroll
