@@ -271,21 +271,33 @@ __global__ __launch_bounds__(THREADS,
         const int next_col = (tile % (D / 32)) * 32 + (lane & 3) * 8;
         *reinterpret_cast<uint4*>(ks + tile_row * QLD + next_col) =
             next_k[n].packed;
-        // Exchange exact half pairs between adjacent rows. The even-row
-        // lane writes even columns; its partner writes odd columns. This
-        // avoids a shared scratch round trip and its extra CTA barrier.
+        // Transpose four rows with exact 32-bit lane exchanges. Each lane
+        // writes two aligned 64-bit vectors instead of four half pairs,
+        // reducing shared store instructions and bank conflicts. No values
+        // pass through arithmetic or a shared transpose scratch buffer.
         const auto* pairs =
             reinterpret_cast<const unsigned*>(&next_v[n].packed);
+        unsigned transposed[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           const unsigned local = pairs[j];
           const unsigned adjacent = __shfl_xor_sync(0xffffffff, local, 4);
-          const unsigned transposed =
-              (lane & 4) ? ((adjacent >> 16) | (local & 0xffff0000u))
-                         : ((local & 0xffffu) | (adjacent << 16));
-          const int d = next_col + 2 * j + ((lane & 4) >> 2);
-          *reinterpret_cast<unsigned*>(vs + d * VLD + (tile_row & ~1)) =
-              transposed;
+          transposed[j] = (lane & 4)
+                              ? ((adjacent >> 16) | (local & 0xffff0000u))
+                              : ((local & 0xffffu) | (adjacent << 16));
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const unsigned other0 =
+              __shfl_xor_sync(0xffffffff, transposed[2 * j], 8);
+          const unsigned other1 =
+              __shfl_xor_sync(0xffffffff, transposed[2 * j + 1], 8);
+          const unsigned local = transposed[2 * j + ((lane & 8) >> 3)];
+          const unsigned other = (lane & 8) ? other1 : other0;
+          const uint2 vector =
+              (lane & 8) ? make_uint2(other, local) : make_uint2(local, other);
+          const int d = next_col + 4 * j + ((lane >> 2) & 3);
+          *reinterpret_cast<uint2*>(vs + d * VLD + (tile_row & ~3)) = vector;
         }
       }
     }

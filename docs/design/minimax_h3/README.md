@@ -1,10 +1,11 @@
 # Native MiniMax H3 (development)
 
 The latest optional residual-sharded FlashInfer development run completes
-39 frames and 20 denoise updates in 63.565580 seconds, with unchanged
-video/audio latents. See [FLASHINFER_SILU.md](FLASHINFER_SILU.md) for the shared
-MLP integration and [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md) for
-operator improvements and remaining quality/performance gates.
+39 frames and 20 denoise updates in 62.434779 seconds, with unchanged
+video/audio latents and fresh MP4. See [FLASHINFER_V4.md](FLASHINFER_V4.md)
+for the exact four-row V transpose, validation and remaining gates.
+The numerical-drift overlap experiment is rejected; see
+[FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md).
 
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log

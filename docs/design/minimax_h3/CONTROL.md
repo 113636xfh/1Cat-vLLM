@@ -1,5 +1,16 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer change: [FLASHINFER_V4.md](FLASHINFER_V4.md).
+Four-row exact V transposition permits 64-bit shared stores, reducing the
+unchanged 39-frame/20-update denoise to 62.434779 seconds and 55.477950 useful
+TFLOPS/card. Final video/audio latents and fresh MP4 remain bitwise equal.
+The 122-test suite and three 12-case sanitizers pass. Human quality review,
+<50 seconds and >80 TFLOPS remain open; residual sharding still defaults off.
+The communication-overlap prototype is rejected after FP32 reduction error
+amplifies during sampling. Future optimization prioritizes bitwise equality;
+see [FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md) for the fresh baseline trace
+and failed paths.
+
 Latest FlashInfer integration: [FLASHINFER_SILU.md](FLASHINFER_SILU.md).
 Dependency `9764b6c202`'s shared FP32 SiLU/FP16 preparation fusion works with
 our FP32 residual reduce-scatter. The unchanged 39-frame/20-update run takes
