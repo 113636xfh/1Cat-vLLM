@@ -5,24 +5,26 @@ Component numerics and short cached-text generation are working. FlashAttention-
 is the user-selected mainline and the default denoiser. Keep profiler
 diagnostics separate from the three formal timing runs.
 
-The dedicated D128 FlashAttention-V100 route completes the INT8 FL2VA
-1344x768/39-frame/seed42/20-update development workload in 77.342982 s,
-or 3.867149 s/update and 44.784329 useful TFLOPS on each of GPU0-3.
-The comparison FlashInfer checkpoint takes 86.200372 s with the same W8A16
-preparation and cache-off settings. This is one unprofiled complete denoise
-measurement after a one-call warmup, using verified cached text embeddings.
-Fresh VAE decode takes 5.650908 s, excluding its 35.935474 s load.
-Automatic media checks pass; full human audiovisual quality remains pending.
-Video/audio latents differ from FlashInfer (relative L2 0.107541/0.018019),
-so this route does not claim bitwise equivalence or reuse its decoded output.
+The current short-development target is **under 50 seconds for 20 actual DiT
+updates**, retaining 1344x768, 39 frames, seed42, INT8 ConvRot, TP4 GPU0-3 and
+output quality. QK/RoPE fusion now completes this workload in **74.411059 s**,
+or 3.720553 s/update and 46.548909 useful TFLOPS/card. The prior FlashAttention
+checkpoint took 77.342982 s; FlashInfer took 86.200372 s with the same W8A16
+preparation and cache-off settings. These are individual unprofiled development
+measurements after a one-call warmup, using verified cached text embeddings.
 
-The native route, independent memory/synchronization checks, matched operator
-benchmarks and NCU counters are documented in `CONTROL.md`. Source/build logs,
-the per-rank report, NVML curves and generated media are retained under
-`/data/minimax-h3/native-h3-20260908/flashattention-mainline/` and
-`/data/minimax-h3/native-h3-20260908/outputs/quality39-int8-flashattn-fused-20steps/`.
-The primary 243-frame warmup/three-run contract has not been executed for this
-candidate. **80 TFLOPS/card is not achieved.**
+The fused QK/RoPE result is bitwise equal to the prior FlashAttention checkpoint
+for both video and audio latents. Fresh VAE decoding also produces the identical
+MP4 SHA256, and all automatic media checks pass. Human audiovisual quality
+review remains pending. This equivalence is to the FlashAttention control;
+its earlier difference from FlashInfer is still recorded in CONTROL.md.
+
+The four-rank trace, matched failed probes and retained fusion are documented
+in CONTROL.md and `/data/minimax-h3/native-h3-20260908/flashattention-feeding-round2/`.
+Media, NVML and phase reports are under
+`/data/minimax-h3/native-h3-20260908/outputs/quality39-int8-flashattn-rope-20steps/`.
+24 targeted tests and three isolated CUDA sanitizer checks pass. Neither the
+50-second development goal nor the primary >80 TFLOPS/card gate is achieved.
 
 ## Short development checks
 
