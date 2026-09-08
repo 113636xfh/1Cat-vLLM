@@ -132,7 +132,7 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         masked_input[input_mask] = 0
         output = F.embedding(masked_input, self.weight)
         output[input_mask, :] = 0.0
-        self.group.all_reduce(output)
+        output = self.group.all_reduce(output)
         return output
 
     def weight_loader(
@@ -387,7 +387,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
             # A bf16 all-reduce of the per-rank partial GEMMs would round twice
             # and amplify error on this model's large-magnitude activations.
             output_parallel = output_parallel.float()
-            self.group.all_reduce(output_parallel)
+            output_parallel = self.group.all_reduce(output_parallel)
             output_parallel = output_parallel.to(self.output_dtype)
         return output_parallel
 

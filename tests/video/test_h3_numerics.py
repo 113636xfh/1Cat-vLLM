@@ -210,3 +210,36 @@ def test_encoder_residual_rmsnorm_preserves_residual_rounding():
     output, updated = norm(x, residual)
     torch.testing.assert_close(updated, expected_residual, rtol=0, atol=0)
     torch.testing.assert_close(output, expected)
+
+
+def test_encoder_uses_functional_all_reduce_return():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from vllm.model_executor.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLRowParallelLinear,
+        MiniMaxH3Qwen3VLVocabParallelEmbedding,
+    )
+
+    # Native GroupCoordinator may return a new tensor without modifying input.
+    group = SimpleNamespace(
+        rank_in_group=0, world_size=2, all_reduce=lambda value: value + 3
+    )
+    embedding = MiniMaxH3Qwen3VLVocabParallelEmbedding(group, 8, 4, torch.float32)
+    embedding.weight.data.fill_(1)
+    actual = embedding(torch.tensor([0, 6]))
+    torch.testing.assert_close(
+        actual, torch.tensor([[4.0, 4.0, 4.0, 4.0], [3.0, 3.0, 3.0, 3.0]])
+    )
+    projection = MiniMaxH3Qwen3VLRowParallelLinear.__new__(
+        MiniMaxH3Qwen3VLRowParallelLinear
+    )
+    nn.Module.__init__(projection)
+    projection.input_is_parallel = True
+    projection._tp_size = 2
+    projection.group = group
+    projection.output_dtype = torch.float16
+    projection.quant_method = SimpleNamespace(apply=lambda layer, value: value * 2)
+    value = torch.ones(2, 4, dtype=torch.float16)
+    torch.testing.assert_close(projection(value), value * 5)

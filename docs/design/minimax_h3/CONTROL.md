@@ -107,3 +107,11 @@ and stopped only the owned stalled downloader. INT8 downloads continue separatel
 Nsight Systems 2025.1 CLI produced a usable trace; the W8A16 projection launched
 `cutlass_70_tensorop_f16_s884gemm_relu_f16_128x128_tn_align8`. This confirms the
 Tensor Core kernel route, not measured Tensor Core activity or full-denoise speed.
+
+The next real-encoder check exposed an integration mismatch: Omni's encoder
+ignored the return value of `group.all_reduce`, while native GroupCoordinator
+can return a new tensor. Fixed both embedding and row-parallel reductions and
+added a functional-collective regression. All four real TP4 encoder ranks now
+have finite layer-50 output with identical amax 16088. The diagnostic comparison
+initially attempted NCCL broadcast on the encoder's CPU result; the test is
+being corrected to broadcast a CUDA copy before checking all-rank identity.
