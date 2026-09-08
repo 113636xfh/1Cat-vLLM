@@ -58,6 +58,49 @@ logger = init_logger(__name__)
 _FORMAT = "int8_tensorwise"
 
 
+def fp16_gemm_input(x):
+    """Scale wide-range activations by exact powers of two before FP16 GEMM.
+
+    Leave headroom for the 256-channel rotation's worst-case amplification.
+    Row scaling is restored in FP32 after the projection.
+    """
+    flat = x.reshape(-1, x.shape[-1]).contiguous()
+    if flat.dtype == torch.float16:
+        return flat, None
+    if flat.dtype != torch.float32:
+        raise ValueError("H3 GEMM activations must be FP16 or FP32")
+    maximum = flat.abs().amax(-1, keepdim=True)
+    _, exponent = torch.frexp(maximum)
+    scale = torch.ldexp(torch.ones_like(maximum), (exponent - 11).clamp_min(0))
+    return (flat / scale).half(), scale
+
+
+class FP32OutputLinearMethod(UnquantizedLinearMethod):
+    """Keep wide-range projection outputs in FP32 with FP16 Tensor Core inputs."""
+
+    def process_weights_after_loading(self, layer):
+        layer.weight.data = layer.weight.data.contiguous()
+
+    def apply(self, layer, x, bias=None):
+        if x.is_cuda:
+            from .cuda_ops import w8a16_extension
+
+            values, scale = fp16_gemm_input(x)
+            output = w8a16_extension().gemm(values, layer.weight, True)
+            if scale is not None:
+                output = output * scale
+            output = output.reshape(*x.shape[:-1], layer.weight.shape[0])
+        else:
+            output = torch.nn.functional.linear(x.float(), layer.weight.float())
+        return output if bias is None else output + bias.float()
+
+
+def preserve_fp32_output(layer):
+    layer.h3_output_fp32 = True
+    if isinstance(layer.quant_method, UnquantizedLinearMethod):
+        layer.quant_method = FP32OutputLinearMethod()
+
+
 @dataclass(frozen=True)
 class Int8ConvRotLayerConfig:
     """Validated per-linear metadata decoded from ``.comfy_quant``."""
@@ -308,14 +351,14 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if x.dtype != torch.float16:
-            raise ValueError("H3 W8A16 requires FP16 activations")
+        if x.dtype not in (torch.float16, torch.float32):
+            raise ValueError("H3 W8A16 requires FP16 or FP32 activations")
         if x.is_cuda:
             from .cuda_ops import w8a16_extension
 
             ops = w8a16_extension()
             shape = x.shape
-            x = x.reshape(-1, shape[-1]).contiguous()
+            x, scale = fp16_gemm_input(x)
             if self.layer_config.convrot:
                 if self.layer_config.convrot_groupsize != 256:
                     raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
@@ -323,9 +366,24 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             weight = getattr(layer, "h3_fp16_weight", None)
             if weight is None:
                 weight = ops.dequantize(layer.weight, layer.weight_scale)
-            output = ops.gemm(x, weight).reshape(*shape[:-1], layer.weight.shape[0])
+            output = ops.gemm(
+                x, weight, getattr(layer, "h3_output_fp32", False) or scale is not None
+            )
+            if scale is not None:
+                output = output * scale
+            output = output.reshape(*shape[:-1], layer.weight.shape[0])
             return output if bias is None else output + bias
+        original_shape = x.shape
+        x, scale = fp16_gemm_input(x)
         if self.layer_config.convrot:
             x = convrot_reference(x, self.layer_config.convrot_groupsize)
         weight = dequantize_int8_reference(layer.weight, layer.weight_scale)
-        return torch.nn.functional.linear(x, weight, bias)
+        if getattr(layer, "h3_output_fp32", False) or scale is not None:
+            output = torch.nn.functional.linear(x.float(), weight.float())
+            if scale is not None:
+                output = output * scale
+            if bias is not None:
+                output = output + bias.float()
+        else:
+            output = torch.nn.functional.linear(x, weight, bias)
+        return output.reshape(*original_shape[:-1], layer.weight.shape[0])

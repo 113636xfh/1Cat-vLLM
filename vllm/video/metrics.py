@@ -25,8 +25,14 @@ class DenoiseWorkCounter:
         from vllm.model_executor.models.minimax_h3.attention import Attention
 
         self.flops = 0
+        self.calls = 0
         self.by_layer: dict[str, int] = {}
         self.handles = []
+
+        def completed_call(module, inputs, output):
+            self.calls += 1
+
+        self.handles.append(model.register_forward_hook(completed_call))
         for name, module in model.named_modules():
             if isinstance(module, LinearBase):
 

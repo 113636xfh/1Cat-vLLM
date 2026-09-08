@@ -560,12 +560,12 @@ class MiniMaxH3Pipeline(nn.Module):
             self._dit_stager.offload()
 
     def progress_bar(self, *, total):
-        self.actual_dit_calls = total
         return tqdm(total=total, desc="H3 denoise", disable=self._dit_rank != 0)
 
     @torch.inference_mode()
     def forward(self, request: H3Request):
         self.stage_durations = {}
+        self.actual_dit_calls = 0
         started = time.perf_counter()
         context = self._prepare_request_inputs(
             prompt=request.prompt,
@@ -1490,6 +1490,7 @@ class MiniMaxH3Pipeline(nn.Module):
             torch.accelerator.synchronize()
             self.stage_durations["denoise"] = time.perf_counter() - started
             self.useful_denoise_flops = counter.flops
+            self.actual_dit_calls = counter.calls
             self.denoise_flops_by_layer = counter.by_layer
             counter.close()
 

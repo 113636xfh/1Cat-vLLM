@@ -190,7 +190,8 @@ class PinnedModuleStager:
             grouped[storage_key][1].append(binding)
 
         groups: list[_StorageGroup] = []
-        for source, bindings in grouped.values():
+        while grouped:
+            _, (source, bindings) = grouped.popitem()
             storage = source.untyped_storage()
             storage_view = torch.empty(0, dtype=torch.uint8, device=source.device).set_(
                 storage,
@@ -206,6 +207,11 @@ class PinnedModuleStager:
             if pin_memory and not master.is_pinned():
                 master = master.pin_memory()
             groups.append(_StorageGroup(master=master, bindings=bindings))
+            # Release each pageable allocation as soon as its pinned master is
+            # ready. Keeping both full copies until the entire encoder is
+            # pinned can transiently double TP4 host memory.
+            for binding in bindings:
+                set_tensor_storage(binding.target, cls._view(master, binding))
         return groups
 
     @staticmethod

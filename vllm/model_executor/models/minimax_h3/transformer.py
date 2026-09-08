@@ -41,6 +41,7 @@ from .modulation import (
     rms_norm_indexed_scale_shift,
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
+from .quantization import preserve_fp32_output
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -129,6 +130,8 @@ MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
         "video_patch_proj.bias",
         "audio_patch_proj.weight",
         "audio_patch_proj.bias",
+        "condition_proj.weight",
+        "condition_proj.bias",
         "time_embedder.proj_in.weight",
         "time_embedder.proj_in.bias",
         "time_embedder.proj_out.weight",
@@ -394,6 +397,7 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        preserve_fp32_output(self.out_proj)
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -623,10 +627,14 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
+        preserve_fp32_output(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
+        # Real H3 gated products exceed FP16 even when both factors are finite.
+        # The following row projection rescales these FP32 activations into
+        # FP16 Tensor Core range and restores their scale in its FP32 output.
+        hidden = self.act_fn(hidden.float())
         out, _ = self.fc2(hidden)
         return out
 
@@ -719,13 +727,13 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         num_requests: int = 1,
     ) -> torch.Tensor:
         x = x + self.attn(
-            self.norm1(x),
+            self.norm1(x).to(_COMPUTE_DTYPE),
             rope_table=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             num_requests=num_requests,
         )
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x).to(_COMPUTE_DTYPE))
         return x
 
 
@@ -838,6 +846,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             scale_msa,
             combined_indices,
             self.norm1.variance_epsilon,
+            output_dtype=_COMPUTE_DTYPE,
         )
         h = self.attn(
             h,
@@ -858,6 +867,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             scale_mlp,
             combined_indices,
             self.norm2.variance_epsilon,
+            output_dtype=_COMPUTE_DTYPE,
         )
         residual = x
         h = self.mlp(h)
@@ -1043,8 +1053,8 @@ class MiniMaxH3DiTModel(nn.Module):
             arch.hidden_size,
             bias=True,
             gather_output=True,
-            params_dtype=_COMPUTE_DTYPE,
-            quant_config=quant_config,
+            params_dtype=_FP32_DTYPE,
+            quant_config=None,
             prefix="condition_proj",
         )
         if arch.adaln_curve_grid is None:
@@ -1331,7 +1341,10 @@ class MiniMaxH3DiTModel(nn.Module):
         audio_rows = audio_rows.index_select(0, audio_global_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_rows = text_embeddings_selected.to(device=device, dtype=_COMPUTE_DTYPE)
+        # Actual H3 text projections exceed FP16's range before the refiner's
+        # final normalization. Preserve projection and residuals in FP32;
+        # normalized refiner attention and MLP inputs still use FP16 GEMMs.
+        text_rows = text_embeddings_selected.to(device=device, dtype=_FP32_DTYPE)
         text_embed, _ = self.condition_proj(text_rows)
         text_embed = self.token_refiner(
             text_embed,
@@ -1345,22 +1358,22 @@ class MiniMaxH3DiTModel(nn.Module):
         embeddings = torch.zeros(
             (local_len, self.hidden_size),
             device=device,
-            dtype=_COMPUTE_DTYPE,
+            dtype=_FP32_DTYPE,
         )
         embeddings.index_add_(
             0,
             text_local_pos,
-            text_embed.to(_COMPUTE_DTYPE)[: text_local_pos.shape[0]],
+            text_embed.to(_FP32_DTYPE)[: text_local_pos.shape[0]],
         )
         embeddings.index_add_(
             0,
             img_local_pos,
-            video_embed.to(_COMPUTE_DTYPE)[: img_local_pos.shape[0]],
+            video_embed[: img_local_pos.shape[0]],
         )
         embeddings.index_add_(
             0,
             audio_local_pos,
-            audio_embed.to(_COMPUTE_DTYPE)[: audio_local_pos.shape[0]],
+            audio_embed[: audio_local_pos.shape[0]],
         )
 
         t_emb = self._embed_timesteps(unique_timesteps)

@@ -115,3 +115,45 @@ added a functional-collective regression. All four real TP4 encoder ranks now
 have finite layer-50 output with identical amax 16088. The diagnostic comparison
 initially attempted NCCL broadcast on the encoder's CPU result; the test is
 being corrected to broadcast a CUDA copy before checking all-rank identity.
+
+### Real INT8 FP16-range fixes (2026-09-08)
+
+- The corrected text-encoder comparison passed bitwise identity across all
+  four TP ranks, with finite layer-50 FP16 output. The full FL2VA INT8 file and
+  Ref2VA INT8 file are downloaded. Original BF16 DiT shards are still downloading.
+- Native explicit width/height requests previously failed Omni's separate
+  aspect-ratio requirement. The native canvas now supplies that ratio; two
+  canvas regressions pass, including the exact 1344x768 primary shape.
+- The first real single-step pipeline reached DiT, then rejected non-finite
+  velocity. Layer diagnostics found condition projection values up to 76615.5,
+  block residuals above four million, and overflowing row projections and
+  gated MLP products. FP16 accumulation settings alone cannot represent these
+  values. Preserve condition projection, residuals and gated products in FP32.
+  Normalize and convert attention/MLP GEMM inputs to FP16; use exact power-of-two
+  row scaling for wide MLP activations, restoring scale in FP32 GEMM output.
+  INT8 weights, FP32 checkpoint scales and ConvRot256 remain intact.
+- A real 50-block INT8 DiT forward at the 256x256 diagnostic shape now has finite
+  output on all four ranks (video amax 10.8243, audio amax 4.36589). This is one
+  forward, not a complete schedule, quality pass or performance result.
+- The current native suite passes 23 tests, including actual CUDA checks for
+  FP32 residuals, above-FP16-range Tensor Core outputs, restored activation
+  scales, signed INT8, padding and alias-preserving CPU/GPU staging.
+- Pinned staging now replaces one host allocation at a time. The old snapshot
+  retained all pageable weights while building the entire pinned copy, raising
+  transient TP4 host memory and swap pressure.
+- Nsight Compute succeeded with the user's sudo authorization. The earlier
+  ERR_NVGPUCTRPERM result is superseded: the isolated FP16-output GEMM recorded
+  462422016 Tensor Core instructions and 86.177% active tensor-pipe cycles.
+  The new FP32-output variant needs its own profile. Complete-denoise >80 TFLOPS,
+  main-shape memory, full-video quality and both-backend quality remain pending.
+- Review scopes: native #557, kernels #558 (stacked). The next end-to-end run
+  initially found both GPU groups occupied by other vLLM workers; the owned
+  launcher waits for a free group without changing those processes.
+
+Evidence: `encoder-real-tp4-final.log`, `pipeline-route-canvas.log`,
+`dit-nan-diagnostic.log`, `dit-nan-fp32-condition.log`,
+`dit-nan-fp32-residual.log`, `dit-nan-fp32-output.log`,
+`dit-nan-fp32-gated.log`, `native-tests-fp32-islands.log`,
+`kernel-build-fp32-output.log`, and `profiles/w8a16-hmma-root.ncu-rep`
+under the task artifact directory. Do not repeat superseded failing routes
+unless a new change requires them.
