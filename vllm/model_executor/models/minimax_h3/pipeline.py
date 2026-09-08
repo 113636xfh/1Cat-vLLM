@@ -482,7 +482,10 @@ class MiniMaxH3Pipeline(nn.Module):
             )
             if restore_adaln:
                 overrides = None
-            quant = DiffusionInt8ConvRotConfig(layer_configs=checkpoint.layer_configs)
+            quant = DiffusionInt8ConvRotConfig(
+                layer_configs=checkpoint.layer_configs,
+                weight_layout=config.int8_weight_layout,
+            )
         architecture = json.loads((path / "transformer/config.json").read_text())
         token = attention_backend.set(config.attention_backend)
         try:
