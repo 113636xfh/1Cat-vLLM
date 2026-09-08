@@ -1,16 +1,134 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer change:
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md).
+Rotate FP16 rows on their owner before all-gather, avoiding duplicated QKV/MLP
+ConvRot while retaining exact matrix operations and TP sums. The unchanged
+39-frame/20-update run takes 61.538397 seconds, 56.286054 useful TFLOPS/card;
+final video/audio latents and fresh MP4 remain bitwise equal. The 123-test
+suite and both independently launched TP4 regressions pass. Current tracing
+attributes 41.10% to GEMM, 39.81% to attention, 13.52% to communication and
+1.02% to ConvRot. Gather/projection overlap, Q64 aliased K/V and updated Q32/N64
+reuse controls do not improve the selected path and are rejected. The combined
+distributed test launcher hang is retained; use separate torchrun lifetimes.
+Human quality, <50 seconds and >80 TFLOPS remain open.
+
+Latest FlashInfer change: [FLASHINFER_V4.md](FLASHINFER_V4.md).
+Four-row exact V transposition permits 64-bit shared stores, reducing the
+unchanged 39-frame/20-update denoise to 62.434779 seconds and 55.477950 useful
+TFLOPS/card. Final video/audio latents and fresh MP4 remain bitwise equal.
+The 122-test suite and three 12-case sanitizers pass. Human quality review,
+<50 seconds and >80 TFLOPS remain open; residual sharding still defaults off.
+The communication-overlap prototype is rejected after FP32 reduction error
+amplifies during sampling. Future optimization prioritizes bitwise equality;
+see [FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md) for the fresh baseline trace
+and failed paths.
+
+Latest FlashInfer integration: [FLASHINFER_SILU.md](FLASHINFER_SILU.md).
+Dependency `9764b6c202`'s shared FP32 SiLU/FP16 preparation fusion works with
+our FP32 residual reduce-scatter. The unchanged 39-frame/20-update run takes
+63.565580 seconds (54.491025 useful TFLOPS/card), with bitwise-equal video/audio
+latents and fresh MP4. The 122-test suite and corrected four-rank block test
+pass. Attention/W8 binaries remain unchanged. Human quality, <50 seconds and
+>80 TFLOPS are still not accepted.
+
+Latest FlashInfer warp transpose: [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md).
+Warp-local exact FP16 pair exchange removes a shared staging round trip and
+one CTA barrier. The unchanged residual-sharded 39-frame/20-update run takes
+64.920336 seconds (53.353907 useful TFLOPS/card), down from 65.804661 seconds.
+Video/audio latents and fresh MP4 remain bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU shows 37.57% Tensor pipe activity;
+direct V stores introduce bank conflicts, so MIO remains a bottleneck.
+Human quality review, <50 seconds and >80 TFLOPS remain open.
+
+Latest FlashInfer operator change:
+[FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md). A 68-half probability stride
+and 64-bit fragment loads remove almost all repeating shared-memory bank
+conflicts. Full unchanged 39-frame/20-update denoise with residual sharding
+falls from 66.863312 to 65.804661 seconds (52.636903 useful TFLOPS/rank).
+Video/audio latents and the fresh MP4 are bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU verifies excessive wavefronts fall
+from 235,879,168 to 1,042,944; Tensor pipe activity reaches 36.33%.
+The first same-name native A/B import collided and is marked invalid; qualified
+module names and identity assertions fix the harness, and corrected short/long
+controls establish the gain. Human quality review, <50 seconds and >80 TFLOPS
+remain open. Residual sharding still defaults off.
+
+Latest opt-in FlashInfer improvement:
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). TP4 FP32 residual sharding
+reduces the unchanged 39-frame/20-update denoise to 66.863312 seconds,
+51.803500 useful TFLOPS/rank. The native implementation matches the prototype
+bitwise; it differs from the replicated baseline (video SSIM 0.986179).
+Automatic media checks and the four-rank block/padding/FP32-range regression
+pass. Human quality acceptance remains pending, so the new option defaults
+off. The below-50-second and >80-TFLOPS/card targets remain incomplete.
+Fresh counters from the retained attention binary show 34.91% Tensor pipe
+activity and 50.09% scheduler cycles without an eligible warp. Three query
+reuse variants regress; the Q128/K128 alias variant spills and is not run.
+Q96/K128 removes spills but remains slower. Replicated INT8 MLP weights with
+local token rows also regress (two updates 6.645113 -> 7.030977 seconds), despite
+removing two MLP collectives; this artifact-only path is rejected without a
+full-video run. Its per-rank valid-row accounting and failed harness attempt
+are recorded in the same document.
+
+Latest retained FlashInfer change: [FLASHINFER_TO50.md](FLASHINFER_TO50.md).
+Q shared-memory swizzling and an exact transposed FP16/cuBLASLt weight cache
+reduce the unchanged 39-frame/20-update denoise to 70.828264 seconds,
+48.903550 useful TFLOPS per rank. Video/audio latents and fresh MP4 remain
+bitwise equal. 105 tests pass after dependency reconciliation; previous
+FlashInfer sanitizer checks and seven added memory checks pass. The below-50s
+milestone, human quality review and per-card >80-TFLOPS acceptance remain open.
+
+Latest FlashInfer investigation: [FLASHINFER_ROOT_CAUSE.md](FLASHINFER_ROOT_CAUSE.md).
+Fused QK preparation and an 8x8 V transpose reduce the same 39-frame/20-update
+denoise to 75.140751 seconds, or 46.096872 useful TFLOPS per rank. Video/audio
+latents and freshly decoded MP4 are unchanged from the preceding K64 run.
+79 tests pass. The next short-run milestone is below 50 seconds with unchanged
+parameters and no quality regression; >80 TFLOPS per rank remains incomplete.
+
+FlashInfer feeding follow-up on its own branch: see
+[FLASHINFER_FEEDING.md](FLASHINFER_FEEDING.md). Q128/K64 reduces complete
+39-frame/20-update denoise to 78.968862 s, or 43.862270 useful TFLOPS per rank.
+65 tests and focused sanitizers pass; fresh decoding passes automatic checks.
+Output rounding changes, human quality review and the >80-TFLOPS gate remain
+open. The parallel FlashAttention task is outside this branch's scope.
+
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
 Workflow and adapter expansion is tracked in [WORKFLOWS.md](WORKFLOWS.md) and
 [ADAPTATION.md](ADAPTATION.md), with validation entries at the end of this file.
 
-Current decision: the user selects FlashAttention-V100 as the H3 development
-mainline, superseding the earlier FlashInfer choice. Optimize complete denoise
-toward >80 useful TFLOPS on every participating GPU; keep FlashInfer as the
-measured control/rollback. Development uses 39-frame clips and 20 actual
-updates for quality. Preserve D128 MHA and its original scale when reusing
-the existing D256 TensorOp architecture; padding never increases useful FLOPs.
+Current decision: development proceeds on separate FlashAttention and
+FlashInfer branches. FlashAttention remains the default H3 backend;
+independent FlashInfer optimization and reproduction explicitly select
+`FLASHINFER_SM70`. Both paths target >80 useful TFLOPS/card and below 50
+seconds for the unchanged 39-frame, 20-update development workload. Preserve
+D128 MHA, its original scale and valid-token FLOP accounting, including when
+reusing the existing D256 TensorOp architecture; padding never increases
+useful FLOPs. Residual sharding remains opt-in, and integrating development
+code does not establish the pending quality or performance acceptance.
+
+## 2026-09-09 FlashInfer integration with main
+
+PR #564 synchronizes with `onecat/main@da65a6b23e9c`, which already contains
+native H3 (#557), SM70 operators (#558), workflows/adapters (#565), shared
+residual/local-rotation support (#568) and validation tools (#559). Both
+backend histories and the workflow records are retained. Configuration keeps
+main's dual-backend residual support and adapter rejection. The local-rotation
+regression checks both backends within one distributed fixture lifetime.
+Shared model dataflow and native FlashInfer/W8 CUDA sources and binaries are
+unchanged from the measured local-rotation build.
+
+The integrated video suite passes **266 tests, 2 skipped, 1 deselected**, using
+the preceding FlashInfer suite command against `e7fa44deb253`. After including
+PRs #568/#559, **24 targeted tests pass** for the changed configuration, metrics
+and regressions. The final INT8 local-rotation and default unquantized TP4
+block modules each pass on every rank, covering both attention backends in
+separate torchrun processes. Raw commands and logs are retained in the
+campaign's `feeding-gather/merge-main/` and its `final/` subdirectory.
+The 61.538397-second result remains the preceding
+development measurement; this integration does not add a performance claim
+or complete the pending human quality, 50-second or 80-TFLOPS gates.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 

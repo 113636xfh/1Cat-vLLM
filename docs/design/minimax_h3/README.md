@@ -1,5 +1,13 @@
 # Native MiniMax H3 (development)
 
+The latest optional residual-sharded FlashInfer development run completes
+39 frames and 20 denoise updates in 61.538397 seconds, with unchanged
+video/audio latents and fresh MP4. See
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md) for local ConvRot,
+the current bottleneck trace, validation and remaining gates.
+The numerical-drift overlap experiment is rejected; see
+[FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md).
+
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation
@@ -86,6 +94,22 @@ budget with `--fp16-weight-cache-gib` and repeat `--fp16-cache-layer` for the
 fixed layer list. Cached weights retain ConvRot coordinates. Cache/staging
 preparation is separately timed; dequantization remains inside denoise timing
 for uncached weights. Both original INT8 tensors and FP32 scales are retained.
+The measured 39-frame/20-update cache list and native cuBLASLt configuration
+are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
+commands, output comparison and the still-incomplete 50-second target.
+
+For the experimental FlashInfer TP4 INT8 FL2VA route, add
+`--residual-sequence-parallel` to shard FP32 residual rows and reduce TP
+communication. It defaults off and changes floating-point reduction order.
+The unchanged 39-frame/20-update denoise measures 66.863312 seconds; automatic
+checks pass, while five-axis human quality review and the 50-second target
+remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
+differences, GPU tests, current hardware counters and rollback.
+
+The subsequent probability-tile layout change reduces this same optional
+route to 65.804661 seconds and preserves its video/audio outputs bitwise.
+See [FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md) for the instruction-level
+bottleneck, corrected A/B measurements and new sanitizer/profiler evidence.
 
 `--int8-weight-layout column` is the default for DiT INT8 projections. Loading
 reorders physical INT8 storage without changing logical weights or scales.
