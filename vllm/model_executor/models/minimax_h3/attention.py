@@ -105,10 +105,10 @@ class Attention(nn.Module):
             raise ValueError("invalid packed H3 attention lengths")
         q_valid, k_valid, v_valid = (x[:, :used].contiguous() for x in (q, k, v))
         if self.backend == "FLASH_ATTN_V100":
-            from flash_attn_v100 import flash_attn_func
+            from .cuda_ops import flashattn_extension
 
-            attended = flash_attn_func(
-                q_valid, k_valid, v_valid, causal=False, softmax_scale=self.scale
+            attended = flashattn_extension().forward(
+                q_valid, k_valid, v_valid, self.scale
             )
         elif self.backend == "FLASHINFER_SM70":
             from .cuda_ops import flashinfer_extension

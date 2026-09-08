@@ -3,11 +3,12 @@
 """Build only the native H3 extensions against the active Torch installation.
 
 Use the regular 1Cat wheel build for a complete release. This helper leaves
-existing vLLM binaries untouched and builds the two independent H3 modules.
+existing vLLM binaries untouched and builds the three independent H3 modules.
 """
 
 import hashlib
 import json
+import os
 import shutil
 import sysconfig
 from pathlib import Path
@@ -17,12 +18,25 @@ from torch.utils.cpp_extension import load
 root = Path(__file__).resolve().parents[2]
 output = root / "vllm"
 records = []
+cutlass_path = os.environ.get("VLLM_CUTLASS_SRC_DIR")
+if not cutlass_path:
+    raise RuntimeError("Set VLLM_CUTLASS_SRC_DIR to CUTLASS v4.4.2 source")
+cutlass = Path(cutlass_path)
 for name, source, includes, libraries in (
     ("_h3_w8a16_C", "csrc/sm70_turbomind/ops/h3_w8a16.cu", [], ["-lcublas"]),
     (
         "_h3_flashinfer_C",
         "flashinfer-sm70/csrc/h3_noncausal_sm70.cu",
         [str(root / "flashinfer-sm70/include")],
+        [],
+    ),
+    (
+        "_h3_flashattn_C",
+        "flash-attention-v100/kernel/h3/forward.cu",
+        [
+            str(cutlass / "include"),
+            str(cutlass / "examples/41_fused_multi_head_attention"),
+        ],
         [],
     ),
 ):
