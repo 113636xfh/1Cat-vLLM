@@ -21,7 +21,7 @@ vllm video generate \
   --partition fl2va \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
   --tensor-parallel-size 4 \
-  --attention-backend FLASH_ATTN_V100 \
+  --attention-backend FLASHINFER_SM70 \
   --output-dir ./h3-output
 ```
 
@@ -66,7 +66,9 @@ curl -sS http://127.0.0.1:8000/v1/videos \
 available to the server process. Jobs are kept in memory for the current service
 lifetime; generated files remain in the configured output directory.
 
-`FLASHINFER_SM70` selects the independent dense Volta WMMA operator. The Torch
+`FLASHINFER_SM70` is the default denoiser and the main performance-development
+path. It selects the independent dense Volta operator. `FLASH_ATTN_V100` remains
+an explicit comparison and rollback option. The Torch
 reference backend is for numerical investigation. Text encoding uses TP4 and
 Flash-V100 causal GQA; the selectable denoiser backends use non-causal MHA.
 

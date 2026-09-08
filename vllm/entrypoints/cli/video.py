@@ -33,7 +33,7 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--attention-backend",
                 choices=("FLASH_ATTN_V100", "FLASHINFER_SM70", "TORCH_SDPA"),
-                default="FLASH_ATTN_V100",
+                default="FLASHINFER_SM70",
             )
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument("--fp16-cache-layer", action="append", default=[])

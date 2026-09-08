@@ -2,6 +2,12 @@
 
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
+Current decision: the user selects FlashInfer-SM70 as the H3 denoiser mainline.
+Optimize complete denoise toward >80 useful TFLOPS on every participating GPU;
+keep Flash-V100 as an explicit control. Development uses 39-frame clips and
+20 actual updates for quality. The historical 60-TFLOPS D256/GQA Flash-V100
+architecture was audited, but its H3 adaptation is not the selected mainline.
+
 ## Fixed scope
 
 - Base: onecat/main 56f534e672657a6c7599afd6c0dcb2e2c211b2e3.
@@ -295,3 +301,50 @@ latents, NVML samples/curves, rank/phase CSV, automated checks, visual-review
 notes and backend comparison JSON. `quality-two-vs-twenty.png` compares the
 same-seed two- and twenty-call outputs. Raw logs are
 `quality39-20steps-run.log` and `quality39-20steps-flashv100.log`.
+
+### Original-checkpoint short quality and FlashInfer mainline profiling
+
+The original BF16 checkpoint also completed FL2VA text-to-video at 1344x768,
+39 frames, seed 42 and 20 updates through Flash-V100, using FP16 matrix inputs
+and FP32 sensitive intermediates on V100. Complete denoise took 110.569167 s
+(5.528458 s/update), with 31.328872 useful TFLOPS per rank. DiT-only peak Torch
+allocation was 17.186255 GiB; this does not include a whole-pipeline memory peak.
+All automatic media checks pass and inspected first/last frames show a clear
+boat and duck without the severe two-update artifacts. Human audio review,
+Ref2VA/reference generation and primary acceptance remain pending. Evidence is
+`outputs/quality39-original-20steps/FLASH_ATTN_V100/` in the artifact directory.
+
+The user subsequently fixed FlashInfer-SM70 as the optimization mainline and
+reaffirmed >80 TFLOPS/card. The CLI/config default now follows that choice.
+A four-rank Nsight Systems trace captures the first two updates from the
+unchanged 20-update schedule, with cached verified text, 39 frames and cache
+off. It truncates the schedule for profiling and makes no quality or acceptance
+claim. The rank-0 synchronized denoise span is 10.600430 s:
+
+| Exclusive wall category | Two-update seconds |
+| --- | ---: |
+| FlashInfer attention | 5.466013 |
+| Model GEMM | 2.692784 |
+| TP communication | 1.088080 |
+| Other GPU kernels | 1.011361 |
+| ConvRot | 0.218711 |
+| Weight dequantization | 0.061064 |
+| Copies | 0.012464 |
+| No recorded GPU activity | 0.049953 |
+
+The parser keeps kernel service and exclusive wall coverage separate, including
+an overlap category if present. This trace prioritizes attention and then TP
+communication over weight caching or launch-overhead tuning. It must not be
+substituted for the unprofiled 20-update result or primary three-run gate.
+
+An initial warp-owned-query prototype is rejected: all sampled FP32 references
+pass, but its Q64/K32, Q64/K64 and Q128/K32 variants take about 89.36, 87.88 and
+59.46 ms at 12323 tokens, versus 53.27 ms for the retained kernel. Registers rise
+to 198/230 per thread. Do not repeat those unchanged variants. A transposed V
+layout and software-prefetch follow-up are being evaluated separately.
+
+Evidence: `profile_h3_steps.py`, `run_profile_h3_steps.py`,
+`profiles/h3-flashinfer-mainline-steps.nsys-rep`, the matching SQLite,
+`profiles/h3-flashinfer-step-breakdown.json`, `query-owned-results.json`, and
+`flashv100-60t-route-audit.md`. GPU 0–3 priority preemption is authorized; the
+active development lease is recorded in `flashinfer-development-lease.json`.

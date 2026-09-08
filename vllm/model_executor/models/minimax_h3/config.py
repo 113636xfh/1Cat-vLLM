@@ -37,7 +37,7 @@ class H3Config:
     partition: Literal["fl2va", "ref2va"] = "fl2va"
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
-    attention_backend: str = "FLASH_ATTN_V100"
+    attention_backend: str = "FLASHINFER_SM70"
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
 
