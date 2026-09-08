@@ -114,6 +114,17 @@ def test_primary_workload_schedule_and_shape():
     assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
 
 
+@pytest.mark.parametrize("height,width", [(768, 1344), (256, 256)])
+def test_native_canvas_does_not_require_omni_aspect_ratio(height, width):
+    from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
+    from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+
+    shape = MiniMaxH3Pipeline._resolve_shape(
+        None, "t2va", H3SamplingParams(height=height, width=width), None
+    )
+    assert shape == (height, width, 243, 72, 405)
+
+
 @pytest.mark.parametrize("used,padded", [(31, 32), (129, 256)])
 def test_attention_padding_excludes_poisoned_suffix(used, padded):
     token = attention_backend.set("TORCH_SDPA")

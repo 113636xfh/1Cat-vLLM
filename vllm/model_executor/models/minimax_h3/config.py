@@ -74,6 +74,8 @@ class H3SamplingParams:
             raise H3InputError("video dimensions must be positive")
         if self.height % 32 or self.width % 32:
             raise H3InputError("H3 video dimensions must be multiples of 32")
+        if not 0.25 <= self.width / self.height <= 4:
+            raise H3InputError("H3 canvas aspect ratio must be in [1:4, 4:1]")
         if self.fps != 24:
             raise H3InputError("H3 generates at 24 FPS")
         if not 96 <= self.num_frames <= 362:
@@ -84,6 +86,14 @@ class H3SamplingParams:
             raise H3InputError("native H3 generates one video per request")
         if self.quality not in (None, "lossless"):
             raise H3InputError("native H3 does not enable approximate step caches")
+        duration = self.extra_args.get("duration_seconds")
+        if duration is not None and (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or not 4 <= duration <= 15
+        ):
+            raise H3InputError("H3 duration must be between 4 and 15 seconds")
 
 
 @dataclass

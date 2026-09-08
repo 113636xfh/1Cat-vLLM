@@ -690,11 +690,16 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         short_edge = int(raw_short_edge)
 
-        aspect_ratio = _resolve_minimax_h3_aspect_ratio(
-            task,
-            aspect_ratio,
-            image,
-        )
+        if height is not None and width is not None and aspect_ratio is None:
+            # Native requests supply the final canvas, including the aligned
+            # 1344x768 shape whose ratio is slightly different from 16:9.
+            aspect_ratio = width / height
+        else:
+            aspect_ratio = _resolve_minimax_h3_aspect_ratio(
+                task,
+                aspect_ratio,
+                image,
+            )
         if not 0.25 <= aspect_ratio <= 4.0:
             raise H3InputError(
                 f"MiniMax H3 canvas aspect ratio must be in [1:4, 4:1], got "
