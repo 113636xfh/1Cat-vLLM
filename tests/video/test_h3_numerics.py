@@ -178,6 +178,25 @@ def test_attention_padding_excludes_poisoned_suffix(used, padded):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [127, 128, 129, 12323])
+def test_flashinfer_online_softmax_across_tiles_and_batches(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(42)
+    q, k, v = [
+        torch.randn(2, length, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    # Later key tiles raise the softmax maximum and exercise accumulator
+    # rescaling. Check spread-out query rows without a full square matrix.
+    k[:, length // 2 :] *= 4
+    rows = torch.linspace(0, length - 1, min(length, 65), device="cuda").long()
+    expected = chunked_attention_reference(q[:, rows], k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual[:, rows], expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("backend", ["FLASH_ATTN_V100", "FLASHINFER_SM70"])
 def test_noncausal_backend_matches_fp32_reference(backend):
     token = attention_backend.set(backend)

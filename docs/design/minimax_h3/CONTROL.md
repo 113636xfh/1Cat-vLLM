@@ -193,3 +193,40 @@ Evidence under `/data/minimax-h3/native-h3-20260908/`:
 `original-checkpoint-manifest.json`, `comfy-checkpoint-manifest.json`,
 `profiles/flashv100-attention.summary.json`, and
 `profiles/w8a16-fp32-output.summary.json`.
+
+### Independent FlashInfer register accumulation
+
+The selected SM70 kernel keeps QK scores, online-softmax reductions and PV
+accumulators in registers. Only cross-warp row partials and probabilities use
+shared memory. A 128-query by 32-key tile uses 512 threads and 64 KiB shared
+memory. The explicit backend continues to execute its own Volta WMMA kernel.
+
+- Full FP32 checks at 17, 243, 1025 and 8192 tokens passed. Spread-out query
+  checks at 12323 and 73483 tokens passed without a square attention matrix.
+  Added regression coverage for batch indexing, 127/128/129 query boundaries,
+  short-video token count and changing softmax maxima across key tiles.
+- The final formatted implementation passes all 38 native video tests on GPU 0.
+- At 12323 tokens (39-frame canvas), candidate median attention time was
+  53.220 ms versus 61.108 ms for Flash-V100. At 73483 tokens the same isolated
+  comparison was 1.857 seconds versus 2.246 seconds. No full long video was run.
+- Cached-text TP4 INT8 denoise at 1344x768, 39 frames, seed 42 and three sigma
+  positions (two forwards), after a one-forward warmup: Flash-V100 11.29494 s,
+  FlashInfer candidate 10.55566 s. Each rank counted 346375340509184 useful
+  FLOPs, giving 30.6664 and 32.8142 useful TFLOPS respectively. All four ranks
+  matched bitwise within each backend and all latents were finite.
+  This is development timing, not the full-schedule >80 TFLOPS acceptance.
+- Rejected candidates: 128x64 requested too many launch resources; 32x64 was
+  slower; keeping only PV in registers was slower than also reducing softmax
+  in registers. Their code/binary and raw measurements remain in artifacts,
+  while the public extension retains only the selected implementation.
+- The first cached-text diagnostic attempted to export the raw BCTHW VAE
+  tensor. Its script omitted the pipeline's output conversion to BTHWC RGB8.
+  The native pipeline already performs that conversion; correct the diagnostic
+  and save latents before export to avoid repeating denoise on export failures.
+
+Artifacts: `attention-short-candidates.json`, `flashinfer-tested-candidates.cu`,
+`flashinfer-tested-candidates.so`, `flashinfer-register-formatted-build.log`,
+`kernel-register-native-tests.log`, `denoise-short-int8.log` and
+`outputs/dev39-int8/{FLASH_ATTN_V100,FLASHINFER_SM70}/` under the task artifact
+directory. Those output directories contain timing and NVML curves; the initial
+export failed and must not be presented as generated-video quality evidence.
