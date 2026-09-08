@@ -74,6 +74,7 @@ template <
     int kMaxK = (int)cutlass::platform::numeric_limits<uint32_t>::max(),
     GroupScheduleMode GroupScheduleMode_ = GroupScheduleMode::kDeviceOnly>
 struct H3FMHA {
+  static_assert(kKeysPerBlock == 64 || kKeysPerBlock == 128);
   using scalar_t = scalar_t_;
   using accum_t = float;
   using output_t = scalar_t;
@@ -88,8 +89,7 @@ struct H3FMHA {
   static bool const kSingleValueIteration = kMaxK <= 128;
   static constexpr bool kIsHalf = cutlass::sizeof_bits<scalar_t>::value == 16;
   static int const kWarpSize = 32;
-  static int const kNumWarpsPerBlock =
-      kQueriesPerBlock * kKeysPerBlock / (kWarpSize * kWarpSize);
+  static int const kNumWarpsPerBlock = (kQueriesPerBlock / kWarpSize) * 2;
 
   struct MM0 {
     /*
@@ -124,7 +124,8 @@ struct H3FMHA {
     using ThreadblockShape =
         cutlass::gemm::GemmShape<kQueriesPerBlock, kKeysPerBlock,
                                  GemmType::ThreadK>;
-    using WarpShape = cutlass::gemm::GemmShape<32, 32, GemmType::WarpK>;
+    using WarpShape =
+        cutlass::gemm::GemmShape<32, kKeysPerBlock / 2, GemmType::WarpK>;
     using InstructionShape = typename GemmType::InstructionShape;
 
     static int const kStages = DefaultConfig::kStages;
@@ -155,9 +156,31 @@ struct H3FMHA {
 
     // Epilogue to store to shared-memory in a format that we can use later for
     // the second matmul
-    using B2bGemm = typename cutlass::gemm::threadblock::B2bGemm<
-        typename Mma::Operator::IteratorC, typename Mma::Operator, scalar_t,
-        WarpShape, ThreadblockShape>;
+    using SmallIteratorC =
+        cutlass::gemm::warp::MmaVoltaTensorOpAccumulatorTileIterator<
+            cutlass::MatrixShape<32, 32>, float, cutlass::layout::RowMajor,
+            cutlass::gemm::GemmShape<16, 16, 4>, cutlass::MatrixShape<1, 1>>;
+    using B2b32 = cutlass::gemm::threadblock::B2bGemm<
+        SmallIteratorC, typename Mma::Operator, scalar_t,
+        cutlass::gemm::GemmShape<32, 32, 32>, ThreadblockShape>;
+    struct B2bGemm {
+      using AccumulatorSharedStorage = typename B2b32::AccumulatorSharedStorage;
+      CUTLASS_DEVICE static void accumToSmem(
+          AccumulatorSharedStorage& storage,
+          typename Mma::FragmentC const& accum, int lane,
+          cutlass::MatrixCoord const& coords) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int tile = 0; tile < kKeysPerBlock / 64; ++tile) {
+          typename SmallIteratorC::Fragment part;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < part.kElements; ++i)
+            part[i] = accum[tile * part.kElements + i];
+          B2b32::accumToSmem(
+              storage, part, lane,
+              {coords.row(), coords.column() * (kKeysPerBlock / 64) + tile});
+        }
+      }
+    };
     using AccumulatorSharedStorage = typename B2bGemm::AccumulatorSharedStorage;
   };
 

@@ -18,10 +18,12 @@ from typing import Any
 import torch
 from torch.nn import Module
 
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -371,23 +373,9 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         if x.dtype not in (torch.float16, torch.float32):
             raise ValueError("H3 W8A16 requires FP16 or FP32 activations")
         if x.is_cuda:
-            from .cuda_ops import fp16_gemm, w8a16_extension
-
-            ops = w8a16_extension()
             shape = x.shape
             x, scale = fp16_gemm_input(x)
-            if self.layer_config.convrot:
-                if self.layer_config.convrot_groupsize != 256:
-                    raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
-                x = ops.rotate(x)
-            weight = getattr(layer, "h3_fp16_weight", None)
-            if weight is None:
-                weight = ops.dequantize(layer.weight, layer.weight_scale)
-            output = fp16_gemm(
-                x, weight, getattr(layer, "h3_output_fp32", False) or scale is not None
-            )
-            if scale is not None:
-                output = output * scale
+            output = self.apply_prepared(layer, x, scale)
             output = output.reshape(*shape[:-1], layer.weight.shape[0])
             return output if bias is None else output + bias
         original_shape = x.shape
@@ -404,3 +392,43 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         else:
             output = torch.nn.functional.linear(x, weight, bias)
         return output.reshape(*original_shape[:-1], layer.weight.shape[0])
+
+    def apply_prepared(self, layer, values, scale):
+        """Project FP16 rows with an explicit scale restored before TP reduction."""
+        from .cuda_ops import fp16_gemm, w8a16_extension
+
+        ops = w8a16_extension()
+        x = values.reshape(-1, values.shape[-1])
+        if self.layer_config.convrot:
+            if self.layer_config.convrot_groupsize != 256:
+                raise ValueError("H3 SM70 ConvRot implements 256-channel groups")
+            x = ops.rotate(x)
+        weight = getattr(layer, "h3_fp16_weight", None)
+        if weight is None:
+            weight = ops.dequantize(layer.weight, layer.weight_scale)
+        output = fp16_gemm(
+            x, weight, getattr(layer, "h3_output_fp32", False) or scale is not None
+        )
+        if scale is not None:
+            output = output * scale
+        return output.reshape(*values.shape[:-1], layer.weight.shape[0])
+
+
+class H3RowParallelLinear(RowParallelLinear):
+    """H3-only optional prepared input; retain normal module hooks and TP sum."""
+
+    def forward(self, input_, input_scale=None):
+        if input_scale is None:
+            return super().forward(input_)
+        if (
+            not self.input_is_parallel
+            or self.bias is not None
+            or not isinstance(self.quant_method, Int8ConvRotLinearMethod)
+        ):
+            raise ValueError(
+                "Prepared H3 rows require a bias-free INT8 local projection"
+            )
+        output = self.quant_method.apply_prepared(self, input_, input_scale)
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return (output, None) if self.return_bias else output
