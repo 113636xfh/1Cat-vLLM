@@ -83,6 +83,7 @@ class NVMLMonitor:
 
         try:
             nvml.nvmlInit()
+            get_processes = nvml.nvmlDeviceGetComputeRunningProcesses
             handles = [
                 (index, nvml.nvmlDeviceGetHandleByIndex(index))
                 for index in self.gpu_ids
@@ -118,6 +119,13 @@ class NVMLMonitor:
                             "throttle_reasons": lambda handle=handle: (
                                 nvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
                             ),
+                            "compute_processes": lambda handle=handle: [
+                                {
+                                    "pid": process.pid,
+                                    "memory_used_bytes": process.usedGpuMemory,
+                                }
+                                for process in get_processes(handle)
+                            ],
                         }
                         for key, query in queries.items():
                             try:
