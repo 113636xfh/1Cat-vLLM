@@ -16,7 +16,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("length", [1, 31, 63, 64, 65, 127, 128, 129, 12323])
+@pytest.mark.parametrize(
+    "length", [1, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129, 12323]
+)
 def test_flashattn_d128_mha_tails_and_online_rescaling(length):
     torch.manual_seed(42)
     q, k, v = [

@@ -54,7 +54,7 @@
 #include "gemm_kernel_utils.h"
 #include "gemm/custom_mma.h"
 #include "gemm/find_default_mma.h"
-#include "gemm/mma_from_smem.h"
+#include "prefetch_mma.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -224,7 +224,8 @@ struct H3FMHA {
             WarpIteratorA,
             false>;  // kScaleOperandA
 
-    using Mma = typename DefaultMmaFromSmem::Mma;
+    using Mma = cutlass::gemm::threadblock::H3PrefetchMma<
+        typename DefaultMmaFromSmem::Mma>;
     using IteratorB = typename Mma::IteratorB;
     using WarpCount = typename Mma::WarpCount;
     static_assert(WarpCount::kCount == kNumWarpsPerBlock, "");

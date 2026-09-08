@@ -63,6 +63,89 @@ FlashInfer experiments and reproduction commands explicitly select
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Attention-focused diagnosis and V prefetch: 69.06 seconds
+
+The user redirects the next optimization to GEMM/attention arithmetic and data
+movement, with **60 useful TFLOPS for D128 attention** as the next operator
+milestone. Preserve the under-50-second complete-denoise and >80 TFLOPS/card
+model targets; none of these targets has passed.
+
+A fresh two-update trace of the 69.92-second native baseline records 2.515795 s
+of GEMM service (94.413296 useful TFLOPS) and 2.580667 s of attention service
+(42.179368 useful TFLOPS) on the critical rank. These are service rates, not
+complete-model throughput. The actual B1/N12323/H14/D128 noncausal attention
+call has 1,088,506,166,272 useful FLOPs; 60 TFLOPS requires 18.141769 ms.
+
+NCU on the same baseline binary finds 234 registers/thread, 26,128 shared
+bytes/block, two resident blocks and 12.5% occupancy. Tensor pipe activity is
+36.99%; HBM throughput is only 1.51%, while the L1/shared data path reaches
+61.64%. SASS-correlated samples identify long-scoreboard consumers at the
+QK/V shared stores after global loads, and short-scoreboard consumers at QK
+HMMA instructions. This supports addressing operand movement and latency
+hiding *inside* attention. It does not establish an HBM bandwidth limit.
+
+The retained change loads the first V fragment before softmax and passes it
+to a small adaptation of the existing SM70 PV software pipeline. Residual
+masks, FP16 rounding, FP32 accumulation and math order are unchanged. It keeps
+234 registers without spills, the same shared footprint and zero persistent
+FP16 cache / zero Lt workspace. The native helper's paired operator median
+is 24.522753 versus 25.702400 ms (44.387601 versus 42.350370 TFLOPS); clocks
+vary, so this is a development microbenchmark, not formal model acceptance.
+
+The new binary's independent NCU run reduces long-scoreboard stalls per
+issued instruction from 0.646730 to 0.342021. Tensor pipe activity rises from
+36.99% to 37.91%; short-scoreboard stalls remain. Do not interpret that stall
+ratio change as an equivalent wall-time reduction. Remaining work should
+address QK's shared-load/HMMA dependencies and input reuse.
+
+The installed CMake build completes the unchanged 39-frame/20-update TP4
+workload in **69.062335 s**, or 3.453117 s/update and 50.154018 useful
+TFLOPS/card: a 1.23% reduction from 69.923404 s. All ranks retain exactly
+6.647851467 GiB peak Torch allocation. Video/audio latents are bitwise equal;
+reuse of the baseline decode is explicit, with MP4 SHA256
+`17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
+Automatic media checks inherit the identical baseline output; human scoring
+is pending. The artifact prototype's 68.980006 s is a separate build/run.
+Neither timing is end-to-end or the formal three-run 243-frame acceptance.
+
+Eighteen native GPU tests pass, including newly added 32/33/96/97-key residual
+boundaries, strided storage, poisoned padding, online rescaling and graph
+replay. The standard CMake FlashAttention component builds. Binary SHA256 is
+`540474cfad758d4328ad0e0f00c745be62d3d8caaebea1d4bc19b86354442b9f`.
+
+CUDA12.8 isolated memcheck, racecheck and synccheck each pass thirteen cases
+with zero errors/hazards. Full pytest under memcheck completed its seventeen
+selected tests but reported a CUDA `cuKernelGetFunction` invalid-handle API
+error during module loading, as in the earlier full-environment diagnostic.
+Retain that failed log; the isolated run loads the exact installed extension
+without importing the full vLLM runtime. Ordinary GPU graph replay is covered
+by pytest; the isolated sanitizer harness does not test graph capture.
+
+Rejected or paused probes, all outside production source:
+
+| Probe | Paired candidate / control | Decision |
+| --- | --- | --- |
+| Manual QK shared fill | 44.529663 / 24.239103 ms | Exact but slower; retain original pipeline |
+| QK internal K64 stage | 25.759745 / 25.328640 ms | Exact, no improvement |
+| PV internal K64 stage | 26.507263 / 24.967169 ms | Exact, slower |
+| QK first-tile persistence / next-K prefetch | 25.236481 / 25.414656 ms | Only 0.7%, registers 234 to 254; not retained |
+| Q64/K128 with a 32x64 QK warp | NaN at length 63 | Rejected; grouped version spills, direct indexing removes spills but does not fix numerics |
+
+The wider QK path needs its accumulator/shared-memory mapping and boundary
+behavior fixed before any timing can be admitted. Its split-32 conversion
+attempt also fails length 63; do not repeat these variants unchanged. Earlier
+Q128/K32 wide-PV variants corrupt the length-one output; their direct-store
+workaround spills and slows down. Manual PV fill and larger Q/K tiles remain
+rejected in the retained artifact records.
+
+Evidence is under `flashattention-warp50/`: `report.json`,
+`attention60-root-cause.json`, `native-steps.nsys-rep`, both NCU reports and
+SASS-correlated samples, candidate source/build logs, native tests and quality
+commands. Media, rank/phase CSVs and NVML curves are under
+`outputs/quality39-int8-flashattn-native-prefetch-20steps/FLASH_ATTN_V100/`.
+Rollback is the kernel parent `8cacbb70219c` plus a rebuild of
+`_h3_flashattn_C`; keep the existing column-major INT8 path.
+
 ### Low-memory follow-up: 69.92 seconds, under-50 target incomplete
 
 The user requires no substantial memory increase. Keep the persistent FP16
@@ -127,6 +210,10 @@ Preserve failed or unselected experiments rather than repeat them unchanged:
 - Q32/K64 attention measured 28.025 ms versus 27.575 ms control. A persistent
   shared-Q prototype measured 24.784 versus 25.083 ms with clock variation;
   this does not establish a useful complete-model gain. Neither is enabled.
+- Manually staging the full PV value tile took 87.811 versus 23.785 ms;
+  128-bit vector loads/stores reduced this to 31.587 versus 24.302 ms, still
+  slower. Both matched control values but are rejected; retain these prototypes
+  in `flashattention-lowmem50/attention-failed-paths.json`.
 - Head-major and sequence-padding copies add storage traffic with no clear
   benefit. Approximate exp2 variants add no clear gain over the exact full-tile
   specialization and are not enabled.
