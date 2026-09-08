@@ -1,5 +1,10 @@
 # H3 FlashInfer: exact weight cache and the 50-second milestone
 
+The newer opt-in FP32 residual-sharding result is recorded in
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md): 66.863312 seconds with numerical
+differences and pending human quality review. The replicated-residual baseline
+and its bitwise output checks remain documented below.
+
 The current source completes the unchanged 39-frame, 1344x768, 24-FPS,
 seed-42 workload in **70.828264 seconds for 20 actual updates**. It uses TP4
 on GPUs 0–3, Comfy INT8 ConvRot, the original prompt and video/audio shifts

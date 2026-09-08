@@ -40,6 +40,13 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--int8-weight-layout", choices=["row", "column"], default="column"
             )
+            mode.add_argument(
+                "--residual-sequence-parallel",
+                action="store_true",
+                help=(
+                    "Experimental FP32 residual sharding for TP4 FL2VA INT8 FlashInfer"
+                ),
+            )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             if name == "generate":
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -77,6 +84,7 @@ class VideoSubcommand(CLISubcommand):
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             int8_weight_layout=args.int8_weight_layout,
+            residual_sequence_parallel=args.residual_sequence_parallel,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

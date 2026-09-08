@@ -1,5 +1,17 @@
 # Native MiniMax H3 migration control
 
+Latest opt-in FlashInfer improvement:
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). TP4 FP32 residual sharding
+reduces the unchanged 39-frame/20-update denoise to 66.863312 seconds,
+51.803500 useful TFLOPS/rank. The native implementation matches the prototype
+bitwise; it differs from the replicated baseline (video SSIM 0.986179).
+Automatic media checks and the four-rank block/padding/FP32-range regression
+pass. Human quality acceptance remains pending, so the new option defaults
+off. The below-50-second and >80-TFLOPS/card targets remain incomplete.
+Fresh counters from the retained attention binary show 34.91% Tensor pipe
+activity and 50.09% scheduler cycles without an eligible warp. Three query
+reuse variants regress; the Q128/K128 alias variant spills and is not run.
+
 Latest retained FlashInfer change: [FLASHINFER_TO50.md](FLASHINFER_TO50.md).
 Q shared-memory swizzling and an exact transposed FP16/cuBLASLt weight cache
 reduce the unchanged 39-frame/20-update denoise to 70.828264 seconds,

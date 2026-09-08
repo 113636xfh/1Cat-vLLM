@@ -85,6 +85,14 @@ The measured 39-frame/20-update cache list and native cuBLASLt configuration
 are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
 commands, output comparison and the still-incomplete 50-second target.
 
+For the experimental FlashInfer TP4 INT8 FL2VA route, add
+`--residual-sequence-parallel` to shard FP32 residual rows and reduce TP
+communication. It defaults off and changes floating-point reduction order.
+The unchanged 39-frame/20-update denoise measures 66.863312 seconds; automatic
+checks pass, while five-axis human quality review and the 50-second target
+remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
+differences, GPU tests, current hardware counters and rollback.
+
 `--int8-weight-layout column` is the default for DiT INT8 projections. Loading
 reorders physical INT8 storage without changing logical weights or scales.
 Each invocation decodes transient FP16 weights and selects the validated SM70
