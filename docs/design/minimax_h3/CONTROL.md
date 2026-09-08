@@ -1226,3 +1226,36 @@ Evidence under `/data/minimax-h3/workflows-lora-20260908/fasth3/`:
 `validate_production_fusion.py`, `production-fusion.log` and
 `production-fusion.json`. Model weights and raw artifacts remain outside Git.
 Keep this work Draft; the wider authorized tracker remains in `ADAPTATION.md`.
+
+### User-requested mainline integration (2026-09-08)
+
+The user subsequently requested merging the implemented workflow scope into
+`main`. This source integration supersedes the earlier Draft-only instruction;
+it does not close the GPU, full-duration, human audiovisual or performance gates.
+Those statuses remain explicit in `ADAPTATION.md`.
+
+Required source dependencies are native model PR #557 at
+`1d201f41344f1a9a50d91197a8ad3a5525e51190` and SM70 operator PR #558 at
+`9764b6c202594158e109c7d7dd4bc3d7124ad25d`. The workflow head before integration
+was `4fc5ba8539bed16e00ecf0935a6ca2bf105dae8c`. These were combined in the owned
+workflow worktree and synchronized with `onecat/main`
+`e5d63c51f0fcc1ddf75d229e3df06bf52df206f5` before publishing the merge candidate.
+
+Conflict resolution retains both `lora_path` and `int8_weight_layout`, the
+FlashGen AdaLN restoration branch and the operator's INT8 layout configuration.
+Both workflow and kernel evidence histories are retained. The optimized INT8
+MLP preparation requires an unwrapped `Int8ConvRotLinearMethod`; a dynamic
+LoRA wrapper follows the existing FP32 activation path and cannot be bypassed.
+
+The combined mainline candidate passes **173 CPU video tests**, with **93 GPU
+tests skipped** (the count includes the operator dependency's GPU tests).
+All changed-file pre-commit checks pass. The three H3 extensions were rebuilt
+from this source with Torch 2.10.0+cu128, CUDA Toolkit 12.8, SM70 and CUTLASS
+v4.4.2, using an owned compiler cache. This component build does not establish
+a complete release wheel or a fresh GPU numerical/quality result.
+
+Integration evidence is under
+`/data/minimax-h3/workflows-lora-20260908/merge/`: `cpu-main.log`,
+`build-extensions.log`, `extension-imports.json`, `cli-serve-help.log`,
+`precommit-kernels.log` and `precommit-main.log`. The exact build command and
+final GitHub merge SHAs are retained in that task's merge/handoff artifacts.

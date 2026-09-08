@@ -44,5 +44,6 @@ must demonstrate an actual supported kernel; forwarding an unsupported backend
 name or silently ignoring a flag does not satisfy acceptance.
 
 Source ownership stays on the task branch/worktree recorded in [CONTROL.md](CONTROL.md)
-and Draft PR #565. Kernel performance work in other tasks remains independently
+and PR #565. The user requested merging this source checkpoint to `main`;
+the pending GPU/quality gates in this table remain open. Kernel performance work remains independently
 owned. Do not preempt their GPU leases to produce workflow evidence.
