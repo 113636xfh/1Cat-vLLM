@@ -7,6 +7,8 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 
+#include "h3_column_major_gemm.h"
+
 namespace {
 __global__ void prepare_fp16_rows(const float* input, half* output,
                                   float* scales, int64_t rows, int width) {
@@ -51,6 +53,15 @@ __global__ void dequantize_rows(const int8_t* weights, const float* scales,
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
        i += int64_t(gridDim.x) * blockDim.x) {
     output[i] = __float2half_rn(float(weights[i]) * scales[i / width]);
+  }
+}
+
+// Physical [K,N] storage retains logical [N,K] and output-channel scales.
+__global__ void dequantize_columns(const int8_t* weights, const float* scales,
+                                   half* output, int64_t count, int64_t rows) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    output[i] = __float2half_rn(float(weights[i]) * scales[i % rows]);
   }
 }
 
@@ -136,7 +147,11 @@ std::tuple<torch::Tensor, torch::Tensor> h3_prepare_fp16(torch::Tensor input) {
 }
 
 torch::Tensor h3_dequantize(torch::Tensor weight, torch::Tensor scale) {
-  validate_cuda(weight);
+  TORCH_CHECK(
+      weight.is_cuda() && weight.dim() == 2 &&
+          (weight.is_contiguous() ||
+           (weight.stride(0) == 1 && weight.stride(1) == weight.size(0))),
+      "H3 INT8 weight requires dense row-major or column-major CUDA storage");
   validate_cuda(scale);
   TORCH_CHECK(weight.dim() == 2 && weight.scalar_type() == torch::kInt8,
               "H3 weight must be a signed INT8 matrix");
@@ -145,14 +160,25 @@ torch::Tensor h3_dequantize(torch::Tensor weight, torch::Tensor scale) {
                   scale.device() == weight.device(),
               "H3 requires same-device FP32 row scales");
   const c10::cuda::CUDAGuard guard(weight.device());
-  auto output =
-      torch::empty(weight.sizes(), weight.options().dtype(torch::kFloat16));
+  const bool columns = !weight.is_contiguous();
+  auto output = columns ? torch::empty({weight.size(1), weight.size(0)},
+                                       weight.options().dtype(torch::kFloat16))
+                              .t()
+                        : torch::empty(weight.sizes(),
+                                       weight.options().dtype(torch::kFloat16));
   if (weight.numel()) {
     const int grid = std::min<int64_t>((weight.numel() + 255) / 256, 65535);
-    dequantize_rows<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        weight.data_ptr<int8_t>(), scale.data_ptr<float>(),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()), weight.numel(),
-        weight.size(1));
+    if (columns) {
+      dequantize_columns<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+          weight.data_ptr<int8_t>(), scale.data_ptr<float>(),
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()), weight.numel(),
+          weight.size(0));
+    } else {
+      dequantize_rows<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+          weight.data_ptr<int8_t>(), scale.data_ptr<float>(),
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()), weight.numel(),
+          weight.size(1));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return output;
@@ -194,6 +220,7 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight,
       {m, n},
       input.options().dtype(output_fp32 ? torch::kFloat32 : torch::kFloat16));
   if (!m || !n) return output;
+  if (!k) return output.zero_();
   // cuBLAS is an existing TurboMind SM70 dispatch option. Explicit 32F compute
   // prevents reduced-precision accumulation; W8 decode is outside the GEMM.
   auto handle = at::cuda::getCurrentCUDABlasHandle();
@@ -222,6 +249,10 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  pybind11::class_<H3ColumnMajorGemmPlan>(m, "ColumnMajorGemmPlan")
+      .def(pybind11::init<int, int64_t, int64_t, int64_t, bool>())
+      .def_property_readonly("supported", &H3ColumnMajorGemmPlan::supported)
+      .def("run", &H3ColumnMajorGemmPlan::run);
   m.def("prepare_fp16", &h3_prepare_fp16);
   m.def("dequantize", &h3_dequantize);
   m.def("rotate", &h3_rotate);

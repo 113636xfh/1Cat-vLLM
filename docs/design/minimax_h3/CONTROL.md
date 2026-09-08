@@ -11,6 +11,78 @@ the existing D256 TensorOp architecture; padding never increases useful FLOPs.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Low-memory follow-up: 69.92 seconds, under-50 target incomplete
+
+The user requires no substantial memory increase. Keep the persistent FP16
+weight cache at zero; the development guard allows at most 1 GiB/card above
+the prior 6.647851467 GiB denoise allocation peak. This allowance is a working
+interpretation of the memory request, not a new user-specified numeric limit.
+
+Two exact changes are now implemented:
+
+- Specialize the softmax bounds check once per complete 64-key tile. The tail
+  still uses valid-key masking; FP32 accumulation and exp2f are unchanged.
+- Repack DiT INT8 weights into column-major physical storage during loading.
+  Logical [N,K] coordinates, signed codes, channel scales and ConvRot remain
+  unchanged. Per-call FP16 decode keeps this layout. A bounded host descriptor
+  cache selects cuBLASLt algorithm 21 / tile 24 / split 1 / reduction 0 with
+  **zero device workspace**. Missing plans fall back to the original row-major
+  GEMM. No persistent FP16 cache is required. Roll back the layout and GEMM with
+  `--int8-weight-layout row`.
+
+| Fixed 39-frame / 20-update workload | Prior QK/RoPE baseline | Native low-memory route |
+| --- | ---: | ---: |
+| Complete synchronized denoise | 74.411059 s | 69.923404 s |
+| Seconds / actual update | 3.720553 | 3.496170 |
+| Effective useful TFLOPS / each rank | 46.548909 | 49.536398 |
+| Peak allocated / each rank | 6.647851 GiB | 6.647851 GiB |
+| Persistent FP16 cache / each rank | 0 | 0 |
+
+The native route reduces denoise time by 6.03%; **50 seconds is not achieved**.
+Video and audio latents are bitwise equal to the baseline, as are decoded
+PCM samples and the MP4 (SHA256
+`17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`).
+A WAV container can differ while its PCM is identical. All automatic media
+checks pass; five-axis human scoring remains pending. Driver-reported peak
+used memory is 8.583496 GiB/card, which includes allocations outside Torch's
+allocator. NVML busy percentage is diagnostic and is not Tensor Core FLOPS.
+
+This is one unprofiled complete run after a one-invocation warmup, with cached
+prompt-verified text. It is not end-to-end timing or the primary 243-frame,
+three-measurement >80 TFLOPS/card acceptance. An artifact prototype measured
+69.868952 s with the same zero-cache policy; do not combine different builds
+into the formal three-run statistic.
+
+Validation: 86 targeted GPU/CPU tests pass, including all signed INT8 codes,
+scale/offset tails, all four padded-M12352 TP4 projections, forced fallback,
+layout idempotence and CUDA Graph replay. Isolated CUDA12.8 memcheck, racecheck
+and synccheck pass with zero errors/hazards for the new decode and Lt path.
+The standard CMake W8A16 and FlashAttention components build successfully.
+
+Evidence: `flashattention-lowmem50/report.json`, `production-binaries.json`,
+`production-quality-job.json` and
+`outputs/quality39-int8-flashattn-lowmem-native-20steps/FLASH_ATTN_V100/`.
+GPU logs are in the serialized queue's `flashattention-under50/` directory.
+
+Preserve failed or unselected experiments rather than repeat them unchanged:
+
+- A 9.63-GB/card FP16 cache plus Lt measured 69.456427 s; it fails the latest
+  memory policy and is not the forward configuration.
+- Alternative cuBLAS row-layout algorithms and larger CUTLASS GEMM tiles were
+  slower; some algorithm IDs also failed exact FP16-output checks.
+- Row-layout GEMM/TP overlap improved standalone row projections only modestly
+  and changed FP32 reduction rounding; it is not enabled.
+- Q32/K64 attention measured 28.025 ms versus 27.575 ms control. A persistent
+  shared-Q prototype measured 24.784 versus 25.083 ms with clock variation;
+  this does not establish a useful complete-model gain. Neither is enabled.
+- Head-major and sequence-padding copies add storage traffic with no clear
+  benefit. Approximate exp2 variants add no clear gain over the exact full-tile
+  specialization and are not enabled.
+
+Attention and serialized TP transfers remain the main opportunities alongside
+GEMM. The prior trace shows less than 1% GPU idle time; allocating more weight
+cache or only reducing Python launches cannot supply the remaining 19.9 seconds.
+
 ### Feeding diagnosis and exact QK/RoPE fusion follow-up
 
 The current development target is **under 50 seconds for 20 actual updates**
