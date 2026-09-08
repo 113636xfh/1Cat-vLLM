@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Numerical reference operations for H3's FP16/FP32 execution contract."""
+"""Precision-sensitive H3 operations and their numerical references."""
 
 import torch
 from torch import nn
@@ -37,6 +37,33 @@ class RotaryEmbedding(nn.Module):
 
 
 def fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps):
+    if (
+        not torch.is_grad_enabled()
+        and rope_table.ndim == 2
+        and rope_table.shape[-1] in (96, 128)
+        and rope_table.is_contiguous()
+        and all(
+            x.is_cuda
+            and x.dtype == torch.float16
+            and x.ndim == 3
+            and x.shape[0] == rope_table.shape[0]
+            and x.shape[0] > 0
+            and x.shape[1] > 0
+            and x.shape[-1] == 128
+            and x.stride(-1) == 1
+            and w.shape == (128,)
+            and w.is_contiguous()
+            and x.device == w.device == rope_table.device
+            for x, w in ((q, q_weight), (k, k_weight))
+        )
+    ):
+        from .qk_norm_rope import qk_norm_rope
+
+        return qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps)
+    return qk_norm_rope_reference(q, k, q_weight, k_weight, rope_table, eps)
+
+
+def qk_norm_rope_reference(q, k, q_weight, k_weight, rope_table, eps):
     # This reference retains the normalized FP16 rounding boundary. The CUDA
     # implementation must preserve it, including partial (96/128) rotation.
     def apply(x, weight):

@@ -1,5 +1,12 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer investigation: [FLASHINFER_ROOT_CAUSE.md](FLASHINFER_ROOT_CAUSE.md).
+Fused QK preparation and an 8x8 V transpose reduce the same 39-frame/20-update
+denoise to 75.140751 seconds, or 46.096872 useful TFLOPS per rank. Video/audio
+latents and freshly decoded MP4 are unchanged from the preceding K64 run.
+79 tests pass. The next short-run milestone is below 50 seconds with unchanged
+parameters and no quality regression; >80 TFLOPS per rank remains incomplete.
+
 FlashInfer feeding follow-up on its own branch: see
 [FLASHINFER_FEEDING.md](FLASHINFER_FEEDING.md). Q128/K64 reduces complete
 39-frame/20-update denoise to 78.968862 s, or 43.862270 useful TFLOPS per rank.

@@ -1,5 +1,10 @@
 # H3 FlashInfer SM70 feeding follow-up
 
+Latest follow-up: [root cause and fused preparation](FLASHINFER_ROOT_CAUSE.md)
+reduce the same complete short denoise to 75.140751 seconds and 46.096872
+useful TFLOPS per rank, with bitwise-equal audio/video latents. The sections
+below retain the preceding K64 baseline and its provenance.
+
 This branch continues the independent FlashInfer route. The concurrent
 FlashAttention-V100 work belongs to another task. The overall requirement
 remains greater than 80 useful model TFLOPS on **each** TP4 rank over complete

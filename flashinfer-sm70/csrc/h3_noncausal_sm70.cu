@@ -243,9 +243,20 @@ __global__ __launch_bounds__(THREADS,
       }
       __syncthreads();
 #pragma unroll
-      for (int i = tid; i < D * BK; i += THREADS) {
-        const int d = i / BK, kv = i % BK;
-        vs[d * VLD + kv] = probabilities[kv * QLD + d];
+      for (int i = tid; i < D * BK / 2; i += THREADS) {
+        // Transpose an 8x8 tile per warp. Adjacent d-pair loads and kv-pair
+        // stores each touch distinct banks; the shuffle exchanges exact bits.
+        const int tile = i / 32;
+        const int kv = (tile % (BK / 8)) * 8 + (lane & 7);
+        const int d = (tile / (BK / 8)) * 8 + (lane >> 3) * 2;
+        const unsigned packed =
+            *reinterpret_cast<const unsigned*>(probabilities + kv * QLD + d);
+        const unsigned adjacent = __shfl_xor_sync(0xffffffff, packed, 1);
+        const unsigned transposed =
+            (lane & 1) ? ((adjacent >> 16) | (packed & 0xffff0000u))
+                       : ((packed & 0xffffu) | (adjacent << 16));
+        *reinterpret_cast<unsigned*>(vs + (d + (lane & 1)) * VLD + (kv & ~1)) =
+            transposed;
       }
     }
   }
