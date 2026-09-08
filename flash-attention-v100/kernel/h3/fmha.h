@@ -642,6 +642,18 @@ struct H3FMHAKernel {
         //             }));
         //       }));
 
+        typename MM1::Mma::FragmentB prefetched_v;
+        {
+          typename MM1::IteratorB early_v(
+              typename MM1::IteratorB::Params{
+                  typename MM1::LayoutB(params.ldv[problem_idx])},
+              params.ptr_V[problem_idx] +
+                  iter_key_start * params.ldv[problem_idx],
+              {problem_size_1_k, problem_size_1_n}, thread_id(), {0, 0});
+          early_v.set_residual_tile(problem_size_1_k <= MM1::Mma::Shape::kK);
+          prefetched_v.clear();
+          early_v.load(prefetched_v);
+        }
         // Update `mi` from accum stored in registers
         // Also does accum[i] <- exp(accum[i] - mi)
         if (num_keys - iter_key_start >= kKeysPerBlock) {
@@ -714,7 +726,8 @@ struct H3FMHAKernel {
             accum_o.clear();
           }
 
-          mma_pv(gemm_k_iterations, accum_o, iterator_V, accum_o);
+          mma_pv(gemm_k_iterations, accum_o, iterator_V, accum_o,
+                 &prefetched_v);
           __syncthreads();
 
           if (kPreloadV && !kKeepOutputInRF && blockN + 1 < nBlockN) {

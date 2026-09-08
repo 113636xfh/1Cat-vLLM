@@ -13,6 +13,14 @@ at revision `da5e086dab31d63815acafdac9a9c5893b1c69e2` (v4.4.2). Both retain
 their BSD-3-Clause notices. Unmodified helper headers are build dependencies
 from the same pinned CUTLASS source already fetched by 1Cat CMake.
 
+`prefetch_mma.h` adapts the SM70 PV main loop from that revision's
+`gemm/mma_from_smem.h`, retaining its BSD-3-Clause notice. It accepts the
+first V fragment loaded before softmax and keeps the remaining CUTLASS
+software pipeline and accumulation order. The first fragment uses the same
+residual mask as the original prologue, including 32-key V tile boundaries.
+Register allocation remains 234/thread without spills; shared memory stays
+26,128 bytes/block. There is no extra persistent device allocation.
+
 The adaptation separates the QK and PV tile widths. All 128 output channels
 remain in FP32 registers while each iteration consumes 64 keys. Rescaling the
 output uses the PV accumulator's lane/row mapping; reusing the QK mapping
