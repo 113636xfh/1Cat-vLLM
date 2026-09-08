@@ -9,7 +9,64 @@ The current short-development target is **under 50 seconds for 20 actual DiT
 updates**, retaining 1344x768, 39 frames/24 FPS, seed42, INT8 ConvRot FL2VA,
 TP4 GPU0-3 and output quality, without a substantial memory increase.
 
-The new explicit `--residual-sequence-parallel` option completes this workload
+## Latest: local ConvRot, 58.19 seconds
+
+With `--residual-sequence-parallel`, normalize and rotate each rank's local
+FP16 rows before gathering, then project without repeating the rotation. This
+preserves the gathered bits, original ConvRot256 operator, INT8 scales, GEMMs
+and useful-FLOP hooks. It adds no persistent FP16 weights or CUDA workspace.
+The installed H3 CUDA binaries are unchanged.
+
+The complete 20-update workload now takes **58.190385 s**, or **2.909519 s/update
+and 59.524500 useful model TFLOPS/card**, versus the earlier 58.794562 s sharded
+route (1.03% less time). Each rank's useful FLOPs remain
+3,463,753,579,661,312. Peak denoise Torch allocation is unchanged at
+**6.195001125 GiB/card**; NVML peak device-used memory is 8.046386719 GiB/card.
+This is one unprofiled development measurement after a one-call warmup with
+prompt-verified cached text, not a formal median or end-to-end measurement.
+Three paired two-update probes give medians 5.878070 ->5.813375 s (1.10%).
+
+Both complete video/audio latents equal the earlier 58.79-second run bitwise,
+are finite and match across ranks. Its previously checked decode is reused
+after latent and MP4-hash checks: **no new VAE decode was run**. Automatic
+validity is preserved; the previous human audiovisual review remains pending.
+The flag still defaults to false; omit it for the 62.804019-second default.
+
+Retained source: `ca5b6a855b` on the native FA residual branch. This reuses a
+read-only working-tree snapshot of the independent FI task, based on
+`53780abef0e9ef190aa55a1f61d8fd5fbd390aa1`; the source was uncommitted at capture.
+Patch SHA256 is
+`ce41592338adeef0388c7b5b826351d378c468bfa58e7df3def662cf7056dc4b`.
+The new regression uses native FlashAttention; there is no FI delegation.
+Parent `2a560b0a7fa0` rolls back only local rotation.
+
+Validation: 62 targeted tests pass with one GPU case deselected. One separate
+four-rank GPU test passes on every rank, checking cached/uncached INT8, two
+valid/padded lengths, consecutive blocks, rank-dependent weights, FP32 values
+above 65504, exact outputs and unchanged FLOP hooks. Pre-commit passes. Exact
+commands are in `flashattention-register50/jobs/13-local-rotation-tests.done.json`
+and `14-local-rotation-tp4.done.json`. Distributed GPU modules run in separate
+pytest invocations because the repository fixture tears down distributed state
+between tests. Prior sanitizer results cover unchanged operators only.
+
+Eight additional attention candidates match the native output across 12 tested
+lengths but show no stable paired speedup. Query-window projection overlap and
+a TP4 block pipeline also lose. The latter's raw counter includes 29 padding
+rows and is explicitly invalid for acceptance accounting. None is installed.
+See CONTROL.md and `flashattention-register50/failed-paths.json`; do not repeat
+unchanged candidates. GEMM/attention remain the major optimization target.
+
+Latest report, exact reproduction wrapper, raw timing, source hashes and NVML
+curves: `flashattention-register50/`. Output:
+`outputs/quality39-int8-flashattn-localrot-20steps/FLASH_ATTN_V100/`.
+MP4 SHA256 remains
+`f00ba75587f58e2a63a105647cb634eebd60b154ab7b3551f385ca2df96e5243`.
+**Under 50 seconds, standalone attention 60 TFLOPS, formal per-card 80 TFLOPS
+and human quality acceptance remain incomplete.**
+
+## Previous residual-sharding and wide-attention evidence
+
+The initial explicit `--residual-sequence-parallel` option completed this workload
 in **58.794562 s**, or **2.939728 s/update and 58.912822 useful model
 TFLOPS/card**. Peak denoise Torch allocation is **6.195001125 GiB/card** and
 NVML peak device-used memory is 8.171386719 GiB/card, with zero persistent

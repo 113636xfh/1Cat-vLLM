@@ -14,6 +14,76 @@ the existing D256 TensorOp architecture; padding never increases useful FLOPs.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Local ConvRot before gather: 58.19 seconds
+
+The optional residual-sharded route now rotates normalized FP16 rows on their
+owning rank before all-gather. QKV and gate/up projections consume those exact
+gathered bits without repeating ConvRot. Each rank rotates one quarter of the
+rows; the original ConvRot256 arithmetic, INT8 scales, projection shapes and
+FLOP hooks are preserved. CPU/unquantized paths retain ordinary forwards.
+This reuses a read-only working-tree snapshot from the independent FI task,
+based on `53780abef0e9ef190aa55a1f61d8fd5fbd390aa1`, with the regression adapted
+to native FlashAttention. Snapshot patch SHA256:
+`ce41592338adeef0388c7b5b826351d378c468bfa58e7df3def662cf7056dc4b`.
+The source was uncommitted in that tree at capture; no FI attention delegation
+or H3 CUDA binary change is involved.
+
+The unchanged 1344x768, 39-frame/24-FPS, seed42, INT8 ConvRot FL2VA, TP4 GPU0-3
+workload completes **20 actual updates in 58.190385 s**, or **2.909519 s/update
+and 59.524500 useful model TFLOPS/card**. This reduces the previous optional
+58.794562 s result by 0.604177 s (1.03%). Per-card useful FLOPs remain
+3,463,753,579,661,312. Peak denoise Torch allocation is unchanged at
+**6.195001125 GiB/card**; NVML peak device-used memory is 8.046386719 GiB/card.
+Persistent FP16 cache and Lt workspace remain zero. This is one unprofiled,
+cached-text development run after a one-call warmup, not formal acceptance.
+Three paired two-update checks give medians 5.878070 ->5.813375 s (1.10%).
+
+Both complete video/audio latent tensors are **bitwise equal** to the previous
+58.79-second run, finite and identical across ranks. Its decoded media is
+reused only after these checks and verification of the MP4 hash below. There
+is no new VAE or end-to-end timing. Automatic validity is preserved; the prior
+human audiovisual review remains pending. The option still defaults to false;
+the flag-off baseline remains 62.804019 s. Omit the flag to restore that path,
+or use parent `2a560b0a7fa0` to revert only the local-rotation change.
+
+Validation: 62 targeted tests pass, one GPU case is deselected. A separate
+torchrun invocation runs one actual four-rank test, passing on every rank:
+cached/uncached INT8 projections, two valid/padded lengths, consecutive blocks,
+rank-specific weights, residuals above 65504, exact output and unchanged FLOP
+hooks. Pre-commit passes. Do not combine distributed GPU test modules in one
+pytest lifetime: the repository fixture tears down distributed state between
+tests. Earlier sanitizer runs cover unchanged operators, not a new run here.
+
+Eight further attention variants remain artifact-only. All match the native
+output exactly across 12 tested lengths and pass sampled FP32 references;
+none establishes a stable paired speedup including wrapper/copy costs:
+
+| Candidate | Native control ms | Candidate ms | Decision |
+| --- | ---: | ---: | --- |
+| Register row max/sum | 20.210688 | 20.071424 | No stable paired gain |
+| Separate max/sum exchange | 20.093952 | 20.232191 | No gain |
+| Head-contiguous Q/K/V packing | 19.866625 | 20.254721 | Packing loses |
+| Direct Q/K vector iterators | 20.256767 | 21.655552 | Hot register spills |
+| Direct Q iterator | 20.048897 | 20.049919 | No gain |
+| Direct K iterator | 19.971071 | 20.135937 | No gain |
+| Direct V iterator | 20.254721 | 19.984385 | Clock drift; unstable gain |
+| PV-only 64x32 warp | 20.199425 | 23.879681 | Slower after mapping fix |
+
+Query-window attention/projection overlap also loses, including a version
+retaining the full-shape attention specialization and validated cloned GEMM
+plans. A three-window TP4 block pipeline takes about 6.04 s versus 5.87 s for
+two updates and introduces nonzero latent deltas; it is not integrated. Its
+raw hook counter includes 29 padding rows and is explicitly invalid for
+acceptance accounting. See `flashattention-register50/failed-paths.json` for
+exact jobs, sources and outcomes; do not repeat unchanged candidates.
+
+Latest evidence: `flashattention-register50/REPORT.md`, `report.json`, source
+snapshot hashes, paired probes, test logs and NVML curves. Media:
+`outputs/quality39-int8-flashattn-localrot-20steps/FLASH_ATTN_V100/`.
+**Under 50 seconds, attention 60 TFLOPS, formal per-card 80 TFLOPS and human
+quality acceptance remain incomplete.** GEMM/attention operand reuse remains
+the main optimization target; this small ConvRot gain does not resolve it.
+
 ### Optional FP32 residual row sharding: 58.79 seconds
 
 `--residual-sequence-parallel` enables an experimental TP4 FL2VA INT8 path
