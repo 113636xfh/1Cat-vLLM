@@ -195,7 +195,11 @@ class H3Engine:
     def generate(self, request: H3Request, output_dir: str | Path):
         import json
 
+        from vllm.model_executor.models.minimax_h3.validation import validate_request
+
         from .metrics import NVMLMonitor
+
+        validate_request(self.config, request)
 
         with self._lock:
             if self._closed:
