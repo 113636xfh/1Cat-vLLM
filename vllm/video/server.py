@@ -137,6 +137,11 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
             raise HTTPException(503, "video engine unavailable")
         try:
             request = body.request()
+            from vllm.model_executor.models.minimax_h3.validation import (
+                validate_request,
+            )
+
+            await asyncio.to_thread(validate_request, config, request)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         if queue.full():
