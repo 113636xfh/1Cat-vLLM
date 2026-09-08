@@ -1866,7 +1866,7 @@ def test_dflash2_e4m3_cannot_bypass_fp32_with_legacy_verifier(page, native_avail
     def legacy(*args, **kwargs):
         pytest.fail("E4M3 DFlash2 selected FP16 partial state")
 
-    legacy.supports_e4m3 = True
+    legacy.supports_e4m3 = True  # type: ignore[attr-defined]
 
     def precise(q, k, v, table, lengths, **kwargs):
         calls.append(("fp32", table, lengths))
