@@ -39,7 +39,7 @@ def test_all_ranks_use_slowest_rank_wall_time_and_strict_threshold():
     assert not evaluate_performance(runs)["performance_passed"]
 
 
-@pytest.mark.parametrize("invalid", ["profiled", "seed", "rank", "calls"])
+@pytest.mark.parametrize("invalid", ["profiled", "seed", "rank", "calls", "excluded"])
 def test_rejects_incomparable_measurements(invalid):
     runs = measurements()
     if invalid == "profiled":
@@ -48,6 +48,8 @@ def test_rejects_incomparable_measurements(invalid):
         runs[1]["request"]["sampling"]["seed"] = 2026
     elif invalid == "rank":
         runs[1]["ranks"][3]["rank"] = 2
+    elif invalid == "excluded":
+        runs[1]["timing_valid"] = False
     else:
         runs[1]["ranks"][0]["dit_calls"] = 48
     with pytest.raises(ValueError):

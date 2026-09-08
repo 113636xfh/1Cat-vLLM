@@ -163,6 +163,8 @@ def evaluate_performance(runs):
             raise ValueError("acceptance requires the fixed primary workload")
         if run.get("measurement", {}).get("profiled") is not False:
             raise ValueError("formal timing must be explicitly recorded as unprofiled")
+        if run.get("timing_valid") is False:
+            raise ValueError("run timing was excluded from performance evidence")
         if any(rank["dit_calls"] != 49 for rank in run["ranks"]):
             raise ValueError("the primary schedule requires 49 completed DiT calls")
         if any(

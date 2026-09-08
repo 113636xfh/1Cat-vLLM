@@ -11,6 +11,11 @@ from pathlib import Path
 def export_report(run_dir):
     run_dir = Path(run_dir)
     run = json.loads((run_dir / "run.json").read_text())
+    if run.get("timing_valid") is False:
+        raise ValueError(
+            "Cannot report excluded timing: "
+            + run.get("timing_exclusion_reason", "run marked invalid")
+        )
     ranks = sorted(run["ranks"], key=lambda rank: rank["rank"])
     denoise_seconds = max(rank["stage_seconds"]["denoise"] for rank in ranks)
     rows = []
@@ -80,7 +85,8 @@ def export_report(run_dir):
     for axis in axes[-1]:
         axis.set_xlabel("Seconds from first NVML sample")
     figure.suptitle(
-        f"H3 {run['config']['attention_backend']} — "
+        f"H3 {run['config']['attention_backend']} "
+        f"({run.get('mode', 'native request')}) — "
         "NVML diagnostics (Tensor Core activity requires Nsight Compute)"
     )
     figure.tight_layout()

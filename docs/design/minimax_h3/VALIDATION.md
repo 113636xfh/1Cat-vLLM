@@ -4,6 +4,24 @@ This draft has not passed the full-video quality or per-GPU 80 TFLOPS gates.
 Component numerics and a short end-to-end route are working. Keep profiler
 diagnostics separate from the three formal timing runs.
 
+## Short development checks
+
+Use the native entrypoint with the same spatial canvas and a short temporal
+extent while developing kernels or debugging components:
+
+```bash
+vllm video generate --model /path/to/MiniMax-H3 \
+  --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --tensor-parallel-size 4 --attention-backend FLASHINFER_SM70 \
+  --num-frames 39 --num-inference-steps 3 --output-dir /path/to/development
+```
+
+This produces 1.625 seconds and performs two DiT forwards. It is an execution,
+numerical-range and profiling workload; two forwards cannot establish the
+checkpoint's final video quality. The streaming VAE requires at least 22 frames.
+Keep the requested 50 sigma positions when evaluating final quality. Do not run
+the full acceptance runner for routine development.
+
 ## Fixed workload
 
 The acceptance helper uses the Chinese paper-boat/duck prompt in
@@ -30,7 +48,7 @@ arguments. The default budget is zero.
 ## Reports and interpretation
 
 ```bash
-python -m pip install matplotlib
+uv pip install --python .venv/bin/python matplotlib
 python tools/minimax_h3/report.py /path/to/acceptance/run-1
 ```
 
@@ -58,18 +76,29 @@ following, subject consistency, temporal continuity, detail and audio at least
 ## Evidence completed so far
 
 - Both fixed INT8 partition files are downloaded and SHA256 manifests saved.
-  The original BF16 DiT partitions and shared components are downloaded; their
-  full file manifest is being generated.
+  The original BF16 DiT partitions and shared components are downloaded, and
+  their 98-file checksum manifest is complete.
 - Real TP4 text-encoder outputs are finite and bitwise identical between ranks.
 - Real 50-block INT8 DiT single-forward checks pass after preserving large
   condition projections, residuals, gated products and row-projection outputs
   in FP32. The matrix inputs/weights remain FP16 for Tensor Core execution.
-- The native numerical/service suite passed 23 tests before the additional
-  request preflight changes. Six acceptance-contract tests pass.
+- The current numerical/service suite passes 38 tests, including short clips
+  and the optimized FlashInfer kernel. Seven acceptance-contract tests pass, including excluded timing.
 - A 256x256, 107-frame, one-DiT-call route exported finite video and audio and
   passed the automatic media checks. It is not a quality/performance baseline.
-- A full primary FL2VA INT8 / Flash-V100 eager video is running. Full quality,
-  both-backend comparisons, original BF16 comparisons, mixed references,
-  extra seeds and formal timing remain pending.
+- The earlier full primary video was interrupted before completion and is
+  retained as partial diagnostics only. Development now uses 39-frame clips.
+  Cached-text INT8 TP4 denoise (two forwards after warmup) measured 11.29494 s
+  with Flash-V100 and 10.55566 s with the FlashInfer candidate: 30.6664 versus
+  32.8142 useful TFLOPS on each rank. Both produced finite, rank-identical
+  latents. These are development results, not full-schedule acceptance.
+- Full quality, original BF16 comparisons, mixed references, extra seeds and
+  formal three-run timing remain pending.
 - Standard CMake configuration, build and component installation of both H3
   extensions pass. Complete release-wheel validation remains pending.
+
+The final short export contains 39 decoded frames and valid audio, but its
+two-forward image has clear ghosting and grid artifacts. It is not quality
+accepted. Other GPU workers were present during that export run, so its JSON
+marks timing invalid. Both the evaluator and report helper reject explicitly
+excluded timing. The earlier isolated candidate comparison is retained separately.
