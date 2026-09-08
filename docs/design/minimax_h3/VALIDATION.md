@@ -13,12 +13,13 @@ extent while developing kernels or debugging components:
 vllm video generate --model /path/to/MiniMax-H3 \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
   --tensor-parallel-size 4 --attention-backend FLASHINFER_SM70 \
-  --num-frames 39 --num-inference-steps 3 --output-dir /path/to/development
+  --num-frames 39 --num-inference-steps 21 --output-dir /path/to/development
 ```
 
-This produces 1.625 seconds and performs two DiT forwards. It is an execution,
-numerical-range and profiling workload; two forwards cannot establish the
-checkpoint's final video quality. The streaming VAE requires at least 22 frames.
+This produces 1.625 seconds and performs 20 DiT forwards. It is the short
+quality/development workload; the sigma-point convention needs 21 positions
+for 20 actual updates. One- or two-forward runs remain numerical/execution
+diagnostics and must not be used to judge normal model image quality. The streaming VAE requires at least 22 frames.
 Keep the requested 50 sigma positions when evaluating final quality. Do not run
 the full acceptance runner for routine development.
 
@@ -97,8 +98,15 @@ following, subject consistency, temporal continuity, detail and audio at least
 - Standard CMake configuration, build and component installation of both H3
   extensions pass. Complete release-wheel validation remains pending.
 
-The final short export contains 39 decoded frames and valid audio, but its
-two-forward image has clear ghosting and grid artifacts. It is not quality
+The earlier two-forward short export contains 39 decoded frames and valid
+audio, but its image has clear ghosting and grid artifacts. It is not quality
 accepted. Other GPU workers were present during that export run, so its JSON
 marks timing invalid. Both the evaluator and report helper reject explicitly
 excluded timing. The earlier isolated candidate comparison is retained separately.
+
+A subsequent matched 20-forward comparison completed on exclusively leased
+GPUs 0–3. Both backends pass automatic media checks, and inspected frames no
+longer show the severe two-forward artifacts. Flash-V100 took 113.459387 s
+(5.672969 s/call); FlashInfer took 105.642574 s (5.282129 s/call). Both used the
+same INT8 checkpoint, prompt, seed, 39 frames, cached text and shift rules.
+Full primary acceptance and human audiovisual review remain pending.
