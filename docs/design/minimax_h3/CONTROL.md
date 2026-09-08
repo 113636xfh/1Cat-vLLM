@@ -75,6 +75,10 @@ Preserve failed or unselected experiments rather than repeat them unchanged:
 - Q32/K64 attention measured 28.025 ms versus 27.575 ms control. A persistent
   shared-Q prototype measured 24.784 versus 25.083 ms with clock variation;
   this does not establish a useful complete-model gain. Neither is enabled.
+- Manually staging the full PV value tile took 87.811 versus 23.785 ms;
+  128-bit vector loads/stores reduced this to 31.587 versus 24.302 ms, still
+  slower. Both matched control values but are rejected; retain these prototypes
+  in `flashattention-lowmem50/attention-failed-paths.json`.
 - Head-major and sequence-padding copies add storage traffic with no clear
   benefit. Approximate exp2 variants add no clear gain over the exact full-tile
   specialization and are not enabled.
