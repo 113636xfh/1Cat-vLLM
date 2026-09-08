@@ -200,11 +200,19 @@ __global__ __launch_bounds__(THREADS,
     }
     __syncthreads();
     if (start + BK < length) {
-      *reinterpret_cast<uint4*>(ks + (tid / (D / 8)) * QLD + next_col) =
-          next_k.packed;
+      const int tile_row = tid / (D / 8);
+      *reinterpret_cast<uint4*>(ks + tile_row * QLD + next_col) = next_k.packed;
+      // Reuse dead P storage to transpose V cooperatively. Direct strided
+      // stores from each thread's eight contiguous values collide heavily.
+      static_assert(BQ * PLD >= BK * QLD);
+      *reinterpret_cast<uint4*>(probabilities + tile_row * QLD + next_col) =
+          next_v.packed;
+      __syncthreads();
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
-        vs[(next_col + j) * VLD + tid / (D / 8)] = next_v.values[j];
+      for (int i = tid; i < D * BK; i += THREADS) {
+        const int d = i / BK, kv = i % BK;
+        vs[d * VLD + kv] = probabilities[kv * QLD + d];
+      }
     }
   }
   {
