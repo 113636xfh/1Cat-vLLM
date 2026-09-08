@@ -446,3 +446,40 @@ eight-step real outputs and other artifact versions, additional seeds, full
 quality/audio review and release-wheel validation. FlashGen, FastH3, combined
 partition serving and upstream multipart upload semantics remain separate
 work. Keep the change Draft until its required review/quality gates pass.
+
+### Direct frontend API expansion (2026-09-08)
+
+The user authorized all official workflow capabilities and clarified that the
+application frontend calls native vLLM APIs directly. ComfyUI integration is
+not required. No ComfyUI source or runtime has been added. The full remaining
+scope is retained in [ADAPTATION.md](ADAPTATION.md).
+
+Continuing the owned PR #565 branch from `92e8c18e2beda42303268979b89519908740fd1c`:
+
+- Added JSON and multipart request normalization, typed HTTP(S)/data URL
+  references and request-owned temporary media. File names cannot choose staging
+  destinations; media size/type/metadata checks run before worker dispatch.
+- Added synchronous MP4 return, multiple outputs with seed offsets, async job
+  listing/deletion, indexed downloads and model discovery. The frontend contract
+  and examples are in [API.md](API.md), and `/openapi.json` includes request schemas.
+- Preserved native adapter defaults consistently across transports: a startup
+  adapter is active unless `lora_scale=0`. A request `lora` object must select
+  that loaded file. This differs from upstream's preload-only PEFT default and
+  is documented explicitly; adding `model` does not toggle activation.
+- Tests cover 11 input combinations, source-file preservation, staged-file
+  cleanup, malformed requests, sync/async results, output indexing and schemas.
+
+CPU command and result: the existing `PATH="$PWD/.venv/bin:$PATH"
+CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest --confcutdir=tests/video
+tests/video -q` passed **110 tests**, with 8 GPU-only tests skipped. The complete
+pre-commit checks on changed files passed. Raw records are
+`/data/minimax-h3/workflows-lora-20260908/api-cpu-all.log` and
+`api-precommit.log`; changed API source hashes are in `api-source-hashes.json`.
+
+The new ASGI-to-native-engine mixed Ref2VA test was attempted once using
+`run_api_reference.py`, with actual image/video/audio uploads, INT8 ConvRot TP4,
+Ref2V four-step v0.1, 1344x768, 4.4 requested seconds, seed 42 and shifts 12/3.
+It exited with status 75 before model loading because neither GPU group was
+free and unleased. Record: `api-ref2va.log`. No GPU generation result is claimed
+for this API revision; no owned workers, service ports or GPU leases remain.
+Retry only after resource ownership changes. The other tasks were not stopped.

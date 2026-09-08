@@ -7,6 +7,8 @@ is required.
 
 For explicit workflow selection, reference-video offsets and four/eight-step
 LightX2V Turbo LoRA, see [Workflows and distilled LoRA](WORKFLOWS.md).
+The application frontend calls the [native video API](API.md) directly.
+The [adaptation tracker](ADAPTATION.md) records the remaining official workflows.
 
 The supported deployment contract is Python 3.12, Torch 2.10.0+cu128, CUDA Toolkit
 12.8 and V100/SM70. Install the normal 1Cat source build with its `video` extra;
@@ -66,10 +68,10 @@ curl -sS http://127.0.0.1:8000/v1/videos \
 ```
 
 `POST /v1/videos` returns a job ID. Query `GET /v1/videos/{id}` and download
-`GET /v1/videos/{id}/content` after completion. `/health` reports readiness;
-`/metrics` reports the queue and job counters. Reference paths refer to files
-available to the server process. Jobs are kept in memory for the current service
-lifetime; generated files remain in the configured output directory.
+`GET /v1/videos/{id}/content` after completion. The service also supports
+multipart uploads, typed reference URLs, synchronous MP4 responses, multiple
+outputs, job listing/deletion and OpenAPI request schemas. See [API.md](API.md)
+for the frontend contract, ownership/cleanup behavior and adapter defaults.
 
 `FLASH_ATTN_V100` is the default denoiser and the main performance-development
 path. With the H3 SM70 extensions it selects the dedicated non-causal D128

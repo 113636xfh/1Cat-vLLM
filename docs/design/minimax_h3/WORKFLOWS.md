@@ -102,8 +102,10 @@ positions, so the 39-frame audio truncation is too short. Official 4–15-second
 output requests do not encounter that development-only boundary.
 
 Serving uses the same deployment flags with `vllm video serve`. Native HTTP
-accepts JSON and local reference paths; it is not the upstream multipart-upload
-API. For example, on a Ref2VA server with its matching Turbo adapter:
+accepts JSON, local reference paths, typed URLs/data URLs and multipart uploads.
+The application frontend calls this API directly; see [API.md](API.md) for
+sync/async requests, multiple outputs, task cleanup and OpenAPI. For example,
+on a Ref2VA server with its matching Turbo adapter:
 
 ```json
 {
@@ -153,5 +155,6 @@ FlashGen's fused native QKV/AdaLN tensors and pinned DMD2 schedule need a
 separate loader; its target AdaLN shape also conflicts with pruned checkpoints.
 FastH3 adds full-rank deltas and sampling/attention requirements, so it cannot
 be accepted by renaming a LightX2V file. These two families, combined-partition
-serving, upstream multipart uploads, step batching, DLO and approximate caches
-remain outside this implementation.
+serving, step batching, DLO and approximate caches remain pending in the
+authorized [adaptation tracker](ADAPTATION.md). Multipart input and the broader
+video task API have now been implemented, with GPU acceptance tracked separately.
