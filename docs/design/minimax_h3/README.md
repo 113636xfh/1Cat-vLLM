@@ -79,3 +79,9 @@ replace the five-axis human quality review. Useful TFLOPS use actual local
 matrix dimensions and valid attention tokens, exclude padding/rotation/dequant,
 and divide by the maximum complete denoise duration across all four ranks.
 NVML utilization and standalone operator speed are diagnostic evidence only.
+
+The native engine reserves a whole available GPU group (0–3 first, then 4–7)
+with the shared 1Cat V100 per-card and group locks. The lease remains held until
+its workers exit. A group reserved by another cooperating task is unavailable
+even while that task is between CUDA processes. If both groups are occupied or
+reserved, startup fails before model loading.
