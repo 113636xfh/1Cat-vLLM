@@ -159,8 +159,11 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     branch = tl.load(
         branch_ptr + row * stride_branch_row + columns, mask=mask, other=0.0
     ).to(tl.float32)
-    # Match the FP16 residual value consumed by the unfused RMSNorm path.
-    updated = (residual + gate * branch).to(tl.float16).to(tl.float32)
+    # Match the stored residual dtype. H3 uses FP32 residuals on Volta because
+    # real checkpoint gates can produce values above FP16's finite range.
+    updated = (
+        (residual + gate * branch).to(residual_out_ptr.dtype.element_ty).to(tl.float32)
+    )
     tl.store(residual_out_ptr + row * hidden_size + columns, updated, mask=mask)
 
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
@@ -252,6 +255,7 @@ def rms_norm_indexed_scale_shift(
     scale: torch.Tensor,
     indices: torch.Tensor,
     eps: float,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Fuse H3 RMSNorm with its indexed AdaLN affine transform."""
     if x.is_cpu:
@@ -263,8 +267,8 @@ def rms_norm_indexed_scale_shift(
         return (
             normalized * (1.0 + scale.index_select(0, indices))
             + shift.index_select(0, indices)
-        ).to(input_dtype)
-    output = torch.empty_like(x)
+        ).to(output_dtype or input_dtype)
+    output = torch.empty_like(x, dtype=output_dtype or x.dtype)
     rows, hidden_size = x.shape
     if rows:
         _rms_norm_indexed_scale_shift_kernel[(rows,)](
@@ -295,6 +299,7 @@ def indexed_gate_rms_norm_scale_shift(
     scale: torch.Tensor,
     indices: torch.Tensor,
     eps: float,
+    output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse gated residual, the following RMSNorm, and AdaLN affine."""
     if residual.is_cpu:
@@ -309,10 +314,10 @@ def indexed_gate_rms_norm_scale_shift(
         modulated_out = (
             normalized * (1.0 + scale.index_select(0, indices))
             + shift.index_select(0, indices)
-        ).to(input_dtype)
+        ).to(output_dtype or input_dtype)
         return residual_out, modulated_out
     residual_out = torch.empty_like(residual)
-    modulated_out = torch.empty_like(residual)
+    modulated_out = torch.empty_like(residual, dtype=output_dtype or residual.dtype)
     rows, hidden_size = residual.shape
     if rows:
         _indexed_gate_rms_norm_scale_shift_kernel[(rows,)](
