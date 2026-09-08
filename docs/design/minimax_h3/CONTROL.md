@@ -11,6 +11,11 @@ off. The below-50-second and >80-TFLOPS/card targets remain incomplete.
 Fresh counters from the retained attention binary show 34.91% Tensor pipe
 activity and 50.09% scheduler cycles without an eligible warp. Three query
 reuse variants regress; the Q128/K128 alias variant spills and is not run.
+Q96/K128 removes spills but remains slower. Replicated INT8 MLP weights with
+local token rows also regress (two updates 6.645113 -> 7.030977 seconds), despite
+removing two MLP collectives; this artifact-only path is rejected without a
+full-video run. Its per-rank valid-row accounting and failed harness attempt
+are recorded in the same document.
 
 Latest retained FlashInfer change: [FLASHINFER_TO50.md](FLASHINFER_TO50.md).
 Q shared-memory swizzling and an exact transposed FP16/cuBLASLt weight cache

@@ -127,6 +127,26 @@ five alternating controls at 1522–1530 MHz. Its 13-length reference check pass
 it is rejected without a full-video run. Fewer softmax iterations did not offset
 reloading Q, staging V and reduced warp parallelism in this implementation.
 
+A further artifact-only control replicates full INT8 FC1/FC2 weights and runs
+each MLP on local residual rows, removing its FP16 all-gather and FP32
+reduce-scatter. All 100 MLP weights/scales are checked exactly against their
+original TP shards before installation. Only the 100 attention projections
+remain in the FP16 cache (3,853,516,800 bytes, within the same 10-GiB budget).
+Two updates regress from **6.645113 to 7.030977 seconds**, while peak Torch
+allocation grows from 16,405,571,072 to 19,280,807,936 bytes/card. Finite outputs
+and rank equality pass; latent relative L2 against residual sharding is
+0.004782 video and 0.002660 audio. This does not justify full-video testing.
+The implementation is not installed: saving collectives did not offset its
+larger-weight GEMM/dequantization cost.
+
+This control explicitly corrects valid MLP rows to 3,088 on ranks 0–2 and
+3,059 on rank 3. The global useful FLOP total equals the baseline; rank 3's
+29 padding rows are excluded. Without this correction, the original counter
+would overcount this new experimental distribution. The first attempt kept
+an obsolete global-row assertion after removing the gather and stopped during
+warmup; its log is retained. `outputs/local-mlp-v2-probe/results.json` contains
+the completed control. No production FLOP accounting was changed.
+
 ## Two-update trace of the native implementation
 
 Nsight Systems captures only the first two updates of the unchanged 21-position
@@ -147,6 +167,9 @@ prioritizing attention operand feeding and communication; launch-gap reduction
 alone cannot close the remaining 16.86-second full-schedule gap. The trace is
 diagnostic, not an additional unprofiled acceptance run. Its capture contains
 module/step NVTX ranges, all four ranks, `steps-breakdown.json` and CSV.
+Rank 0 executes 200 main FP32 reduce-scatter kernels totaling 0.527586 seconds;
+all-gather kernels, including AdaLN and boundary gathers, total 0.313676 seconds.
+The kernel symbols alone do not establish the selected NCCL protocol.
 
 ## Reproduction, evidence and rollback
 
