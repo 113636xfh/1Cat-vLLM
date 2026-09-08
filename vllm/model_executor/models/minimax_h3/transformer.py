@@ -21,8 +21,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -42,9 +40,12 @@ from .modulation import (
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
 from .quantization import (
+    H3MergedColumnParallelLinear,
+    H3QKVParallelLinear,
     H3RowParallelLinear,
     Int8ConvRotLinearMethod,
     preserve_fp32_output,
+    rotate_local_fp16,
 )
 
 if TYPE_CHECKING:
@@ -375,7 +376,7 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = arch.attention_head_dim
         inner_dim = self.total_num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = H3QKVParallelLinear(
             hidden_size=arch.hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
@@ -547,6 +548,7 @@ class MiniMaxH3Attention(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        input_is_rotated: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -560,7 +562,10 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        if input_is_rotated:
+            qkv, _ = self.qkv_proj(x, input_is_rotated=True)
+        else:
+            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -610,7 +615,7 @@ class MiniMaxH3MLP(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        self.fc1 = MergedColumnParallelLinear(
+        self.fc1 = H3MergedColumnParallelLinear(
             arch.hidden_size,
             [arch.ffn_hidden_size, arch.ffn_hidden_size],
             bias=False,
@@ -633,8 +638,11 @@ class MiniMaxH3MLP(nn.Module):
         )
         preserve_fp32_output(self.fc2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
+    def forward(self, x: torch.Tensor, *, input_is_rotated=False) -> torch.Tensor:
+        if input_is_rotated:
+            hidden, _ = self.fc1(x, input_is_rotated=True)
+        else:
+            hidden, _ = self.fc1(x)
         if (
             hidden.is_cuda
             and hidden.dtype == torch.float16
@@ -890,8 +898,11 @@ class MiniMaxH3DiTBlock(nn.Module):
             self.norm1.variance_epsilon,
             output_dtype=_COMPUTE_DTYPE,
         )
+        input_is_rotated = False
         if group is not None:
-            # Gather only after the existing normalization's FP16 boundary.
+            # Rotation is row-independent. Compute it once on each row's owner,
+            # after the existing FP16 boundary, then gather its exact FP16 bits.
+            h, input_is_rotated = rotate_local_fp16(self.attn.qkv_proj, h)
             h = group.all_gather(h, dim=0)
         h = self.attn(
             h,
@@ -902,6 +913,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
+            input_is_rotated=input_is_rotated,
         )
         if group is not None:
             h = group.reduce_scatter(h, dim=0)
@@ -917,9 +929,11 @@ class MiniMaxH3DiTBlock(nn.Module):
             output_dtype=_COMPUTE_DTYPE,
         )
         residual = x
+        input_is_rotated = False
         if group is not None:
+            h, input_is_rotated = rotate_local_fp16(self.mlp.fc1, h)
             h = group.all_gather(h, dim=0)
-        h = self.mlp(h)
+        h = self.mlp(h, input_is_rotated=input_is_rotated)
         if group is not None:
             h = group.reduce_scatter(h, dim=0)
         return indexed_gate(residual, gate_mlp, h, combined_indices)

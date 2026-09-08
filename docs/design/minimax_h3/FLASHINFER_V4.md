@@ -130,7 +130,7 @@ initial worker-child exit message did not invalidate the capture: the target
 kernel completed 24 passes, reported finite output and the expected binary
 hash, and NCU exited successfully. Task-owned GPU reservations are released.
 
-The next investigation should preserve TP summation order: overlap FP16
-all-gather with column projections and consider moving row-independent
-ConvRot before the gather. These are unmeasured hypotheses, requiring the
-same exact-output gate before integration; they are not credited as savings.
+The follow-up in
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md) moves ConvRot
+before the gather and preserves exact outputs. Its gather/projection overlap
+control adds no model benefit and is not integrated.

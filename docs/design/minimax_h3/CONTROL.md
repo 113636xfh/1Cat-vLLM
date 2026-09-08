@@ -1,5 +1,18 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer change:
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md).
+Rotate FP16 rows on their owner before all-gather, avoiding duplicated QKV/MLP
+ConvRot while retaining exact matrix operations and TP sums. The unchanged
+39-frame/20-update run takes 61.538397 seconds, 56.286054 useful TFLOPS/card;
+final video/audio latents and fresh MP4 remain bitwise equal. The 123-test
+suite and both independently launched TP4 regressions pass. Current tracing
+attributes 41.10% to GEMM, 39.81% to attention, 13.52% to communication and
+1.02% to ConvRot. Gather/projection overlap, Q64 aliased K/V and updated Q32/N64
+reuse controls do not improve the selected path and are rejected. The combined
+distributed test launcher hang is retained; use separate torchrun lifetimes.
+Human quality, <50 seconds and >80 TFLOPS remain open.
+
 Latest FlashInfer change: [FLASHINFER_V4.md](FLASHINFER_V4.md).
 Four-row exact V transposition permits 64-bit shared stores, reducing the
 unchanged 39-frame/20-update denoise to 62.434779 seconds and 55.477950 useful

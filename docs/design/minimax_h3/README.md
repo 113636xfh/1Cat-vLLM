@@ -1,9 +1,10 @@
 # Native MiniMax H3 (development)
 
 The latest optional residual-sharded FlashInfer development run completes
-39 frames and 20 denoise updates in 62.434779 seconds, with unchanged
-video/audio latents and fresh MP4. See [FLASHINFER_V4.md](FLASHINFER_V4.md)
-for the exact four-row V transpose, validation and remaining gates.
+39 frames and 20 denoise updates in 61.538397 seconds, with unchanged
+video/audio latents and fresh MP4. See
+[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md) for local ConvRot,
+the current bottleneck trace, validation and remaining gates.
 The numerical-drift overlap experiment is rejected; see
 [FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md).
 
