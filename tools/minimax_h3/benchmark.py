@@ -24,7 +24,7 @@ def main():
     parser.add_argument(
         "--attention-backend",
         choices=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
-        default="FLASHINFER_SM70",
+        default="FLASH_ATTN_V100",
     )
     args = parser.parse_args()
     inspect_comfy_checkpoint(args.transformer_path, expected_partition="fl2va")

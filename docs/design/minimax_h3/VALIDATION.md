@@ -1,9 +1,28 @@
 # H3 reproducible validation
 
 This draft has not passed the full-video quality or per-GPU 80 TFLOPS gates.
-Component numerics and short cached-text generation are working. FlashInfer-SM70
+Component numerics and short cached-text generation are working. FlashAttention-V100
 is the user-selected mainline and the default denoiser. Keep profiler
 diagnostics separate from the three formal timing runs.
+
+The dedicated D128 FlashAttention-V100 route completes the INT8 FL2VA
+1344x768/39-frame/seed42/20-update development workload in 77.342982 s,
+or 3.867149 s/update and 44.784329 useful TFLOPS on each of GPU0-3.
+The comparison FlashInfer checkpoint takes 86.200372 s with the same W8A16
+preparation and cache-off settings. This is one unprofiled complete denoise
+measurement after a one-call warmup, using verified cached text embeddings.
+Fresh VAE decode takes 5.650908 s, excluding its 35.935474 s load.
+Automatic media checks pass; full human audiovisual quality remains pending.
+Video/audio latents differ from FlashInfer (relative L2 0.107541/0.018019),
+so this route does not claim bitwise equivalence or reuse its decoded output.
+
+The native route, independent memory/synchronization checks, matched operator
+benchmarks and NCU counters are documented in `CONTROL.md`. Source/build logs,
+the per-rank report, NVML curves and generated media are retained under
+`/data/minimax-h3/native-h3-20260908/flashattention-mainline/` and
+`/data/minimax-h3/native-h3-20260908/outputs/quality39-int8-flashattn-fused-20steps/`.
+The primary 243-frame warmup/three-run contract has not been executed for this
+candidate. **80 TFLOPS/card is not achieved.**
 
 ## Short development checks
 
@@ -13,7 +32,7 @@ extent while developing kernels or debugging components:
 ```bash
 vllm video generate --model /path/to/MiniMax-H3 \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  --tensor-parallel-size 4 --attention-backend FLASHINFER_SM70 \
+  --tensor-parallel-size 4 --attention-backend FLASH_ATTN_V100 \
   --num-frames 39 --num-inference-steps 21 --output-dir /path/to/development
 ```
 
@@ -38,12 +57,12 @@ python tools/minimax_h3/fixtures.py --model-root /path/to/MiniMax-H3 \
   --output-dir /path/to/reference-fixtures
 python tools/minimax_h3/benchmark.py --model /path/to/MiniMax-H3 \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  --attention-backend FLASHINFER_SM70 --output-dir /path/to/acceptance
+  --attention-backend FLASH_ATTN_V100 --output-dir /path/to/acceptance
 ```
 
 The runner performs one warmup and three unprofiled requests in one engine.
 The warmup's automatic media checks must pass before formal timing starts.
-Use `FLASH_ATTN_V100` for an explicit comparison or rollback. A nonzero FP16
+Use `FLASHINFER_SM70` for an explicit comparison or rollback. A nonzero FP16
 weight-cache budget requires an explicit measured list of `--fp16-cache-layer`
 arguments. The default budget is zero.
 
