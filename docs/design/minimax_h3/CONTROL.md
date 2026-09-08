@@ -431,3 +431,44 @@ Evidence: `prefetch-long-results.json`, `prefetch-final-tests.log`,
 `prefetch-cmake-build.log`, `profiles/flashinfer-prefetch-short.*`, and
 `outputs/quality39-int8-prefetch-20steps/`. The previous binary is retained as
 `flashinfer-register-baseline.so` for exact rollback/AB comparison.
+
+### Selected cooperative V transpose
+
+The selected follow-up reuses the consumed probability tile as temporary
+row-major V storage, synchronizes, and writes the column-major V tile
+cooperatively. This removes the direct strided-store pattern without changing
+floating-point arithmetic. The final binary SHA256 is
+`339ceba5f296faba8c4a13a0ebed7788a5f2f795ab39d7a5c6c3d3353dbb0186`;
+compilation uses 127 registers/thread and reports no spills.
+
+At 12323 tokens with observed SM clocks at 1530 MHz throughout the timed
+comparison, medians are 38.209343 ms for direct prefetch stores, 34.983711 ms
+for cooperative transpose and 35.778271 ms for an additional XOR-swizzle
+candidate. Outputs are bitwise equal; reject the slower extra-swizzle variant.
+An earlier warmed long-shape bracket at 73483 tokens gives 1334.623779 versus
+1223.218689 ms for direct versus cooperative stores. These remain isolated
+operator results and are not used as model acceptance figures.
+
+The same complete 20-update INT8 short request takes 87.824099 s
+(4.391205 s/update), giving 39.439671 useful TFLOPS on every rank. Both final
+latent tensors are bitwise equal to the prior validated video/audio tensors.
+The diagnostic therefore reuses the unchanged decoder's prior output only
+after verifying both equalities and the MP4 hash. Its explicit mode is
+`short_clip_denoise_quality_with_reused_decode`; no fresh VAE or end-to-end
+service timing is claimed. The original register-softmax baseline was
+105.642574 s and 32.787478 TFLOPS/rank. The >80 gate remains unmet.
+
+All 47 video tests pass with the final binary. CUDA12.8 memcheck, racecheck and
+synccheck each pass all six tail/unaligned cases, with zero errors/hazards.
+The standard CMake component build passes. Final matched-shape NCU measures
+25.091% tensor-pipe activity, 0.580% long-scoreboard stalls, 0.872 billion
+shared-load conflicts and 0.101 billion shared-store conflicts. The remaining
+25% theoretical active-warp limit, shared-load stalls and matrix scheduling
+need further attention; the previous full-step trace also records nontrivial
+TP communication. Hardware counters are not full-model TFLOPS.
+
+Evidence: `transpose-candidates-warm.json`, `cooperative-long-results.json`,
+`cooperative-final-tests.log`, `cooperative-{memcheck,racecheck,synccheck}.log`,
+`cooperative-cmake-build.log`, `profiles/flashinfer-cooperative-short.*`, and
+`outputs/quality39-int8-cooperative-20steps/`. The prior accepted prefetch
+binary is retained as `flashinfer-prefetch-baseline.so`.
