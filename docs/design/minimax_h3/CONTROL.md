@@ -536,3 +536,67 @@ Next acceptance: uninterrupted mixed-reference API generation and FlashGen
 T2VA, with measured restoration residency, every-rank call counts, output decode
 and video/audio review. FastH3 and the rest of the authorized workflow tracker
 remain outstanding; this checkpoint is not full workflow completion.
+
+### FastH3 Dense native fusion and four-step API (2026-09-08)
+
+Continues owned PR #565 from `54d72466f3a81426fc8afe0bf481da7c8e60c4dd`.
+Native model/frontend scope and the Python 3.12.13, Torch 2.10.0+cu128,
+CUDA 12.8 environment remain unchanged.
+
+- Added explicit FastH3 Dense release identification, rank-64 pairing, declared
+  tensor counts and complete 50-block / 2-refiner coverage checks. The official
+  artifact's 809 tensors contain 362 low-rank pairs and 85 full-rank weight/bias
+  deltas, targeting 343 native parameters.
+- Fusion reconstructs FP32 deltas in the original grouped-QKV and gate/up
+  layout, rounds to the source checkpoint dtype and enters normal native TP
+  loading before pinned staging snapshots the host model. Mapped FP32 adapter
+  tensors are not modified. Missing, duplicate and unapplied edits fail startup.
+- The CLI/HTTP contract fixes T2VA-only FL2VA, four intervals, shifts 12/3 and
+  `[0.999, 0.749, 0.5, 0.25, 0]`. Omitted sampling values follow that contract.
+  Fused weights require request scale 1; request `lora` selection is rejected.
+  Restart without the adapter to recover the base model.
+- This implementation requires original weights. Serialized INT8 fusion and
+  VSA execution are rejected and remain separate implementation work. Native
+  staging runs after fusion; it does not use Omni's fusion-bypassing host-plan
+  path, which is why the upstream offload restriction is not copied blindly.
+
+The complete official Dense artifact was downloaded and SHA256-verified.
+`UPSTREAM.md` pins the revision and hash. The artifact's declared original base
+and the native pinned base have identical hashes for all 81 FL2VA files.
+
+Validation from the owned worktree:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES='' \
+  .venv/bin/python -m pytest --confcutdir=tests/video tests/video -q
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES='' .venv/bin/python \
+  /data/minimax-h3/workflows-lora-20260908/fasth3/validate_production_fusion.py
+```
+
+The final video suite passes **171 tests**, with **9 GPU-only tests skipped**.
+The 29 new CPU tests cover release metadata, partial layouts, checkpoint dtype
+rounding, full-rank/bias edits, original INT8 refusal, malformed base streams,
+actual native TP1/2/4 loaders, CPU staging snapshot/restore and API restrictions.
+A CUDA-versus-CPU fusion regression is present but has not run without a lease.
+
+The real-weight CPU audit fused **all 343 parameters** (66,279,468,032 bytes
+of reconstructed source-dtype weights, streamed without retaining a full copy).
+Nine representative QKV, row projection, FFN, AdaLN, refiner and patch-projection
+weights/biases match the pinned upstream fusion implementation bit for bit.
+Every reconstructed tensor is finite and every edit is accounted for. The
+four-thread CPU diagnostic took 171.429758 s and peaked at 9.180790 GiB process
+RSS. It includes selected oracle reconstruction and comparison; it is not
+native worker startup time, deployed host residency, GPU peak or inference speed.
+
+Both four-GPU groups were already leased when inspected. GPU0-3 belonged to
+the separate H3 kernel task (PID 526342); GPU4-7 belonged to the other lease
+scheduler (PID 48286). No GPU test was launched for this revision. FlashGen,
+FastH3 and mixed-reference API generation, CUDA fusion numerics, actual staging
+transfers, memory peaks and audio/video quality remain pending GPU acceptance.
+
+Evidence under `/data/minimax-h3/workflows-lora-20260908/fasth3/`:
+`download-verified.json`, `base-compatibility.json`, `native-index.json`,
+`cpu-all-final.log`, `cpu-final.log`, `precommit.log`,
+`validate_production_fusion.py`, `production-fusion.log` and
+`production-fusion.json`. Model weights and raw artifacts remain outside Git.
+Keep this work Draft; the wider authorized tracker remains in `ADAPTATION.md`.

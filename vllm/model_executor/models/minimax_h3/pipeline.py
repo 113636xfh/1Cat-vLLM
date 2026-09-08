@@ -428,14 +428,11 @@ class MiniMaxH3Pipeline(nn.Module):
         self.config = config
         self.partition = config.partition
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
+        from .fasth3 import FastH3Fusion, FastH3Spec
         from .flashgen import FlashGenSpec, restore_dense_adaln_weights
-        from .lora import inspect_adapter
+        from .lora import inspect_deployment_adapter, select_adapter_file
 
-        adapter_spec = (
-            inspect_adapter(config.lora_path, config.partition)
-            if config.lora_path
-            else None
-        )
+        adapter_spec = inspect_deployment_adapter(config) if config.lora_path else None
         self.model_root = resolve_model_root(
             config,
             require_original_transformer=isinstance(adapter_spec, FlashGenSpec),
@@ -458,6 +455,17 @@ class MiniMaxH3Pipeline(nn.Module):
         self._base_schedule_by_partition = {
             self.partition: _read_base_schedule(release)
         }
+        if (
+            adapter_spec is not None
+            and self._base_schedule_by_partition[self.partition] is not None
+        ):
+            raise H3InputError(
+                "H3 LoRA cannot overlay an already distilled base_schedule"
+            )
+        if isinstance(adapter_spec, FastH3Spec):
+            if (self.default_video_shift, self.default_audio_shift) != (12.0, 3.0):
+                raise H3InputError("FastH3 requires base video/audio shifts 12/3")
+            self.supported_tasks = adapter_spec.supported_tasks
         transformer_path = path / "transformer"
         quant = None
         overrides = None
@@ -486,7 +494,18 @@ class MiniMaxH3Pipeline(nn.Module):
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
+        fusion = None
+        if isinstance(adapter_spec, FastH3Spec):
+            fusion = FastH3Fusion(
+                select_adapter_file(config.lora_path),
+                partition=config.partition,
+                head_dim=self.transformer.arch.attention_head_dim,
+                device=self.device,
+            )
+            weights = fusion.apply(weights)
         loaded = self.transformer.load_weights(weights)
+        if fusion is not None:
+            fusion.validate_fully_applied(loaded)
         required = set(dict(self.transformer.named_parameters()))
         required.update(dict(self.transformer.named_buffers()))
         missing = required - loaded
@@ -498,13 +517,11 @@ class MiniMaxH3Pipeline(nn.Module):
                 method.process_weights_after_loading(layer)
         self.transformer.post_load_weights()
         self.turbo_spec = None
-        if config.lora_path:
+        if fusion is not None:
+            self.turbo_spec = fusion.spec
+        elif config.lora_path:
             from .lora import install_adapter
 
-            if self._base_schedule_by_partition[self.partition] is not None:
-                raise H3InputError(
-                    "H3 LoRA cannot overlay an already distilled base_schedule"
-                )
             self.turbo_spec = install_adapter(
                 self.transformer, config.lora_path, self.partition
             )
@@ -550,11 +567,12 @@ class MiniMaxH3Pipeline(nn.Module):
         return self.transformer
 
     def _resolve_sigma_positions(self, task, sampling):
-        if getattr(self, "turbo_spec", None) is not None and sampling.lora_scale != 0:
+        if getattr(self, "turbo_spec", None) is not None:
             from .lora import validate_adapter_sampling
 
             validate_adapter_sampling(self.turbo_spec, task, sampling)
-            return self.turbo_spec.base_schedule, self.turbo_spec.api_steps
+            if sampling.lora_scale != 0:
+                return self.turbo_spec.base_schedule, self.turbo_spec.api_steps
         schedule = self._base_schedule_for_task(task)
         if schedule is None:
             return None, sampling.num_inference_steps

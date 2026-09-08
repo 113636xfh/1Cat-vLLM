@@ -140,10 +140,11 @@ leave the engine usable.
 
 Start with a supported adapter in `--lora-path`. JSON and multipart use the same
 default: the loaded adapter is active at scale 1, and omitted steps/shifts follow
-its contract. `lora_scale=0` bypasses it and restores base sampling defaults.
+its contract. For LightX2V and FlashGen, `lora_scale=0` bypasses the adapter and
+restores base sampling defaults. Fused FastH3 Dense requires scale 1.
 Adding a `model` or `extra_params` field never changes adapter activation.
 
-The optional `lora` object accepts `path` (or `local_path`), `name`, `scale`, and
+For LightX2V/FlashGen, the optional `lora` object accepts `path` (or `local_path`), `name`, `scale`, and
 `int_id`. Its path must resolve to the preloaded adapter. It selects that adapter
 and scale; arbitrary hot loading is not yet implemented. This native startup
 default differs from upstream PEFT's preload-only behavior.
@@ -174,6 +175,14 @@ modules; restart without the adapter to return to the pruned base. See
 original-weight and memory requirements. CPU validation has passed; actual
 FlashGen GPU generation and quality acceptance remain pending.
 
+FastH3 Dense uses `task=t2va`, `num_inference_steps=4` and video/audio shifts
+12/3, also selected when omitted. Its released sigma positions are
+`[0.999, 0.749, 0.5, 0.25, 0]`. It is fused at startup: per-request `lora` and
+`lora_scale` values other than 1 return HTTP 422. Restart without the adapter
+to recover the base model. Use the original weights; native INT8 fusion and
+VSA variants remain unsupported. See [FastH3 deployment](WORKFLOWS.md#fasth3-dense-four-step-t2va).
+GPU generation and quality acceptance remain pending.
+
 ## Scope and validation
 
 The interface changes have CPU coverage for real media parsing and fake-engine
@@ -182,7 +191,7 @@ seeds and OpenAPI. These tests do not establish GPU generation or video quality.
 Current model evidence and pending acceptance are recorded in [CONTROL.md](CONTROL.md).
 
 `quality=lossless` selects the existing reference path. `high`, cache policies,
-FastH3, combined partition routing and additional execution modes remain
+FastH3 VSA, combined partition routing and additional execution modes remain
 tracked implementation work in [ADAPTATION.md](ADAPTATION.md), not accepted
 no-op parameters. Generic neutral CFG fields are accepted at 1; H3 has no
 negative CFG branch. Native VAE tiling remains deployment-controlled.

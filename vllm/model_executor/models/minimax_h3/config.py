@@ -139,10 +139,16 @@ def sampling_for_deployment(
     Python callers can also use this helper instead of specifying sigma points.
     """
     spec = None
-    if config.lora_path and lora_scale != 0:
-        from .lora import inspect_adapter
+    if config.lora_path:
+        from .fasth3 import FastH3Spec
+        from .lora import inspect_deployment_adapter
 
-        spec = inspect_adapter(config.lora_path, config.partition)
+        candidate = inspect_deployment_adapter(config)
+        if isinstance(candidate, FastH3Spec) and lora_scale != 1:
+            raise H3InputError("FastH3 is fused; request lora_scale must be 1")
+        if lora_scale != 0:
+            spec = candidate
+    if spec is not None:
         extra = dict(kwargs.get("extra_args") or {})
         extra.setdefault("flow_shift", spec.video_shift)
         extra.setdefault("audio_flow_shift", spec.audio_shift)

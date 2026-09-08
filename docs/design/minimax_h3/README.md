@@ -6,7 +6,7 @@ records completed tests and remaining gates. No separate vllm-omni installation
 is required.
 
 For explicit workflow selection, reference-video offsets, four/eight-step
-LightX2V Turbo and four-step FlashGen, see [Workflows and distilled LoRA](WORKFLOWS.md).
+LightX2V Turbo, FlashGen and FastH3 Dense, see [Workflows and distilled LoRA](WORKFLOWS.md).
 The application frontend calls the [native video API](API.md) directly.
 The [adaptation tracker](ADAPTATION.md) records the remaining official workflows.
 

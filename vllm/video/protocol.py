@@ -138,6 +138,16 @@ class VideoRequest(BaseModel):
             raise H3InputError("H3 short_edge must be 768")
         scale = self.lora_scale
         if self.lora is not None:
+            if config.lora_path:
+                from vllm.model_executor.models.minimax_h3.fasth3 import FastH3Spec
+                from vllm.model_executor.models.minimax_h3.lora import (
+                    inspect_deployment_adapter,
+                )
+
+                if isinstance(inspect_deployment_adapter(config), FastH3Spec):
+                    raise H3InputError(
+                        "FastH3 is fused; per-request lora is unavailable"
+                    )
             if (
                 self.lora.path is not None
                 and self.lora.local_path is not None

@@ -16,8 +16,11 @@ layout and metadata schedule follow `diffusion/models/minimax_h3/npu/lora.py`
 at the initial pinned Omni revision. The export is device-independent; native
 execution uses the same SM70 staged delta path. The pruned INT8 integration
 restores original dense AdaLN/time tensors, preserving backbone INT8 data.
-Approximate diffusion caches, step batching, Ulysses/Ring parallelism, FastH3,
-and other model families remain outside this implementation. Model weights and checkpoint
+FastH3 Dense mapping and fusion follow `diffusion/models/minimax_h3/fasth3.py`
+at the initial pinned Omni revision. Original weights are fused before native
+TP loading and staging; native INT8 fusion and VSA remain unimplemented.
+Approximate diffusion caches, step batching, Ulysses/Ring parallelism and other
+model families remain outside this implementation. Model weights and checkpoint
 remote code retain their respective upstream terms; they are not vendored here.
 
 Frozen model revisions:
@@ -30,3 +33,9 @@ Frozen model revisions:
   File: `minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors`;
   size 1,258,539,599 bytes;
   SHA256 `0e17fff71d76db497707328a49d61dd7bcd0a375beabef5ae7e93234d15dff00`.
+- FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA:
+  `f509e629374cac104e7f62daecce6d1488a3041d`.
+  File: `dense-datafree/adapter_model.safetensors`, 1,485,626,152 bytes;
+  verified SHA256 `4ce198c83132251b7fd0de2503823aa49c53983f068318f66cb19eaefb7fcc12`.
+  Its declared base revision `9bfb6693f2cf6de171db46d1aa586f67d773a1da`
+  has the same blob/LFS hashes for all 81 FL2VA files as the native pinned base.

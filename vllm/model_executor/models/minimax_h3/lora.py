@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
 
 from .config import H3InputError
+from .fasth3 import FASTH3_FILENAME, FastH3Spec
 from .flashgen import FLASHGEN_FILENAME, FlashGenSpec
 from .quantization import fp16_gemm_input
 
@@ -117,18 +118,25 @@ def select_adapter_file(artifact: str | Path) -> Path:
         candidates = sorted(
             file
             for file in path.glob("*.safetensors")
-            if file.name == FLASHGEN_FILENAME or parse_turbo_filename(file.name)
+            if file.name in (FLASHGEN_FILENAME, FASTH3_FILENAME)
+            or parse_turbo_filename(file.name)
         )
         if len(candidates) != 1:
             raise H3InputError("--lora-path must select exactly one H3 adapter")
         path = candidates[0]
-    if path.is_file() and path.name == FLASHGEN_FILENAME:
+    if path.is_file() and path.name in (FLASHGEN_FILENAME, FASTH3_FILENAME):
         return path
     return select_turbo_file(path)
 
 
-def inspect_adapter(artifact: str | Path, partition: str) -> TurboSpec | FlashGenSpec:
+def inspect_adapter(
+    artifact: str | Path, partition: str
+) -> TurboSpec | FlashGenSpec | FastH3Spec:
     path = select_adapter_file(artifact)
+    if path.name == FASTH3_FILENAME:
+        from .fasth3 import inspect_fasth3_lora
+
+        return inspect_fasth3_lora(path, partition)
     if path.name == FLASHGEN_FILENAME:
         from .flashgen import inspect_flashgen_lora
 
@@ -136,8 +144,19 @@ def inspect_adapter(artifact: str | Path, partition: str) -> TurboSpec | FlashGe
     return inspect_turbo_lora(path, partition)
 
 
+def inspect_deployment_adapter(config):
+    spec = inspect_adapter(config.lora_path, config.partition)
+    if isinstance(spec, FastH3Spec) and config.transformer_path:
+        raise H3InputError(
+            "FastH3 Dense fusion requires original weights; omit --transformer-path"
+        )
+    return spec
+
+
 def install_adapter(model, artifact: str | Path, partition: str):
     path = select_adapter_file(artifact)
+    if path.name == FASTH3_FILENAME:
+        raise H3InputError("FastH3 must be fused before loading and CPU staging")
     if path.name == FLASHGEN_FILENAME:
         from .flashgen import install_flashgen_lora
 
@@ -196,8 +215,10 @@ def validate_turbo_sampling(spec: TurboSpec, task: str, sampling) -> None:
 
 
 def validate_adapter_sampling(
-    spec: TurboSpec | FlashGenSpec, task: str, sampling
+    spec: TurboSpec | FlashGenSpec | FastH3Spec, task: str, sampling
 ) -> None:
+    if isinstance(spec, FastH3Spec) and sampling.lora_scale != 1:
+        raise H3InputError("FastH3 is fused; request lora_scale must be 1")
     if sampling.lora_scale == 0:
         return
     if task not in spec.supported_tasks:

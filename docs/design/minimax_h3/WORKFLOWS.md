@@ -65,10 +65,9 @@ with LightX2V's reference default 8 when metadata omits it.
 | `ref2v_turbo_8step_v1.0_768p_bf16` | Ref2VA | 8 | 9 | 6 | 8 |
 
 `--lora-path` accepts one local file, or a directory containing exactly one
-recognized artifact. ComfyUI fused exports, renamed files and FastH3 bundles
-are refused instead of being interpreted as this layout. FlashGen uses the
-separate native loader described below. FL2V and Ref2V adapters require their
-matching base partition.
+recognized artifact. ComfyUI fused exports and renamed files are refused instead
+of being interpreted as this layout. FlashGen and FastH3 Dense use their separate
+loaders described below. FL2V and Ref2V adapters require their matching base partition.
 
 One immutable adapter is loaded at engine startup. Requests apply a multiplier
 `--lora-scale` / `lora_scale` (default 1) to `alpha / rank`. Setting it to zero
@@ -161,6 +160,49 @@ the restored dense AdaLN/time modules. It does not return to the earlier pruned
 base bit for bit. Restart without `--lora-path` to recover that exact deployment.
 Original-checkpoint deployments do not need AdaLN restoration.
 
+## FastH3 Dense four-step T2VA
+
+Download the explicit dense adapter from the
+[FastVideo release](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA):
+
+```bash
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors \
+  --revision f509e629374cac104e7f62daecce6d1488a3041d \
+  --local-dir ./fasth3
+
+vllm video serve \
+  --model /path/to/MiniMax-H3 --partition fl2va \
+  --tensor-parallel-size 4 --attention-backend FLASHINFER_SM70 \
+  --lora-path ./fasth3/dense-datafree/adapter_model.safetensors
+```
+
+The leaf directory containing that file is also accepted; a repository root
+containing several variants is not guessed. Native FastH3 Dense requires the
+**original transformer weights**; `--transformer-path` is rejected. Serialized
+INT8 fusion and VSA execution remain unimplemented.
+
+This artifact has 809 tensors: 362 rank-64 A/B pairs and 85 full-rank weight/bias
+edits, affecting 343 native parameters. The loader validates release identity,
+metadata counts, pairing and coverage of all 50 DiT and 2 refiner blocks. It
+reconstructs the deltas in FP32, adds them to the original weights, and rounds
+to the checkpoint dtype before the usual native FP16/FP32 TP loading. There is
+no PEFT alpha scaling. Separate Q/K/V deltas are placed into grouped checkpoint
+order; FFN value/gate rows are swapped into native gate/up order.
+
+Fusion runs once during startup, before pinned CPU staging snapshots the model.
+It reads one parameter's edits at a time and verifies that all edits reached the
+model. Native staging therefore retains fused weights. Actual startup cost and
+GPU peak still need measurement; this is not a qualified GPU deployment yet.
+
+Only `task=t2va` is supported. Omitting request steps/shifts selects four
+intervals, `num_inference_steps=4`, video/audio shifts 12/3 and the released
+schedule `[0.999, 0.749, 0.5, 0.25, 0]`. These positions differ from FlashGen's
+four-step schedule. The fused model is immutable: request `lora` selection and
+`lora_scale` values other than 1 return errors. Restart without `--lora-path`
+to recover the base model. Merely setting the request scale to zero cannot undo
+full-rank norm, bias and projection edits.
+
 ## Numerical and memory contract
 
 The LightX2V loader consumes all 624 tensors / 312 A/B pairs, covering 50 DiT blocks
@@ -194,8 +236,8 @@ combination requires its own evidence before being promoted.
 
 FlashGen's loader, schedule and AdaLN restoration have CPU validation, including
 production-sized adapter binding; completed GPU generation remains pending.
-FastH3 adds full-rank deltas and sampling/attention requirements, so it cannot
-be accepted by renaming a LightX2V file. FastH3, combined-partition serving,
+FastH3 Dense has native original-weight fusion and CPU validation; its GPU
+generation remains pending. FastH3 INT8/VSA, combined-partition serving,
 step batching, DLO and approximate caches remain pending in the authorized
 [adaptation tracker](ADAPTATION.md). Multipart input and the broader video task
 API are implemented, with GPU acceptance tracked separately.
