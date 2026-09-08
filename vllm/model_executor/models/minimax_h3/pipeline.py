@@ -33,7 +33,15 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_aug_rows,
 )
 from .conditioning import MiniMaxH3TextConditioning
-from .config import H3Config, H3InputError, H3Request
+from .config import (
+    MAX_OUTPUT_FRAMES,
+    MAX_OUTPUT_SECONDS,
+    MIN_OUTPUT_FRAMES,
+    MIN_OUTPUT_SECONDS,
+    H3Config,
+    H3InputError,
+    H3Request,
+)
 from .denoise_loop import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .packed_sequence import (
@@ -125,12 +133,6 @@ MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 
 
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
-
-
-MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
-
-
-MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
 
 
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
@@ -638,24 +640,22 @@ class MiniMaxH3Pipeline(nn.Module):
         if duration is not None:
             if isinstance(duration, bool):
                 raise H3InputError(
-                    f"MiniMax H3 output duration must be in [4, 15] seconds, got "
+                    f"MiniMax H3 output duration must be in [22/24, 15] seconds, got "
                     f"{duration!r}"
                 )
             try:
                 duration = float(duration)
             except (TypeError, ValueError) as exc:
                 raise H3InputError(
-                    f"MiniMax H3 output duration must be in [4, 15] seconds, got "
+                    f"MiniMax H3 output duration must be in [22/24, 15] seconds, got "
                     f"{duration!r}"
                 ) from exc
             if (
                 not math.isfinite(duration)
-                or not MINIMAX_H3_MIN_OUTPUT_SECONDS
-                <= duration
-                <= MINIMAX_H3_MAX_OUTPUT_SECONDS
+                or not MIN_OUTPUT_SECONDS <= duration <= MAX_OUTPUT_SECONDS
             ):
                 raise H3InputError(
-                    f"MiniMax H3 output duration must be in [4, 15] seconds, got "
+                    f"MiniMax H3 output duration must be in [22/24, 15] seconds, got "
                     f"{duration}"
                 )
             requested_frames = int(round(duration * fps))
@@ -664,14 +664,9 @@ class MiniMaxH3Pipeline(nn.Module):
         else:
             requested_frames = 124 if task == "ref2va" else 209
             duration = requested_frames / fps
-        if (
-            not MINIMAX_H3_MIN_OUTPUT_SECONDS
-            <= requested_frames / fps
-            <= MINIMAX_H3_MAX_OUTPUT_SECONDS
-        ):
+        if not MIN_OUTPUT_FRAMES <= requested_frames <= MAX_OUTPUT_FRAMES:
             raise H3InputError(
-                f"MiniMax H3 output duration must be in [4, 15] seconds, got "
-                f"{requested_frames / fps:.3f}"
+                f"MiniMax H3 requires between 22 and 362 frames, got {requested_frames}"
             )
         num_frames = minimax_h3_align_frame_count(requested_frames)
 

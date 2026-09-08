@@ -157,3 +157,39 @@ Evidence: `encoder-real-tp4-final.log`, `pipeline-route-canvas.log`,
 `kernel-build-fp32-output.log`, and `profiles/w8a16-hmma-root.ncu-rep`
 under the task artifact directory. Do not repeat superseded failing routes
 unless a new change requires them.
+
+### Short development workloads and attention evidence (2026-09-08)
+
+- User requested 1–2 second development clips and no repeated full-video runs.
+  Native requests now accept 22 and 39 aligned frames; 39 frames at 24 FPS is
+  1.625 seconds. The primary 243-frame/49-forward acceptance contract is unchanged.
+  Ten targeted shape/schedule tests pass, including short audio latent alignment
+  and rejection below the streaming VAE's minimum temporal chunk.
+- The earlier primary run was interrupted before completion; the host rebooted.
+  Its log reaches 22/49 DiT calls. Preserve it as partial diagnostic evidence,
+  never as a completed run or acceptance measurement. Initial stable calls took
+  about 129.5 seconds; late slow calls are not a reproducible speed baseline.
+- NVML medians were 100% GPU utilization. Nsight Compute separately measured
+  13.886% tensor-pipe activity in main-shape Flash-V100 attention and 78.150% in
+  the FP16-input/FP32-output Tensor Core GEMM. Utilization is not useful TFLOPS.
+  Attention at 73483 tokens took about 2.262 seconds without profiler, explaining
+  most of the observed DiT time. The performance gate remains unqualified.
+- Native TP4 video VAE decoded 39 frames at 1344x768 using 28 tiles. All four
+  outputs were finite with the expected shape; each peak allocation was
+  17805820416 bytes (16.58 GiB). Decode took 4.62–5.50 seconds per rank, without
+  a synchronized performance protocol; this is a functional result only.
+- CMake configure/build/install succeeded for both H3 extension targets. Five
+  targeted CUDA numerical tests passed against those installed modules. This
+  does not yet establish a complete release-wheel build.
+- All fixed-revision original and Comfy weights have downloaded and checksum
+  manifests are retained. Host memory is shared with another service, so current
+  short denoise diagnostics reuse the previously validated TP4 text embeddings
+  and load the VAE after releasing DiT, rather than retaining every component.
+  Such runs must explicitly report cached text and separate loading costs.
+
+Evidence under `/data/minimax-h3/native-h3-20260908/`:
+`short-clip-contract-tests.log`, `vae-tp4-short.log`,
+`cmake-numerics-tests.log`, `interrupted-baseline-summary.json`,
+`original-checkpoint-manifest.json`, `comfy-checkpoint-manifest.json`,
+`profiles/flashv100-attention.summary.json`, and
+`profiles/w8a16-fp32-output.summary.json`.
