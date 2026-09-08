@@ -1,5 +1,12 @@
 # Native MiniMax H3 migration control
 
+FlashInfer feeding follow-up on its own branch: see
+[FLASHINFER_FEEDING.md](FLASHINFER_FEEDING.md). Q128/K64 reduces complete
+39-frame/20-update denoise to 78.968862 s, or 43.862270 useful TFLOPS per rank.
+65 tests and focused sanitizers pass; fresh decoding passes automatic checks.
+Output rounding changes, human quality review and the >80-TFLOPS gate remain
+open. The parallel FlashAttention task is outside this branch's scope.
+
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
 Current decision: the user selects FlashInfer-SM70 as the H3 denoiser mainline.
