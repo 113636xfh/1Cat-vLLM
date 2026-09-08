@@ -114,6 +114,38 @@ def test_primary_workload_schedule_and_shape():
     assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
 
 
+@pytest.mark.parametrize(
+    "frames,duration,expected",
+    [
+        (22, None, (22, 7, 37)),
+        (39, None, (39, 12, 65)),
+        (243, 1, (39, 12, 65)),
+        (243, 2, (56, 17, 93)),
+        (362, None, (362, 107, 603)),
+    ],
+)
+def test_short_clip_shape_and_audio_alignment(frames, duration, expected):
+    from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
+    from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+
+    sampling = H3SamplingParams(
+        num_frames=frames,
+        extra_args={} if duration is None else {"duration_seconds": duration},
+    )
+    shape = MiniMaxH3Pipeline._resolve_shape(None, "t2va", sampling, None)
+    assert shape == (768, 1344, *expected)
+
+
+@pytest.mark.parametrize(
+    "values", [{"num_frames": 21}, {"extra_args": {"duration_seconds": 0.5}}]
+)
+def test_short_clip_rejects_incomplete_vae_temporal_chunk(values):
+    from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
+
+    with pytest.raises(ValueError, match="22"):
+        H3SamplingParams(**values)
+
+
 @pytest.mark.parametrize("height,width", [(768, 1344), (256, 256)])
 def test_native_canvas_does_not_require_omni_aspect_ratio(height, width):
     from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
