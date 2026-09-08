@@ -42,8 +42,11 @@ class H3Config:
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
     int8_weight_layout: str = "column"
+    video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        if self.video_encoder not in ("libx264", "h264_nvenc"):
+            raise H3InputError("video encoder must be libx264 or h264_nvenc")
         if self.partition not in ("fl2va", "ref2va"):
             raise H3InputError("partition must be fl2va or ref2va")
         if self.int8_weight_layout not in ("row", "column"):
