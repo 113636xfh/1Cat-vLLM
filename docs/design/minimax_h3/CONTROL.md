@@ -2,11 +2,66 @@
 
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
-Current decision: the user selects FlashInfer-SM70 as the H3 denoiser mainline.
-Optimize complete denoise toward >80 useful TFLOPS on every participating GPU;
-keep Flash-V100 as an explicit control. Development uses 39-frame clips and
-20 actual updates for quality. The historical 60-TFLOPS D256/GQA Flash-V100
-architecture was audited, but its H3 adaptation is not the selected mainline.
+Current decision: the user selects FlashAttention-V100 as the H3 development
+mainline, superseding the earlier FlashInfer choice. Optimize complete denoise
+toward >80 useful TFLOPS on every participating GPU; keep FlashInfer as the
+measured control/rollback. Development uses 39-frame clips and 20 actual
+updates for quality. Preserve D128 MHA and its original scale when reusing
+the existing D256 TensorOp architecture; padding never increases useful FLOPs.
+
+## 2026-09-08 FlashAttention-V100 D128 native route
+
+The new `_h3_flashattn_C` extension selects a dedicated CUTLASS SM70 fused
+kernel under `FLASH_ATTN_V100`. Its QK tile is 64x64 and PV tile is 64x128;
+all 128 output channels remain in FP32 registers across online-softmax updates.
+It uses 128 threads, 232 registers without spills in the initial build, and
+26,128 bytes of shared memory. Each MHA head is independent. There is no D256
+head padding, global square score allocation, or FlashInfer delegation.
+The wrapper supports masked query/key tails, storage-offset/strided inputs and
+stream-local metadata. Provenance and BSD notices are in
+`flash-attention-v100/kernel/h3/UPSTREAM.md`. Standard CMake, setuptools and
+the source-only extension helper include the new operator.
+
+The existing v37 QK/PV implementation was separately adapted to D128 with
+FP32 scale and masked KV padding. At actual H3 N12323 it passes the sampled
+FP32 reference and takes 34.279 ms against a 34.993 ms FlashInfer control.
+The serial bounded-score prototype is slower than the fused path and is not
+installed. Fused Q32/K64 and Q128/K64 candidates also pass numerical checks
+but are slower than Q64/K64 in their respective matched comparisons.
+
+An unprofiled GPU0 B1/H14/D128 comparison at actual valid H3 lengths measures:
+
+| Tokens | New Flash-V100 | FlashInfer control | Generic Flash-V100 |
+| --- | ---: | ---: | ---: |
+| 12323 | 26.185728 ms | 35.336193 ms | 61.659138 ms |
+| 73483 | 942.884888 ms | 1229.690918 ms | 2245.138428 ms |
+
+Both lengths pass spread-out FP32 query references and whole-output finiteness.
+These are operator measurements, not full-denoise acceptance. Clocks were
+recorded, not locked: at the long length new Flash-V100 observed 1455-1462 MHz
+and the controls 1530 MHz. Useful operator throughput is 41.57/41.05 TFLOPS;
+the requested 80 TFLOPS/card model gate remains pending.
+
+Validation: 73 video-suite tests passed on the initial JIT binary, including
+14 new cases for tail masking, independent batches, rescaling, strided/offset
+storage, native dispatch, graph replay and rejected inputs. The final standard
+CMake binary SHA256 is
+`84a41632bbc8e99459a938b90ca5981ded5600f336ce72b1e10e294613bc986a`.
+Eight independent offset/tail/rescaling cases pass CUDA12.8 memcheck,
+racecheck and synccheck with zero reported errors/hazards and
+`CUDA_MODULE_LOADING=EAGER`. The broader pytest sanitizer harness reports
+`cuKernelGetFunction` error 400 despite passing numerical assertions; the
+instrumented graph/API issue remains open. It is not suppressed or counted
+as a clean all-tests sanitizer result. A temporary diagnostic named `profile.py`
+also shadowed Python's standard library; it was renamed `profile_native.py`.
+No production Python dependency was changed to address that harness error.
+
+Raw artifacts: `/data/minimax-h3/native-h3-20260908/flashattention-mainline/`.
+They include all prototype sources/build logs, `bench-results.json`, GPU
+ownership records, tests and sanitizer logs. The first ordinary-user NCU
+attempt lacked GPU counter permission; it produced no counters. Complete
+short-denoise measurements and the privileged profile are recorded below
+when completed. Use `FLASHINFER_SM70` as the measured rollback path.
 
 ## Fixed scope
 
