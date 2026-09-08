@@ -56,6 +56,8 @@ The latter separates frame preparation/copy, WAV writing, FFmpeg startup/feed,
 and encoder/muxer completion. Feed time includes pipe backpressure and overlaps
 encoding, so these are sequential wall intervals rather than GPU kernel timings.
 The frontend video API and output audio/video contract are unchanged.
+See [the V100 export measurement](GPU_EXPORT.md) for measured latency, output
+quality, file-size tradeoffs, and the remaining host-memory transfer cost.
 
 ## Endpoints
 
