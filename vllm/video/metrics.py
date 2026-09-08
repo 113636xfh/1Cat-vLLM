@@ -23,6 +23,10 @@ class DenoiseWorkCounter:
     def __init__(self, model, *, used_length, video_outputs, audio_outputs):
         from vllm.model_executor.layers.linear import LinearBase
         from vllm.model_executor.models.minimax_h3.attention import Attention
+        from vllm.model_executor.models.minimax_h3.lora import (
+            TurboLinearMethod,
+            lora_scale,
+        )
 
         self.flops = 0
         self.calls = 0
@@ -47,6 +51,20 @@ class DenoiseWorkCounter:
                     count = 2 * effective * n * k
                     self.flops += count
                     self.by_layer[name] = self.by_layer.get(name, 0) + count
+                    method = layer.quant_method
+                    if isinstance(method, TurboLinearMethod) and lora_scale.get() != 0:
+                        work = sum(
+                            2
+                            * effective
+                            * (
+                                getattr(layer, f"h3_lora_a_{index}").numel()
+                                + getattr(layer, f"h3_lora_b_{index}").numel()
+                            )
+                            for index, _, _ in method.parts
+                        )
+                        self.flops += work
+                        key = name + ".lora"
+                        self.by_layer[key] = self.by_layer.get(key, 0) + work
 
                 self.handles.append(module.register_forward_hook(linear_hook))
             elif isinstance(module, Attention):

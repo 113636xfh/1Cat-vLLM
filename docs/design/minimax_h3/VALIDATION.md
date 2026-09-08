@@ -7,8 +7,48 @@ diagnostics separate from the three formal timing runs.
 
 The current short-development target is **under 50 seconds for 20 actual DiT
 updates**, retaining 1344x768, 39 frames/24 FPS, seed42, INT8 ConvRot FL2VA,
-TP4 GPU0-3 and output quality, without a substantial memory increase. The
-latest native wide-QK plus fused MLP route measures **62.804019 s**, or
+TP4 GPU0-3 and output quality, without a substantial memory increase.
+
+The new explicit `--residual-sequence-parallel` option completes this workload
+in **58.794562 s**, or **2.939728 s/update and 58.912822 useful model
+TFLOPS/card**. Peak denoise Torch allocation is **6.195001125 GiB/card** and
+NVML peak device-used memory is 8.171386719 GiB/card, with zero persistent
+FP16 cache and zero Lt workspace. This is a 6.38% time reduction from the
+default 62.804019 s route. The option defaults to false and currently requires
+TP4 FL2VA INT8 without adapters, using either native SM70 attention backend.
+It preserves FP32 residuals and gathers FP16 values only at the original
+normalization boundary. Omit the flag for rollback.
+
+Measured implementation commit: `59df80f5aae63e36a428a095d6f43570cfbc6547`.
+Integration with current main `e7fa44deb2` preserves byte-identical DiT,
+activation, quantization, attention, residency and weight-cache source, and
+an AST-identical `diffuse` method. The separate CPU compatibility check has
+78 passes, 30 GPU skips and one deselection. It does not replace the earlier
+actual four-rank residual test, which passed on every rank for both native
+backends. The earlier targeted numerics/service/configuration run has 70
+passes; these overlapping suites are not summed as distinct tests.
+
+A fresh decode passes all automatic media checks. FP32 collective reduction
+order changes yield video/audio latent relative RMS deltas of 3.87465% and
+1.20270% from the default. Decoded-video SSIM is 0.983989; PSNR is38.238221 dB.
+These are auxiliary comparisons, not human quality thresholds. Eight sampled
+frames show stable count, color and background; full audiovisual review is
+pending. New MP4 SHA256:
+`f00ba75587f58e2a63a105647cb634eebd60b154ab7b3551f385ca2df96e5243`.
+Evidence is in `flashattention-pipeline50/` and fresh media in
+`outputs/quality39-int8-flashattn-residual-20steps/FLASH_ATTN_V100/`.
+
+Separate two-update traces attribute the residual-sharding gain to lower
+normalization/gating work (0.440786 ->0.237076 s of other GPU kernels) and
+collective data movement (1.076831 ->0.845654 s). GEMM and attention still
+account for about78% of the new trace. Copies are only0.012507 s. Eight paired
+attention candidates failed to establish a gain and remain uninstalled.
+A zero-cache projection-overlap prototype improves a two-update paired median
+by2.20%, but is not integrated or claimed as a complete20/video result.
+See CONTROL.md for NCU/SASS evidence and negative experiments.
+
+Without residual sharding, the native wide-QK plus fused MLP route measures
+**62.804019 s**, or
 **3.140201 s/update and 55.151783 useful model TFLOPS/card**, compared with
 69.062335 s previously (9.06% reduction). Cache and Lt workspace are zero.
 Peak Torch denoise allocation is **6.566735744 GiB/card**, down from
@@ -93,6 +133,9 @@ python tools/minimax_h3/benchmark.py --model /path/to/MiniMax-H3 \
 
 The runner performs one warmup and three unprofiled requests in one engine.
 The warmup's automatic media checks must pass before formal timing starts.
+Add `--residual-sequence-parallel` to evaluate the experimental route;
+this records the option in every run config and rejects mixed configurations.
+The full 243-frame benchmark has not been run for this option.
 Use `FLASHINFER_SM70` for an explicit comparison or rollback. A nonzero FP16
 weight-cache budget requires an explicit measured list of `--fp16-cache-layer`
 arguments. The default budget is zero.

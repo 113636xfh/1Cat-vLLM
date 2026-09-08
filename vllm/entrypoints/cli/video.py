@@ -29,6 +29,10 @@ class VideoSubcommand(CLISubcommand):
                 "--partition", choices=("fl2va", "ref2va"), default="fl2va"
             )
             mode.add_argument("--transformer-path")
+            mode.add_argument(
+                "--lora-path",
+                help="LightX2V Turbo, FlashGen or FastH3 Dense safetensors",
+            )
             mode.add_argument("--tensor-parallel-size", "-tp", type=int, default=4)
             mode.add_argument(
                 "--attention-backend",
@@ -40,6 +44,11 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument(
                 "--int8-weight-layout", choices=["row", "column"], default="column"
             )
+            mode.add_argument(
+                "--residual-sequence-parallel",
+                action="store_true",
+                help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
+            )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             if name == "generate":
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -48,7 +57,23 @@ class VideoSubcommand(CLISubcommand):
                 mode.add_argument("--num-frames", type=int, default=243)
                 mode.add_argument("--duration", type=float)
                 mode.add_argument("--seed", type=int, default=42)
-                mode.add_argument("--num-inference-steps", type=int, default=50)
+                mode.add_argument(
+                    "--num-inference-steps",
+                    type=int,
+                    help="Default 50; LightX2V uses 5/9 points, FlashGen/FastH3 use 4",
+                )
+                mode.add_argument(
+                    "--lora-scale",
+                    type=float,
+                    default=1.0,
+                    help="Adapter multiplier; 0 bypasses the loaded adapter",
+                )
+                mode.add_argument("--task", choices=("t2va", "fl2va", "ref2va"))
+                mode.add_argument("--flow-shift", type=float)
+                mode.add_argument("--audio-flow-shift", type=float)
+                mode.add_argument(
+                    "--reference-video-start-times", nargs="+", type=float
+                )
                 mode.add_argument("--image", action="append", default=[])
                 mode.add_argument("--video", action="append", default=[])
                 mode.add_argument("--audio", action="append", default=[])
@@ -63,7 +88,7 @@ class VideoSubcommand(CLISubcommand):
         from vllm.model_executor.models.minimax_h3.config import (
             H3Config,
             H3Request,
-            H3SamplingParams,
+            sampling_for_deployment,
         )
         from vllm.video.engine import H3Engine
 
@@ -76,7 +101,9 @@ class VideoSubcommand(CLISubcommand):
             attention_backend=args.attention_backend,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
+            lora_path=args.lora_path,
             int8_weight_layout=args.int8_weight_layout,
+            residual_sequence_parallel=args.residual_sequence_parallel,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve
@@ -84,18 +111,25 @@ class VideoSubcommand(CLISubcommand):
             serve(config, host=args.host, port=args.port, output_dir=args.output_dir)
             return
         extra = {}
+        for key in ("task", "flow_shift", "audio_flow_shift"):
+            if getattr(args, key) is not None:
+                extra[key] = getattr(args, key)
         if args.duration is not None:
             extra["duration_seconds"] = args.duration
         if args.keyframe_indices is not None:
             extra["frame_indices"] = args.keyframe_indices
+        if args.reference_video_start_times is not None:
+            extra["start_time_seconds"] = args.reference_video_start_times
         request = H3Request(
             prompt=args.prompt,
-            sampling=H3SamplingParams(
+            sampling=sampling_for_deployment(
+                config,
                 width=args.width,
                 height=args.height,
                 num_frames=args.num_frames,
                 seed=args.seed,
                 num_inference_steps=args.num_inference_steps,
+                lora_scale=args.lora_scale,
                 extra_args=extra,
             ),
             media={

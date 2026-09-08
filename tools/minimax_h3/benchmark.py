@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--fp16-weight-cache-gib", type=float, default=0)
     parser.add_argument("--fp16-cache-layer", action="append", default=[])
+    parser.add_argument("--residual-sequence-parallel", action="store_true")
     parser.add_argument(
         "--attention-backend",
         choices=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
@@ -34,6 +35,7 @@ def main():
         attention_backend=args.attention_backend,
         fp16_weight_cache_gib=args.fp16_weight_cache_gib,
         fp16_cache_layers=tuple(args.fp16_cache_layer),
+        residual_sequence_parallel=args.residual_sequence_parallel,
     )
     results = []
     with H3Engine(config) as engine:
