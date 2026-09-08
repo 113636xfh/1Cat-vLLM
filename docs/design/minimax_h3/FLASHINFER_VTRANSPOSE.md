@@ -107,6 +107,14 @@ two-update NSYS split is context, not a fresh trace of this build.
 - Initial alternative-tile generation also replaced an unrelated Q fragment
   lane mask and failed the oracle. Corrected versions limit edits to K/V staging.
   Failed artifacts are retained and were never installed.
+- A follow-up V row permutation and row-dependent K-coordinate XOR targets
+  the new store conflicts, retaining 128-bit fragment loads. Its first build
+  spills 24 bytes and is not benchmarked. A compiler barrier limiting address
+  lifetime removes spills at 128 registers and passes all 13 reference lengths
+  bitwise, but improves the operator only 23.781376 -> 23.501823 ms at matched
+  1507–1515 MHz. This 1.18% operator result remains experimental; it is not
+  installed or credited as a full-denoise improvement, and no additional video
+  is generated for it. Both variants remain under `feeding-operands/vwarp_swizzle*`.
 
 Use the environment, fixed revisions, cache list and commands from
 [FLASHINFER_TO50.md](FLASHINFER_TO50.md), with explicit `FLASHINFER_SM70` and
