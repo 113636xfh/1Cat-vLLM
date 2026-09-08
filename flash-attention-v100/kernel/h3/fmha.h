@@ -644,11 +644,19 @@ struct H3FMHAKernel {
 
         // Update `mi` from accum stored in registers
         // Also does accum[i] <- exp(accum[i] - mi)
-        iterative_softmax<typename MM0::Mma::Operator::IteratorC>(
-            accum_o, accum, mi, m_prime, s_prime, out_rescale,
-            shared_storage.addition_storage, lane_id(), thread_id(), warp_id(),
-            num_keys - iter_key_start, iter_key_start == 0,
-            iteratorC_tile_offset, kSupportsBias ? 1.0f : params.scale);
+        if (num_keys - iter_key_start >= kKeysPerBlock) {
+          iterative_softmax<typename MM0::Mma::Operator::IteratorC, true>(
+              accum_o, accum, mi, m_prime, s_prime, out_rescale,
+              shared_storage.addition_storage, lane_id(), thread_id(),
+              warp_id(), num_keys - iter_key_start, iter_key_start == 0,
+              iteratorC_tile_offset, kSupportsBias ? 1.0f : params.scale);
+        } else {
+          iterative_softmax<typename MM0::Mma::Operator::IteratorC, false>(
+              accum_o, accum, mi, m_prime, s_prime, out_rescale,
+              shared_storage.addition_storage, lane_id(), thread_id(),
+              warp_id(), num_keys - iter_key_start, iter_key_start == 0,
+              iteratorC_tile_offset, kSupportsBias ? 1.0f : params.scale);
+        }
 
         // Output results to shared-memory
         int warp_idx_mn_0 = warp_id() % (MM0::Mma::Base::WarpCount::kM *
@@ -822,7 +830,7 @@ struct H3FMHAKernel {
     }
   }
 
-  template <typename WarpIteratorC>
+  template <typename WarpIteratorC, bool FullKeys>
   CUTLASS_DEVICE static void iterative_softmax(
       typename MM1::Mma::FragmentC& frag_o,  // output so far
       typename WarpIteratorC::Fragment& frag,
@@ -870,7 +878,7 @@ struct H3FMHAKernel {
             max = -cutlass::platform::numeric_limits<accum_t>::infinity();
           },
           [&](int accum_m, int accum_n, int idx) {
-            if (accum_n < max_col) {
+            if (FullKeys || accum_n < max_col) {
               max = cutlass::fast_max(max, frag[idx]);
             }
           },
@@ -930,8 +938,9 @@ struct H3FMHAKernel {
       LambdaIterator::iterateRows(
           lane_offset, [&](int accum_m) { mi_row = mi[accum_m]; },
           [&](int accum_m, int accum_n, int idx) {
-            frag[idx] =
-                (accum_n < max_col) ? exp2f(frag[idx] - mi_row) : accum_t(0.0);
+            frag[idx] = (FullKeys || accum_n < max_col)
+                            ? exp2f(frag[idx] - mi_row)
+                            : accum_t(0.0);
           },
           [&](int accum_m) {});
       LambdaIterator::iterateRows(

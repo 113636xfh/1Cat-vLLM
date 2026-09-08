@@ -40,10 +40,13 @@ class H3Config:
     attention_backend: str = "FLASH_ATTN_V100"
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
+    int8_weight_layout: str = "column"
 
     def __post_init__(self) -> None:
         if self.partition not in ("fl2va", "ref2va"):
             raise H3InputError("partition must be fl2va or ref2va")
+        if self.int8_weight_layout not in ("row", "column"):
+            raise H3InputError("H3 INT8 weight layout must be row or column")
         if self.tensor_parallel_size not in (1, 2, 4):
             raise H3InputError("native H3 supports TP1, TP2, or TP4")
         if self.attention_backend not in (
