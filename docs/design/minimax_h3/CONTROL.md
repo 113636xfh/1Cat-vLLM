@@ -510,3 +510,33 @@ reuse gives no improvement; skipping unit output rescaling gives only about
 rounding, and are not installed or counted as FlashInfer results. An asymmetric
 QK/PV CUTLASS control compiles but remains unmeasured after the user's ComfyUI
 audit request. Preserve these controls rather than repeat them unchanged.
+
+## Recovered ComfyUI V100 source audit
+
+The user identified unmounted local disks as the likely source location.
+Read-only inspection recovered a ComfyUI/Raylight tree containing
+`flash-attention-v100-1cat-0.0.5`. Its dense source SHA256 is
+`82e4a09dda874034bf0ca76482d670fe22676315e9143232f63c742dc475683f`.
+The recovered D128 route uses Q32/K176, 512 threads and WMMA. CUDA12.8 emits
+64 registers/thread with spills. The original files remain unmodified.
+
+An unaligned 65-token request hangs: a block barrier is inside a conditional
+that excludes invalid query-row threads. Padding Q alone avoids that hang
+but still produces NaNs with 65 valid K/V tokens. Do not use this recovered
+kernel directly for H3's unaligned lengths or infer quality from its timing.
+
+Fully aligned controls isolate the old kernel's performance. At B1/H14/D128,
+noncausal FP16 N12320, current FlashInfer takes 34.900993 ms versus recovered
+ComfyUI's 67.394562 ms; at N73568, 1224.818726 versus 2334.326904 ms. All
+outputs are finite and sampled-row FP32 references pass. Three alternating
+measurements after warmup observed 1530 MHz throughout. These aligned lengths
+differ from H3's actual 12323/73483 and are only operator controls. Their
+effective attention rates are approximately 31.2/31.7 TFLOPS for FlashInfer
+versus 16.1/16.6 for recovered ComfyUI, not full-model acceptance figures.
+
+The old Raylight documentation's large cold/hot speedup includes worker/model
+startup. Its archived logs also show PyTorch/xformers routes, while LTX TP
+can call ComfyUI's selected attention directly. A workflow's FLASH_ATTN label
+alone is insufficient route evidence. The audit does not justify replacing
+the current H3 FlashInfer mainline. Source snapshots, licenses, reproduction
+scripts, failures and results are retained in `comfy-audit/`.
