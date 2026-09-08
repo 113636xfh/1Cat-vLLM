@@ -219,3 +219,29 @@ audio, latents, frames and invalidated timing), `denoise-short-int8-final.log`
 directory. As of this checkpoint GPU groups 0–3 and 4–7 have other vLLM workers.
 No owned long-video or waiting-GPU process is being retained. BF16 and reference
 generation checks still need an available four-GPU group.
+
+### Twenty-step short-clip quality check requested
+
+The user prioritizes normal output quality over further throughput tuning and
+requested a 20-step check. The diagnostic now fixes 39 frames at 1344x768,
+24 FPS, seed 42, the same INT8 checkpoint and FlashInfer implementation, and
+20 actual DiT calls (`num_inference_steps=21` under the reference sigma-point
+convention). Video/audio shifts remain 12/3, Turbo LoRA is off, and FP16 weight
+cache is off. Reuse the verified text conditioning for the same prompt to keep
+the comparison focused on the changed step count. Assert the completed call
+count and retain latents before export.
+
+At preparation time both GPU groups were occupied. A later idle GPU snapshot
+was still covered by another task's group lease. Capacity-only preflight can
+race such a task during service replacement. H3 now acquires the shared 1Cat
+per-card/group locks, checks capacity again, and retains the lease until its
+workers have exited. Failed acquisition/startup releases its own partial locks.
+The quality diagnostic uses the same lease and propagates launch errors. Ten
+CPU lease/service tests pass, including partial-lock rollback, whole-group
+fallback and worker-startup failure. No unrelated process was stopped.
+
+The 20-step GPU/video result is pending; do not infer that low step count is
+the sole cause of the two-step clip's artifacts. Prepared contract and commands
+are retained as `quality39-20steps-contract.json`, `denoise_quality.py`,
+`run_quality_guarded.py`, and `quality39-20steps-launch.log` in the task artifact
+directory. `gpu-lease-tests.log` records the focused regression result.
