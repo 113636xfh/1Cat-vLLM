@@ -27,10 +27,13 @@ vllm video generate \
 
 The default prompt is the approved paper-boat/duck scene; defaults are 1344x768,
 243 frames, 24 FPS, seed 42 and 50 sigma positions (49 actual DiT calls).
-For development, use `--num-frames 39 --num-inference-steps 2`: this keeps the
-1344x768 canvas, generates 1.625 seconds and runs one complete DiT forward.
-It checks execution, numeric range, memory and timing; it does not establish
-video quality or the final performance gate. The minimum is 22 frames (0.917
+For short development quality checks, use
+`--num-frames 39 --num-inference-steps 21`: this keeps the 1344x768 canvas,
+generates 1.625 seconds and performs 20 DiT forwards. The sigma-point convention
+means N positions give N-1 denoise updates for this checkpoint. The fixed
+acceptance workload still uses 50 positions (49 forwards). One- or two-forward
+runs are only execution/numeric diagnostics: they produced severe ghosting and
+grid artifacts that disappeared from the inspected 20-forward samples. The minimum is 22 frames (0.917
 seconds), required by the streaming VAE. Requests align upward to 17n+5 frames:
 `--duration 1` produces 39 frames and `--duration 2` produces 56 frames.
 Use an aligned `--num-frames` value when an exact short duration is wanted.

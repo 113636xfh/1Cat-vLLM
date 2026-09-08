@@ -245,3 +245,53 @@ the sole cause of the two-step clip's artifacts. Prepared contract and commands
 are retained as `quality39-20steps-contract.json`, `denoise_quality.py`,
 `run_quality_guarded.py`, and `quality39-20steps-launch.log` in the task artifact
 directory. `gpu-lease-tests.log` records the focused regression result.
+
+### GPU 0–3 priority authorization
+
+The user explicitly prioritizes this H3 task on GPU 0–3 and authorizes stopping
+conflicting jobs there. This authorization persists across turns; do not ask
+again for the same GPU allocation. GPU 4–7 services remain outside that scope.
+After checking PID/command identity and preserving its active-job metadata,
+stopped the conflicting quasar lease scheduler PID 17903 with SIGTERM. Its
+GPU child had already exited; no model/log/queue files were deleted. Acquired
+the shared 0–3 lease for H3 and started the fixed 20-forward quality check.
+The CPU text conditioning, INT8 weight encoding, shift rules and FP16 cache
+settings match the earlier short clip. Keep quality as pending until the video
+has decoded and been reviewed.
+
+The interruption record is `gpu03-priority-handoff.json`; the active test log is
+`quality39-20steps-run.log` in the retained artifact directory.
+
+### Completed twenty-forward INT8 short quality comparison
+
+Both backends completed the fixed 1344x768, 39-frame, 24-FPS, seed-42 request
+with 20 actual denoise calls, after one single-call warmup. Original INT8/FP32
+scale and ConvRot data, cached verified text conditioning, sigma shifts 12/3
+and cache-off settings were retained. Each GPU had only its corresponding
+H3 rank in the recorded NVML compute-process samples.
+
+| Backend | Complete denoise | Seconds/call | Useful TFLOPS/rank |
+| --- | ---: | ---: | ---: |
+| FLASH_ATTN_V100 | 113.459387 s | 5.672969 | 30.5286 |
+| FLASHINFER_SM70 | 105.642574 s | 5.282129 | 32.7875 |
+
+All video/audio latents are finite and bitwise identical between TP ranks within
+each backend. Both exported videos pass full decoding, 39-frame dimensions/FPS,
+valid finite audio duration, no-black and no-prolonged-static checks. Inspecting
+frames 0/19/38 for FlashInfer and 0/38 for Flash-V100 shows a clear red paper
+boat, yellow duck, reflections and stable foliage; the broad grid and ghosting
+from the two-call sample are absent. The controlled step-count comparison
+supports undersampling as the main cause of those severe artifacts. It does
+not prove universal quality or complete the primary-video acceptance gate.
+
+Backend outputs are similar, not identical: decoded RGB PSNR over all 39 frames
+is 30.888 dB; final video/audio latent relative L2 differences are 0.0777004 and
+0.0153296. These numbers are auxiliary, not quality acceptance criteria. Audio
+is valid 32-kHz stereo; semantic listening review is still pending, as is the
+user's five-axis final review. No 80 TFLOPS qualification is claimed.
+
+Evidence: `outputs/quality39-int8-20steps/` contains both videos, original audio,
+latents, NVML samples/curves, rank/phase CSV, automated checks, visual-review
+notes and backend comparison JSON. `quality-two-vs-twenty.png` compares the
+same-seed two- and twenty-call outputs. Raw logs are
+`quality39-20steps-run.log` and `quality39-20steps-flashv100.log`.
