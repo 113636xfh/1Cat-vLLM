@@ -459,13 +459,12 @@ def _transcode_reference_video(
     return output
 
 
-def prepare_reference_videos(
+def validate_reference_video_files(
     values: Any,
     *,
-    target_frame_count: int,
-    workdir: str,
     start_time_seconds: Any = None,
 ) -> list[dict[str, Any]]:
+    """Probe and validate references without transcoding or allocating on GPU."""
     if isinstance(values, (str, os.PathLike)):
         values = [values]
     if not isinstance(values, (list, tuple)) or not values:
@@ -520,6 +519,26 @@ def prepare_reference_videos(
                     "reference videos must be at most 15 seconds in total"
                 )
         total_duration += duration
+        prepared.append(
+            {"source": source, "meta": meta, "start": start, "duration": duration}
+        )
+    return prepared
+
+
+def prepare_reference_videos(
+    values: Any,
+    *,
+    target_frame_count: int,
+    workdir: str,
+    start_time_seconds: Any = None,
+) -> list[dict[str, Any]]:
+    sources = validate_reference_video_files(
+        values, start_time_seconds=start_time_seconds
+    )
+    prepared = []
+    for index, item in enumerate(sources):
+        source, meta = item["source"], item["meta"]
+        start, duration = item["start"], item["duration"]
         width, height = _reference_video_shape(meta["width"], meta["height"])
         item_workdir = Path(workdir) / f"video_{index}"
         item_workdir.mkdir(parents=True)
