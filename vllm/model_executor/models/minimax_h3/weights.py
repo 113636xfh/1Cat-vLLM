@@ -12,7 +12,9 @@ from safetensors import safe_open
 from .config import H3Config
 
 
-def resolve_model_root(config: H3Config) -> Path:
+def resolve_model_root(
+    config: H3Config, *, require_original_transformer: bool = False
+) -> Path:
     path = Path(config.model).expanduser()
     if path.is_dir():
         return path.absolute()
@@ -23,7 +25,9 @@ def resolve_model_root(config: H3Config) -> Path:
         for name in ("text_encoder", "tokenizer", "processor", "video_vae", "audio_vae")
     ]
     ignored = (
-        [f"{partition}/transformer/*.safetensors"] if config.transformer_path else None
+        [f"{partition}/transformer/*.safetensors"]
+        if config.transformer_path and not require_original_transformer
+        else None
     )
     return Path(
         snapshot_download(
@@ -35,7 +39,7 @@ def resolve_model_root(config: H3Config) -> Path:
     )
 
 
-def iter_checkpoint_weights(path: str | Path):
+def iter_checkpoint_weights(path: str | Path, *, include: set[str] | None = None):
     path = Path(path)
     files = [path] if path.is_file() else sorted(path.glob("*.safetensors"))
     if not files:
@@ -44,6 +48,8 @@ def iter_checkpoint_weights(path: str | Path):
     for file in files:
         with safe_open(file, framework="pt", device="cpu") as checkpoint:
             for name in checkpoint.keys():  # noqa: SIM118 (safe_open is not iterable)
+                if include is not None and name not in include:
+                    continue
                 if name in seen:
                     raise ValueError(f"duplicate checkpoint tensor {name}")
                 seen.add(name)

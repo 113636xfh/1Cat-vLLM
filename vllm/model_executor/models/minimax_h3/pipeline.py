@@ -428,7 +428,15 @@ class MiniMaxH3Pipeline(nn.Module):
         self.config = config
         self.partition = config.partition
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
-        self.model_root = resolve_model_root(config)
+        from .fasth3 import FastH3Fusion, FastH3Spec
+        from .flashgen import FlashGenSpec, restore_dense_adaln_weights
+        from .lora import inspect_deployment_adapter, select_adapter_file
+
+        adapter_spec = inspect_deployment_adapter(config) if config.lora_path else None
+        self.model_root = resolve_model_root(
+            config,
+            require_original_transformer=isinstance(adapter_spec, FlashGenSpec),
+        )
         path = self.model_root / ("FL2VA" if self.partition == "fl2va" else "Ref2VA")
         shared = self.model_root / "FL2VA"
         if not shared.is_dir():
@@ -447,15 +455,33 @@ class MiniMaxH3Pipeline(nn.Module):
         self._base_schedule_by_partition = {
             self.partition: _read_base_schedule(release)
         }
+        if (
+            adapter_spec is not None
+            and self._base_schedule_by_partition[self.partition] is not None
+        ):
+            raise H3InputError(
+                "H3 LoRA cannot overlay an already distilled base_schedule"
+            )
+        if isinstance(adapter_spec, FastH3Spec):
+            if (self.default_video_shift, self.default_audio_shift) != (12.0, 3.0):
+                raise H3InputError("FastH3 requires base video/audio shifts 12/3")
+            self.supported_tasks = adapter_spec.supported_tasks
         transformer_path = path / "transformer"
         quant = None
         overrides = None
+        restore_adaln = False
         if config.transformer_path:
             transformer_path = resolve_comfy_checkpoint_path(config.transformer_path)
             checkpoint = inspect_comfy_checkpoint(
                 transformer_path, expected_partition=self.partition
             )
             overrides = checkpoint.arch_overrides
+            restore_adaln = (
+                isinstance(adapter_spec, FlashGenSpec)
+                and checkpoint.adaln_curve_grid is not None
+            )
+            if restore_adaln:
+                overrides = None
             quant = DiffusionInt8ConvRotConfig(
                 layer_configs=checkpoint.layer_configs,
                 weight_layout=config.int8_weight_layout,
@@ -468,9 +494,21 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         finally:
             attention_backend.reset(token)
-        loaded = self.transformer.load_weights(
-            iter_checkpoint_weights(transformer_path)
-        )
+        weights = iter_checkpoint_weights(transformer_path)
+        if restore_adaln:
+            weights = restore_dense_adaln_weights(weights, path / "transformer")
+        fusion = None
+        if isinstance(adapter_spec, FastH3Spec):
+            fusion = FastH3Fusion(
+                select_adapter_file(config.lora_path),
+                partition=config.partition,
+                head_dim=self.transformer.arch.attention_head_dim,
+                device=self.device,
+            )
+            weights = fusion.apply(weights)
+        loaded = self.transformer.load_weights(weights)
+        if fusion is not None:
+            fusion.validate_fully_applied(loaded)
         required = set(dict(self.transformer.named_parameters()))
         required.update(dict(self.transformer.named_buffers()))
         missing = required - loaded
@@ -481,6 +519,15 @@ class MiniMaxH3Pipeline(nn.Module):
             if method is not None:
                 method.process_weights_after_loading(layer)
         self.transformer.post_load_weights()
+        self.turbo_spec = None
+        if fusion is not None:
+            self.turbo_spec = fusion.spec
+        elif config.lora_path:
+            from .lora import install_adapter
+
+            self.turbo_spec = install_adapter(
+                self.transformer, config.lora_path, self.partition
+            )
         self._dit_stager = PinnedModuleStager(self.transformer, self.device)
         self._weight_cache = FP16WeightCache(
             self.transformer,
@@ -523,6 +570,12 @@ class MiniMaxH3Pipeline(nn.Module):
         return self.transformer
 
     def _resolve_sigma_positions(self, task, sampling):
+        if getattr(self, "turbo_spec", None) is not None:
+            from .lora import validate_adapter_sampling
+
+            validate_adapter_sampling(self.turbo_spec, task, sampling)
+            if sampling.lora_scale != 0:
+                return self.turbo_spec.base_schedule, self.turbo_spec.api_steps
         schedule = self._base_schedule_for_task(task)
         if schedule is None:
             return None, sampling.num_inference_steps
@@ -580,7 +633,13 @@ class MiniMaxH3Pipeline(nn.Module):
         torch.accelerator.synchronize()
         self.stage_durations["encode"] = time.perf_counter() - started
         started = time.perf_counter()
-        video_latent, audio_latent = self.diffuse(**self._denoise_kwargs(context))
+        from .lora import lora_scale
+
+        token = lora_scale.set(request.sampling.lora_scale)
+        try:
+            video_latent, audio_latent = self.diffuse(**self._denoise_kwargs(context))
+        finally:
+            lora_scale.reset(token)
         torch.accelerator.synchronize()
         self.stage_durations["denoise_including_staging"] = (
             time.perf_counter() - started
@@ -1543,6 +1602,11 @@ class MiniMaxH3Pipeline(nn.Module):
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)
+        turbo = getattr(self, "turbo_spec", None)
+        if turbo is not None:
+            from .lora import validate_adapter_sampling
+
+            validate_adapter_sampling(turbo, task, sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -1795,8 +1859,19 @@ class MiniMaxH3Pipeline(nn.Module):
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        video_shift = float(extra.get("flow_shift", self.default_video_shift))
-        audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        active_turbo = turbo is not None and sampling.lora_scale != 0
+        video_shift = float(
+            extra.get(
+                "flow_shift",
+                turbo.video_shift if active_turbo else self.default_video_shift,
+            )
+        )
+        audio_shift = float(
+            extra.get(
+                "audio_flow_shift",
+                turbo.audio_shift if active_turbo else self.default_audio_shift,
+            )
+        )
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         return {
             "task": task,

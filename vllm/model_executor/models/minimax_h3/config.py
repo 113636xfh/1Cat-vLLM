@@ -40,6 +40,7 @@ class H3Config:
     attention_backend: str = "FLASH_ATTN_V100"
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
+    lora_path: str | None = None
     int8_weight_layout: str = "column"
 
     def __post_init__(self) -> None:
@@ -76,9 +77,12 @@ class H3SamplingParams:
     seed: int = 42
     num_outputs_per_prompt: int = 1
     quality: str | None = None
+    lora_scale: float = 1.0
     extra_args: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.lora_scale):
+            raise H3InputError("LoRA scale must be finite")
         if self.height <= 0 or self.width <= 0:
             raise H3InputError("video dimensions must be positive")
         if self.height % 32 or self.width % 32:
@@ -95,6 +99,15 @@ class H3SamplingParams:
             raise H3InputError("native H3 generates one video per request")
         if self.quality not in (None, "lossless"):
             raise H3InputError("native H3 does not enable approximate step caches")
+        for key in ("flow_shift", "audio_flow_shift"):
+            value = self.extra_args.get(key)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise H3InputError(f"{key} must be finite and positive")
         duration = self.extra_args.get("duration_seconds")
         if duration is not None and (
             isinstance(duration, bool)
@@ -114,3 +127,37 @@ class H3Request:
     def __post_init__(self) -> None:
         if not self.prompt.strip():
             raise H3InputError("prompt must not be empty")
+
+
+def sampling_for_deployment(
+    config: H3Config,
+    *,
+    num_inference_steps: int | None = None,
+    lora_scale: float = 1.0,
+    **kwargs,
+) -> H3SamplingParams:
+    """Choose omitted CLI/HTTP steps from the active adapter's contract.
+
+    Explicit step/shift values are preserved and validated before dispatch.
+    Python callers can also use this helper instead of specifying sigma points.
+    """
+    spec = None
+    if config.lora_path:
+        from .fasth3 import FastH3Spec
+        from .lora import inspect_deployment_adapter
+
+        candidate = inspect_deployment_adapter(config)
+        if isinstance(candidate, FastH3Spec) and lora_scale != 1:
+            raise H3InputError("FastH3 is fused; request lora_scale must be 1")
+        if lora_scale != 0:
+            spec = candidate
+    if spec is not None:
+        extra = dict(kwargs.get("extra_args") or {})
+        extra.setdefault("flow_shift", spec.video_shift)
+        extra.setdefault("audio_flow_shift", spec.audio_shift)
+        kwargs["extra_args"] = extra
+    if num_inference_steps is None:
+        num_inference_steps = spec.api_steps if spec is not None else 50
+    return H3SamplingParams(
+        num_inference_steps=num_inference_steps, lora_scale=lora_scale, **kwargs
+    )
