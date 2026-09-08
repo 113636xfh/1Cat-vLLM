@@ -149,8 +149,7 @@ struct H3FMHAKernel {
   static int const kThreadsPerWarp = 32;
   static int const kThreadCount = kThreadsPerWarp * WarpCount::kCount;
 
-  static constexpr int kNumWarpsPerBlock =
-      kQueriesPerBlock * kKeysPerBlock / (kThreadsPerWarp * kThreadsPerWarp);
+  static constexpr int kNumWarpsPerBlock = WarpCount::kCount;
 
   using ProblemVisitor =
       FMHAGroupedProblemVisitor<ThreadblockShape, kGroupScheduleMode,
@@ -355,9 +354,6 @@ struct H3FMHAKernel {
     epilogue_shared_storage() {
       return epilogue;
     }
-
-    // ProblemVisitor shared storage can't be overlapped with others
-    typename ProblemVisitor::SharedStorage problem_visitor;
   };
 
   struct SharedStorageEpilogueInLoop : ScalingCoefs {
@@ -377,9 +373,6 @@ struct H3FMHAKernel {
     epilogue_shared_storage() {
       return after_mm0.epilogue;
     }
-
-    // ProblemVisitor shared storage can't be overlapped with others
-    typename ProblemVisitor::SharedStorage problem_visitor;
   };
 
   using SharedStorage = typename cutlass::platform::conditional<
@@ -447,31 +440,39 @@ struct H3FMHAKernel {
     return threadIdx.x % kThreadsPerWarp;
   }
 
+  struct DirectParams {
+    ElementQ* q;
+    ElementK* k;
+    ElementV* v;
+    ElementO* output;
+    int queries;
+    int keys;
+    int heads;
+    float scale;
+    static constexpr bool causal = false;
+  };
+
   /// Executes one GEMM
   CUTLASS_DEVICE
-  void operator()(Params const& params, SharedStorage& shared_storage) {
+  void operator()(DirectParams const& params, SharedStorage& shared_storage) {
     auto& m_prime = shared_storage.m_prime;
     auto& s_prime = shared_storage.s_prime;
     [[maybe_unused]] auto& si = shared_storage.after_mm0.si;
     auto& mi = shared_storage.mi;
     auto& out_rescale = shared_storage.out_rescale;
 
-    ProblemVisitor problem_visitor(params.problem_visitor,
-                                   shared_storage.problem_visitor, blockIdx.x);
-
-    // Outer 'persistent' loop to iterate over tiles
-    while (problem_visitor.next_tile()) {
-      GemmCoord problem_size0 = problem_visitor.problem_size0();
-      GemmCoord problem_size1 = problem_visitor.problem_size1();
-      const int32_t threadblock_idx =
-          int32_t(problem_visitor.threadblock_idx());
-
-      if (!TileParams::can_compute(threadblock_idx, problem_size0)) {
-        problem_visitor.advance(gridDim.x);
-        continue;
-      }
-
-      const int32_t problem_idx = problem_visitor.problem_index();
+    {
+      const int32_t threadblock_idx = blockIdx.x;
+      const int group = blockIdx.y;
+      const int64_t stride = int64_t(params.heads) * 128;
+      const int64_t q_offset =
+          int64_t(group / params.heads) * params.queries * stride +
+          (group % params.heads) * 128;
+      const int64_t kv_offset =
+          int64_t(group / params.heads) * params.keys * stride +
+          (group % params.heads) * 128;
+      const GemmCoord problem_size0(params.queries, params.keys, 128);
+      const GemmCoord problem_size1(params.queries, 128, params.keys);
 
       if (thread_id() < kQueriesPerBlock) {
         s_prime[thread_id()] = ElementAccumulator(0);
@@ -482,21 +483,17 @@ struct H3FMHAKernel {
             -cutlass::platform::numeric_limits<ElementAccumulator>::infinity();
       }
 
-      ElementO* ptr_O =
-          params.ptr_O[problem_idx] +
-          TileParams::query_start(threadblock_idx) * params.ldo[problem_idx];
-      ElementOAccum* ptr_O_accum =
-          params.ptr_O_accum[problem_idx] +
-          TileParams::query_start(threadblock_idx) * params.ldo[problem_idx];
+      ElementO* ptr_O = (params.output + q_offset) +
+                        TileParams::query_start(threadblock_idx) * stride;
+      static_assert(kKeepOutputInRF);
+      ElementOAccum* ptr_O_accum = nullptr;
       const int num_queries =
           TileParams::num_queries(threadblock_idx, problem_size0);
 
       auto createOutputIter = [&](int col) -> typename MM1::OutputTileIterator {
         using OutputTileIterator = typename MM1::OutputTileIterator;
         return OutputTileIterator(
-            typename OutputTileIterator::Params{
-                (int32_t)params.ldo[problem_idx]},
-            ptr_O,
+            typename OutputTileIterator::Params{(int32_t)stride}, ptr_O,
             typename OutputTileIterator::TensorCoord{num_queries,
                                                      problem_size1.n()},
             thread_id(), {0, col});
@@ -506,8 +503,7 @@ struct H3FMHAKernel {
           [&](int col) -> typename MM1::OutputTileIteratorAccum {
         using OutputTileIteratorAccum = typename MM1::OutputTileIteratorAccum;
         return OutputTileIteratorAccum(
-            typename OutputTileIteratorAccum::Params{
-                (int32_t)params.ldo[problem_idx]},
+            typename OutputTileIteratorAccum::Params{(int32_t)stride},
             ptr_O_accum,
             typename OutputTileIteratorAccum::TensorCoord{num_queries,
                                                           problem_size1.n()},
@@ -532,10 +528,8 @@ struct H3FMHAKernel {
 
         auto prologueV = [&](int blockN) {
           typename MM1::Mma::IteratorB iterator_V(
-              typename MM1::IteratorB::Params{
-                  typename MM1::LayoutB(params.ldv[problem_idx])},
-              params.ptr_V[problem_idx] +
-                  iter_key_start * params.ldv[problem_idx],
+              typename MM1::IteratorB::Params{typename MM1::LayoutB(stride)},
+              (params.v + kv_offset) + iter_key_start * stride,
               {problem_size_1_k, problem_size_1_n}, thread_id(),
               cutlass::MatrixCoord{0, blockN * MM1::Mma::Shape::kN});
 
@@ -556,21 +550,19 @@ struct H3FMHAKernel {
         // and stores that into `shared_storage.si`
         //
 
-        ElementQ* ptr_Q =
-            params.ptr_Q[problem_idx] +
-            TileParams::query_start(threadblock_idx) * params.ldq[problem_idx];
+        ElementQ* ptr_Q = (params.q + q_offset) +
+                          TileParams::query_start(threadblock_idx) * stride;
 
         // Construct iterators to A and B operands
         typename MM0::IteratorA iterator_A(
             typename MM0::IteratorA::Params(
-                typename MM0::MmaCore::LayoutA(params.ldq[problem_idx])),
+                typename MM0::MmaCore::LayoutA(stride)),
             ptr_Q, {problem_size_0_m, problem_size_0_k}, thread_id(), {0, 0});
 
         typename MM0::IteratorB iterator_B(
             typename MM0::IteratorB::Params(
-                typename MM0::MmaCore::LayoutB(params.ldk[problem_idx])),
-            params.ptr_K[problem_idx] +
-                iter_key_start * params.ldk[problem_idx],
+                typename MM0::MmaCore::LayoutB(stride)),
+            (params.k + kv_offset) + iter_key_start * stride,
             {problem_size_0_k, problem_size_0_n}, thread_id(), {0, 0});
 
         // Construct thread-scoped matrix multiply
@@ -645,10 +637,8 @@ struct H3FMHAKernel {
         typename MM1::Mma::FragmentB prefetched_v;
         {
           typename MM1::IteratorB early_v(
-              typename MM1::IteratorB::Params{
-                  typename MM1::LayoutB(params.ldv[problem_idx])},
-              params.ptr_V[problem_idx] +
-                  iter_key_start * params.ldv[problem_idx],
+              typename MM1::IteratorB::Params{typename MM1::LayoutB(stride)},
+              params.v + kv_offset + iter_key_start * stride,
               {problem_size_1_k, problem_size_1_n}, thread_id(), {0, 0});
           early_v.set_residual_tile(problem_size_1_k <= MM1::Mma::Shape::kK);
           prefetched_v.clear();
@@ -706,10 +696,8 @@ struct H3FMHAKernel {
           }
 
           typename MM1::Mma::IteratorB iterator_V(
-              typename MM1::IteratorB::Params{
-                  typename MM1::LayoutB(params.ldv[problem_idx])},
-              params.ptr_V[problem_idx] +
-                  iter_key_start * params.ldv[problem_idx],
+              typename MM1::IteratorB::Params{typename MM1::LayoutB(stride)},
+              (params.v + kv_offset) + iter_key_start * stride,
               {problem_size_1_k, problem_size_1_n}, thread_id(),
               cutlass::MatrixCoord{0, blockN * MM1::Mma::Shape::kN});
 
@@ -836,10 +824,7 @@ struct H3FMHAKernel {
         epilogue(rescale, dest_iter, accum_o);
       }
 
-      // Next tile
-      problem_visitor.advance(gridDim.x);
-      __syncthreads();  // Don't start the next iteration until all threads are
-                        // done using shared memory.
+      __syncthreads();  // Complete all shared-memory consumers before exit.
     }
   }
 

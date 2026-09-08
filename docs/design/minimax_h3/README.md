@@ -1,9 +1,10 @@
 # Native MiniMax H3 (development)
 
 The latest optional residual-sharded FlashInfer development run completes
-39 frames and 20 denoise updates in 64.920336 seconds, with unchanged
-video/audio latents. See [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md)
-for the measured warp-transpose gain and remaining quality/performance gates.
+39 frames and 20 denoise updates in 63.565580 seconds, with unchanged
+video/audio latents. See [FLASHINFER_SILU.md](FLASHINFER_SILU.md) for the shared
+MLP integration and [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md) for
+operator improvements and remaining quality/performance gates.
 
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log
@@ -110,6 +111,13 @@ cuBLASLt plan with FP32 accumulation and zero workspace. This does not create
 a persistent FP16 cache. Unsupported plans use the original GEMM; warm up a
 shape before CUDA graph capture. Use `--int8-weight-layout row` to restore the
 original weight layout and GEMM route. Original BF16 checkpoints are unaffected.
+
+For INT8 MLPs, the native path combines FP32 SiLU/product evaluation and
+power-of-two FP16 input preparation in one kernel. The following projection
+restores the scale in FP32 before the normal TP reduction. This removes the
+large FP32 activation intermediate without lowering arithmetic precision or
+adding a persistent cache. CPU, unquantized and FP32-input paths keep their
+existing implementation.
 
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not

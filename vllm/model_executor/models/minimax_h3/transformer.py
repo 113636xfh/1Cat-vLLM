@@ -41,7 +41,11 @@ from .modulation import (
     rms_norm_indexed_scale_shift,
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
-from .quantization import preserve_fp32_output
+from .quantization import (
+    H3RowParallelLinear,
+    Int8ConvRotLinearMethod,
+    preserve_fp32_output,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -618,7 +622,7 @@ class MiniMaxH3MLP(nn.Module):
         self.act_fn = SiluAndMul()
         # Chunk the fused fc1 output as [gate, up], then compute
         # silu(gate) * up.
-        self.fc2 = RowParallelLinear(
+        self.fc2 = H3RowParallelLinear(
             arch.ffn_hidden_size,
             arch.hidden_size,
             bias=False,
@@ -631,6 +635,18 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
+        if (
+            hidden.is_cuda
+            and hidden.dtype == torch.float16
+            and 0 < hidden.shape[-1] <= 32768
+            and isinstance(self.fc2.quant_method, Int8ConvRotLinearMethod)
+        ):
+            from .activation import silu_prepare_fp16
+
+            values, scale = silu_prepare_fp16(hidden)
+            del hidden
+            out, _ = self.fc2(values, scale)
+            return out
         # Real H3 gated products exceed FP16 even when both factors are finite.
         # The following row projection rescales these FP32 activations into
         # FP16 Tensor Core range and restores their scale in its FP32 output.

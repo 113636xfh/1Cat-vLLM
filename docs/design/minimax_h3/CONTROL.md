@@ -1,5 +1,13 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer integration: [FLASHINFER_SILU.md](FLASHINFER_SILU.md).
+Dependency `9764b6c202`'s shared FP32 SiLU/FP16 preparation fusion works with
+our FP32 residual reduce-scatter. The unchanged 39-frame/20-update run takes
+63.565580 seconds (54.491025 useful TFLOPS/card), with bitwise-equal video/audio
+latents and fresh MP4. The 122-test suite and corrected four-rank block test
+pass. Attention/W8 binaries remain unchanged. Human quality, <50 seconds and
+>80 TFLOPS are still not accepted.
+
 Latest FlashInfer warp transpose: [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md).
 Warp-local exact FP16 pair exchange removes a shared staging round trip and
 one CTA barrier. The unchanged residual-sharded 39-frame/20-update run takes
@@ -72,6 +80,95 @@ FlashInfer experiments and reproduction commands explicitly select
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Wide QK reuse and fused MLP preparation: 62.80 seconds
+
+The retained native implementation completes the unchanged 1344x768,
+39-frame/24-FPS, seed42, INT8 ConvRot FL2VA, TP4 GPU0-3 workload in
+**62.804019 s for 20 actual updates** (21 sigma positions), or
+**3.140201 s/update and 55.151783 useful model TFLOPS/card**. This is 9.06%
+less time than 69.062335 s. Peak denoise Torch allocation falls from
+6.647851467 to **6.566735744 GiB/card**; NVML peak device-used memory is
+8.419433594 GiB/card. Persistent FP16 cache and Lt workspace remain zero.
+This is one unprofiled development measurement after a one-call warmup with
+prompt-verified cached text, not end-to-end or formal repeated acceptance.
+
+Two changes address arithmetic operand reuse and intermediate data movement:
+
+- Q64/K128 uses four 32x64 QK warps, reusing each Q fragment across twice as
+  many keys. Direct batch/head indexing removes grouped pointer metadata and
+  register pressure. Softmax distributes rows by actual `WarpCount::kCount`.
+  The previous wide-QK failure incorrectly inferred eight warps from tile
+  area despite launching four, leaving rows 32..63 unnormalized. This fixes
+  the length-63 NaNs; the prior mapping-only diagnosis below is superseded.
+  Two original 32x32 accumulator subfragments retain the probability store
+  layout. Large sequences select K128; small refiners retain K64. The N12323,
+  H14 specialization and V-load/softmax overlap use 246 registers/thread,
+  34,304 shared bytes/block and no spills. There is no extra global workspace.
+- INT8 MLPs fuse FP32 SiLU/product evaluation with power-of-two FP16 input
+  preparation, avoiding the large FP32 intermediate write/read. A model-local
+  row-parallel subclass accepts the explicit scale, preserves module/FLOP
+  hooks and restores scale in FP32 before the ordinary TP sum. Releasing the
+  gate/up buffer before projection avoids retaining an extra allocation.
+  CPU, unquantized and FP32-input MLPs use the previous implementation.
+
+The installed native attention's independently loaded, paired control is
+**25.572351 ->20.110336 ms**, or **42.565744 ->54.126701 useful TFLOPS** at
+B1/N12323/H14/D128. The earlier 19.772415 ms /55.051756 TFLOPS artifact
+prototype is a separate build/run. A corrected Q128/K128 prototype passes
+numerics but only improves 20.046848 ->19.749887 ms against the new native
+path (1.48%); it is not enabled or treated as a full-model gain. The wider-M
+64x32 warp spills 40 bytes in each direction and is slower, so it is rejected.
+
+Quality provenance matters: changing K64 to K128 changes FP32 online reduction
+and FP16 probability rounding. The native attention-only run (64.284648 s)
+was freshly decoded; relative RMS changes against the previous video/audio
+latents are 10.5741% /1.8484%. All automatic media checks pass. Eight sampled
+frames show one red paper boat and one yellow duck, stable scene/color/count
+and no obvious geometric corruption; this is not a full audiovisual score.
+The subsequent SiLU fusion run (62.852804 s) and final buffer-release run
+(62.804019 s) are both bitwise equal to the attention-only latents, so their
+decode reuse is explicit. MP4 SHA256 is
+`97b9196c49a8e1bf61cb8368f4db7d7013e99bc107650945dbe92b4b59b0184a`.
+Human five-axis review remains pending; do not claim quality accepted.
+
+Validation: 103 targeted attention/activation/INT8/numerics tests pass. New
+coverage includes both key tiles, half-warp row boundaries, the CUDA grid-y
+limit, hot-shape graph replay with changed values, fused activation scaling
+and scale restoration before reduction. Long N73483 uses sampled FP32 rows,
+never a full square reference allocation. K64 is bitwise equal to the frozen
+V-prefetch primitive on all 16 checked lengths. Isolated CUDA12.8 memcheck,
+racecheck and synccheck each pass 25 attention cases without errors/hazards;
+graph replay is covered by ordinary pytest, not isolated sanitizer capture.
+The previous full-runtime sanitizer loader issue remains documented below.
+
+Two initial native control probes loaded both extensions under the same Python
+module name, causing import caching to reuse the candidate as control. Their
+timings and apparent bitwise failure are invalid. `native-verified-results.json`
+uses distinct qualified module names and checks both function schemas before
+comparison. Preserve the invalid logs; do not reuse them as evidence.
+
+Evidence: `flashattention-qk50/` contains source prototypes, exact job JSON,
+build/test/sanitizer logs, `report.json`, `REPORT.md`, `failed-paths.json`,
+NVML curves and the sampled contact sheet. Final media and raw rank/NVML data:
+`outputs/quality39-int8-flashattn-native-wide-silu-release-20steps/FLASH_ATTN_V100/`.
+The measured attention binary is
+`98b2e902208fae496b03ee5d66e9718931ccf056b4ae8d65eeb16d168c18f8a4`.
+After repository formatting, the rebuilt binary is
+`bdb3dcf0eea8c23f992536182a06d26f7b61c7bb6ddefa4b3c88590b81ad0005`;
+its entire cuobjdump SASS output is byte-for-byte identical to the measured
+binary (`formatted-build-comparison.json`). No new denoise timing is inferred
+from the rebuild.
+Rollback the combined change to kernel parent `f825756607db` and rebuild the
+FlashAttention extension; `key_tile=64` is also available for primitive
+numerical comparison. The existing `--int8-weight-layout row` independently
+rolls back the column-major GEMM path.
+
+**The under-50-second, attention-60-TFLOPS, formal per-card-80-TFLOPS and human
+quality gates remain incomplete.** Next work should continue the measured
+attention operand-reuse/shared-load/HMMA focus. Do not inflate useful FLOPs
+with padding, rotations or dequantization, or use NVML's 100% median GPU
+utilization as a Tensor Core saturation claim.
+
 ### Attention-focused diagnosis and V prefetch: 69.06 seconds
 
 The user redirects the next optimization to GEMM/attention arithmetic and data
@@ -138,11 +235,11 @@ Rejected or paused probes, all outside production source:
 | QK internal K64 stage | 25.759745 / 25.328640 ms | Exact, no improvement |
 | PV internal K64 stage | 26.507263 / 24.967169 ms | Exact, slower |
 | QK first-tile persistence / next-K prefetch | 25.236481 / 25.414656 ms | Only 0.7%, registers 234 to 254; not retained |
-| Q64/K128 with a 32x64 QK warp | NaN at length 63 | Rejected; grouped version spills, direct indexing removes spills but does not fix numerics |
+| Q64/K128 with a 32x64 QK warp | NaN at length 63 in the earlier probe | Superseded by the actual-warp-count fix above |
 
-The wider QK path needs its accumulator/shared-memory mapping and boundary
-behavior fixed before any timing can be admitted. Its split-32 conversion
-attempt also fails length 63; do not repeat these variants unchanged. Earlier
+At this earlier checkpoint, split-32 conversion still failed length 63.
+The newer investigation above identifies and fixes the separate softmax warp-count
+error; do not repeat the original variants unchanged. Earlier
 Q128/K32 wide-PV variants corrupt the length-one output; their direct-store
 workaround spills and slows down. Manual PV fill and larger Q/K tiles remain
 rejected in the retained artifact records.

@@ -16,10 +16,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_flashattn_rejects_batch_head_grid_overflow():
+    q = torch.empty(1, 1, 65536, 128, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="index limits"):
+        flashattn_extension().forward(q, q, q, 128**-0.5)
+
+
 @pytest.mark.parametrize(
     "length", [1, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129, 12323]
 )
-def test_flashattn_d128_mha_tails_and_online_rescaling(length):
+@pytest.mark.parametrize("key_tile", [64, 128])
+def test_flashattn_d128_mha_tails_and_online_rescaling(length, key_tile):
     torch.manual_seed(42)
     q, k, v = [
         torch.randn(2, length, 2, 128, device="cuda", dtype=torch.float16)
@@ -30,13 +37,14 @@ def test_flashattn_d128_mha_tails_and_online_rescaling(length):
     k[:, length // 2 :] *= 4
     rows = torch.linspace(0, length - 1, min(length, 65), device="cuda").long()
     expected = chunked_attention_reference(q[:, rows], k, v, scale=128**-0.5)
-    actual = flashattn_extension().forward(q, k, v, 128**-0.5)
+    actual = flashattn_extension().forward(q, k, v, 128**-0.5, key_tile)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual[:, rows], expected, atol=0.002, rtol=0.03)
 
 
 @pytest.mark.parametrize("layout", ["offset", "strided"])
-def test_flashattn_d128_storage_and_different_q_k_lengths(layout):
+@pytest.mark.parametrize("key_tile", [64, 128])
+def test_flashattn_d128_storage_and_different_q_k_lengths(layout, key_tile):
     torch.manual_seed(42)
     tensors = []
     for length, offset in [(33, 1), (65, 3), (65, 5)]:
@@ -51,7 +59,7 @@ def test_flashattn_d128_storage_and_different_q_k_lengths(layout):
         tensors.append(value)
     q, k, v = tensors
     expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
-    actual = flashattn_extension().forward(q, k, v, 128**-0.5)
+    actual = flashattn_extension().forward(q, k, v, 128**-0.5, key_tile)
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
 
 
@@ -89,10 +97,35 @@ def test_flashattn_dispatch_slices_poisoned_padding(monkeypatch):
     assert torch.count_nonzero(actual[:, 243:]) == 0
 
 
-def test_flashattn_graph_replay_uses_new_values():
+@pytest.mark.parametrize("key_tile", [64, 128])
+def test_flashattn_graph_replay_uses_new_values(key_tile):
     ops = flashattn_extension()
     q, k, v = [
         torch.randn(1, 129, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            ops.forward(q, k, v, 128**-0.5, key_tile)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = ops.forward(q, k, v, 128**-0.5, key_tile)
+    for _ in range(2):
+        q.normal_()
+        k.normal_()
+        v.normal_()
+        graph.replay()
+        expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
+        torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+
+
+def test_flashattn_fixed_shape_graph_replay():
+    ops = flashattn_extension()
+    q, k, v = [
+        torch.randn(1, 12323, 14, 128, device="cuda", dtype=torch.float16)
         for _ in range(3)
     ]
     stream = torch.cuda.Stream()
@@ -104,13 +137,12 @@ def test_flashattn_graph_replay_uses_new_values():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = ops.forward(q, k, v, 128**-0.5)
+    rows = torch.tensor([0, 31, 32, 63, 64, 127, 128, 12322], device="cuda")
     for _ in range(2):
-        q.normal_()
-        k.normal_()
         v.normal_()
         graph.replay()
-        expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
-        torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+        expected = chunked_attention_reference(q[:, rows], k, v, scale=128**-0.5)
+        torch.testing.assert_close(actual[:, rows], expected, atol=0.002, rtol=0.03)
 
 
 def test_flashattn_rejects_changed_head_dimension_and_scale():
@@ -121,3 +153,5 @@ def test_flashattn_rejects_changed_head_dimension_and_scale():
     q = q[..., :128].contiguous()
     with pytest.raises(RuntimeError, match="finite and positive"):
         ops.forward(q, q, q, float("nan"))
+    with pytest.raises(RuntimeError, match="key tile"):
+        ops.forward(q, q, q, 128**-0.5, 32)
