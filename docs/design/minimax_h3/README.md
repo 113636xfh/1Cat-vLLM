@@ -5,6 +5,9 @@ four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation
 is required.
 
+For explicit workflow selection, reference-video offsets and four/eight-step
+LightX2V Turbo LoRA, see [Workflows and distilled LoRA](WORKFLOWS.md).
+
 The supported deployment contract is Python 3.12, Torch 2.10.0+cu128, CUDA Toolkit
 12.8 and V100/SM70. Install the normal 1Cat source build with its `video` extra;
 `tools/minimax_h3/build_extensions.py` builds the three independent H3 operators

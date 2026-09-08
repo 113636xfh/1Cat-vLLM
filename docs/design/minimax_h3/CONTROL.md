@@ -2,6 +2,10 @@
 
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
+Workflow/LoRA expansion is tracked in the 2026-09-08 entry at the end of this
+file and [WORKFLOWS.md](WORKFLOWS.md). Its distilled schedules are separate
+from the fixed no-LoRA kernel-performance acceptance contract below.
+
 Current decision: the user selects FlashInfer-SM70 as the H3 denoiser mainline.
 Optimize complete denoise toward >80 useful TFLOPS on every participating GPU;
 keep Flash-V100 as an explicit control. Development uses 39-frame clips and
@@ -348,3 +352,97 @@ Evidence: `profile_h3_steps.py`, `run_profile_h3_steps.py`,
 `profiles/h3-flashinfer-step-breakdown.json`, `query-owned-results.json`, and
 `flashv100-60t-route-audit.md`. GPU 0–3 priority preemption is authorized; the
 active development lease is recorded in `flashinfer-development-lease.json`.
+
+### Official workflows and LightX2V Turbo expansion (2026-09-08)
+
+Owned branch: `codex/v100-h3-workflows-lora-20260908-091941`.
+Stack base: native PR #557 at `1d201f41344f1a9a50d91197a8ad3a5525e51190`;
+integration remains `onecat/main` (observed `e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`).
+This scope adds workflow/LoRA execution and does not change the other tasks'
+attention kernels. [Omni coverage](../omni_workflow_coverage.md) records the
+90-row upstream support inventory, relevant task history and remaining families.
+
+- Added complete-layout LightX2V Diffusers Turbo loading for FL2V and Ref2V,
+  four/eight updates, 544p/768p training variants, metadata alpha and per-artifact
+  modality shifts. Every A/B tensor must be consumed; ambiguous directories,
+  wrong partitions, other export layouts and malformed shapes are rejected.
+- TP-local Q/K/V delta slices and reordered MLP gate/value rows use the existing
+  FP16-input/FP32-output GEMM with range scaling. INT8 ConvRot base weights stay
+  unchanged; LoRA consumes unrotated activations. Buffers join pinned staging.
+- CLI and HTTP expose task, flow shifts, reference-video offsets and request
+  LoRA scale. Omitted sampling values come from the adapter; explicit mismatches
+  fail before dispatch. Scale zero restores base defaults and bypasses deltas.
+- Reference audio/video metadata is validated before queueing using the same
+  source checks as preprocessing. The service remains healthy after rejected
+  media. LoRA GEMM work is counted separately from base work.
+
+Validation environment: Python 3.12.13, Torch 2.10.0+cu128, CUDA 12.8,
+Transformers 5.15.1, Diffusers 0.40.0, V100-SXM2-32GB TP4, GPU0-3.
+Signed Comfy INT8 and FP32 scales, AdaLN pruning and ConvRot256 retained;
+FP16 weight cache and approximate caches off. Denoising uses the copied,
+hash-recorded #558 FlashInfer-SM70 development binary; text encoder keeps its
+causal Flash-V100 path. This is not a rebuilt release wheel. All generation
+runs below encode their actual prompt/media and decode/export fresh audio/video.
+
+| Workflow | Adapter | Frames | Calls/rank | Encode | Complete denoise | VAE | Generation total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| T2VA | FL2V 4-step v1.2 768p, alpha 8, shifts 6/3 | 39 | 4 | 5.76 s | 27.57 s | 6.65 s max rank | 43.94 s |
+| First+last FL2VA | same | 39 | 4 | 12.97 s | 34.36 s | 6.11 s max rank | 57.40 s |
+
+Both outputs are 1344x768, 24 FPS, seed 42, with native finite 32-kHz audio.
+All automatic checks pass. Inspected first/last screenshots show the red paper
+boat and yellow duck; the FL2VA endpoints follow the supplied frames. Human
+listening/temporal review is pending. The peak per-rank allocation is 16.59 GiB
+for T2VA and 16.61 GiB for FL2VA. Cold worker startup is separate: maximum
+94.26 s and 106.30 s, respectively. These are single functional runs with no
+warmup/three-repeat performance protocol, not formal speed or quality gates.
+The T2VA run preceded the separate LoRA FLOP counter addition; its recorded
+numerator excludes adapter work and must not be used for TFLOPS claims.
+
+Commands (from the owned worktree, with task-owned caches and media tools):
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES='' \
+  .venv/bin/python -m pytest --confcutdir=tests/video tests/video -q
+.venv/bin/ruff check \
+  vllm/entrypoints/cli/video.py \
+  vllm/model_executor/models/minimax_h3/{config,lora,pipeline,reference_video,validation}.py \
+  vllm/video/{server,metrics}.py \
+  tests/video/{test_h3_lora,test_h3_workflows}.py
+```
+
+Result: 84 passed, 8 GPU tests skipped by the CPU-only environment. Real TP4
+CLI generation above provides GPU validation of both active adapter loading
+and full pipeline execution. The new tests cover all eight official media
+combinations, malformed media before dispatch, all eight Turbo filename
+contracts, metadata alpha, TP1/2/4 algebra, ConvRot basis and exact zero-scale
+bypass. The first fixture attempt lacked FFmpeg on PATH; rerunning with the
+existing task-local FFmpeg/FFprobe 7.0.2 passed. Do not diagnose that setup error
+as a model failure.
+
+Ref2VA four-step v0.1 weights were downloaded and validated (624 tensors,
+alpha 8, shifts 12/3). The mixed-reference real run reached four-rank adapter
+binding and the 10337-token Qwen presentation for one image, one video and
+standalone audio, then received SIGTERM (exit 143) before denoise. It produced
+no completed video and is not counted as passing. Another H3 task held GPU0-3
+immediately afterwards. A prior launch was correctly rejected while the group
+was leased. No other task's process was stopped by this scope.
+
+For short mixed-reference development use 56 frames: the existing post-encode
+reference-audio length check rejects a 39-frame embedded soundtrack after it
+is truncated below two seconds. This does not affect the upstream 4–15-second
+output contract; it remains an explicit short-development limitation.
+
+Retained artifacts: `/data/minimax-h3/workflows-lora-20260908/`:
+`ownership.txt`, `worktree-create.log`, `binary-hashes.txt`, `lora-sha256.txt`,
+`omni-supported-models.md`, `omni-h3-recipe.md`, `omni-lora.py`,
+`cpu-final.log`, `workflow-tests.log`, `t2va-turbo4.log`, `fl2va-turbo4.log`,
+`ref2va-turbo4-wait.log`, `run_reference.py`, and `outputs/*-turbo4/`.
+Model and adapter weights remain outside Git. Original/Comfy and Turbo source
+revisions are in `UPSTREAM.md`.
+
+Remaining gates: completed mixed Ref2VA, original BF16-base + LoRA generation,
+eight-step real outputs and other artifact versions, additional seeds, full
+quality/audio review and release-wheel validation. FlashGen, FastH3, combined
+partition serving and upstream multipart upload semantics remain separate
+work. Keep the change Draft until its required review/quality gates pass.

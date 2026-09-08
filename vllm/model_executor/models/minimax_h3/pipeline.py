@@ -478,6 +478,17 @@ class MiniMaxH3Pipeline(nn.Module):
             if method is not None:
                 method.process_weights_after_loading(layer)
         self.transformer.post_load_weights()
+        self.turbo_spec = None
+        if config.lora_path:
+            from .lora import install_turbo_lora
+
+            if self._base_schedule_by_partition[self.partition] is not None:
+                raise H3InputError(
+                    "Turbo cannot overlay an already distilled base_schedule"
+                )
+            self.turbo_spec = install_turbo_lora(
+                self.transformer, config.lora_path, self.partition
+            )
         self._dit_stager = PinnedModuleStager(self.transformer, self.device)
         self._weight_cache = FP16WeightCache(
             self.transformer,
@@ -520,6 +531,11 @@ class MiniMaxH3Pipeline(nn.Module):
         return self.transformer
 
     def _resolve_sigma_positions(self, task, sampling):
+        if getattr(self, "turbo_spec", None) is not None and sampling.lora_scale != 0:
+            from .lora import validate_turbo_sampling
+
+            validate_turbo_sampling(self.turbo_spec, task, sampling)
+            return None, self.turbo_spec.sigma_points
         schedule = self._base_schedule_for_task(task)
         if schedule is None:
             return None, sampling.num_inference_steps
@@ -577,7 +593,13 @@ class MiniMaxH3Pipeline(nn.Module):
         torch.accelerator.synchronize()
         self.stage_durations["encode"] = time.perf_counter() - started
         started = time.perf_counter()
-        video_latent, audio_latent = self.diffuse(**self._denoise_kwargs(context))
+        from .lora import lora_scale
+
+        token = lora_scale.set(request.sampling.lora_scale)
+        try:
+            video_latent, audio_latent = self.diffuse(**self._denoise_kwargs(context))
+        finally:
+            lora_scale.reset(token)
         torch.accelerator.synchronize()
         self.stage_durations["denoise_including_staging"] = (
             time.perf_counter() - started
@@ -1540,6 +1562,11 @@ class MiniMaxH3Pipeline(nn.Module):
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         task = self._resolve_task(extra.get("task"), multi_modal_data)
+        turbo = getattr(self, "turbo_spec", None)
+        if turbo is not None:
+            from .lora import validate_turbo_sampling
+
+            validate_turbo_sampling(turbo, task, sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -1792,8 +1819,19 @@ class MiniMaxH3Pipeline(nn.Module):
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        video_shift = float(extra.get("flow_shift", self.default_video_shift))
-        audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        active_turbo = turbo is not None and sampling.lora_scale != 0
+        video_shift = float(
+            extra.get(
+                "flow_shift",
+                turbo.video_shift if active_turbo else self.default_video_shift,
+            )
+        )
+        audio_shift = float(
+            extra.get(
+                "audio_flow_shift",
+                turbo.audio_shift if active_turbo else self.default_audio_shift,
+            )
+        )
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         return {
             "task": task,

@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -20,7 +20,7 @@ from vllm.model_executor.models.minimax_h3.config import (
     DEFAULT_PROMPT,
     H3Config,
     H3Request,
-    H3SamplingParams,
+    sampling_for_deployment,
 )
 
 
@@ -32,26 +32,38 @@ class VideoRequest(BaseModel):
     num_frames: int = 243
     duration: float | None = None
     seed: int = 42
-    num_inference_steps: int = 50
+    num_inference_steps: int | None = None
+    task: Literal["t2va", "fl2va", "ref2va"] | None = None
+    lora_scale: float = 1.0
+    flow_shift: float | None = None
+    audio_flow_shift: float | None = None
     image: list[str] = Field(default_factory=list)
     video: list[str] = Field(default_factory=list)
     audio: list[str] = Field(default_factory=list)
     keyframe_indices: list[int] | None = None
+    reference_video_start_times: list[float] | None = None
 
-    def request(self):
+    def request(self, config: H3Config):
         extra: dict[str, Any] = {}
+        for key in ("task", "flow_shift", "audio_flow_shift"):
+            if getattr(self, key) is not None:
+                extra[key] = getattr(self, key)
         if self.duration is not None:
             extra["duration_seconds"] = self.duration
         if self.keyframe_indices is not None:
             extra["frame_indices"] = self.keyframe_indices
+        if self.reference_video_start_times is not None:
+            extra["start_time_seconds"] = self.reference_video_start_times
         return H3Request(
             prompt=self.prompt,
-            sampling=H3SamplingParams(
+            sampling=sampling_for_deployment(
+                config,
                 width=self.width,
                 height=self.height,
                 num_frames=self.num_frames,
                 seed=self.seed,
                 num_inference_steps=self.num_inference_steps,
+                lora_scale=self.lora_scale,
                 extra_args=extra,
             ),
             media={
@@ -136,7 +148,7 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
         if not state["ready"]:
             raise HTTPException(503, "video engine unavailable")
         try:
-            request = body.request()
+            request = body.request(config)
             from vllm.model_executor.models.minimax_h3.validation import (
                 validate_request,
             )

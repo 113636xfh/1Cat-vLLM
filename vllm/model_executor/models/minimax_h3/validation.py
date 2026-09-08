@@ -4,6 +4,7 @@
 
 from os import PathLike
 from pathlib import Path
+from subprocess import CalledProcessError
 from types import SimpleNamespace
 
 from .config import H3Config, H3InputError, H3Request
@@ -25,6 +26,14 @@ def validate_request(config: H3Config, request: H3Request) -> None:
     task = MiniMaxH3Pipeline._resolve_task(
         deployment, request.sampling.extra_args.get("task"), request.media
     )
+    if config.lora_path:
+        from .lora import inspect_turbo_lora, validate_turbo_sampling
+
+        validate_turbo_sampling(
+            inspect_turbo_lora(config.lora_path, config.partition),
+            task,
+            request.sampling,
+        )
     references = {}
     for key in ("image", "video", "audio"):
         value = request.media.get(key)
@@ -45,6 +54,26 @@ def validate_request(config: H3Config, request: H3Request) -> None:
     counts = [len(references[key]) for key in ("image", "video", "audio")]
     if task == "ref2va":
         _validate_ref2va_reference_counts(*counts)
+        from .pipeline import _load_audios
+        from .reference_video import (
+            validate_reference_audio_files,
+            validate_reference_audio_waveforms,
+            validate_reference_video_files,
+        )
+
+        try:
+            if references["video"]:
+                validate_reference_video_files(
+                    references["video"],
+                    start_time_seconds=request.sampling.extra_args.get(
+                        "start_time_seconds"
+                    ),
+                )
+            if references["audio"]:
+                validate_reference_audio_files(request.media["audio"])
+                validate_reference_audio_waveforms(_load_audios(request.media["audio"]))
+        except (OSError, CalledProcessError, ValueError) as exc:
+            raise H3InputError(f"invalid reference media: {exc}") from exc
     elif task == "t2va" and any(counts):
         raise H3InputError("t2va does not accept reference media")
     elif task == "fl2va":
@@ -53,6 +82,11 @@ def validate_request(config: H3Config, request: H3Request) -> None:
         _resolve_fl2va_keyframe_indices(request.sampling.extra_args, counts[0])
     if task != "fl2va" and request.sampling.extra_args.get("frame_indices") is not None:
         raise H3InputError("keyframe indices require image keyframes")
+    if (
+        request.sampling.extra_args.get("start_time_seconds") is not None
+        and not counts[1]
+    ):
+        raise H3InputError("reference start times require video references")
     images = []
     try:
         if references["image"]:
