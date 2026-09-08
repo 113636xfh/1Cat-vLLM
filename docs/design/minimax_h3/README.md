@@ -1,5 +1,10 @@
 # Native MiniMax H3 (development)
 
+The latest optional residual-sharded FlashInfer development run completes
+39 frames and 20 denoise updates in 64.920336 seconds, with unchanged
+video/audio latents. See [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md)
+for the measured warp-transpose gain and remaining quality/performance gates.
+
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation

@@ -28,7 +28,7 @@ constexpr int shared_bytes() {
 }
 
 // QK maxima and probability rows are consumed only by the matching pair.
-// Keep CTA-wide barriers around K/V staging and shared scratch reuse.
+// Keep CTA-wide barriers around K/V staging and tile consumption.
 __device__ __forceinline__ void sync_query_pair(int query_group) {
   asm volatile("bar.sync %0, 64;" ::"r"(query_group + 1) : "memory");
 }
@@ -213,8 +213,12 @@ __global__ __launch_bounds__(THREADS,
     } next_k[PREFETCH_VECTORS], next_v[PREFETCH_VECTORS];
 #pragma unroll
     for (int n = 0; n < PREFETCH_VECTORS; ++n) {
-      const int next_row = start + BK + (tid + n * THREADS) / (D / 8);
-      const int next_col = (tid % (D / 8)) * 8;
+      // Each warp stages an 8-row by 32-column tile. Adjacent K/V rows
+      // occupy lanes differing in bit 2, enabling the V transpose below.
+      const int tile = (tid + n * THREADS) / 32;
+      const int tile_row = (tile / (D / 32)) * 8 + (lane >> 2);
+      const int next_row = start + BK + tile_row;
+      const int next_col = (tile % (D / 32)) * 32 + (lane & 3) * 8;
       if (next_row < length) {
         const int64_t position =
             base + int64_t(next_row) * heads * D + next_col;
@@ -262,32 +266,27 @@ __global__ __launch_bounds__(THREADS,
     if (start + BK < length) {
 #pragma unroll
       for (int n = 0; n < PREFETCH_VECTORS; ++n) {
-        const int tile_row = (tid + n * THREADS) / (D / 8);
-        const int next_col = (tid % (D / 8)) * 8;
+        const int tile = (tid + n * THREADS) / 32;
+        const int tile_row = (tile / (D / 32)) * 8 + (lane >> 2);
+        const int next_col = (tile % (D / 32)) * 32 + (lane & 3) * 8;
         *reinterpret_cast<uint4*>(ks + tile_row * QLD + next_col) =
             next_k[n].packed;
-        // Reuse dead P storage to transpose V cooperatively. Direct strided
-        // stores from each thread's eight contiguous values collide heavily.
-        static_assert(BQ * PLD >= BK * QLD);
-        *reinterpret_cast<uint4*>(probabilities + tile_row * QLD + next_col) =
-            next_v[n].packed;
-      }
-      __syncthreads();
+        // Exchange exact half pairs between adjacent rows. The even-row
+        // lane writes even columns; its partner writes odd columns. This
+        // avoids a shared scratch round trip and its extra CTA barrier.
+        const auto* pairs =
+            reinterpret_cast<const unsigned*>(&next_v[n].packed);
 #pragma unroll
-      for (int i = tid; i < D * BK / 2; i += THREADS) {
-        // Transpose an 8x8 tile per warp. Adjacent d-pair loads and kv-pair
-        // stores each touch distinct banks; the shuffle exchanges exact bits.
-        const int tile = i / 32;
-        const int kv = (tile % (BK / 8)) * 8 + (lane & 7);
-        const int d = (tile / (BK / 8)) * 8 + (lane >> 3) * 2;
-        const unsigned packed =
-            *reinterpret_cast<const unsigned*>(probabilities + kv * QLD + d);
-        const unsigned adjacent = __shfl_xor_sync(0xffffffff, packed, 1);
-        const unsigned transposed =
-            (lane & 1) ? ((adjacent >> 16) | (packed & 0xffff0000u))
-                       : ((packed & 0xffffu) | (adjacent << 16));
-        *reinterpret_cast<unsigned*>(vs + (d + (lane & 1)) * VLD + (kv & ~1)) =
-            transposed;
+        for (int j = 0; j < 4; ++j) {
+          const unsigned local = pairs[j];
+          const unsigned adjacent = __shfl_xor_sync(0xffffffff, local, 4);
+          const unsigned transposed =
+              (lane & 4) ? ((adjacent >> 16) | (local & 0xffff0000u))
+                         : ((local & 0xffffu) | (adjacent << 16));
+          const int d = next_col + 2 * j + ((lane & 4) >> 2);
+          *reinterpret_cast<unsigned*>(vs + d * VLD + (tile_row & ~1)) =
+              transposed;
+        }
       }
     }
   }

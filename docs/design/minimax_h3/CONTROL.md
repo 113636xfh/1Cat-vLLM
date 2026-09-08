@@ -1,5 +1,14 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer warp transpose: [FLASHINFER_VTRANSPOSE.md](FLASHINFER_VTRANSPOSE.md).
+Warp-local exact FP16 pair exchange removes a shared staging round trip and
+one CTA barrier. The unchanged residual-sharded 39-frame/20-update run takes
+64.920336 seconds (53.353907 useful TFLOPS/card), down from 65.804661 seconds.
+Video/audio latents and fresh MP4 remain bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU shows 37.57% Tensor pipe activity;
+direct V stores introduce bank conflicts, so MIO remains a bottleneck.
+Human quality review, <50 seconds and >80 TFLOPS remain open.
+
 Latest FlashInfer operator change:
 [FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md). A 68-half probability stride
 and 64-bit fragment loads remove almost all repeating shared-memory bank
