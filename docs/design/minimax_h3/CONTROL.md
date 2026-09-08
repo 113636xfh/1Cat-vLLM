@@ -230,3 +230,29 @@ Artifacts: `attention-short-candidates.json`, `flashinfer-tested-candidates.cu`,
 `outputs/dev39-int8/{FLASH_ATTN_V100,FLASHINFER_SM70}/` under the task artifact
 directory. Those output directories contain timing and NVML curves; the initial
 export failed and must not be presented as generated-video quality evidence.
+
+### Short-video export and GPU ownership diagnostics
+
+The register-softmax FlashInfer implementation in kernel draft #558 passes 38
+native numerical/service tests. Its cached-text INT8 TP4 development run exported
+a 1344x768, 39-frame, 24-FPS video with 1.632 seconds of decoded audio. Automatic
+frame/dimension/audio/finite/black/static checks pass. Visual inspection of the
+first screenshot shows pronounced ghosting and grid artifacts; the two-forward
+schedule is an execution check and is not a quality pass.
+
+The first export retry encountered other workers taking 27 GiB per GPU and ran
+out of memory. A subsequent diagnostic shell performed a preflight but continued
+after Python returned an error; it ran beside other workers using about 13 GiB
+each. That run's timing is explicitly invalidated in its JSON. The native engine
+already propagates selection errors; the separate diagnostic launcher now also
+propagates them and checks external GPU processes before and after denoise.
+NVML records now include compute PIDs and their memory to expose interference.
+A 12-sample read-only telemetry check passed on the live GPU inventory.
+
+Retained evidence: `outputs/dev39-int8-final/FLASHINFER_SM70/` (video, original
+audio, latents, frames and invalidated timing), `denoise-short-int8-final.log`
+(OOM), `denoise-short-int8-final-retry.log` (export passed, timing excluded),
+`run_short_guarded.py`, and `nvml-process-record-smoke.jsonl` in the artifact
+directory. As of this checkpoint GPU groups 0–3 and 4–7 have other vLLM workers.
+No owned long-video or waiting-GPU process is being retained. BF16 and reference
+generation checks still need an available four-GPU group.
