@@ -97,6 +97,18 @@ large FP32 activation intermediate without lowering arithmetic precision or
 adding a persistent cache. CPU, unquantized and FP32-input paths keep their
 existing implementation.
 
+For the measured TP4 FL2VA INT8 development workload, optionally add
+`--residual-sequence-parallel` to `video generate` or `video serve`. This keeps
+FP32 residual rows sharded across ranks and gathers normalized FP16 inputs at
+the existing precision boundary. Both native SM70 attention backends support
+this option; it rejects BF16, Ref2VA and non-TP4 configurations. It defaults to
+false. The native FlashAttention 39-frame/20-update run measures 58.794562 s
+and 6.195001125 GiB peak denoise allocation/card, versus 62.804019 s and
+6.566735744 GiB without the flag, with zero persistent cache in both cases.
+Automatic media checks pass; changed FP32 reduction order requires human
+quality review, which remains pending. Omit the flag to restore the default.
+These are short development measurements, not the 243-frame acceptance run.
+
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not
 replace the five-axis human quality review. Useful TFLOPS use actual local

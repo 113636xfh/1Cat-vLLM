@@ -41,6 +41,7 @@ class H3Config:
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     int8_weight_layout: str = "column"
+    residual_sequence_parallel: bool = False
 
     def __post_init__(self) -> None:
         if self.partition not in ("fl2va", "ref2va"):
@@ -55,6 +56,17 @@ class H3Config:
             "TORCH_SDPA",
         ):
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
+        if self.residual_sequence_parallel and (
+            self.tensor_parallel_size != 4
+            or self.attention_backend not in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
+            or self.partition != "fl2va"
+            or not self.transformer_path
+        ):
+            raise H3InputError(
+                "experimental residual sequence parallelism requires TP4, "
+                "FLASH_ATTN_V100 or FLASHINFER_SM70 and an FL2VA INT8 "
+                "ConvRot checkpoint"
+            )
         if (
             not math.isfinite(self.fp16_weight_cache_gib)
             or self.fp16_weight_cache_gib < 0

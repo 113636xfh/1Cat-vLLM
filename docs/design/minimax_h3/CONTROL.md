@@ -11,6 +11,115 @@ the existing D256 TensorOp architecture; padding never increases useful FLOPs.
 
 ## 2026-09-08 FlashAttention-V100 D128 native route
 
+### Optional FP32 residual row sharding: 58.79 seconds
+
+`--residual-sequence-parallel` enables an experimental TP4 FL2VA INT8 path
+for either native SM70 attention backend. It defaults to false in both
+`video generate` and `video serve`. This reuses the committed residual dataflow
+from the independent FlashInfer branch at `5b4f0bba31`, adapting its backend
+gate and tests for FlashAttention-V100. No FlashInfer attention code is ported
+or delegated to when FlashAttention is selected.
+
+Each rank retains only its FP32 residual rows through the DiT blocks. The
+existing normalization boundary produces FP16 rows, which are gathered before
+QKV and MLP projection. Output projections retain FP32 partial sums and use
+FP32 reduce-scatter. Final heads receive the gathered FP32 rows. This reduces
+repeated normalization/gating work and intermediate data movement, preserving
+INT8/scale information, all GEMMs, valid attention tokens and denoise updates.
+The feature rejects unsupported TP sizes, BF16 checkpoints, Ref2VA, multiple
+requests and simultaneous Ulysses hooks. The original path remains available
+by omitting the flag; source rollback is kernel parent `9764b6c20259`.
+
+On the unchanged 1344x768, 39-frame/24-FPS, seed42, INT8 ConvRot FL2VA,
+TP4 GPU0-3 request, **20 actual updates take 58.794562 s**:
+**2.939728 s/update and 58.912822 useful model TFLOPS/card**. This is a 6.38%
+time reduction from the 62.804019 s default. Per-card useful FLOPs remain
+3,463,753,579,661,312. Peak denoise Torch allocation falls from 6.566735744 to
+**6.195001125 GiB/card**; NVML peak device-used memory is 8.171386719 GiB/card.
+Persistent FP16 weight cache and cuBLASLt workspace stay zero. This is one
+unprofiled development run with a one-call warmup and prompt-verified cached
+text, not an end-to-end or formal repeated measurement.
+
+Fresh VAE decoding takes 8.478661 s, with 34.904292 s VAE loading reported
+separately. All automatic media checks pass. FP32 reduction order changes:
+video/audio latent relative RMS differences from the 62.80-second baseline
+are 3.87465% /1.20270%. Decoded-video SSIM is 0.983989 and PSNR 38.238221 dB;
+these are auxiliary comparisons, not quality thresholds. Eight sampled frames
+show a consistent red boat, yellow duck and background. Human audiovisual
+scoring remains pending, so the option is not promoted to the default.
+MP4 SHA256 is
+`f00ba75587f58e2a63a105647cb634eebd60b154ab7b3551f385ca2df96e5243`.
+
+Separate two-update Nsight Systems traces explain the gain. Rank0 exclusive
+wall seconds close to each trace's own denoise NVTX span:
+
+| Category | Replicated residual | Sharded residual |
+| --- | ---: | ---: |
+| GEMM | 2.539663 | 2.550870 |
+| Attention | 2.005245 | 2.023926 |
+| TP collectives | 1.076831 | 0.845654 |
+| Other GPU kernels | 0.440786 | 0.237076 |
+| ConvRot | 0.125264 | 0.126346 |
+| Weight dequantization | 0.059483 | 0.059765 |
+| Copies | 0.012490 | 0.012507 |
+| FP16 preparation outside fused kernels | 0.000026 | 0.000025 |
+| No recorded GPU activity | 0.031895 | 0.035798 |
+| Complete trace span | 6.291683 | 5.891967 |
+
+The fused activation's preparation is included in other GPU kernels. GEMM
+and attention still consume about 78% of the new trace. This is not an idle
+optimization. Explicit copies are small; the profile does not establish an
+HBM-copy bottleneck. At 60 useful attention TFLOPS alone, the old trace still
+projects roughly 61 seconds for 20 updates with all other costs held fixed;
+this is an Amdahl illustration, not a measurement or hardware lower bound.
+
+NCU on the unchanged native wide attention reports 246 registers/thread,
+34,304 shared bytes/block, 12.47% achieved occupancy, 49.23% tensor-pipe
+activity, 66.46% L1/shared data-path throughput and 4.57% HBM throughput.
+SASS samples point to QK shared stores waiting for operands, shared-load/HMMA
+dependencies and PV address instructions. Higher occupancy alone is not a
+sufficient fix. Eight isolated paired candidates pass sampled FP32 references
+but fail to establish a speedup; all remain outside the installed extension:
+
+| Candidate | Native control ms | Candidate ms | Decision |
+| --- | ---: | ---: | --- |
+| Pretranspose V to column layout | 20.215809 | 21.629951 | Packing/zeroing loses |
+| Warp/shared row maximum | 20.073471 | 20.227072 | No gain |
+| Q32/K256 | 20.044800 | 24.824833 | Reuse/traffic regression |
+| Unroll fixed QK loop | 20.204544 | 20.252672 | No gain |
+| Unroll fixed PV loop | 19.892223 | 20.021248 | No gain |
+| Eight warps | 20.045824 | 26.279936 | Register spills |
+| Global-load cache policy cg | 20.264959 | 20.225023 | 0.2% noise |
+| Q32/K128, four warps, three CTAs | 20.711424 | 26.468351 | Reuse regression |
+
+A further artifact-only GEMM/reduce-scatter overlap probe uses zero persistent
+cache and workspace, unlike the earlier independent 10-GiB-cache probe. Three
+paired two-update runs give medians 5.872043 ->5.742729 s (2.20%). It preserves
+useful FLOPs and reduces temporary memory, but has nonzero latent differences
+and no complete-video quality validation. Extra packing, streams and GEMM-plan
+APIs are not integrated for this modest prefix gain. Do not report 57.43 s as
+measured full-20 denoise, or repeat these variants without a new hypothesis.
+
+Validation: 70 targeted numerics/service/configuration tests pass. One actual
+four-rank collective test passes on every rank, covering both native attention
+backends, three valid/padded lengths, consecutive blocks, rank-dependent
+weights, FP32 residual values above 65504 and poisoned padding. Pre-commit
+checks pass. No CUDA source or installed binary changes in this follow-up;
+prior attention sanitizer coverage is retained, not presented as a new run.
+The actual full-20 run records all ranks' finite, mutually identical final
+latents and unchanged FLOP counts.
+
+Evidence root: `flashattention-pipeline50/` (exact jobs, NCU/SASS, both Nsight
+traces, candidate source/binaries, negative results, tests, reports and NVML
+curves). Fresh output:
+`outputs/quality39-int8-flashattn-residual-20steps/FLASH_ATTN_V100/`.
+Installed attention SHA256 remains
+`bdb3dcf0eea8c23f992536182a06d26f7b61c7bb6ddefa4b3c88590b81ad0005`.
+
+**Under 50 seconds, attention 60 TFLOPS, formal per-card 80 TFLOPS and human
+quality acceptance remain incomplete.** Keep the arithmetic operand-reuse
+focus; do not mistake 100% NVML utilization for Tensor Core saturation.
+
 ### Wide QK reuse and fused MLP preparation: 62.80 seconds
 
 The retained native implementation completes the unchanged 1344x768,
