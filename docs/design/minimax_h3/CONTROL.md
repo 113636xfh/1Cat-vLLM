@@ -1,5 +1,18 @@
 # Native MiniMax H3 migration control
 
+Latest FlashInfer operator change:
+[FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md). A 68-half probability stride
+and 64-bit fragment loads remove almost all repeating shared-memory bank
+conflicts. Full unchanged 39-frame/20-update denoise with residual sharding
+falls from 66.863312 to 65.804661 seconds (52.636903 useful TFLOPS/rank).
+Video/audio latents and the fresh MP4 are bitwise equal. The 117-test suite and
+three 12-case sanitizers pass. Fresh NCU verifies excessive wavefronts fall
+from 235,879,168 to 1,042,944; Tensor pipe activity reaches 36.33%.
+The first same-name native A/B import collided and is marked invalid; qualified
+module names and identity assertions fix the harness, and corrected short/long
+controls establish the gain. Human quality review, <50 seconds and >80 TFLOPS
+remain open. Residual sharding still defaults off.
+
 Latest opt-in FlashInfer improvement:
 [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). TP4 FP32 residual sharding
 reduces the unchanged 39-frame/20-update denoise to 66.863312 seconds,

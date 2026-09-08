@@ -22,7 +22,7 @@ constexpr int PREFETCH_VECTORS = BK * D / (THREADS * 8);
 static_assert(THREADS * PREFETCH_VECTORS * 8 == BK * D);
 static_assert(BQ / 16 < 16);  // Barrier 0 joins the CTA; 1..8 join query pairs.
 constexpr int shared_bytes() {
-  constexpr int QLD = D + 8, PLD = BK + 8;
+  constexpr int QLD = D + 8, PLD = BK + 4;
   return (BQ * D + BK * QLD + D * VLD + BQ * PLD) * 2 +
          (BQ * KEY_WARPS * 2 + BQ * 2) * 4;
 }
@@ -49,12 +49,27 @@ __device__ __forceinline__ void load_q_fragment(fi::AFragment& fragment,
   values[1] = *reinterpret_cast<const uint4*>(base + ((col + 8) ^ mask));
 }
 
+// A 68-half P stride makes accumulator pair stores conflict-free. Odd rows
+// remain 8-byte aligned, so use 64-bit loads rather than WMMA's 128-bit loads.
+__device__ __forceinline__ void load_p_fragment(fi::AFragment& fragment,
+                                                const half* source, int row,
+                                                int col) {
+  const int lane = threadIdx.x & 31;
+  const int physical_row =
+      row + (lane & 3) + ((lane & 16) >> 2) + ((lane & 4) << 1);
+  const half* base = source + physical_row * (BK + 4) + col;
+  auto* values = reinterpret_cast<uint2*>(fragment.x);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    values[i] = *reinterpret_cast<const uint2*>(base + i * 4);
+}
+
 __global__ __launch_bounds__(THREADS,
                              1) void h3_noncausal(const half* q, const half* k,
                                                   const half* v, half* output,
                                                   int length, int heads,
                                                   float scale) {
-  constexpr int QLD = D + 8, PLD = BK + 8;
+  constexpr int QLD = D + 8, PLD = BK + 4;
   extern __shared__ __align__(32) unsigned char raw[];
   half* qs = reinterpret_cast<half*>(raw);
   half* ks = qs + BQ * D;
@@ -238,7 +253,7 @@ __global__ __launch_bounds__(THREADS,
       for (int kv = 0; kv < BK; kv += 16) {
         fi::AFragment pa;
         fi::QKBFragment vb;
-        fi::load_a_fragment(pa, probabilities + row * PLD + kv, PLD);
+        load_p_fragment(pa, probabilities, row, kv);
         fi::load_qk_b_fragment(vb, vs + col * VLD + kv, VLD);
         fi::mma_sync_m16n16k16_row_col_f16f16f32(pv, pa, vb);
       }

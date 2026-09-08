@@ -93,6 +93,11 @@ checks pass, while five-axis human quality review and the 50-second target
 remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
 differences, GPU tests, current hardware counters and rollback.
 
+The subsequent probability-tile layout change reduces this same optional
+route to 65.804661 seconds and preserves its video/audio outputs bitwise.
+See [FLASHINFER_OPERANDS.md](FLASHINFER_OPERANDS.md) for the instruction-level
+bottleneck, corrected A/B measurements and new sanitizer/profiler evidence.
+
 `--int8-weight-layout column` is the default for DiT INT8 projections. Loading
 reorders physical INT8 storage without changing logical weights or scales.
 Each invocation decodes transient FP16 weights and selects the validated SM70
