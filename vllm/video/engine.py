@@ -18,30 +18,8 @@ from typing import cast
 
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
 
-
-def select_gpu_group(tp: int) -> tuple[int, ...]:
-    import pynvml as nvml
-
-    nvml.nvmlInit()
-    try:
-        for start in (0, 4):
-            indices = tuple(range(start, start + tp))
-            if indices[-1] >= nvml.nvmlDeviceGetCount():
-                continue
-            available = True
-            for index in indices:
-                handle = nvml.nvmlDeviceGetHandleByIndex(index)
-                processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                # Ignore a small desktop CUDA allocation; never displace jobs.
-                if any(p.usedGpuMemory > 256 * 1024**2 for p in processes):
-                    available = False
-                if nvml.nvmlDeviceGetMemoryInfo(handle).free < 30 * 1024**3:
-                    available = False
-            if available:
-                return indices
-        raise RuntimeError("Neither configured GPU group has enough free memory")
-    finally:
-        nvml.nvmlShutdown()
+from .gpu import acquire_gpu_group
+from .gpu import select_gpu_group as select_gpu_group
 
 
 def _worker(rank, config, gpu_ids, endpoint, connection):
@@ -143,18 +121,20 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
 class H3Engine:
     def __init__(self, config: H3Config):
         self.config = config
-        self.gpu_ids = select_gpu_group(config.tensor_parallel_size)
+        self._gpu_lease = None
         self._lock = threading.Lock()
         self._closed = False
         self.workers = []
         self.connections = []
         self.startup = []
         context = mp.get_context("spawn")
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        endpoint = f"tcp://127.0.0.1:{port}"
         try:
+            self._gpu_lease = acquire_gpu_group(config.tensor_parallel_size)
+            self.gpu_ids = self._gpu_lease.gpu_ids
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            endpoint = f"tcp://127.0.0.1:{port}"
             for rank in range(config.tensor_parallel_size):
                 parent, child = context.Pipe()
                 worker = context.Process(
@@ -247,6 +227,9 @@ class H3Engine:
                 worker.join()
         for connection in self.connections:
             connection.close()
+        if self._gpu_lease is not None:
+            self._gpu_lease.close()
+            self._gpu_lease = None
 
     def __enter__(self):
         return self
