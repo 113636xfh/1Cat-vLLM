@@ -50,6 +50,12 @@ class VideoSubcommand(CLISubcommand):
                 help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
             )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
+            mode.add_argument(
+                "--video-encoder",
+                choices=("libx264", "h264_nvenc"),
+                default="libx264",
+                help="MP4 encoder; NVENC requires a capable IMAGEIO_FFMPEG_EXE",
+            )
             if name == "generate":
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
                 mode.add_argument("--width", type=int, default=1344)
@@ -104,6 +110,7 @@ class VideoSubcommand(CLISubcommand):
             lora_path=args.lora_path,
             int8_weight_layout=args.int8_weight_layout,
             residual_sequence_parallel=args.residual_sequence_parallel,
+            video_encoder=args.video_encoder,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve
