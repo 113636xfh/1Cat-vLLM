@@ -126,7 +126,24 @@ as the full pipeline's memory gate. This single short run does not satisfy the
 primary three-run timing contract or the >80 TFLOPS threshold.
 
 The profiler-only run uses the first two updates of the unchanged 20-update
-schedule. Its critical-rank trace attributes about 52% of the synchronized
+schedule. Its rank-0 trace attributes about 52% of the synchronized
 span to attention, 25% to GEMM and 10% to communication before this optimization.
 Explicit wall coverage and kernel service are retained separately. Profiling
 results never replace unprofiled timing.
+
+The selected cooperative-transpose kernel completes the same 20-update denoise
+in 87.824099 s (4.391205 s/update), with 39.439671 useful TFLOPS on each rank.
+Compared with the original 105.642574 s FlashInfer baseline, throughput improves
+by 20.29%. Both final video and audio latent tensors are bitwise identical to
+the previously decoded prefetch result. Only after checking both tensors and
+the MP4 hash, this run reuses that validated decoder output. Its metadata marks
+`short_clip_denoise_quality_with_reused_decode`; it does not provide a new VAE
+or end-to-end timing measurement. Text embeddings are also cached and verified.
+
+The final binary passes all 47 video tests and the ordinary CMake component
+build. CUDA 12.8 memcheck, racecheck and synccheck each pass all six new
+tail/unaligned cases without errors or hazards. Matched-shape Nsight Compute
+reports 25.091% tensor-pipe activity, up from 16.976% before prefetch. This
+counter is diagnostic, not effective model throughput. The 39-frame result
+remains below 80 TFLOPS/card; primary-load quality, three formal timing runs
+and the full-pipeline memory gate remain incomplete.
