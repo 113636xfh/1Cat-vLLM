@@ -385,3 +385,49 @@ Evidence: `profile_h3_steps.py`, `run_profile_h3_steps.py`,
 `profiles/h3-flashinfer-step-breakdown.json`, `query-owned-results.json`, and
 `flashv100-60t-route-audit.md`. GPU 0–3 priority preemption is authorized; the
 active development lease is recorded in `flashinfer-development-lease.json`.
+
+### FlashInfer V-layout and K/V-prefetch checkpoint
+
+Retained the 128x32 register-softmax layout and moved V into column-major
+shared storage for PV. Vectorized loads fetch the next K/V tile while the
+current PV tile computes; the next iteration joins before consuming it.
+Contiguous storage-offset views retain a scalar load path when their K/V
+pointers are not 16-byte aligned. The launch remains 512 threads, 128
+registers/thread, with no register spills.
+
+After warmup, three ABBA groups at each shape give these prototype operator
+medians (padding excluded from useful FLOPs):
+
+| Length | Previous kernel | Prefetch candidate |
+| --- | ---: | ---: |
+| 12323 | 53.202433 ms | 38.789122 ms |
+| 73483 | 1859.025452 ms | 1354.961914 ms |
+
+The final source also handles unaligned storage and passes all 47 video tests.
+CUDA 12.8 Compute Sanitizer memcheck and synccheck each pass all six new tail
+and unaligned-view cases with zero errors. The system sanitizer was incomplete
+and could not find its injection library; the verified CUDA 12.8 redistributable
+was used instead. The ordinary CMake H3 FlashInfer target builds successfully.
+
+The final binary SHA256 is
+`67d542efaaf9bf3fa4e360bfe4c32e9537832a239d0d12b5488460cf9bf464c1`.
+With this binary, the same seed-42/39-frame/20-update cached-text INT8 request
+completes denoise in 90.880784 s, versus 105.642574 s before: 4.544039 s/update
+and 38.113157 useful TFLOPS per rank. Both video and audio latents are bitwise
+identical to the earlier register-softmax result. Automatic export checks pass;
+the MP4 SHA256 is also identical:
+`db77e1ab34999a1727b962edc77d42780b203c4cd23a835e6e05540956c6a078`.
+DiT-only peak allocation remains 6.647851 GiB/rank. This is one short diagnostic,
+not primary quality or the three-run >80 TFLOPS qualification.
+
+Matched-shape NCU reports tensor-pipe activity rising from 16.976% to 22.950%,
+and long-scoreboard stalls falling from 28.329% to 0.531%. Shared load conflicts
+fall from 1.208 billion to 0.671 billion, while shared store conflicts rise to
+1.105 billion. The next experiment targets the transpose stores; no further
+speedup is assumed. NCU durations/counters remain separate from formal timing.
+
+Evidence: `prefetch-long-results.json`, `prefetch-final-tests.log`,
+`prefetch-memcheck-12.8.log`, `prefetch-synccheck.log`,
+`prefetch-cmake-build.log`, `profiles/flashinfer-prefetch-short.*`, and
+`outputs/quality39-int8-prefetch-20steps/`. The previous binary is retained as
+`flashinfer-register-baseline.so` for exact rollback/AB comparison.
