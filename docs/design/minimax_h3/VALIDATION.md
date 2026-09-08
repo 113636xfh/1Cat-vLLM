@@ -7,24 +7,33 @@ diagnostics separate from the three formal timing runs.
 
 The current short-development target is **under 50 seconds for 20 actual DiT
 updates**, retaining 1344x768, 39 frames, seed42, INT8 ConvRot, TP4 GPU0-3 and
-output quality. QK/RoPE fusion now completes this workload in **74.411059 s**,
-or 3.720553 s/update and 46.548909 useful TFLOPS/card. The prior FlashAttention
-checkpoint took 77.342982 s; FlashInfer took 86.200372 s with the same W8A16
-preparation and cache-off settings. These are individual unprofiled development
-measurements after a one-call warmup, using verified cached text embeddings.
+output quality, without a substantial memory increase. Exact full-tile
+FlashAttention specialization and column-major INT8/Lt now complete this workload
+in **69.923404 s**, or 3.496170 s/update and 49.536398 useful TFLOPS/card.
+The preceding QK/RoPE baseline took 74.411059 s; the new route reduces that time
+by 6.03%. Both use zero persistent FP16 cache. New Lt workspace is also zero.
+Peak allocated denoise memory remains exactly 6.647851467 GiB on all four cards;
+NVML peak device-used memory, including runtime allocations, is 8.583496 GiB.
 
-The fused QK/RoPE result is bitwise equal to the prior FlashAttention checkpoint
-for both video and audio latents. Fresh VAE decoding also produces the identical
-MP4 SHA256, and all automatic media checks pass. Human audiovisual quality
-review remains pending. This equivalence is to the FlashAttention control;
-its earlier difference from FlashInfer is still recorded in CONTROL.md.
+Both video and audio latents are bitwise equal to the prior FlashAttention
+baseline. Fresh VAE decoding produces identical PCM samples and MP4 bytes;
+MP4 SHA256 is `17ac6de78b7bc280ce91a0c6ca018785d131b3798856ca3ea3cdc55a10811988`.
+All automatic media checks pass. Human audiovisual quality scoring remains
+pending. Earlier FlashInfer comparisons remain recorded in CONTROL.md.
 
-The four-rank trace, matched failed probes and retained fusion are documented
-in CONTROL.md and `/data/minimax-h3/native-h3-20260908/flashattention-feeding-round2/`.
-Media, NVML and phase reports are under
-`/data/minimax-h3/native-h3-20260908/outputs/quality39-int8-flashattn-rope-20steps/`.
-24 targeted tests and three isolated CUDA sanitizer checks pass. Neither the
-50-second development goal nor the primary >80 TFLOPS/card gate is achieved.
+These are individual unprofiled development measurements after a one-invocation
+warmup with prompt-verified cached text embeddings. Do not interpret them as
+end-to-end generation or the formal three-measurement 243-frame acceptance.
+The separate low-memory prototype took 69.868952 s; combining different builds
+into a formal median is not permitted.
+
+The standard CMake components build. 86 targeted GPU/CPU tests pass, including
+INT8 offsets/scales, padded-M12352 projection equality, fallback and CUDA Graph
+replay. Isolated CUDA12.8 memcheck/racecheck/synccheck pass without errors or
+hazards. Evidence is under `flashattention-lowmem50/`; serialized GPU test logs
+are under `flashattention-under50/`. Media and NVML reports are under
+`outputs/quality39-int8-flashattn-lowmem-native-20steps/FLASH_ATTN_V100/` in the
+recorded artifact root. **Neither 50 seconds nor >80 TFLOPS/card is achieved.**
 
 ## Short development checks
 
@@ -35,6 +44,7 @@ extent while developing kernels or debugging components:
 vllm video generate --model /path/to/MiniMax-H3 \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
   --tensor-parallel-size 4 --attention-backend FLASH_ATTN_V100 \
+  --int8-weight-layout column --fp16-weight-cache-gib 0 \
   --num-frames 39 --num-inference-steps 21 --output-dir /path/to/development
 ```
 
