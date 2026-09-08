@@ -5,6 +5,11 @@ four-card 80 useful TFLOPS acceptance are not yet established. The control log
 records completed tests and remaining gates. No separate vllm-omni installation
 is required.
 
+For explicit workflow selection, reference-video offsets, four/eight-step
+LightX2V Turbo, FlashGen and FastH3 Dense, see [Workflows and distilled LoRA](WORKFLOWS.md).
+The application frontend calls the [native video API](API.md) directly.
+The [adaptation tracker](ADAPTATION.md) records the remaining official workflows.
+
 The supported deployment contract is Python 3.12, Torch 2.10.0+cu128, CUDA Toolkit
 12.8 and V100/SM70. Install the normal 1Cat source build with its `video` extra;
 `tools/minimax_h3/build_extensions.py` builds the three independent H3 operators
@@ -63,10 +68,10 @@ curl -sS http://127.0.0.1:8000/v1/videos \
 ```
 
 `POST /v1/videos` returns a job ID. Query `GET /v1/videos/{id}` and download
-`GET /v1/videos/{id}/content` after completion. `/health` reports readiness;
-`/metrics` reports the queue and job counters. Reference paths refer to files
-available to the server process. Jobs are kept in memory for the current service
-lifetime; generated files remain in the configured output directory.
+`GET /v1/videos/{id}/content` after completion. The service also supports
+multipart uploads, typed reference URLs, synchronous MP4 responses, multiple
+outputs, job listing/deletion and OpenAPI request schemas. See [API.md](API.md)
+for the frontend contract, ownership/cleanup behavior and adapter defaults.
 
 `FLASH_ATTN_V100` is the default denoiser and the main performance-development
 path. With the H3 SM70 extensions it selects the dedicated non-causal D128
@@ -101,7 +106,7 @@ For the measured TP4 FL2VA INT8 development workload, optionally add
 `--residual-sequence-parallel` to `video generate` or `video serve`. This keeps
 FP32 residual rows sharded across ranks and gathers normalized FP16 inputs at
 the existing precision boundary. Both native SM70 attention backends support
-this option; it rejects BF16, Ref2VA and non-TP4 configurations. It defaults to
+this option; it rejects BF16, Ref2VA, adapters and non-TP4 configurations. It defaults to
 false. The native FlashAttention 39-frame/20-update run measures 58.794562 s
 and 6.195001125 GiB peak denoise allocation/card, versus 62.804019 s and
 6.566735744 GiB without the flag, with zero persistent cache in both cases.

@@ -2,6 +2,9 @@
 
 Status: implementation in progress; no video quality or 80 TFLOPS acceptance yet.
 
+Workflow and adapter expansion is tracked in [WORKFLOWS.md](WORKFLOWS.md) and
+[ADAPTATION.md](ADAPTATION.md), with validation entries at the end of this file.
+
 Current decision: the user selects FlashAttention-V100 as the H3 development
 mainline, superseding the earlier FlashInfer choice. Optimize complete denoise
 toward >80 useful TFLOPS on every participating GPU; keep FlashInfer as the
@@ -26,7 +29,7 @@ QKV and MLP projection. Output projections retain FP32 partial sums and use
 FP32 reduce-scatter. Final heads receive the gathered FP32 rows. This reduces
 repeated normalization/gating work and intermediate data movement, preserving
 INT8/scale information, all GEMMs, valid attention tokens and denoise updates.
-The feature rejects unsupported TP sizes, BF16 checkpoints, Ref2VA, multiple
+The feature rejects unsupported TP sizes, BF16 checkpoints, Ref2VA, adapters, multiple
 requests and simultaneous Ulysses hooks. The original path remains available
 by omitting the flag; source rollback is kernel parent `9764b6c20259`.
 
@@ -1084,3 +1087,284 @@ can call ComfyUI's selected attention directly. A workflow's FLASH_ATTN label
 alone is insufficient route evidence. The audit does not justify replacing
 the current H3 FlashInfer mainline. Source snapshots, licenses, reproduction
 scripts, failures and results are retained in `comfy-audit/`.
+
+### Official workflows and LightX2V Turbo expansion (2026-09-08)
+
+Owned branch: `codex/v100-h3-workflows-lora-20260908-091941`.
+Stack base: native PR #557 at `1d201f41344f1a9a50d91197a8ad3a5525e51190`;
+integration remains `onecat/main` (observed `e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`).
+This scope adds workflow/LoRA execution and does not change the other tasks'
+attention kernels. [Omni coverage](../omni_workflow_coverage.md) records the
+90-row upstream support inventory, relevant task history and remaining families.
+
+- Added complete-layout LightX2V Diffusers Turbo loading for FL2V and Ref2V,
+  four/eight updates, 544p/768p training variants, metadata alpha and per-artifact
+  modality shifts. Every A/B tensor must be consumed; ambiguous directories,
+  wrong partitions, other export layouts and malformed shapes are rejected.
+- TP-local Q/K/V delta slices and reordered MLP gate/value rows use the existing
+  FP16-input/FP32-output GEMM with range scaling. INT8 ConvRot base weights stay
+  unchanged; LoRA consumes unrotated activations. Buffers join pinned staging.
+- CLI and HTTP expose task, flow shifts, reference-video offsets and request
+  LoRA scale. Omitted sampling values come from the adapter; explicit mismatches
+  fail before dispatch. Scale zero restores base defaults and bypasses deltas.
+- Reference audio/video metadata is validated before queueing using the same
+  source checks as preprocessing. The service remains healthy after rejected
+  media. LoRA GEMM work is counted separately from base work.
+
+Validation environment: Python 3.12.13, Torch 2.10.0+cu128, CUDA 12.8,
+Transformers 5.15.1, Diffusers 0.40.0, V100-SXM2-32GB TP4, GPU0-3.
+Signed Comfy INT8 and FP32 scales, AdaLN pruning and ConvRot256 retained;
+FP16 weight cache and approximate caches off. Denoising uses the copied,
+hash-recorded #558 FlashInfer-SM70 development binary; text encoder keeps its
+causal Flash-V100 path. This is not a rebuilt release wheel. All generation
+runs below encode their actual prompt/media and decode/export fresh audio/video.
+
+| Workflow | Adapter | Frames | Calls/rank | Encode | Complete denoise | VAE | Generation total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| T2VA | FL2V 4-step v1.2 768p, alpha 8, shifts 6/3 | 39 | 4 | 5.76 s | 27.57 s | 6.65 s max rank | 43.94 s |
+| First+last FL2VA | same | 39 | 4 | 12.97 s | 34.36 s | 6.11 s max rank | 57.40 s |
+
+Both outputs are 1344x768, 24 FPS, seed 42, with native finite 32-kHz audio.
+All automatic checks pass. Inspected first/last screenshots show the red paper
+boat and yellow duck; the FL2VA endpoints follow the supplied frames. Human
+listening/temporal review is pending. The peak per-rank allocation is 16.59 GiB
+for T2VA and 16.61 GiB for FL2VA. Cold worker startup is separate: maximum
+94.26 s and 106.30 s, respectively. These are single functional runs with no
+warmup/three-repeat performance protocol, not formal speed or quality gates.
+The T2VA run preceded the separate LoRA FLOP counter addition; its recorded
+numerator excludes adapter work and must not be used for TFLOPS claims.
+
+Commands (from the owned worktree, with task-owned caches and media tools):
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES='' \
+  .venv/bin/python -m pytest --confcutdir=tests/video tests/video -q
+.venv/bin/ruff check \
+  vllm/entrypoints/cli/video.py \
+  vllm/model_executor/models/minimax_h3/{config,lora,pipeline,reference_video,validation}.py \
+  vllm/video/{server,metrics}.py \
+  tests/video/{test_h3_lora,test_h3_workflows}.py
+```
+
+Result: 84 passed, 8 GPU tests skipped by the CPU-only environment. Real TP4
+CLI generation above provides GPU validation of both active adapter loading
+and full pipeline execution. The new tests cover all eight official media
+combinations, malformed media before dispatch, all eight Turbo filename
+contracts, metadata alpha, TP1/2/4 algebra, ConvRot basis and exact zero-scale
+bypass. The first fixture attempt lacked FFmpeg on PATH; rerunning with the
+existing task-local FFmpeg/FFprobe 7.0.2 passed. Do not diagnose that setup error
+as a model failure.
+
+Ref2VA four-step v0.1 weights were downloaded and validated (624 tensors,
+alpha 8, shifts 12/3). The mixed-reference real run reached four-rank adapter
+binding and the 10337-token Qwen presentation for one image, one video and
+standalone audio, then received SIGTERM (exit 143) before denoise. It produced
+no completed video and is not counted as passing. Another H3 task held GPU0-3
+immediately afterwards. A prior launch was correctly rejected while the group
+was leased. No other task's process was stopped by this scope.
+
+For short mixed-reference development use 56 frames: the existing post-encode
+reference-audio length check rejects a 39-frame embedded soundtrack after it
+is truncated below two seconds. This does not affect the upstream 4–15-second
+output contract; it remains an explicit short-development limitation.
+
+Retained artifacts: `/data/minimax-h3/workflows-lora-20260908/`:
+`ownership.txt`, `worktree-create.log`, `binary-hashes.txt`, `lora-sha256.txt`,
+`omni-supported-models.md`, `omni-h3-recipe.md`, `omni-lora.py`,
+`cpu-final.log`, `workflow-tests.log`, `t2va-turbo4.log`, `fl2va-turbo4.log`,
+`ref2va-turbo4-wait.log`, `run_reference.py`, and `outputs/*-turbo4/`.
+Model and adapter weights remain outside Git. Original/Comfy and Turbo source
+revisions are in `UPSTREAM.md`.
+
+Remaining gates: completed mixed Ref2VA, original BF16-base + LoRA generation,
+eight-step real outputs and other artifact versions, additional seeds, full
+quality/audio review and release-wheel validation. FlashGen, FastH3, combined
+partition serving and upstream multipart upload semantics remain separate
+work. Keep the change Draft until its required review/quality gates pass.
+
+### Direct frontend API expansion (2026-09-08)
+
+The user authorized all official workflow capabilities and clarified that the
+application frontend calls native vLLM APIs directly. ComfyUI integration is
+not required. No ComfyUI source or runtime has been added. The full remaining
+scope is retained in [ADAPTATION.md](ADAPTATION.md).
+
+Continuing the owned PR #565 branch from `92e8c18e2beda42303268979b89519908740fd1c`:
+
+- Added JSON and multipart request normalization, typed HTTP(S)/data URL
+  references and request-owned temporary media. File names cannot choose staging
+  destinations; media size/type/metadata checks run before worker dispatch.
+- Added synchronous MP4 return, multiple outputs with seed offsets, async job
+  listing/deletion, indexed downloads and model discovery. The frontend contract
+  and examples are in [API.md](API.md), and `/openapi.json` includes request schemas.
+- Preserved native adapter defaults consistently across transports: a startup
+  adapter is active unless `lora_scale=0`. A request `lora` object must select
+  that loaded file. This differs from upstream's preload-only PEFT default and
+  is documented explicitly; adding `model` does not toggle activation.
+- Tests cover 11 input combinations, source-file preservation, staged-file
+  cleanup, malformed requests, sync/async results, output indexing and schemas.
+
+CPU command and result: the existing `PATH="$PWD/.venv/bin:$PATH"
+CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest --confcutdir=tests/video
+tests/video -q` passed **110 tests**, with 8 GPU-only tests skipped. The complete
+pre-commit checks on changed files passed. Raw records are
+`/data/minimax-h3/workflows-lora-20260908/api-cpu-all.log` and
+`api-precommit.log`; changed API source hashes are in `api-source-hashes.json`.
+
+The new ASGI-to-native-engine mixed Ref2VA test was attempted once using
+`run_api_reference.py`, with actual image/video/audio uploads, INT8 ConvRot TP4,
+Ref2V four-step v0.1, 1344x768, 4.4 requested seconds, seed 42 and shifts 12/3.
+It exited with status 75 before model loading because neither GPU group was
+free and unleased. Record: `api-ref2va.log`. No GPU generation result is claimed
+for this API revision; no owned workers, service ports or GPU leases remain.
+Retry only after resource ownership changes. The other tasks were not stopped.
+
+### FlashGen native four-step adapter and AdaLN restoration (2026-09-08)
+
+Continues the owned PR #565 branch from
+`79398b0b5a08e0ea6ed7cac37358f55624b651a7`, with the same base, Python/Torch
+environment and direct native API scope.
+
+- Added the official FlashGen rank-64/alpha-64 T2VA artifact as a separate
+  native layout. The loader validates all 518 tensors / 259 pairs, including
+  grouped QKV, native gate/up FFN and dense AdaLN targets. Runtime deltas use
+  staged FP16 A/B buffers, FP32 intermediates and the unrotated input basis.
+- Metadata supplies `[1, 0.7, 0.4, 0.15, 0]`; shifts are 12/3. CLI/HTTP defaults
+  select four intervals (`num_inference_steps=4`). LightX2V's five/nine-point
+  convention is unchanged. Wrong active tasks, layouts and schedules fail.
+- A pruned INT8 base restores 106 original AdaLN/time tensors; all backbone
+  signed INT8 weights and FP32 scales remain unchanged. Original transformer
+  shards are required. Restored weights add about 6.1 GiB per TP4 rank before
+  adapter/activation costs. This is a weight-size estimate; actual GPU peak
+  remains pending. Scale zero retains restored AdaLN/time components; omit the
+  adapter and restart to recover the exact earlier pruned deployment.
+- The downloaded official artifact's revision, byte size and verified SHA256
+  are recorded in `UPSTREAM.md`. Production TP4 meta-model binding consumed all
+  259 targets with 518 actual CPU buffers, totaling 435,126,272 bytes per rank.
+  This verifies real checkpoint shapes and FP16 representability, not GPU
+  execution. The CPU audit explicitly simulates TP configuration and groups.
+
+The same CPU test command now passes **142 tests**, with 8 GPU-only tests
+skipped. Thirty-two FlashGen tests cover metadata errors, exact schedule/task
+semantics, TP1/2/4 projection algebra, complete binding, missing original
+restoration tensors, INT8 tensor preservation, scale-zero bypass and HTTP
+defaults. All changed-file pre-commit checks pass. The first standalone binding
+audit needed the owned worktree on `PYTHONPATH` and explicit simulated TP config;
+those setup-only failures are retained separately from the successful audit.
+
+Evidence under `/data/minimax-h3/workflows-lora-20260908/flashgen/`:
+`manifest.json`, `files.json`, `cpu-all.log`, `precommit.log`,
+`inspect_binding.py`, `production-binding-tp4.log`, and `production-binding.json`.
+No FlashGen GPU result or output-quality acceptance is claimed.
+
+The real native-engine API mixed-Ref2VA test was retried after an idle snapshot
+and successful native GPU lease acquisition. INT8 TP4, Ref2V four-step v0.1,
+actual image/video/audio uploads, 1344x768, 107 frames at 24 FPS, seed 42 and
+shifts 12/3 reached startup (107.824344 s), all-rank binding and 10,266-token
+Qwen media encoding. The process then received SIGTERM (exit 143), at the
+start of the four-call denoise loop. There is no completed media or valid
+generation timing. The sender was not identified. `api-ref2va-run2.log` retains
+the record; no owned workers or GPU leases remain. Do not repeat this unchanged
+GPU run without a resource-ownership change or coordinated validation window.
+
+Next acceptance: uninterrupted mixed-reference API generation and FlashGen
+T2VA, with measured restoration residency, every-rank call counts, output decode
+and video/audio review. FastH3 and the rest of the authorized workflow tracker
+remain outstanding; this checkpoint is not full workflow completion.
+
+### FastH3 Dense native fusion and four-step API (2026-09-08)
+
+Continues owned PR #565 from `54d72466f3a81426fc8afe0bf481da7c8e60c4dd`.
+Native model/frontend scope and the Python 3.12.13, Torch 2.10.0+cu128,
+CUDA 12.8 environment remain unchanged.
+
+- Added explicit FastH3 Dense release identification, rank-64 pairing, declared
+  tensor counts and complete 50-block / 2-refiner coverage checks. The official
+  artifact's 809 tensors contain 362 low-rank pairs and 85 full-rank weight/bias
+  deltas, targeting 343 native parameters.
+- Fusion reconstructs FP32 deltas in the original grouped-QKV and gate/up
+  layout, rounds to the source checkpoint dtype and enters normal native TP
+  loading before pinned staging snapshots the host model. Mapped FP32 adapter
+  tensors are not modified. Missing, duplicate and unapplied edits fail startup.
+- The CLI/HTTP contract fixes T2VA-only FL2VA, four intervals, shifts 12/3 and
+  `[0.999, 0.749, 0.5, 0.25, 0]`. Omitted sampling values follow that contract.
+  Fused weights require request scale 1; request `lora` selection is rejected.
+  Restart without the adapter to recover the base model.
+- This implementation requires original weights. Serialized INT8 fusion and
+  VSA execution are rejected and remain separate implementation work. Native
+  staging runs after fusion; it does not use Omni's fusion-bypassing host-plan
+  path, which is why the upstream offload restriction is not copied blindly.
+
+The complete official Dense artifact was downloaded and SHA256-verified.
+`UPSTREAM.md` pins the revision and hash. The artifact's declared original base
+and the native pinned base have identical hashes for all 81 FL2VA files.
+
+Validation from the owned worktree:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" CUDA_VISIBLE_DEVICES='' \
+  .venv/bin/python -m pytest --confcutdir=tests/video tests/video -q
+PYTHONPATH="$PWD" CUDA_VISIBLE_DEVICES='' .venv/bin/python \
+  /data/minimax-h3/workflows-lora-20260908/fasth3/validate_production_fusion.py
+```
+
+The final video suite passes **171 tests**, with **9 GPU-only tests skipped**.
+The 29 new CPU tests cover release metadata, partial layouts, checkpoint dtype
+rounding, full-rank/bias edits, original INT8 refusal, malformed base streams,
+actual native TP1/2/4 loaders, CPU staging snapshot/restore and API restrictions.
+A CUDA-versus-CPU fusion regression is present but has not run without a lease.
+
+The real-weight CPU audit fused **all 343 parameters** (66,279,468,032 bytes
+of reconstructed source-dtype weights, streamed without retaining a full copy).
+Nine representative QKV, row projection, FFN, AdaLN, refiner and patch-projection
+weights/biases match the pinned upstream fusion implementation bit for bit.
+Every reconstructed tensor is finite and every edit is accounted for. The
+four-thread CPU diagnostic took 171.429758 s and peaked at 9.180790 GiB process
+RSS. It includes selected oracle reconstruction and comparison; it is not
+native worker startup time, deployed host residency, GPU peak or inference speed.
+
+Both four-GPU groups were already leased when inspected. GPU0-3 belonged to
+the separate H3 kernel task (PID 526342); GPU4-7 belonged to the other lease
+scheduler (PID 48286). No GPU test was launched for this revision. FlashGen,
+FastH3 and mixed-reference API generation, CUDA fusion numerics, actual staging
+transfers, memory peaks and audio/video quality remain pending GPU acceptance.
+
+Evidence under `/data/minimax-h3/workflows-lora-20260908/fasth3/`:
+`download-verified.json`, `base-compatibility.json`, `native-index.json`,
+`cpu-all-final.log`, `cpu-final.log`, `precommit.log`,
+`validate_production_fusion.py`, `production-fusion.log` and
+`production-fusion.json`. Model weights and raw artifacts remain outside Git.
+Keep this work Draft; the wider authorized tracker remains in `ADAPTATION.md`.
+
+### User-requested mainline integration (2026-09-08)
+
+The user subsequently requested merging the implemented workflow scope into
+`main`. This source integration supersedes the earlier Draft-only instruction;
+it does not close the GPU, full-duration, human audiovisual or performance gates.
+Those statuses remain explicit in `ADAPTATION.md`.
+
+Required source dependencies are native model PR #557 at
+`1d201f41344f1a9a50d91197a8ad3a5525e51190` and SM70 operator PR #558 at
+`9764b6c202594158e109c7d7dd4bc3d7124ad25d`. The workflow head before integration
+was `4fc5ba8539bed16e00ecf0935a6ca2bf105dae8c`. These were combined in the owned
+workflow worktree and synchronized with `onecat/main`
+`e5d63c51f0fcc1ddf75d229e3df06bf52df206f5` before publishing the merge candidate.
+
+Conflict resolution retains both `lora_path` and `int8_weight_layout`, the
+FlashGen AdaLN restoration branch and the operator's INT8 layout configuration.
+Both workflow and kernel evidence histories are retained. The optimized INT8
+MLP preparation requires an unwrapped `Int8ConvRotLinearMethod`; a dynamic
+LoRA wrapper follows the existing FP32 activation path and cannot be bypassed.
+
+The combined mainline candidate passes **173 CPU video tests**, with **93 GPU
+tests skipped** (the count includes the operator dependency's GPU tests).
+All changed-file pre-commit checks pass. The three H3 extensions were rebuilt
+from this source with Torch 2.10.0+cu128, CUDA Toolkit 12.8, SM70 and CUTLASS
+v4.4.2, using an owned compiler cache. This component build does not establish
+a complete release wheel or a fresh GPU numerical/quality result.
+
+Integration evidence is under
+`/data/minimax-h3/workflows-lora-20260908/merge/`: `cpu-main.log`,
+`build-extensions.log`, `extension-imports.json`, `cli-serve-help.log`,
+`precommit-kernels.log` and `precommit-main.log`. The exact build command and
+final GitHub merge SHAs are retained in that task's merge/handoff artifacts.

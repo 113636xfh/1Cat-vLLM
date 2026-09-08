@@ -32,6 +32,7 @@ def test_residual_parallel_accepts_native_sm70_backends(backend):
         {"attention_backend": "TORCH_SDPA"},
         {"partition": "ref2va"},
         {"transformer_path": None},
+        {"lora_path": "adapter.safetensors"},
     ],
 )
 def test_residual_parallel_rejects_unvalidated_deployments(change):
