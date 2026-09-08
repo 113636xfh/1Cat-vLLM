@@ -8,6 +8,44 @@
 #include <cublas_v2.h>
 
 namespace {
+__global__ void prepare_fp16_rows(const float* input, half* output,
+                                  float* scales, int64_t rows, int width) {
+  __shared__ float warp_maxima[8];
+  __shared__ float row_scale;
+  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+  for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+    float maximum = 0.f;
+    for (int col = tid; col < width; col += blockDim.x) {
+      float value = fabsf(input[row * width + col]);
+      // Nonfinite inputs remain nonfinite after conversion. Like torch.frexp,
+      // use scale 1 when a row's maximum is nonfinite.
+      maximum = fmaxf(maximum, isnan(value) ? INFINITY : value);
+    }
+#pragma unroll
+    for (int delta = 16; delta; delta /= 2)
+      maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, delta));
+    if (lane == 0) warp_maxima[warp] = maximum;
+    __syncthreads();
+    if (warp == 0) {
+      maximum = lane < 8 ? warp_maxima[lane] : 0.f;
+#pragma unroll
+      for (int delta = 16; delta; delta /= 2)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, delta));
+      if (lane == 0) {
+        int exponent = 0;
+        if (isfinite(maximum)) frexpf(maximum, &exponent);
+        row_scale = ldexpf(1.f, max(exponent - 11, 0));
+        scales[row] = row_scale;
+      }
+    }
+    __syncthreads();
+    for (int col = tid; col < width; col += blockDim.x)
+      output[row * width + col] =
+          __float2half_rn(input[row * width + col] / row_scale);
+    __syncthreads();
+  }
+}
+
 __global__ void dequantize_rows(const int8_t* weights, const float* scales,
                                 half* output, int64_t count, int64_t width) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
@@ -16,28 +54,56 @@ __global__ void dequantize_rows(const int8_t* weights, const float* scales,
   }
 }
 
+__device__ __forceinline__ float convrot_butterfly(float a, float b, float c,
+                                                   float d, int digit) {
+  return digit == 0   ? a + b + c - d
+         : digit == 1 ? a + b - c + d
+         : digit == 2 ? a - b + c + d
+                      : -a + b + c + d;
+}
+
 __global__ void convrot256(const half* input, half* output, int64_t groups) {
-  __shared__ float values[256];
-  const int lane = threadIdx.x;
-  for (int64_t group = blockIdx.x; group < groups; group += gridDim.x) {
-    values[lane] = __half2float(input[group * 256 + lane]);
-    __syncthreads();
+  const int lane = threadIdx.x % 32;
+  // Each warp owns a full rotation group, with eight channels per lane.
+  // Keep the checkpoint's radix-four operation order and FP32 intermediates.
+  for (int64_t group =
+           int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+       group < groups; group += int64_t(gridDim.x) * (blockDim.x / 32)) {
+    float values[8], next[8];
 #pragma unroll
-    for (int stride = 1; stride <= 64; stride *= 4) {
+    for (int i = 0; i < 8; ++i)
+      values[i] = __half2float(input[group * 256 + lane + 32 * i]);
+#pragma unroll
+    for (int stride = 1; stride <= 4; stride *= 4) {
       const int digit = (lane / stride) % 4;
       const int base = lane - digit * stride;
-      float a = values[base], b = values[base + stride];
-      float c = values[base + 2 * stride], d = values[base + 3 * stride];
-      float value = digit == 0   ? a + b + c - d
-                    : digit == 1 ? a + b - c + d
-                    : digit == 2 ? a - b + c + d
-                                 : -a + b + c + d;
-      __syncthreads();
-      values[lane] = value;
-      __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        float a = __shfl_sync(0xffffffff, values[i], base);
+        float b = __shfl_sync(0xffffffff, values[i], base + stride);
+        float c = __shfl_sync(0xffffffff, values[i], base + 2 * stride);
+        float d = __shfl_sync(0xffffffff, values[i], base + 3 * stride);
+        values[i] = convrot_butterfly(a, b, c, d, digit);
+      }
     }
-    output[group * 256 + lane] = __float2half_rn(values[lane] * (1.f / 16.f));
-    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int even = i & ~1, base = lane % 16;
+      const int digit = lane / 16 + 2 * (i % 2);
+      float a = __shfl_sync(0xffffffff, values[even], base);
+      float b = __shfl_sync(0xffffffff, values[even], base + 16);
+      float c = __shfl_sync(0xffffffff, values[even + 1], base);
+      float d = __shfl_sync(0xffffffff, values[even + 1], base + 16);
+      next[i] = convrot_butterfly(a, b, c, d, digit);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int base = i % 2;
+      float value = convrot_butterfly(next[base], next[base + 2],
+                                      next[base + 4], next[base + 6], i / 2);
+      output[group * 256 + lane + 32 * i] =
+          __float2half_rn(value * (1.f / 16.f));
+    }
   }
 }
 
@@ -49,6 +115,25 @@ void validate_cuda(const torch::Tensor& value) {
               "H3 SM70 operator requires Volta");
 }
 }  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> h3_prepare_fp16(torch::Tensor input) {
+  validate_cuda(input);
+  TORCH_CHECK(input.dim() == 2 && input.scalar_type() == torch::kFloat32 &&
+                  input.size(1) > 0 && input.size(1) <= INT_MAX,
+              "H3 FP16 preparation requires a FP32 matrix with nonempty rows");
+  const c10::cuda::CUDAGuard guard(input.device());
+  auto output =
+      torch::empty(input.sizes(), input.options().dtype(torch::kFloat16));
+  auto scales = torch::empty({input.size(0), 1}, input.options());
+  if (input.size(0)) {
+    prepare_fp16_rows<<<std::min<int64_t>(input.size(0), 65535), 256, 0,
+                        at::cuda::getCurrentCUDAStream()>>>(
+        input.data_ptr<float>(), reinterpret_cast<half*>(output.data_ptr()),
+        scales.data_ptr<float>(), input.size(0), input.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {output, scales};
+}
 
 torch::Tensor h3_dequantize(torch::Tensor weight, torch::Tensor scale) {
   validate_cuda(weight);
@@ -82,7 +167,7 @@ torch::Tensor h3_rotate(torch::Tensor input) {
   auto output = torch::empty_like(input);
   const int64_t groups = input.numel() / 256;
   if (groups) {
-    convrot256<<<std::min<int64_t>(groups, 65535), 256, 0,
+    convrot256<<<std::min<int64_t>((groups + 3) / 4, 65535), 128, 0,
                  at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
         reinterpret_cast<half*>(output.data_ptr<at::Half>()), groups);
@@ -137,6 +222,7 @@ torch::Tensor h3_fp16_gemm(torch::Tensor input, torch::Tensor weight,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("prepare_fp16", &h3_prepare_fp16);
   m.def("dequantize", &h3_dequantize);
   m.def("rotate", &h3_rotate);
   m.def("gemm", &h3_fp16_gemm, pybind11::arg("input"), pybind11::arg("weight"),

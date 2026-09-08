@@ -472,3 +472,41 @@ Evidence: `transpose-candidates-warm.json`, `cooperative-long-results.json`,
 `cooperative-cmake-build.log`, `profiles/flashinfer-cooperative-short.*`, and
 `outputs/quality39-int8-cooperative-20steps/`. The prior accepted prefetch
 binary is retained as `flashinfer-prefetch-baseline.so`.
+
+## FlashInfer mainline: conversion and ConvRot follow-up
+
+The retained W8A16 change replaces block-wide ConvRot256 shared-memory
+butterflies with warp shuffles and register permutations. FP32 intermediates,
+radix-four addition order and the final FP16 rounding stay intact. A separate
+CUDA operator fuses FP32 row maximum, exact power-of-two scaling and FP16
+conversion before GEMM. CPU reference behavior remains available.
+
+On a synthetic `[12323,7168]` matrix, ConvRot decreases from 1.054720 to
+0.571392 ms and FP16 preparation from 2.870272 to 1.302528 ms. Both conversions
+and row scales are bitwise equal to their controls. These operator results
+are distinct from the real H3 layer dimensions and model timing below.
+
+The final W8A16 binary SHA256 is
+`c7eb5d619eb6a3a5e260acae04f17e7f88a172649717ad26478a5a9d6d6e9a1b`.
+The FlashInfer attention binary stays at the cooperative-prefetch revision
+above. The same 39-frame/20-update INT8 TP4 request completes denoise in
+86.200372 s (4.310019 s/update), or 40.182583 useful TFLOPS on each rank.
+Video/audio latents are bitwise equal to the previous result; decoder reuse
+is explicitly recorded. This single short run is still below the primary
+>80 TFLOPS/card gate. DiT-only peak remains 6.647851 GiB.
+
+Validation: 58 video tests pass, plus the subsequently added nonfinite-input
+test passes separately. CUDA12.8 memcheck, racecheck and synccheck each pass
+the eleven new rotation/scaling cases, including grid-stride boundaries.
+The standard CMake W8A16 component builds. Evidence is under
+`feeding-round2/` and `outputs/quality39-int8-fusedprep-20steps/`.
+
+Rejected attention controls at D128/N12323: expanding BK to 64 spills
+registers and takes 58.25 ms; limiting unrolling lowers that to 38.63 ms but
+still loses to the 34.99 ms baseline. BK32 without unrolling takes 40.46 ms.
+Halving BQ to 64 gives 41.07 ms (BK32) or 45.72 ms (BK64). Explicit P-fragment
+reuse gives no improvement; skipping unit output rescaling gives only about
+1% and is not retained. CUTLASS FMHA controls take about 30 ms, with different
+rounding, and are not installed or counted as FlashInfer results. An asymmetric
+QK/PV CUTLASS control compiles but remains unmeasured after the user's ComfyUI
+audit request. Preserve these controls rather than repeat them unchanged.
