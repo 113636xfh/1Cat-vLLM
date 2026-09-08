@@ -178,6 +178,46 @@ def test_attention_padding_excludes_poisoned_suffix(used, padded):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [127, 128, 129, 12323])
+def test_flashinfer_online_softmax_across_tiles_and_batches(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(42)
+    q, k, v = [
+        torch.randn(2, length, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    # Later key tiles raise the softmax maximum and exercise accumulator
+    # rescaling. Check spread-out query rows without a full square matrix.
+    k[:, length // 2 :] *= 4
+    rows = torch.linspace(0, length - 1, min(length, 65), device="cuda").long()
+    expected = chunked_attention_reference(q[:, rows], k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual[:, rows], expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65])
+def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(42)
+    shape = (2, length, 2, 128)
+    count = 2 * length * 2 * 128
+    q, k, v = [
+        torch.randn(count + offset, device="cuda", dtype=torch.float16)[
+            offset:
+        ].reshape(shape)
+        for offset in (1, 3, 5)
+    ]
+    # The next K/V tile can be absent, partial or complete. Storage offsets
+    # also exercise the scalar load path without changing contiguous layout.
+    expected = chunked_attention_reference(q, k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("backend", ["FLASH_ATTN_V100", "FLASHINFER_SM70"])
 def test_noncausal_backend_matches_fp32_reference(backend):
     token = attention_backend.set(backend)
@@ -217,6 +257,66 @@ def test_sm70_w8a16_uses_signed_scales_and_fp32_gemm_reduction():
     result = ops.gemm(rotated, decoded)
     reference = (rotated.float() @ decoded.float().T).half()
     torch.testing.assert_close(result, reference, atol=1e-5, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("groups", [0, 1, 3, 4, 5, 262141])
+def test_sm70_convrot_warp_tails_and_grid_stride(groups):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import w8a16_extension
+
+    torch.manual_seed(42)
+    # Offset storage also verifies scalar FP16 loads do not require vector
+    # alignment. The largest case crosses the grid's four-warps/block cap.
+    storage = torch.randn(groups * 256 + 1, device="cuda", dtype=torch.float16)
+    x = storage[1:].view(groups, 256)
+    actual = w8a16_extension().rotate(x)
+    torch.testing.assert_close(actual, convrot_reference(x), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("shape", [(0, 256), (1, 1), (17, 31), (19, 7168), (65536, 1)])
+def test_fp16_preparation_preserves_power_of_two_scales(shape):
+    from vllm.model_executor.models.minimax_h3.quantization import fp16_gemm_input
+
+    torch.manual_seed(42)
+    x = torch.randn(*shape, device="cuda")
+    exponents = torch.arange(shape[0], device="cuda") % 140 - 20
+    x = torch.ldexp(x, exponents[:, None])
+    if shape[0] and shape[1] > 1:
+        x[0] = 0
+        # Exact threshold values and their immediate neighbors exercise the
+        # frexp exponent transition used to leave room for ConvRot.
+        if shape[0] > 4:
+            x[1] = 2048
+            x[2] = torch.nextafter(x[1], torch.zeros_like(x[1]))
+            x[3] = torch.nextafter(x[1], torch.full_like(x[1], float("inf")))
+            x[4] = torch.finfo(torch.float32).max
+    maximum = x.abs().amax(-1, keepdim=True)
+    _, exponent = torch.frexp(maximum)
+    expected_scale = torch.ldexp(torch.ones_like(maximum), (exponent - 11).clamp_min(0))
+    expected = (x / expected_scale).half()
+    actual, scale = fp16_gemm_input(x)
+    torch.testing.assert_close(scale, expected_scale, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_fp16_preparation_keeps_nonfinite_values_visible():
+    from vllm.model_executor.models.minimax_h3.quantization import fp16_gemm_input
+
+    x = torch.tensor(
+        [[float("nan"), 1e10], [float("inf"), 4096], [-float("inf"), -0.0]],
+        device="cuda",
+    )
+    _, exponent = torch.frexp(x.abs().amax(-1, keepdim=True))
+    expected_scale = torch.ldexp(
+        torch.ones_like(exponent, dtype=torch.float32), (exponent - 11).clamp_min(0)
+    )
+    actual, scale = fp16_gemm_input(x)
+    torch.testing.assert_close(scale, expected_scale, atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual, (x / expected_scale).half(), atol=0, rtol=0, equal_nan=True
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
