@@ -87,6 +87,28 @@ or clock settings were changed. NVML recorded software power-capping events.
 GPU utilization medians of 100% are diagnostic and do not establish the
 80-TFLOPS requirement.
 
+A separate Nsight Systems capture of the first two actual updates retains
+the 21-position schedule. Rank 0's synchronized NVTX interval is 7.903882 s:
+
+| Exclusive wall category | Two-update seconds |
+| --- | ---: |
+| Attention | 2.946113 |
+| GEMM | 2.722174 |
+| TP communication | 1.057550 |
+| Other GPU kernels | 0.932589 |
+| ConvRot | 0.119705 |
+| Weight dequantization | 0.062780 |
+| Copies | 0.012645 |
+| No recorded GPU activity | 0.050326 |
+
+There is no overlap category in this capture. Attention is about 37% of this
+interval, GEMM 34% and communication 13%; launch gaps are below 1%. The next
+optimization should address actual matrix/shared-memory work or communication,
+not assume CPU launch overhead is the dominant problem. This profiled interval
+is not substituted into the unprofiled performance result. Raw data is in
+`steps-profile.nsys-rep`, `steps-profile.sqlite`, `steps-breakdown.json` and
+`kernel-services-rank0.json` under the artifact directory below.
+
 ## Quality limits
 
 Both video and audio were freshly decoded; VAE time was 8.908984 seconds.
@@ -142,6 +164,9 @@ isolated worktree and dependencies. The old kernel worktree was not modified.
   spills alone did not explain its regression.
 - K128 with Q/P and K/V shared-storage reuse: 42.971 ms versus a matched
   34.980-ms control; 44-byte spill stores and 84-byte spill loads. Reject.
+- Reducing that K128 query tile to 96 removes spills (157 registers) but takes
+  54.322 ms versus 34.972 ms on GPU 1. Reject: eliminating spills alone does
+  not recover throughput when the CTA shape and data-staging costs change.
 - CUTLASS asymmetric FMHA controls: about 26.4–26.5 ms at the short shape,
   but are not installed, delegated to, or reported as FlashInfer performance.
 
@@ -152,3 +177,9 @@ three formal unprofiled measurements, and >80 TFLOPS on each rank are still
 outstanding. Keep this branch Draft. Rollback is the retained Q128/K32
 FlashInfer kernel at the dependency base; the other attention route is managed
 by its separate task.
+
+The trace's NCCL kernel symbol ends in `RING_LL`; the symbol alone is not
+protocol-selection evidence. No NCCL protocol override was set. Before a
+protocol experiment, inspect tuning/debug information: NVIDIA documents
+[misleading protocol suffixes](https://github.com/NVIDIA/nccl/issues/2196)
+and the supported [NCCL_PROTO controls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-proto).
