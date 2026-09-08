@@ -7,9 +7,11 @@ is required.
 
 The supported deployment contract is Python 3.12, Torch 2.10.0+cu128, CUDA Toolkit
 12.8 and V100/SM70. Install the normal 1Cat source build with its `video` extra;
-`tools/minimax_h3/build_extensions.py` builds the two independent H3 operators
+`tools/minimax_h3/build_extensions.py` builds the three independent H3 operators
 when working on top of an existing compatible 1Cat installation. It requires
-`CUDA_HOME` and `TORCH_CUDA_ARCH_LIST=7.0`. It does not rebuild the rest of vLLM.
+`CUDA_HOME`, `TORCH_CUDA_ARCH_LIST=7.0`, and `VLLM_CUTLASS_SRC_DIR` pointing to
+CUTLASS v4.4.2 source. It does not rebuild the rest of vLLM. The normal CMake
+build fetches that pinned CUTLASS version automatically.
 The development tests use Transformers 5.15.1 and Diffusers 0.40.0.
 
 ```bash
@@ -21,7 +23,7 @@ vllm video generate \
   --partition fl2va \
   --transformer-path /path/to/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
   --tensor-parallel-size 4 \
-  --attention-backend FLASHINFER_SM70 \
+  --attention-backend FLASH_ATTN_V100 \
   --output-dir ./h3-output
 ```
 
@@ -66,8 +68,10 @@ curl -sS http://127.0.0.1:8000/v1/videos \
 available to the server process. Jobs are kept in memory for the current service
 lifetime; generated files remain in the configured output directory.
 
-`FLASHINFER_SM70` is the default denoiser and the main performance-development
-path. It selects the independent dense Volta operator. `FLASH_ATTN_V100` remains
+`FLASH_ATTN_V100` is the default denoiser and the main performance-development
+path. With the H3 SM70 extensions it selects the dedicated non-causal D128
+TensorOp operator. It preserves all independent MHA heads and the D128 scale;
+it does not pad the model's head dimension to D256. `FLASHINFER_SM70` remains
 an explicit comparison and rollback option. The Torch
 reference backend is for numerical investigation. Text encoding uses TP4 and
 Flash-V100 causal GQA; the selectable denoiser backends use non-causal MHA.
