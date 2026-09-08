@@ -12,6 +12,12 @@ BASE_MODEL = "MiniMaxAI/MiniMax-H3"
 BASE_REVISION = "42ed227ee7df40d41602854ae760620d6eb651fe"
 COMFY_MODEL = "Comfy-Org/MiniMax-H3"
 COMFY_REVISION = "a98869194787969724c7425d95d0ed73ce9202af"
+# The streaming VAE needs at least one full temporal chunk (22 frames).
+# Short clips are useful development workloads; acceptance stays at 243 frames.
+MIN_OUTPUT_FRAMES = 22
+MAX_OUTPUT_FRAMES = 362
+MIN_OUTPUT_SECONDS = MIN_OUTPUT_FRAMES / 24
+MAX_OUTPUT_SECONDS = 15
 DEFAULT_PROMPT = (
     "一个连续的写实镜头。白天自然光下的公园浅水池，一艘红色纸船从画面左侧"
     "缓慢漂向右侧，一只黄色橡皮鸭从纸船后方经过。微风在水面形成细小涟漪，"
@@ -78,8 +84,8 @@ class H3SamplingParams:
             raise H3InputError("H3 canvas aspect ratio must be in [1:4, 4:1]")
         if self.fps != 24:
             raise H3InputError("H3 generates at 24 FPS")
-        if not 96 <= self.num_frames <= 362:
-            raise H3InputError("H3 duration must be between 4 and 15 seconds")
+        if not MIN_OUTPUT_FRAMES <= self.num_frames <= MAX_OUTPUT_FRAMES:
+            raise H3InputError("H3 requires between 22 and 362 frames")
         if self.num_inference_steps < 2:
             raise H3InputError("H3 needs at least two sigma positions")
         if self.num_outputs_per_prompt != 1:
@@ -91,9 +97,9 @@ class H3SamplingParams:
             isinstance(duration, bool)
             or not isinstance(duration, (int, float))
             or not math.isfinite(duration)
-            or not 4 <= duration <= 15
+            or not MIN_OUTPUT_SECONDS <= duration <= MAX_OUTPUT_SECONDS
         ):
-            raise H3InputError("H3 duration must be between 4 and 15 seconds")
+            raise H3InputError("H3 duration must be between 22/24 and 15 seconds")
 
 
 @dataclass

@@ -114,6 +114,38 @@ def test_primary_workload_schedule_and_shape():
     assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
 
 
+@pytest.mark.parametrize(
+    "frames,duration,expected",
+    [
+        (22, None, (22, 7, 37)),
+        (39, None, (39, 12, 65)),
+        (243, 1, (39, 12, 65)),
+        (243, 2, (56, 17, 93)),
+        (362, None, (362, 107, 603)),
+    ],
+)
+def test_short_clip_shape_and_audio_alignment(frames, duration, expected):
+    from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
+    from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+
+    sampling = H3SamplingParams(
+        num_frames=frames,
+        extra_args={} if duration is None else {"duration_seconds": duration},
+    )
+    shape = MiniMaxH3Pipeline._resolve_shape(None, "t2va", sampling, None)
+    assert shape == (768, 1344, *expected)
+
+
+@pytest.mark.parametrize(
+    "values", [{"num_frames": 21}, {"extra_args": {"duration_seconds": 0.5}}]
+)
+def test_short_clip_rejects_incomplete_vae_temporal_chunk(values):
+    from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
+
+    with pytest.raises(ValueError, match="22"):
+        H3SamplingParams(**values)
+
+
 @pytest.mark.parametrize("height,width", [(768, 1344), (256, 256)])
 def test_native_canvas_does_not_require_omni_aspect_ratio(height, width):
     from vllm.model_executor.models.minimax_h3.config import H3SamplingParams
@@ -143,6 +175,25 @@ def test_attention_padding_excludes_poisoned_suffix(used, padded):
     actual = attention(q, k, v, AttentionMetadata(extra={"valid_kv_length": used}))
     torch.testing.assert_close(actual[:, :used], expected)
     assert torch.count_nonzero(actual[:, used:]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("length", [127, 128, 129, 12323])
+def test_flashinfer_online_softmax_across_tiles_and_batches(length):
+    from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
+
+    torch.manual_seed(42)
+    q, k, v = [
+        torch.randn(2, length, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    # Later key tiles raise the softmax maximum and exercise accumulator
+    # rescaling. Check spread-out query rows without a full square matrix.
+    k[:, length // 2 :] *= 4
+    rows = torch.linspace(0, length - 1, min(length, 65), device="cuda").long()
+    expected = chunked_attention_reference(q[:, rows], k, v, scale=128**-0.5)
+    actual = flashinfer_extension().forward(q, k, v, 128**-0.5)
+    torch.testing.assert_close(actual[:, rows], expected, atol=0.002, rtol=0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")

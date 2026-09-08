@@ -157,3 +157,76 @@ Evidence: `encoder-real-tp4-final.log`, `pipeline-route-canvas.log`,
 `kernel-build-fp32-output.log`, and `profiles/w8a16-hmma-root.ncu-rep`
 under the task artifact directory. Do not repeat superseded failing routes
 unless a new change requires them.
+
+### Short development workloads and attention evidence (2026-09-08)
+
+- User requested 1–2 second development clips and no repeated full-video runs.
+  Native requests now accept 22 and 39 aligned frames; 39 frames at 24 FPS is
+  1.625 seconds. The primary 243-frame/49-forward acceptance contract is unchanged.
+  Ten targeted shape/schedule tests pass, including short audio latent alignment
+  and rejection below the streaming VAE's minimum temporal chunk.
+- The earlier primary run was interrupted before completion; the host rebooted.
+  Its log reaches 22/49 DiT calls. Preserve it as partial diagnostic evidence,
+  never as a completed run or acceptance measurement. Initial stable calls took
+  about 129.5 seconds; late slow calls are not a reproducible speed baseline.
+- NVML medians were 100% GPU utilization. Nsight Compute separately measured
+  13.886% tensor-pipe activity in main-shape Flash-V100 attention and 78.150% in
+  the FP16-input/FP32-output Tensor Core GEMM. Utilization is not useful TFLOPS.
+  Attention at 73483 tokens took about 2.262 seconds without profiler, explaining
+  most of the observed DiT time. The performance gate remains unqualified.
+- Native TP4 video VAE decoded 39 frames at 1344x768 using 28 tiles. All four
+  outputs were finite with the expected shape; each peak allocation was
+  17805820416 bytes (16.58 GiB). Decode took 4.62–5.50 seconds per rank, without
+  a synchronized performance protocol; this is a functional result only.
+- CMake configure/build/install succeeded for both H3 extension targets. Five
+  targeted CUDA numerical tests passed against those installed modules. This
+  does not yet establish a complete release-wheel build.
+- All fixed-revision original and Comfy weights have downloaded and checksum
+  manifests are retained. Host memory is shared with another service, so current
+  short denoise diagnostics reuse the previously validated TP4 text embeddings
+  and load the VAE after releasing DiT, rather than retaining every component.
+  Such runs must explicitly report cached text and separate loading costs.
+
+Evidence under `/data/minimax-h3/native-h3-20260908/`:
+`short-clip-contract-tests.log`, `vae-tp4-short.log`,
+`cmake-numerics-tests.log`, `interrupted-baseline-summary.json`,
+`original-checkpoint-manifest.json`, `comfy-checkpoint-manifest.json`,
+`profiles/flashv100-attention.summary.json`, and
+`profiles/w8a16-fp32-output.summary.json`.
+
+### Independent FlashInfer register accumulation
+
+The selected SM70 kernel keeps QK scores, online-softmax reductions and PV
+accumulators in registers. Only cross-warp row partials and probabilities use
+shared memory. A 128-query by 32-key tile uses 512 threads and 64 KiB shared
+memory. The explicit backend continues to execute its own Volta WMMA kernel.
+
+- Full FP32 checks at 17, 243, 1025 and 8192 tokens passed. Spread-out query
+  checks at 12323 and 73483 tokens passed without a square attention matrix.
+  Added regression coverage for batch indexing, 127/128/129 query boundaries,
+  short-video token count and changing softmax maxima across key tiles.
+- The final formatted implementation passes all 38 native video tests on GPU 0.
+- At 12323 tokens (39-frame canvas), candidate median attention time was
+  53.220 ms versus 61.108 ms for Flash-V100. At 73483 tokens the same isolated
+  comparison was 1.857 seconds versus 2.246 seconds. No full long video was run.
+- Cached-text TP4 INT8 denoise at 1344x768, 39 frames, seed 42 and three sigma
+  positions (two forwards), after a one-forward warmup: Flash-V100 11.29494 s,
+  FlashInfer candidate 10.55566 s. Each rank counted 346375340509184 useful
+  FLOPs, giving 30.6664 and 32.8142 useful TFLOPS respectively. All four ranks
+  matched bitwise within each backend and all latents were finite.
+  This is development timing, not the full-schedule >80 TFLOPS acceptance.
+- Rejected candidates: 128x64 requested too many launch resources; 32x64 was
+  slower; keeping only PV in registers was slower than also reducing softmax
+  in registers. Their code/binary and raw measurements remain in artifacts,
+  while the public extension retains only the selected implementation.
+- The first cached-text diagnostic attempted to export the raw BCTHW VAE
+  tensor. Its script omitted the pipeline's output conversion to BTHWC RGB8.
+  The native pipeline already performs that conversion; correct the diagnostic
+  and save latents before export to avoid repeating denoise on export failures.
+
+Artifacts: `attention-short-candidates.json`, `flashinfer-tested-candidates.cu`,
+`flashinfer-tested-candidates.so`, `flashinfer-register-formatted-build.log`,
+`kernel-register-native-tests.log`, `denoise-short-int8.log` and
+`outputs/dev39-int8/{FLASH_ATTN_V100,FLASHINFER_SM70}/` under the task artifact
+directory. Those output directories contain timing and NVML curves; the initial
+export failed and must not be presented as generated-video quality evidence.
